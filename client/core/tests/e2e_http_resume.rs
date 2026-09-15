@@ -1,7 +1,7 @@
 //! End-to-end coverage for a journalled HTTP send pause and same-session resume.
 //!
-//! The test uses the real UniFFI surface and a private server fixture. Without
-//! `VOTPORT_BIN` it is inert, like the other client e2e binaries.
+//! The test uses the real UniFFI surface and a private server fixture. Local
+//! runs may skip without `VOTPORT_BIN`; CI requires the server binary.
 
 #![cfg(target_os = "linux")]
 
@@ -157,8 +157,7 @@ fn pause_http_send(bin: &str) -> PausedHttp {
 #[test]
 fn a_paused_http_send_resumes_the_same_session_prefix() {
     let _test_lock = TEST_LOCK.lock().unwrap();
-    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
-        eprintln!("VOTPORT_BIN unset; skipping the HTTP pause/resume e2e");
+    let Some(bin) = common::server_binary() else {
         return;
     };
     let paused = pause_http_send(&bin);
@@ -232,8 +231,7 @@ fn a_paused_http_send_resumes_the_same_session_prefix() {
 #[test]
 fn forgetting_a_paused_http_send_aborts_its_owned_session() {
     let _test_lock = TEST_LOCK.lock().unwrap();
-    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
-        eprintln!("VOTPORT_BIN unset; skipping the HTTP forget e2e");
+    let Some(bin) = common::server_binary() else {
         return;
     };
     let paused = pause_http_send(&bin);
@@ -255,8 +253,7 @@ fn forgetting_a_paused_http_send_aborts_its_owned_session() {
 #[test]
 fn watch_ship_replacement_aborts_the_old_http_session() {
     let _test_lock = TEST_LOCK.lock().unwrap();
-    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
-        eprintln!("VOTPORT_BIN unset; skipping the watch replacement e2e");
+    let Some(bin) = common::server_binary() else {
         return;
     };
     let paused = pause_http_send(&bin);
@@ -286,8 +283,7 @@ fn watch_ship_replacement_aborts_the_old_http_session() {
 #[test]
 fn a_concurrent_resume_cannot_take_ownership_from_the_first_run() {
     let _test_lock = TEST_LOCK.lock().unwrap();
-    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
-        eprintln!("VOTPORT_BIN unset; skipping the concurrent resume e2e");
+    let Some(bin) = common::server_binary() else {
         return;
     };
     let paused = pause_http_send(&bin);
@@ -393,8 +389,7 @@ fn rewrite_saved_http(id: &str, update: impl FnOnce(&mut serde_json::Value)) {
 #[test]
 fn paused_http_resume_clears_invalid_expired_and_changed_sessions() {
     let _test_lock = TEST_LOCK.lock().unwrap();
-    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
-        eprintln!("VOTPORT_BIN unset; skipping the HTTP resume lifecycle e2e");
+    let Some(bin) = common::server_binary() else {
         return;
     };
 
@@ -499,8 +494,7 @@ fn paused_http_resume_clears_invalid_expired_and_changed_sessions() {
 #[test]
 fn a_clear_failure_is_reported_and_retains_the_saved_session() {
     let _test_lock = TEST_LOCK.lock().unwrap();
-    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
-        eprintln!("VOTPORT_BIN unset; skipping the clear failure e2e");
+    let Some(bin) = common::server_binary() else {
         return;
     };
     let paused = pause_http_send(&bin);

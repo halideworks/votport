@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use rusqlite::{Connection, OptionalExtension as _};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use vot_sdk::object::ObjectId;
@@ -472,8 +475,16 @@ pub struct SettingsOverlay {
     pub draining_source: &'static str,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 42;
+pub(crate) const SCHEMA_VERSION: u64 = 43;
 pub(crate) const DELIVERED_CANDIDATE_PAGE: usize = 128;
+
+#[cfg(test)]
+const TENANT_RECEIVED_VM_UNOBSERVED: u64 = u64::MAX;
+
+#[cfg(test)]
+thread_local! {
+    static LAST_TENANT_RECEIVED_VM_STEPS: Cell<u64> = const { Cell::new(TENANT_RECEIVED_VM_UNOBSERVED) };
+}
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
@@ -536,6 +547,16 @@ CREATE TABLE IF NOT EXISTS files (
     PRIMARY KEY (link_id, upload_id, file_index)
 );
 CREATE INDEX IF NOT EXISTS files_tenant_live ON files(tenant, deleted, bytes_hi, bytes_lo);
+CREATE INDEX IF NOT EXISTS files_quota_identity ON files(
+    tenant,
+    CASE WHEN stored_as = '' THEN 1 ELSE 0 END,
+    CASE WHEN stored_as = '' THEN '' ELSE stored_as END,
+    CASE WHEN stored_as = '' THEN link_id ELSE '' END,
+    CASE WHEN stored_as = '' THEN upload_id ELSE '' END,
+    CASE WHEN stored_as = '' THEN file_index ELSE 0 END,
+    bytes_hi DESC,
+    bytes_lo DESC
+) WHERE deleted = 0;
 CREATE INDEX IF NOT EXISTS files_link_path ON files(link_id, stored_as);
 CREATE INDEX IF NOT EXISTS files_delivered_object
 ON files(tenant, link_id, suite, root, bytes_hi, bytes_lo, stored_as) WHERE deleted = 0;
@@ -687,6 +708,7 @@ CREATE TABLE IF NOT EXISTS upload_sessions (
     committed_upload_id TEXT
 );
 CREATE UNIQUE INDEX upload_sessions_push_key ON upload_sessions(push_key) WHERE push_key IS NOT NULL;
+CREATE INDEX upload_sessions_quota_live ON upload_sessions(tenant, id) WHERE committed_upload_id IS NULL;
 CREATE TABLE IF NOT EXISTS upload_session_files (
     session_id TEXT NOT NULL,
     entry INTEGER NOT NULL,
@@ -758,6 +780,179 @@ CREATE TABLE delivery_storage_credentials(id TEXT PRIMARY KEY REFERENCES deliver
 CREATE TABLE receive_workflows(link_id TEXT PRIMARY KEY REFERENCES links(id) ON DELETE CASCADE, document TEXT NOT NULL);
 CREATE TABLE receive_workflow_uploads(link_id TEXT NOT NULL REFERENCES links(id) ON DELETE CASCADE, upload_id TEXT NOT NULL, PRIMARY KEY(link_id,upload_id));
 ";
+
+const QUOTA_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS tenant_quota_usage (
+    tenant TEXT PRIMARY KEY,
+    bytes_hi INTEGER NOT NULL CHECK (bytes_hi BETWEEN 0 AND 4294967295),
+    bytes_lo INTEGER NOT NULL CHECK (bytes_lo BETWEEN 0 AND 4294967295),
+    state INTEGER NOT NULL CHECK (state IN (0, 1, 2))
+);
+";
+
+const QUOTA_INDEXES: &str = "
+CREATE INDEX IF NOT EXISTS files_quota_identity ON files(
+    tenant,
+    CASE WHEN stored_as = '' THEN 1 ELSE 0 END,
+    CASE WHEN stored_as = '' THEN '' ELSE stored_as END,
+    CASE WHEN stored_as = '' THEN link_id ELSE '' END,
+    CASE WHEN stored_as = '' THEN upload_id ELSE '' END,
+    CASE WHEN stored_as = '' THEN file_index ELSE 0 END,
+    bytes_hi DESC,
+    bytes_lo DESC
+) WHERE deleted = 0;
+CREATE INDEX IF NOT EXISTS upload_sessions_quota_live
+    ON upload_sessions(tenant, id) WHERE committed_upload_id IS NULL;
+";
+
+const QUOTA_BASE: i64 = 4_294_967_296;
+const QUOTA_MAX_LIMB: i64 = 4_294_967_295;
+// tenant_quota_usage.state: 0 exact, 1 saturated, 2 dirty.
+
+fn quota_identity(alias: &str) -> String {
+    format!(
+        "CASE WHEN {alias}.stored_as = '' THEN 1 ELSE 0 END,
+         CASE WHEN {alias}.stored_as = '' THEN '' ELSE {alias}.stored_as END,
+         CASE WHEN {alias}.stored_as = '' THEN {alias}.link_id ELSE '' END,
+         CASE WHEN {alias}.stored_as = '' THEN {alias}.upload_id ELSE '' END,
+         CASE WHEN {alias}.stored_as = '' THEN {alias}.file_index ELSE 0 END",
+    )
+}
+
+fn quota_probe(reference: &str, exclude: &str, column: &str) -> String {
+    format!(
+        "SELECT {column} FROM files AS candidate
+         WHERE candidate.tenant = {reference}.tenant AND candidate.deleted = 0
+           AND ({identity}) = ({reference_identity})
+           AND NOT (candidate.link_id = {exclude}.link_id
+                    AND candidate.upload_id = {exclude}.upload_id
+                    AND candidate.file_index = {exclude}.file_index)
+         ORDER BY candidate.bytes_hi DESC, candidate.bytes_lo DESC LIMIT 1",
+        identity = quota_identity("candidate"),
+        reference_identity = quota_identity(reference),
+    )
+}
+
+fn quota_add_update(reference: &str, exclude: &str, live: &str) -> String {
+    let previous_hi = quota_probe(reference, exclude, "candidate.bytes_hi");
+    let previous_lo = quota_probe(reference, exclude, "candidate.bytes_lo");
+    format!(
+        "UPDATE tenant_quota_usage
+         SET bytes_hi = CASE WHEN bytes_hi + q.delta_hi + (bytes_lo + q.delta_lo >= {base}) > {max}
+                             THEN {max} ELSE bytes_hi + q.delta_hi + (bytes_lo + q.delta_lo >= {base}) END,
+             bytes_lo = (bytes_lo + q.delta_lo) % {base},
+             state = CASE WHEN bytes_hi + q.delta_hi + (bytes_lo + q.delta_lo >= {base}) > {max}
+                               OR (bytes_hi + q.delta_hi + (bytes_lo + q.delta_lo >= {base}) = {max}
+                                   AND (bytes_lo + q.delta_lo) % {base} = {max})
+                          THEN 1 ELSE 0 END
+         FROM (
+             SELECT CASE WHEN {reference}.bytes_hi > old.bytes_hi
+                              OR ({reference}.bytes_hi = old.bytes_hi AND {reference}.bytes_lo > old.bytes_lo)
+                         THEN {reference}.bytes_hi - old.bytes_hi - ({reference}.bytes_lo < old.bytes_lo)
+                         ELSE 0 END AS delta_hi,
+                    CASE WHEN {reference}.bytes_hi > old.bytes_hi
+                              OR ({reference}.bytes_hi = old.bytes_hi AND {reference}.bytes_lo > old.bytes_lo)
+                         THEN ({reference}.bytes_lo - old.bytes_lo + {base}) % {base}
+                         ELSE 0 END AS delta_lo
+             FROM (SELECT COALESCE(({previous_hi}), 0) AS bytes_hi,
+                          COALESCE(({previous_lo}), 0) AS bytes_lo) AS old
+         ) AS q
+         WHERE tenant = {reference}.tenant AND state = 0 AND {live}",
+        base=QUOTA_BASE,
+        max=QUOTA_MAX_LIMB,
+    )
+}
+
+fn quota_remove_update(reference: &str, exclude: &str, live: &str) -> String {
+    let remaining_hi = quota_probe(reference, exclude, "candidate.bytes_hi");
+    let remaining_lo = quota_probe(reference, exclude, "candidate.bytes_lo");
+    format!(
+        "UPDATE tenant_quota_usage
+         SET bytes_hi = CASE WHEN bytes_hi < q.delta_hi
+                                  OR (bytes_hi = q.delta_hi AND bytes_lo < q.delta_lo)
+                             THEN bytes_hi
+                             ELSE bytes_hi - q.delta_hi - (bytes_lo < q.delta_lo) END,
+             bytes_lo = CASE WHEN bytes_hi < q.delta_hi
+                                  OR (bytes_hi = q.delta_hi AND bytes_lo < q.delta_lo)
+                             THEN bytes_lo
+                             ELSE (bytes_lo - q.delta_lo + {base}) % {base} END,
+             state = CASE WHEN state = 1 AND q.removed THEN 2
+                          WHEN state = 0 AND (bytes_hi < q.delta_hi
+                               OR (bytes_hi = q.delta_hi AND bytes_lo < q.delta_lo)) THEN 2
+                          ELSE state END
+         FROM (
+             SELECT CASE WHEN old.bytes_hi > remaining.bytes_hi
+                              OR (old.bytes_hi = remaining.bytes_hi AND old.bytes_lo > remaining.bytes_lo)
+                         THEN 1 ELSE 0 END AS removed,
+                    CASE WHEN old.bytes_hi > remaining.bytes_hi
+                              OR (old.bytes_hi = remaining.bytes_hi AND old.bytes_lo > remaining.bytes_lo)
+                         THEN old.bytes_hi - remaining.bytes_hi - (old.bytes_lo < remaining.bytes_lo)
+                         ELSE 0 END AS delta_hi,
+                    CASE WHEN old.bytes_hi > remaining.bytes_hi
+                              OR (old.bytes_hi = remaining.bytes_hi AND old.bytes_lo > remaining.bytes_lo)
+                         THEN (old.bytes_lo - remaining.bytes_lo + {base}) % {base}
+                         ELSE 0 END AS delta_lo
+             FROM (SELECT {reference}.bytes_hi, {reference}.bytes_lo) AS old
+             CROSS JOIN (SELECT COALESCE(({remaining_hi}), 0) AS bytes_hi,
+                                COALESCE(({remaining_lo}), 0) AS bytes_lo) AS remaining
+         ) AS q
+         WHERE tenant = {reference}.tenant AND state IN (0, 1) AND {live}",
+        base=QUOTA_BASE,
+    )
+}
+
+fn quota_ensure_row(reference: &str, exclude: &str) -> String {
+    format!(
+        "INSERT INTO tenant_quota_usage(tenant, bytes_hi, bytes_lo, state)
+         SELECT {reference}.tenant, 0, 0,
+                CASE WHEN EXISTS(
+                    SELECT 1 FROM files AS existing
+                    WHERE existing.tenant = {reference}.tenant AND existing.deleted = 0
+                      AND NOT (existing.link_id = {exclude}.link_id
+                               AND existing.upload_id = {exclude}.upload_id
+                               AND existing.file_index = {exclude}.file_index)
+                ) THEN 2 ELSE 0 END
+         WHERE NOT EXISTS(SELECT 1 FROM tenant_quota_usage WHERE tenant={reference}.tenant)
+         ON CONFLICT(tenant) DO NOTHING;"
+    )
+}
+
+fn quota_trigger_sql() -> String {
+    let add_insert = quota_add_update("NEW", "NEW", "1");
+    let remove_delete = quota_remove_update("OLD", "OLD", "1");
+    let remove_update = quota_remove_update("OLD", "NEW", "OLD.deleted = 0");
+    let add_update = quota_add_update("NEW", "NEW", "NEW.deleted = 0");
+    let ensure_insert = quota_ensure_row("NEW", "NEW");
+    let ensure_delete = quota_ensure_row("OLD", "OLD");
+    let ensure_old_update = quota_ensure_row("OLD", "NEW");
+    let ensure_new_update = quota_ensure_row("NEW", "NEW");
+    format!(
+        "CREATE TRIGGER tenant_quota_usage_insert AFTER INSERT ON files
+         WHEN NEW.deleted = 0 BEGIN
+             {ensure_insert}
+             {add_insert};
+         END;
+         CREATE TRIGGER tenant_quota_usage_delete AFTER DELETE ON files
+         WHEN OLD.deleted = 0
+              AND NOT EXISTS(
+                  SELECT 1 FROM tenant_quota_usage
+                  WHERE tenant=OLD.tenant AND state=2
+              ) BEGIN
+             {ensure_delete}
+             {remove_delete};
+         END;
+         CREATE TRIGGER tenant_quota_usage_update
+         AFTER UPDATE OF tenant, link_id, upload_id, file_index, bytes_hi, bytes_lo, deleted, stored_as ON files
+         WHEN (OLD.tenant, OLD.link_id, OLD.upload_id, OLD.file_index, OLD.bytes_hi, OLD.bytes_lo, OLD.deleted, OLD.stored_as)
+            IS NOT (NEW.tenant, NEW.link_id, NEW.upload_id, NEW.file_index, NEW.bytes_hi, NEW.bytes_lo, NEW.deleted, NEW.stored_as)
+         BEGIN
+             {ensure_old_update}
+             {ensure_new_update}
+             {remove_update};
+             {add_update};
+         END;",
+    )
+}
 
 /// Audit rows the store failed to persist since boot; exported on /metrics.
 pub static AUDIT_INSERT_FAILURES: std::sync::atomic::AtomicU64 =
@@ -1065,31 +1260,13 @@ impl Store {
         output: &mut W,
     ) -> Result<(), String> {
         self.with(|connection| {
-            let mut statement = connection.prepare_cached(
-                "SELECT CASE WHEN stored_as = ''
-                            THEN link_id || '/' || upload_id || '/' || file_index
-                            ELSE stored_as END AS group_key,
-                        CASE WHEN stored_as = '' THEN '' ELSE stored_as END AS stored_as,
-                        MAX(bytes_hi) AS bytes_hi, bytes_lo
-                 FROM files
-                 WHERE tenant = ?1 AND deleted = 0
-                 GROUP BY group_key
-                 ORDER BY group_key",
-            )?;
-            let rows = statement.query_map([tenant], |row| {
-                Ok((
-                    row.get::<_, String>(1)?,
-                    combine_byte_sums(row.get(2)?, row.get(3)?),
-                ))
-            })?;
-            for row in rows {
-                let row = row?;
-                serde_json::to_writer(&mut *output, &row)
+            walk_quota_files(connection, Some(tenant), |identity, bytes| {
+                serde_json::to_writer(&mut *output, &(&identity.stored_as, bytes))
                     .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
                 output
                     .write_all(b"\n")
-                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-            }
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+            })?;
             Ok(())
         })
     }
@@ -1098,25 +1275,8 @@ impl Store {
     /// file counted once however many records reference it.
     pub fn tenant_stored(&self, tenant: &str) -> Result<(u64, u64), String> {
         self.with(|connection| {
-            connection
-                .prepare_cached(
-                    "WITH live_paths AS (
-                         SELECT MAX(bytes_hi) AS bytes_hi, bytes_lo
-                         FROM files WHERE tenant = ?1 AND deleted = 0
-                         GROUP BY CASE WHEN stored_as = ''
-                             THEN link_id || '/' || upload_id || '/' || file_index
-                             ELSE stored_as END
-                     )
-                     SELECT COUNT(*), COALESCE(SUM(bytes_hi), 0), COALESCE(SUM(bytes_lo), 0)
-                     FROM live_paths",
-                )?
-                .query_row(rusqlite::params![tenant], |row| {
-                    let count: i64 = row.get(0)?;
-                    Ok((
-                        u64::try_from(count).unwrap_or(0),
-                        combine_byte_sums(row.get(1)?, row.get(2)?),
-                    ))
-                })
+            let (count, total, state) = quota_fold(connection, tenant)?;
+            Ok((count, if state == 1 { u64::MAX } else { total }))
         })
     }
 
@@ -1933,7 +2093,16 @@ impl Store {
         };
         if matches!(removal, TenantRemoval::Deleted | TenantRemoval::Absent) {
             transaction
+                .execute(
+                    "UPDATE tenant_quota_usage SET state=2 WHERE tenant=?1",
+                    [key],
+                )
+                .map_err(|e| e.to_string())?;
+            transaction
                 .execute("DELETE FROM files WHERE tenant=?1", [key])
+                .map_err(|e| e.to_string())?;
+            transaction
+                .execute("DELETE FROM tenant_quota_usage WHERE tenant=?1", [key])
                 .map_err(|e| e.to_string())?;
             transaction
                 .execute("DELETE FROM link_uploads WHERE tenant=?1", [key])
@@ -2933,7 +3102,63 @@ impl Store {
 
     /// Bytes received-and-not-deleted across a tenant's links.
     pub fn tenant_received_bytes(&self, tenant: &str) -> Result<u64, String> {
-        self.tenant_stored(tenant).map(|(_, bytes)| bytes)
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let mut statement = connection
+            .prepare_cached(
+                "SELECT bytes_hi,bytes_lo,state FROM tenant_quota_usage WHERE tenant=?1",
+            )
+            .map_err(|e| e.to_string())?;
+        #[cfg(test)]
+        statement.reset_status(rusqlite::StatementStatus::VmStep);
+        let state: Option<(i64, i64, i64)> = statement
+            .query_row([tenant], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .optional()
+            .map_err(|e| e.to_string())?;
+        #[cfg(test)]
+        LAST_TENANT_RECEIVED_VM_STEPS.with(|steps| {
+            steps.set(
+                u64::try_from(statement.get_status(rusqlite::StatementStatus::VmStep)).unwrap(),
+            )
+        });
+        drop(statement);
+        let Some((mut bytes_hi, mut bytes_lo, mut state)) = state else {
+            let live: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM files WHERE tenant=?1 AND deleted=0)",
+                    [tenant],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if live {
+                return Err(
+                    "tenant quota aggregate is missing for live files; refusing admission".into(),
+                );
+            }
+            return Ok(0);
+        };
+        if !(0..=QUOTA_MAX_LIMB).contains(&bytes_hi)
+            || !(0..=QUOTA_MAX_LIMB).contains(&bytes_lo)
+            || !(0..=2).contains(&state)
+        {
+            return Err("tenant quota aggregate is invalid; refusing admission".into());
+        }
+        if state == 2 {
+            let transaction = connection.transaction().map_err(|e| e.to_string())?;
+            rebuild_tenant_quota(&transaction, tenant).map_err(|e| e.to_string())?;
+            transaction.commit().map_err(|e| e.to_string())?;
+            (bytes_hi, bytes_lo, state) = connection
+                .query_row(
+                    "SELECT bytes_hi,bytes_lo,state FROM tenant_quota_usage WHERE tenant=?1",
+                    [tenant],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        if state == 1 {
+            Ok(u64::MAX)
+        } else {
+            Ok((u64::try_from(bytes_hi).unwrap() << 32) | u64::try_from(bytes_lo).unwrap())
+        }
     }
 
     pub fn tenant_admission_usage(
@@ -2951,45 +3176,90 @@ impl Store {
         Ok((received, retained))
     }
 
-    /// Link and live-byte totals for every tenant in one grouped query. Both
-    /// byte queries take the bare `bytes_lo` beside `MAX(bytes_hi)`: SQLite
-    /// returns the other columns from the row that won a lone MAX, so the
-    /// pair always comes from one row instead of mixing two.
+    /// Link and live-byte totals for every tenant. File bytes come from the
+    /// same aggregate used for admission so admin holdings cannot disagree.
     pub fn tenant_usage(&self) -> Result<Vec<TenantUsage>, String> {
-        self.with(|connection| {
-            let mut statement = connection.prepare(
-                "WITH namespaces(tenant) AS (
-                     SELECT ''
-                     UNION SELECT key FROM tenants
-                     UNION SELECT tenant FROM links
-                 ), link_counts AS (
-                     SELECT tenant, COUNT(*) AS links FROM links GROUP BY tenant
-                 ), live_paths AS (
-                     SELECT tenant, MAX(bytes_hi) AS bytes_hi, bytes_lo
-                     FROM files WHERE deleted = 0
-                     GROUP BY tenant, CASE WHEN stored_as = ''
-                         THEN link_id || '/' || upload_id || '/' || file_index
-                         ELSE stored_as END
-                 ), file_bytes AS (
-                     SELECT tenant, SUM(bytes_hi) AS bytes_hi, SUM(bytes_lo) AS bytes_lo
-                     FROM live_paths GROUP BY tenant
-                 )
-                 SELECT namespaces.tenant, COALESCE(link_counts.links, 0),
-                        COALESCE(file_bytes.bytes_hi, 0), COALESCE(file_bytes.bytes_lo, 0)
-                 FROM namespaces
-                 LEFT JOIN link_counts USING (tenant)
-                 LEFT JOIN file_bytes USING (tenant)
-                 ORDER BY namespaces.tenant",
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let result = (|| -> rusqlite::Result<Vec<TenantUsage>> {
+            let transaction = connection.transaction()?;
+            let namespaces = transaction
+                .prepare(
+                    "WITH namespaces(tenant) AS (
+                         SELECT ''
+                         UNION SELECT key FROM tenants
+                         UNION SELECT tenant FROM links
+                     )
+                     SELECT n.tenant,q.state FROM namespaces n
+                     LEFT JOIN tenant_quota_usage q USING (tenant)
+                     ORDER BY n.tenant",
+                )?
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for (tenant, state) in &namespaces {
+                match state {
+                    Some(2) => {
+                        rebuild_tenant_quota(&transaction, tenant)?;
+                    }
+                    Some(0 | 1) => {}
+                    Some(_) => return Err(rusqlite::Error::InvalidQuery),
+                    None => {
+                        let live: bool = transaction.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM files WHERE tenant=?1 AND deleted=0)",
+                            [tenant],
+                            |row| row.get(0),
+                        )?;
+                        if live {
+                            return Err(rusqlite::Error::InvalidQuery);
+                        }
+                        transaction.execute(
+                        "INSERT INTO tenant_quota_usage(tenant,bytes_hi,bytes_lo,state) VALUES (?1,0,0,0)",
+                        [tenant],
+                    )?;
+                    }
+                }
+            }
+            let mut statement = transaction.prepare(
+                "WITH link_counts AS (
+                 SELECT tenant, COUNT(*) AS links FROM links GROUP BY tenant
+             )
+             SELECT n.tenant, COALESCE(link_counts.links, 0), q.bytes_hi, q.bytes_lo, q.state
+             FROM (
+                 SELECT '' AS tenant
+                 UNION SELECT key FROM tenants
+                 UNION SELECT tenant FROM links
+             ) AS n
+             JOIN tenant_quota_usage AS q ON q.tenant=n.tenant
+             LEFT JOIN link_counts USING (tenant)
+             ORDER BY n.tenant",
             )?;
             let rows = statement.query_map([], |row| {
+                let state: i64 = row.get(4)?;
+                let received_bytes = if state == 1 {
+                    u64::MAX
+                } else {
+                    let bytes_hi: i64 = row.get(2)?;
+                    let bytes_lo: i64 = row.get(3)?;
+                    if !(0..=QUOTA_MAX_LIMB).contains(&bytes_hi)
+                        || !(0..=QUOTA_MAX_LIMB).contains(&bytes_lo)
+                    {
+                        return Err(rusqlite::Error::InvalidQuery);
+                    }
+                    (u64::try_from(bytes_hi).unwrap() << 32) | u64::try_from(bytes_lo).unwrap()
+                };
                 Ok(TenantUsage {
                     tenant: row.get(0)?,
                     links: row.get::<_, i64>(1)?.max(0) as u64,
-                    received_bytes: combine_byte_sums(row.get(2)?, row.get(3)?),
+                    received_bytes,
                 })
             })?;
-            rows.collect::<Result<Vec<_>, _>>()
-        })
+            let result = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            transaction.commit()?;
+            Ok(result)
+        })();
+        result.map_err(|e| e.to_string())
     }
 
     // ------------------------------------------------------ outbound grants
@@ -4295,6 +4565,359 @@ fn combine_byte_sums(hi: i64, lo: i64) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+struct QuotaIdentity {
+    tenant: String,
+    stored_as: String,
+    discriminator: i64,
+    link_id: String,
+    upload_id: String,
+    file_index: i64,
+}
+
+impl PartialEq for QuotaIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.tenant == other.tenant
+            && self.discriminator == other.discriminator
+            && if self.discriminator == 0 {
+                self.stored_as == other.stored_as
+            } else {
+                self.link_id == other.link_id
+                    && self.upload_id == other.upload_id
+                    && self.file_index == other.file_index
+            }
+    }
+}
+
+impl Eq for QuotaIdentity {}
+
+fn quota_live_file_sql(tenant: bool) -> &'static str {
+    if tenant {
+        "SELECT tenant,stored_as,link_id,upload_id,file_index,bytes_hi,bytes_lo
+         FROM files WHERE tenant=?1 AND deleted=0
+         ORDER BY tenant,
+             CASE WHEN stored_as='' THEN 1 ELSE 0 END,
+             CASE WHEN stored_as='' THEN '' ELSE stored_as END,
+             CASE WHEN stored_as='' THEN link_id ELSE '' END,
+             CASE WHEN stored_as='' THEN upload_id ELSE '' END,
+             CASE WHEN stored_as='' THEN file_index ELSE 0 END,
+             bytes_hi DESC, bytes_lo DESC"
+    } else {
+        "SELECT tenant,stored_as,link_id,upload_id,file_index,bytes_hi,bytes_lo
+         FROM files WHERE deleted=0
+         ORDER BY tenant,
+             CASE WHEN stored_as='' THEN 1 ELSE 0 END,
+             CASE WHEN stored_as='' THEN '' ELSE stored_as END,
+             CASE WHEN stored_as='' THEN link_id ELSE '' END,
+             CASE WHEN stored_as='' THEN upload_id ELSE '' END,
+             CASE WHEN stored_as='' THEN file_index ELSE 0 END,
+             bytes_hi DESC, bytes_lo DESC"
+    }
+}
+
+fn walk_quota_files(
+    connection: &Connection,
+    tenant: Option<&str>,
+    mut visit: impl FnMut(&QuotaIdentity, u64) -> rusqlite::Result<()>,
+) -> rusqlite::Result<()> {
+    let mut statement = connection.prepare(quota_live_file_sql(tenant.is_some()))?;
+    let mut rows = match tenant {
+        Some(tenant) => statement.query([tenant])?,
+        None => statement.query([])?,
+    };
+    let mut previous = None;
+    while let Some(row) = rows.next()? {
+        let tenant: String = row.get(0)?;
+        let stored_as: String = row.get(1)?;
+        let link_id: String = row.get(2)?;
+        let upload_id: String = row.get(3)?;
+        let file_index: i64 = row.get(4)?;
+        let bytes_hi: i64 = row.get(5)?;
+        let bytes_lo: i64 = row.get(6)?;
+        if !(0..=QUOTA_MAX_LIMB).contains(&bytes_hi) || !(0..=QUOTA_MAX_LIMB).contains(&bytes_lo) {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Integer,
+                "file byte limbs are outside the u32 range".into(),
+            ));
+        }
+        let identity = QuotaIdentity {
+            discriminator: i64::from(stored_as.is_empty()),
+            tenant,
+            stored_as,
+            link_id,
+            upload_id,
+            file_index,
+        };
+        let bytes = (u64::try_from(bytes_hi).unwrap() << 32) | u64::try_from(bytes_lo).unwrap();
+        if previous.as_ref() != Some(&identity) {
+            visit(&identity, bytes)?;
+            previous = Some(identity);
+        }
+    }
+    Ok(())
+}
+
+fn quota_fold(connection: &Connection, tenant: &str) -> rusqlite::Result<(u64, u64, u8)> {
+    let mut count = 0_u64;
+    let mut total = 0_u64;
+    let mut saturated = false;
+    walk_quota_files(connection, Some(tenant), |_identity, bytes| {
+        count = count.saturating_add(1);
+        if let Some(value) = total.checked_add(bytes) {
+            total = value;
+        } else {
+            total = u64::MAX;
+            saturated = true;
+        }
+        Ok(())
+    })?;
+    Ok((
+        count,
+        total,
+        if saturated || total == u64::MAX { 1 } else { 0 },
+    ))
+}
+
+fn backfill_quota_usage(connection: &Connection) -> rusqlite::Result<()> {
+    fn flush(
+        connection: &Connection,
+        tenant: Option<String>,
+        bytes: u64,
+        saturated: bool,
+    ) -> rusqlite::Result<()> {
+        let Some(tenant) = tenant else {
+            return Ok(());
+        };
+        let (bytes_hi, bytes_lo) = split_bytes(bytes);
+        connection.execute(
+            "INSERT INTO tenant_quota_usage(tenant,bytes_hi,bytes_lo,state)
+             VALUES (?1,?2,?3,?4)",
+            rusqlite::params![
+                tenant,
+                bytes_hi,
+                bytes_lo,
+                i64::from(saturated || bytes == u64::MAX)
+            ],
+        )?;
+        Ok(())
+    }
+
+    let mut previous_tenant = None;
+    let mut total = 0_u64;
+    let mut saturated = false;
+    connection.execute("DELETE FROM tenant_quota_usage", [])?;
+    walk_quota_files(connection, None, |identity, bytes| {
+        if previous_tenant.as_deref() != Some(identity.tenant.as_str()) {
+            flush(connection, previous_tenant.take(), total, saturated)?;
+            previous_tenant = Some(identity.tenant.clone());
+            total = 0;
+            saturated = false;
+        }
+        if let Some(value) = total.checked_add(bytes) {
+            total = value;
+        } else {
+            total = u64::MAX;
+            saturated = true;
+        }
+        Ok(())
+    })?;
+    flush(connection, previous_tenant, total, saturated)?;
+    connection.execute(
+        "INSERT OR IGNORE INTO tenant_quota_usage(tenant,bytes_hi,bytes_lo,state)
+         SELECT key,0,0,0 FROM tenants",
+        [],
+    )?;
+    connection.execute(
+        "INSERT OR IGNORE INTO tenant_quota_usage(tenant,bytes_hi,bytes_lo,state) VALUES ('',0,0,0)",
+        [],
+    )?;
+    Ok(())
+}
+
+fn rebuild_tenant_quota(connection: &Connection, tenant: &str) -> rusqlite::Result<u64> {
+    let (count, total, state) = quota_fold(connection, tenant)?;
+    let (bytes_hi, bytes_lo) = split_bytes(if state == 1 { u64::MAX } else { total });
+    connection.execute(
+        "INSERT INTO tenant_quota_usage(tenant,bytes_hi,bytes_lo,state) VALUES (?1,?2,?3,?4)
+         ON CONFLICT(tenant) DO UPDATE SET bytes_hi=excluded.bytes_hi,bytes_lo=excluded.bytes_lo,state=excluded.state",
+        rusqlite::params![tenant, bytes_hi, bytes_lo, state],
+    )?;
+    Ok(count)
+}
+
+fn install_quota_schema(connection: &Connection) -> rusqlite::Result<()> {
+    connection.execute_batch(QUOTA_SCHEMA)?;
+    connection.execute_batch(QUOTA_INDEXES)?;
+    connection.execute_batch(
+        "DROP TRIGGER IF EXISTS tenant_quota_usage_insert;
+         DROP TRIGGER IF EXISTS tenant_quota_usage_delete;
+         DROP TRIGGER IF EXISTS tenant_quota_usage_update;",
+    )?;
+    backfill_quota_usage(connection)?;
+    connection.execute_batch(&quota_trigger_sql())?;
+    validate_quota_schema(connection).map_err(|error| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            error,
+        )))
+    })?;
+    Ok(())
+}
+
+fn validate_quota_schema(connection: &Connection) -> Result<(), String> {
+    let table_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='tenant_quota_usage'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let table_sql =
+        table_sql.ok_or("tenant quota aggregate table is missing; refusing to start")?;
+    for column in ["tenant", "bytes_hi", "bytes_lo", "state"] {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tenant_quota_usage') WHERE name=?1)",
+                [column],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !exists {
+            return Err(format!(
+                "tenant quota aggregate column {column} is missing; refusing to start"
+            ));
+        }
+    }
+    let normalized_table = normalize_schema_sql(&table_sql);
+    let canonical_table = QUOTA_SCHEMA
+        .split("CREATE TABLE IF NOT EXISTS tenant_quota_usage")
+        .nth(1)
+        .map(|suffix| normalize_schema_sql(&format!("CREATE TABLE tenant_quota_usage{suffix}")));
+    if canonical_table.as_deref() != Some(normalized_table.as_str()) {
+        return Err("tenant quota aggregate table definition is invalid; refusing to start".into());
+    }
+    let index_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='index' AND name='files_quota_identity'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let index_sql = index_sql.ok_or("tenant quota identity index is missing; refusing to start")?;
+    let normalized_index = normalize_schema_sql(&index_sql);
+    let canonical_index = QUOTA_INDEXES
+        .split("CREATE INDEX IF NOT EXISTS files_quota_identity")
+        .nth(1)
+        .and_then(|sql| {
+            sql.split("CREATE INDEX IF NOT EXISTS upload_sessions_quota_live")
+                .next()
+        })
+        .map(|sql| normalize_schema_sql(&format!("CREATE INDEX files_quota_identity{sql}")));
+    if canonical_index.as_deref() != Some(normalized_index.as_str()) {
+        return Err("tenant quota identity index definition is invalid; refusing to start".into());
+    }
+    let session_index_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='index' AND name='upload_sessions_quota_live'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let session_index_sql =
+        session_index_sql.ok_or("tenant retained-session index is missing; refusing to start")?;
+    let canonical_session_index = QUOTA_INDEXES
+        .split("CREATE INDEX IF NOT EXISTS upload_sessions_quota_live")
+        .nth(1)
+        .map(|sql| normalize_schema_sql(&format!("CREATE INDEX upload_sessions_quota_live{sql}")));
+    let normalized_session_index = normalize_schema_sql(&session_index_sql);
+    if canonical_session_index.as_deref() != Some(normalized_session_index.as_str()) {
+        return Err(
+            "tenant retained-session index definition is invalid; refusing to start".into(),
+        );
+    }
+    let expected = quota_trigger_sql();
+    for name in [
+        "tenant_quota_usage_insert",
+        "tenant_quota_usage_delete",
+        "tenant_quota_usage_update",
+    ] {
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let actual = actual
+            .ok_or_else(|| format!("tenant quota trigger {name} is missing; refusing to start"))?;
+        let actual = normalize_schema_sql(&actual);
+        let expected_sql = expected
+            .split("CREATE TRIGGER")
+            .find(|sql| sql.contains(name))
+            .unwrap_or_default();
+        let expected = normalize_schema_sql(&format!("CREATE TRIGGER{expected_sql}"));
+        if actual != expected {
+            return Err(format!(
+                "tenant quota trigger {name} definition is invalid; refusing to start"
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn normalize_schema_sql(sql: &str) -> String {
+    let mut normalized = String::with_capacity(sql.len());
+    let mut characters = sql.chars().peekable();
+    let mut quote = None;
+    let mut pending_space = false;
+    while let Some(character) = characters.next() {
+        if let Some(delimiter) = quote {
+            normalized.push(character);
+            if character == delimiter {
+                if characters.peek() == Some(&delimiter) {
+                    normalized.push(characters.next().expect("peeked quote"));
+                } else {
+                    quote = None;
+                }
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' | '`' => {
+                if pending_space && !normalized.is_empty() {
+                    normalized.push(' ');
+                }
+                pending_space = false;
+                quote = Some(character);
+                normalized.push(character);
+            }
+            character if character.is_ascii_whitespace() => pending_space = true,
+            ';' => {
+                while normalized.ends_with(' ') {
+                    normalized.pop();
+                }
+                normalized.push(';');
+                pending_space = true;
+            }
+            character => {
+                if pending_space && !normalized.is_empty() {
+                    normalized.push(' ');
+                }
+                pending_space = false;
+                normalized.extend(character.to_lowercase());
+            }
+        }
+    }
+    while normalized.ends_with(' ') || normalized.ends_with(';') {
+        normalized.pop();
+    }
+    normalized
+}
+
 fn encode_quota(value: u64) -> String {
     format!("u:{value}")
 }
@@ -4926,13 +5549,29 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
     if !empty {
-        if validate_schema(connection, 41).is_ok() {
+        let stored: u64 = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|e| e.to_string())?
+            .parse()
+            .map_err(|_| "database schema version is invalid; refusing to start")?;
+        if stored == 41 || stored == 42 {
+            validate_schema(connection, stored)?;
             let transaction = connection.transaction().map_err(|e| e.to_string())?;
+            if stored == 41 {
+                transaction
+                    .execute_batch(
+                        "ALTER TABLE outbound_grants ADD COLUMN share_token TEXT;
+                         UPDATE meta SET value='42' WHERE key='schema_version';",
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
+            install_quota_schema(&transaction).map_err(|e| e.to_string())?;
             transaction
-                .execute_batch(
-                    "ALTER TABLE outbound_grants ADD COLUMN share_token TEXT;
-                UPDATE meta SET value='42' WHERE key='schema_version';",
-                )
+                .execute("UPDATE meta SET value='43' WHERE key='schema_version'", [])
                 .map_err(|e| e.to_string())?;
             transaction.commit().map_err(|e| e.to_string())?;
         }
@@ -4946,6 +5585,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
         PRINCIPALS_IDENTITY_INDEX,
         SCIM_GROUPS_SCHEMA,
         FILES_SCHEMA,
+        QUOTA_SCHEMA,
         OUTBOUND_GRANTS_SCHEMA,
         OUTBOUND_GRANT_FILES_SCHEMA,
         AUTOMATION_TOKENS_SCHEMA,
@@ -4967,6 +5607,15 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
     }
     transaction.execute_batch("CREATE INDEX delivery_jobs_received ON delivery_jobs(tenant,json_extract(document,'$.received.link_id')) WHERE json_extract(document,'$.received') IS NOT NULL;
         INSERT INTO meta(key,value) VALUES ('tenant_storage_layout','reserved-v1');")
+        .map_err(|e| e.to_string())?;
+    transaction
+        .execute_batch(&quota_trigger_sql())
+        .map_err(|e| format!("quota schema: {e}"))?;
+    transaction
+        .execute(
+            "INSERT INTO tenant_quota_usage(tenant,bytes_hi,bytes_lo,state) VALUES ('',0,0,0)",
+            [],
+        )
         .map_err(|e| e.to_string())?;
     transaction
         .execute(
@@ -5005,6 +5654,9 @@ pub(crate) fn validate_schema(connection: &Connection, expected: u64) -> Result<
         .map_err(|e| e.to_string())?;
     if layout.as_deref() != Some("reserved-v1") {
         return Err("unsupported tenant storage layout; preserve the database and receiving files and use a matching release".into());
+    }
+    if expected == SCHEMA_VERSION {
+        validate_quota_schema(connection)?;
     }
     Ok(())
 }
@@ -5523,6 +6175,7 @@ pub(crate) mod tests {
             store.insert_tenant(test_tenant(key)).unwrap();
             residue(key);
         }
+        assert_eq!(store.tenant_received_bytes("acme").unwrap(), 8);
         let object = vot_sdk::object::ObjectId {
             suite: 1,
             root: [7; 32],
@@ -5575,6 +6228,7 @@ pub(crate) mod tests {
         store.with(|connection| connection.execute_batch("CREATE TRIGGER fail_upload_removal BEFORE DELETE ON upload_session_files WHEN OLD.session_id='pending' BEGIN SELECT RAISE(ABORT, 'fixture'); END;")).unwrap();
         assert!(store.remove_tenant("acme").is_err());
         assert!(store.tenant("acme").unwrap().is_some());
+        assert_eq!(store.tenant_received_bytes("acme").unwrap(), 8);
         assert_eq!(retained("acme"), (1, 1));
         assert_eq!(retained("other"), (1, 1));
         assert_eq!(store.load_upload_sessions().unwrap().len(), 3);
@@ -6650,6 +7304,39 @@ pub(crate) mod tests {
         store.insert_outbound_grant(grant.clone()).unwrap();
         store
             .with(|connection| {
+                connection
+                    .execute(
+                        "INSERT INTO files
+                     (link_id,tenant,upload_id,file_index,bytes_hi,bytes_lo,deleted,
+                      stored_as,path,suite,root,receipt)
+                     VALUES ('anonymous-link','', 'anonymous-upload',0,0,13,0,
+                             'anonymous-object','anonymous-object','blake3','root',0)",
+                        [],
+                    )
+                    .and_then(|_| {
+                        connection.execute(
+                            "INSERT INTO files
+                         (link_id,tenant,upload_id,file_index,bytes_hi,bytes_lo,deleted,
+                          stored_as,path,suite,root,receipt)
+                         VALUES ('duplicate-low','', 'duplicate-upload',0,0,5,0,
+                                 'shared-object','shared-object','blake3','root',0)",
+                            [],
+                        )
+                    })
+                    .and_then(|_| {
+                        connection.execute(
+                            "INSERT INTO files
+                         (link_id,tenant,upload_id,file_index,bytes_hi,bytes_lo,deleted,
+                          stored_as,path,suite,root,receipt)
+                         VALUES ('duplicate-high','', 'duplicate-upload',1,0,17,0,
+                                 'shared-object','shared-object','blake3','root',0)",
+                            [],
+                        )
+                    })
+            })
+            .unwrap();
+        store
+            .with(|connection| {
                 connection.execute_batch(
                     "DROP INDEX delivery_jobs_retirement_due;
              DROP INDEX delivery_jobs_deadline_pending;
@@ -6670,6 +7357,7 @@ pub(crate) mod tests {
             store.outbound_share_token("acme", "preserved").unwrap(),
             None
         );
+        assert_eq!(store.tenant_received_bytes("").unwrap(), 30);
         let token = crate::auth::random_token();
         assert!(store
             .rotate_outbound_grant_token("acme", "preserved", &token)
@@ -6687,7 +7375,7 @@ pub(crate) mod tests {
                     [],
                     |row| row.get(0),
                 )?;
-                assert_eq!(version, "42");
+                assert_eq!(version, SCHEMA_VERSION.to_string());
                 let indexes: Vec<String> = connection
                     .prepare(
                         "SELECT name FROM sqlite_schema WHERE type='index' AND name IN (
@@ -6711,6 +7399,55 @@ pub(crate) mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn current_schema_rejects_quota_literal_mutations() {
+        for (left, right) in [
+            ("SELECT 'a b'", "SELECT 'ab'"),
+            ("SELECT ';'", "SELECT ''"),
+            ("SELECT 'A'", "SELECT 'a'"),
+            ("SELECT 'a'' b'", "SELECT 'a''b'"),
+            ("SELECT a b", "SELECT ab"),
+            ("SELECT 1; SELECT 2", "SELECT 1 SELECT 2"),
+        ] {
+            assert_ne!(normalize_schema_sql(left), normalize_schema_sql(right));
+        }
+        assert_eq!(
+            normalize_schema_sql("  SELECT \n'A'' B' ;  "),
+            "select 'A'' B'"
+        );
+        for (kind, name) in [
+            ("trigger", "tenant_quota_usage_insert"),
+            ("index", "files_quota_identity"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open(directory.path()).unwrap();
+            store
+                .with(|connection| {
+                    connection.execute_batch("PRAGMA writable_schema=ON")?;
+                    let changed = connection.execute(
+                        "UPDATE sqlite_schema
+                         SET sql=replace(sql, ?1, ?2)
+                         WHERE type=?3 AND name=?4",
+                        rusqlite::params!["stored_as = ''", "stored_as = ' '", kind, name],
+                    )?;
+                    connection.execute_batch("PRAGMA writable_schema=OFF")?;
+                    assert_eq!(changed, 1, "{kind} {name} was not changed");
+                    Ok(())
+                })
+                .unwrap();
+            drop(store);
+
+            let error = match Store::open(directory.path()) {
+                Ok(_) => panic!("malformed {kind} {name} was accepted"),
+                Err(error) => error,
+            };
+            assert!(
+                error.contains("definition is invalid"),
+                "{kind} {name}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -7080,6 +7817,75 @@ pub(crate) mod tests {
             .link_upload("other", "link-1", "up-1")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn schema41_quota_backfill_failure_rolls_back_without_partial_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .with(|connection| {
+                connection.execute_batch(
+                    "DROP TRIGGER tenant_quota_usage_insert;
+                     DROP TRIGGER tenant_quota_usage_delete;
+                     DROP TRIGGER tenant_quota_usage_update;
+                     DROP INDEX files_quota_identity;
+                     DROP INDEX upload_sessions_quota_live;
+                     DROP TABLE tenant_quota_usage;
+                     ALTER TABLE outbound_grants DROP COLUMN share_token;
+                     INSERT INTO files
+                         (link_id,tenant,upload_id,file_index,bytes_hi,bytes_lo,deleted,
+                          stored_as,path,suite,root,receipt)
+                     VALUES ('anonymous-link','', 'anonymous-upload',0,-1,13,0,
+                             'anonymous-object','anonymous-object','blake3','root',0);
+                     UPDATE meta SET value='41' WHERE key='schema_version';",
+                )
+            })
+            .unwrap();
+        drop(store);
+
+        let error = match Store::open(directory.path()) {
+            Ok(_) => panic!("invalid file limbs must abort schema upgrade"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("file byte limbs are outside the u32 range"),
+            "{error}"
+        );
+        let connection = Connection::open(directory.path().join("votport.db")).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "41"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type IN ('table','trigger','index')
+                       AND (name='tenant_quota_usage' OR name LIKE 'tenant_quota_usage_%'
+                            OR name IN ('files_quota_identity','upload_sessions_quota_live'))",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT bytes_hi,bytes_lo FROM files WHERE link_id='anonymous-link'",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            (-1, 13)
+        );
     }
 
     #[test]
@@ -7896,6 +8702,190 @@ mod tenant_tests {
         assert_eq!(files, 0);
     }
 
+    #[test]
+    fn quota_aggregate_tracks_identity_limb_and_saturation_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let insert = |tenant: &str, link: &str, upload: &str, stored_as: &str, bytes: u64| {
+            store
+                .with(|connection| {
+                    let (hi, lo) = split_bytes(bytes);
+                    connection.execute(
+                        "INSERT INTO files(link_id,tenant,upload_id,file_index,bytes_hi,bytes_lo,deleted,stored_as,path,suite,root,receipt)
+                         VALUES (?1,?2,?3,0,?4,?5,0,?6,'path','blake3','root',0)",
+                        rusqlite::params![link, tenant, upload, hi, lo, stored_as],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        };
+        insert("acme", "a", "one", "same", u64::from(u32::MAX));
+        insert("acme", "b", "two", "same", (1_u64 << 32) + 1);
+        insert("acme", "c", "three", "", 5);
+        insert("acme", "d", "four", "c/three/0", 7);
+        insert("other", "e", "five", "same", 10);
+        assert_eq!(
+            store.tenant_received_bytes("acme").unwrap(),
+            (1_u64 << 32) + 13
+        );
+
+        store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE files SET bytes_hi=1,bytes_lo=10 WHERE tenant='acme' AND link_id='b'",
+                    [],
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            store.tenant_received_bytes("acme").unwrap(),
+            (1_u64 << 32) + 22
+        );
+        store
+            .with(|connection| {
+                connection.execute("DELETE FROM files WHERE tenant='acme' AND link_id='b'", [])
+            })
+            .unwrap();
+        assert_eq!(
+            store.tenant_received_bytes("acme").unwrap(),
+            (1_u64 << 32) + 11
+        );
+        store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE files SET deleted=1 WHERE tenant='acme' AND link_id='a'",
+                    [],
+                )
+            })
+            .unwrap();
+        assert_eq!(store.tenant_received_bytes("acme").unwrap(), 12);
+        store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE files SET tenant='other' WHERE tenant='acme' AND link_id='c'",
+                    [],
+                )
+            })
+            .unwrap();
+        assert_eq!(store.tenant_received_bytes("acme").unwrap(), 7);
+        assert_eq!(store.tenant_received_bytes("other").unwrap(), 15);
+
+        insert("acme", "max", "six", "max", u64::MAX);
+        insert("acme", "small", "seven", "small", 1);
+        assert_eq!(store.tenant_received_bytes("acme").unwrap(), u64::MAX);
+        store
+            .with(|connection| {
+                connection.execute(
+                    "DELETE FROM files WHERE tenant='acme' AND link_id='small'",
+                    [],
+                )
+            })
+            .unwrap();
+        assert_eq!(store.tenant_received_bytes("acme").unwrap(), u64::MAX);
+        store
+            .with(|connection| {
+                connection.execute(
+                    "DELETE FROM files WHERE tenant='acme' AND link_id='max'",
+                    [],
+                )
+            })
+            .unwrap();
+        assert_eq!(store.tenant_received_bytes("acme").unwrap(), 7);
+        let state = store
+            .with(|connection| {
+                connection.query_row(
+                    "SELECT state FROM tenant_quota_usage WHERE tenant='acme'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(state, 0);
+
+        insert("acme", "tie-a", "eight", "tie", (7_u64 << 32) + 1);
+        insert("acme", "tie-b", "nine", "tie", (7_u64 << 32) + 9);
+        assert_eq!(
+            store.tenant_received_bytes("acme").unwrap(),
+            (7_u64 << 32) + 16
+        );
+        store
+            .with(|connection| {
+                connection.execute(
+                    "DELETE FROM files WHERE tenant='acme' AND link_id='tie-b'",
+                    [],
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            store.tenant_received_bytes("acme").unwrap(),
+            (7_u64 << 32) + 8
+        );
+        store
+            .with(|connection| {
+                connection.execute(
+                    "DELETE FROM files WHERE tenant='acme' AND link_id='tie-a'",
+                    [],
+                )
+            })
+            .unwrap();
+        assert_eq!(store.tenant_received_bytes("acme").unwrap(), 7);
+        store
+            .with(|connection| {
+                connection.execute("DELETE FROM files WHERE tenant='acme' AND link_id='d'", [])
+            })
+            .unwrap();
+        assert_eq!(store.tenant_received_bytes("acme").unwrap(), 0);
+    }
+
+    #[test]
+    fn tenant_received_bytes_admission_vm_work_is_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let insert = |start: usize, count: usize| {
+            store
+                .with(|connection| {
+                    connection.execute_batch("BEGIN")?;
+                    for index in start..start + count {
+                        let (hi, lo) = split_bytes((index + 1) as u64);
+                        connection.execute(
+                            "INSERT INTO files(link_id,tenant,upload_id,file_index,bytes_hi,bytes_lo,deleted,stored_as,path,suite,root,receipt)
+                             VALUES (?1,'acme','upload',?2,?3,?4,0,?5,?5,'blake3','root',0)",
+                            rusqlite::params![format!("link-{index}"), index as i64, hi, lo, format!("path-{index}")],
+                        )?;
+                    }
+                    connection.execute_batch("COMMIT")
+                })
+                .unwrap();
+        };
+        insert(0, 100);
+
+        let read_work = || {
+            LAST_TENANT_RECEIVED_VM_STEPS.with(|steps| steps.set(TENANT_RECEIVED_VM_UNOBSERVED));
+            let value = store.tenant_received_bytes("acme").unwrap();
+            let vm_steps = LAST_TENANT_RECEIVED_VM_STEPS.with(Cell::get);
+            assert_ne!(
+                vm_steps, TENANT_RECEIVED_VM_UNOBSERVED,
+                "production reader did not report VM work"
+            );
+            (value, vm_steps)
+        };
+        assert_eq!(read_work().0, 5_050);
+        let hundred_rows = read_work().1;
+
+        insert(100, 900);
+        assert_eq!(read_work().0, 500_500);
+        let thousand_rows = read_work().1;
+
+        assert!(
+            (1..=500).contains(&hundred_rows),
+            "aggregate read used {hundred_rows} VM callbacks"
+        );
+        assert!(
+            (1..=500).contains(&thousand_rows),
+            "aggregate read used {thousand_rows} VM callbacks"
+        );
+    }
+
     /// A deduped re-send or a partial record references a file an earlier
     /// record already counts; the physical file counts once until every
     /// record over it is tombstoned.
@@ -7941,6 +8931,15 @@ mod tenant_tests {
             .unwrap();
         assert_eq!(store.tenant_received_bytes("acme").unwrap(), 500);
         assert_eq!(store.tenant_usage().unwrap()[1].received_bytes, 500);
+        assert_eq!(store.tenant_stored("acme").unwrap(), (2, 500));
+        let mut spool = Vec::new();
+        store.write_tenant_live_files("acme", &mut spool).unwrap();
+        let live: Vec<(String, u64)> = spool
+            .split(|byte| *byte == b'\n')
+            .filter(|row| !row.is_empty())
+            .map(|row| serde_json::from_slice(row).unwrap())
+            .collect();
+        assert_eq!(live, [("a.bin".to_owned(), 300), ("b.bin".to_owned(), 200)]);
         // Delete file tombstones every record over the path, so the bytes go.
         store
             .tombstone_files(

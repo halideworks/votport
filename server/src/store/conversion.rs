@@ -187,6 +187,7 @@ fn convert(data: &Path, public_url: &str) -> Result<Conversion> {
         },
     )?;
     normalize_uploads(&transaction, &target)?;
+    install_quota_schema(&transaction)?;
     result.replacements = convert_jobs(&transaction, &target, &signer, seed, result.created_at)?;
     transaction.execute(
         "UPDATE meta SET value=?1 WHERE key='schema_version'",
@@ -255,6 +256,10 @@ fn schema(connection: &Connection) -> Result<BTreeMap<(String, String), Vec<Stri
         ))
     })? {
         let (kind, name, sql, table) = row?;
+        if kind == "trigger" {
+            result.insert((kind, name), vec![super::normalize_schema_sql(&sql)]);
+            continue;
+        }
         if kind != "table" && kind != "index" {
             return Err(format!("unsupported schema object {name}").into());
         }
@@ -337,6 +342,9 @@ fn check_schema(connection: &Connection, reference: &Connection) -> Result<()> {
             .chain(expected.keys())
             .find(|key| actual.get(*key) != expected.get(*key))
             .ok_or("schema mismatch")?;
+        if mismatch.0 == "trigger" {
+            return Err(format!("unsupported schema object {}", mismatch.1).into());
+        }
         return Err(format!(
             "unsupported schema35/target definition for {} {}",
             mismatch.0, mismatch.1
@@ -923,6 +931,106 @@ mod tests {
         upload
     }
 
+    fn seed_anonymous_upload(connection: &Connection) -> UploadRecord {
+        let upload: UploadRecord = serde_json::from_value(serde_json::json!({
+            "id":"anonymous-upload","started_at":1,"completed_at":2,"package_root":"anonymous-package","total_bytes":20,
+            "files":[{"path":"anonymous.mov","stored_as":"shared-anonymous-object","bytes":13,"suite":"blake3","root":"ef".repeat(32),"receipt":false},
+                {"path":"anonymous-copy.mov","stored_as":"shared-anonymous-object","bytes":7,"suite":"blake3","root":"01".repeat(32),"receipt":false}]
+        })).unwrap();
+        connection.execute("INSERT INTO links(id,tenant,label,created_at,uploads_json) VALUES ('anonymous-link','','Anonymous',1,?1)",[serde_json::to_string(&vec![&upload]).unwrap()]).unwrap();
+        for (index, file) in upload.files.iter().enumerate() {
+            let (hi, lo) = split_bytes(file.bytes);
+            connection.execute("INSERT INTO files(link_id,tenant,upload_index,file_index,bytes_hi,bytes_lo,deleted,stored_as) VALUES ('anonymous-link','',0,?1,?2,?3,0,?4)",params![index as i64,hi,lo,file.stored_as]).unwrap();
+        }
+        upload
+    }
+
+    #[test]
+    fn conversion_backfills_anonymous_live_quota_usage() {
+        let directory = fixture();
+        let path = directory.path().join("votport.db");
+        let connection = Connection::open(&path).unwrap();
+        seed_anonymous_upload(&connection);
+        drop(connection);
+
+        convert(directory.path(), "https://drop.example.com").unwrap();
+
+        let store = Store::open(directory.path()).unwrap();
+        assert_eq!(store.tenant_received_bytes(""), Ok(13));
+        assert_eq!(
+            store
+                .with(|connection| {
+                    connection.query_row(
+                        "SELECT bytes_hi,bytes_lo,state FROM tenant_quota_usage WHERE tenant=''",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        },
+                    )
+                })
+                .unwrap(),
+            (0, 13, 0)
+        );
+    }
+
+    #[test]
+    fn conversion_rolls_back_anonymous_quota_backfill_on_late_failure() {
+        let directory = fixture();
+        let path = directory.path().join("votport.db");
+        let connection = Connection::open(&path).unwrap();
+        seed_anonymous_upload(&connection);
+        seed_job(&connection, "job", false, false);
+        connection
+            .execute("UPDATE delivery_jobs SET document='{}' WHERE id='job'", [])
+            .unwrap();
+        drop(connection);
+
+        let error = convert(directory.path(), "https://drop.example.com")
+            .unwrap_err()
+            .to_string();
+        assert!(!error.is_empty());
+
+        let connection = Connection::open(&path).unwrap();
+        validate_schema(&connection, 35).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE name='tenant_quota_usage' OR name LIKE 'tenant_quota_usage_%'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT bytes_hi,bytes_lo FROM files
+                     WHERE link_id='anonymous-link' AND upload_index=0 AND file_index=0",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            (0, 13)
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM files WHERE link_id='anonymous-link'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        assert!(!directory.path().join(ARTIFACT).exists());
+    }
+
     #[test]
     fn conversion_invalidates_outstanding_rotated_tickets_but_preserves_delivery_history() {
         let directory = fixture();
@@ -1193,6 +1301,38 @@ mod tests {
         let connection = Connection::open(path).unwrap();
         validate_schema(&connection, 35).unwrap();
         assert!(!directory.path().join(ARTIFACT).exists());
+    }
+
+    #[test]
+    fn quota_literal_validation_rejects_malformed_schema_and_rolls_back() {
+        for (kind, name) in [
+            ("trigger", "tenant_quota_usage_insert"),
+            ("index", "files_quota_identity"),
+        ] {
+            let mut actual = Connection::open_in_memory().unwrap();
+            initialize_schema(&mut actual).unwrap();
+            let mut reference = Connection::open_in_memory().unwrap();
+            initialize_schema(&mut reference).unwrap();
+            let transaction = actual.transaction().unwrap();
+            transaction
+                .execute_batch("PRAGMA writable_schema=ON")
+                .unwrap();
+            let changed = transaction
+                .execute(
+                    "UPDATE sqlite_schema
+                     SET sql=replace(sql, ?1, ?2)
+                     WHERE type=?3 AND name=?4",
+                    rusqlite::params!["stored_as = ''", "stored_as = ' '", kind, name],
+                )
+                .unwrap();
+            transaction
+                .execute_batch("PRAGMA writable_schema=OFF")
+                .unwrap();
+            assert_eq!(changed, 1, "{kind} {name} was not changed");
+            assert!(check_schema(&transaction, &reference).is_err());
+            transaction.rollback().unwrap();
+            check_schema(&actual, &reference).unwrap();
+        }
     }
 
     #[test]

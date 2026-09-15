@@ -2,7 +2,7 @@
 //! and close a request link, browse the library, issue a delivery and
 //! receive it through the FFI, revoke it, sign out.
 //!
-//! Without `VOTPORT_BIN` the test returns early. The state directory (the
+//! Local runs may skip without `VOTPORT_BIN`; CI requires it. The state directory (the
 //! device key, the journal, the stored session) is pointed at a temporary
 //! directory through `XDG_DATA_HOME`, so the test never touches this
 //! machine's session; the e2e runs on Linux only.
@@ -52,8 +52,7 @@ impl TransferListener for Recorder {
 
 #[test]
 fn an_operator_runs_the_port_from_the_core() {
-    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
-        eprintln!("VOTPORT_BIN unset; skipping the port e2e");
+    let Some(bin) = common::server_binary() else {
         return;
     };
     let state = tempfile::tempdir().unwrap();

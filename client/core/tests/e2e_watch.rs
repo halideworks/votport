@@ -2,7 +2,7 @@
 //! is handed to the listener, ships to the request link through `ship`,
 //! and moves into the folder's `shipped` subfolder; the server holds it.
 //!
-//! Without `VOTPORT_BIN` the test returns early. The state directory is
+//! Local runs may skip without `VOTPORT_BIN`; CI requires it. The state directory is
 //! pointed at a temporary directory through `XDG_DATA_HOME`; Linux only.
 
 #![cfg(target_os = "linux")]
@@ -44,8 +44,7 @@ impl WatchListener for Shipper {
 
 #[test]
 fn a_watched_folder_ships_what_settles_in_it() {
-    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
-        eprintln!("VOTPORT_BIN unset; skipping the watch e2e");
+    let Some(bin) = common::server_binary() else {
         return;
     };
     let state = tempfile::tempdir().unwrap();

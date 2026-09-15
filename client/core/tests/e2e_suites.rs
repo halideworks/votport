@@ -10,7 +10,7 @@ use votport_client_core::{
 
 #[test]
 fn sha256_partial_proofs_and_both_receive_transports_preserve_identity() {
-    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
+    let Some(bin) = common::server_binary() else {
         return;
     };
     let port = common::free_port();

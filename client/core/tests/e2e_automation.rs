@@ -9,8 +9,7 @@ use votport_client_core::{
 
 #[test]
 fn desktop_issued_token_runs_an_isolated_verified_delivery_workflow() {
-    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
-        eprintln!("VOTPORT_BIN unset; skipping automation e2e");
+    let Some(bin) = common::server_binary() else {
         return;
     };
     let state = tempfile::tempdir().unwrap();

@@ -1,7 +1,6 @@
 //! End-to-end HTTP receive against a real votport server.
 //!
-//! Without `VOTPORT_BIN` the test returns early, so it is inert where no server
-//! binary exists and real where the client CI job builds one.
+//! Local runs may skip without `VOTPORT_BIN`; CI requires the server binary.
 
 mod common;
 
@@ -12,8 +11,7 @@ use votport_client_core::{receive_over_http, Delivery, Error};
 
 #[test]
 fn a_delivery_is_received_and_verified_into_a_local_directory() {
-    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
-        eprintln!("VOTPORT_BIN unset; skipping the HTTP receive e2e");
+    let Some(bin) = common::server_binary() else {
         return;
     };
     let server = common::start_server(&bin, &[]);
@@ -66,8 +64,7 @@ fn a_delivery_is_received_and_verified_into_a_local_directory() {
 
 #[test]
 fn a_password_delivery_needs_the_password() {
-    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
-        eprintln!("VOTPORT_BIN unset; skipping the HTTP receive password e2e");
+    let Some(bin) = common::server_binary() else {
         return;
     };
     let server = common::start_server(&bin, &[]);
@@ -114,8 +111,7 @@ fn a_password_delivery_needs_the_password() {
 
 #[test]
 fn an_interrupted_download_resumes_from_the_partial() {
-    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
-        eprintln!("VOTPORT_BIN unset; skipping the HTTP resume e2e");
+    let Some(bin) = common::server_binary() else {
         return;
     };
     let server = common::start_server(&bin, &[]);
@@ -169,7 +165,7 @@ fn an_interrupted_download_resumes_from_the_partial() {
 #[cfg(unix)]
 #[test]
 fn a_receive_refuses_an_escaping_parent_link_before_writing() {
-    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
+    let Some(bin) = common::server_binary() else {
         return;
     };
     let server = common::start_server(&bin, &[]);
@@ -216,7 +212,7 @@ fn a_receive_refuses_an_escaping_parent_link_before_writing() {
 
 #[test]
 fn a_capped_password_delivery_resumes_without_spending_another_download() {
-    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
+    let Some(bin) = common::server_binary() else {
         return;
     };
     let serve_port = common::free_port();
