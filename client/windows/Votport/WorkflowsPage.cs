@@ -100,6 +100,7 @@ public sealed partial class WorkflowsPage : Page
         var selected = recipients.Children.OfType<CheckBox>().Where(item => item.IsChecked == true).Select(item => (string)item.Tag).ToArray();
         var spec = new WorkflowJobSpec(operation, id, label.Text.Trim(), fields, selected, expiry, null, null);
         var issued = await Task.Run(() => VotportClientCoreMethods.CreateWorkflowJob(spec));
+        operation = Guid.NewGuid().ToString();
         problem.Text = $"Job {issued.Id}: {issued.State.Replace('_', ' ')}. Refresh to follow its progress.";
         await LoadJobs(false);
     }

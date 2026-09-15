@@ -445,11 +445,10 @@ impl LinkPreview {
 /// comes back with `problem` set, so a screen shows it under the field. A
 /// screen that takes one kind of link passes it as `expect`, so a delivery
 /// link pasted into Send is named as such rather than previewed.
-/// Blocks for the round trip: about two minutes against a host that never
-/// connects (the connect timeout inside the retry budget), and with no bound
-/// against one that connects and never answers, since the client sets no
-/// read timeout (a transfer's reads are long by design). A shell runs it off
-/// its main thread and ignores a result for a link the field no longer holds.
+/// Blocks for at most the preview request timeout against a host that accepts
+/// but never answers. Preview requests make one attempt; transfer requests
+/// keep their longer retry budget. A shell runs it off its main thread and
+/// ignores a result for a link the field no longer holds.
 #[uniffi::export]
 pub fn inspect(link: String, expect: Option<LinkKind>) -> LinkPreview {
     match preview(&link, expect) {
@@ -477,9 +476,9 @@ fn preview(link: &str, expect: Option<LinkKind>) -> std::result::Result<LinkPrev
         Some(kind) => split_link_as(link, kind)?,
         None => split_link(link)?,
     };
-    let client = crate::api::Client::new(&link.base)?;
+    let client = crate::api::Client::for_preview(&link.base)?;
     if link.kind == LinkKind::Delivery {
-        let metadata = client.outbound_metadata(&link.token, None)?;
+        let metadata = client.outbound_metadata_for_preview(&link.token, None)?;
         // Before the password is proven the server answers with the gate
         // alone, so nothing else in the reply is known.
         let known = metadata.authorized || !metadata.has_password;
@@ -510,7 +509,7 @@ fn preview(link: &str, expect: Option<LinkKind>) -> std::result::Result<LinkPrev
             line: None,
         })
     } else {
-        let info = client.link_info(&link.token)?;
+        let info = client.link_info_for_preview(&link.token)?;
         let closed = (!info.usable).then(|| Error::LinkUnusable {
             token: link.token.clone(),
         });
@@ -992,9 +991,6 @@ struct Model {
     started: Instant,
     elapsed: Option<Duration>,
     attempt_bytes: u64,
-    transfer_started: Option<Instant>,
-    transfer_elapsed: Duration,
-    carrier_moved: u64,
     files: Vec<FileView>,
     positions: HashMap<u64, usize>,
     dirty: HashSet<usize>,
@@ -1006,7 +1002,7 @@ struct Model {
     /// Whether a carrier reports bytes for the whole package (QUIC), in which
     /// case the per-file `moved` fields do not sum to `moved_bytes`.
     carrier_bytes: bool,
-    /// (when, moved_bytes) samples inside the rate window.
+    /// (when, rate bytes) samples inside the rate window.
     samples: VecDeque<(Instant, u64)>,
     /// When the rate first became positive and has stayed so.
     rate_since: Option<Instant>,
@@ -1037,9 +1033,6 @@ impl Model {
             started: Instant::now(),
             elapsed: None,
             attempt_bytes: 0,
-            transfer_started: None,
-            transfer_elapsed: Duration::ZERO,
-            carrier_moved: 0,
             files: Vec::new(),
             positions: HashMap::new(),
             dirty: HashSet::new(),
@@ -1071,9 +1064,6 @@ impl Model {
             }
             Event::Transferred { bytes } => {
                 self.attempt_bytes = self.attempt_bytes.saturating_add(bytes);
-                if bytes > 0 && self.view.transport == Some(Transport::Http) {
-                    self.note_transfer_bytes(now);
-                }
             }
             Event::Selected { files } | Event::Planned { files } => {
                 self.files = files
@@ -1098,6 +1088,7 @@ impl Model {
                 self.files_complete = 0;
                 self.carrier_bytes = false;
                 self.view.moved_bytes = 0;
+                self.attempt_bytes = 0;
                 self.samples.clear();
                 self.rate_since = None;
                 let total = self
@@ -1110,16 +1101,11 @@ impl Model {
                 self.view.total_bytes = Some(total);
             }
             Event::Transport(transport) => {
-                self.transfer_started.get_or_insert(now);
                 self.view.transport = Some(transport);
                 self.view.phase = Phase::Transferring;
             }
             Event::SessionCreated { .. } | Event::Rebegin => {}
             Event::Bytes { moved, total } => {
-                if moved > self.carrier_moved {
-                    self.note_transfer_bytes(now);
-                    self.carrier_moved = moved;
-                }
                 if self.view.transport == Some(Transport::Push) {
                     self.attempt_bytes = moved;
                 }
@@ -1190,12 +1176,6 @@ impl Model {
                 .is_some_and(|total| self.view.moved_bytes >= total)
     }
 
-    fn note_transfer_bytes(&mut self, now: Instant) {
-        if let Some(started) = self.transfer_started {
-            self.transfer_elapsed = now.saturating_duration_since(started);
-        }
-    }
-
     fn update_file(&mut self, index: usize, update: impl FnOnce(&mut FileView)) {
         if let Some(&position) = self.positions.get(&(index as u64)) {
             let file = &mut self.files[position];
@@ -1224,7 +1204,14 @@ impl Model {
             self.view.eta_seconds = None;
             return;
         }
-        self.samples.push_back((now, self.view.moved_bytes));
+        // Fetch exposes placed bytes live and exact attempt bytes only at completion.
+        // Keep its live rate until the dependency exposes attempt progress.
+        let rate_bytes = if self.view.transport == Some(Transport::Fetch) {
+            self.view.moved_bytes
+        } else {
+            self.attempt_bytes
+        };
+        self.samples.push_back((now, rate_bytes));
         // Keep the newest sample older than the window as the floor, so a
         // stall reads as a rate falling to zero rather than no rate.
         while let Some(&(second, _)) = self.samples.get(1) {
@@ -1237,7 +1224,7 @@ impl Model {
         let (first_when, first_bytes) = self.samples[0];
         let span = now.duration_since(first_when);
         let rate = if span >= Duration::from_secs(1) {
-            let moved = self.view.moved_bytes.saturating_sub(first_bytes) as f64;
+            let moved = rate_bytes.saturating_sub(first_bytes) as f64;
             Some((moved / span.as_secs_f64()) as u64)
         } else {
             None
@@ -1354,14 +1341,10 @@ impl Model {
                 };
                 let bytes = self.planned_total.unwrap_or(view.moved_bytes);
                 let elapsed = self.elapsed.unwrap_or_default();
-                let rate = (u128::from(self.attempt_bytes) * 1_000
-                    / self.transfer_elapsed.as_millis().max(1))
-                .min(u128::from(u64::MAX)) as u64;
                 format!(
-                    "{action}, {count} {noun}, {}, {}, {}/s average",
+                    "{action}, {count} {noun}, {}, {}",
                     human_bytes(bytes),
-                    human_seconds(elapsed.as_secs()),
-                    human_bytes(rate)
+                    human_seconds(elapsed.as_secs())
                 )
             }
             Phase::Cancelled => "Cancelled".to_owned(),
@@ -1781,42 +1764,102 @@ mod tests {
     }
 
     #[test]
-    fn rate_needs_a_second_and_eta_needs_ten_held() {
+    fn rate_counts_only_bytes_transferred_in_this_attempt() {
         let t0 = Instant::now();
-        let mut model = Model::new(journal::Kind::Send);
+        let mut model = Model::new(journal::Kind::Receive);
         model.apply(planned(&[10_000]), t0);
         model.apply(Event::Transport(Transport::Http), t0);
-        let tick = |model: &mut Model, at: Duration, covered: u64| {
+        let mut previous = 0;
+        let mut tick = |at: Duration, covered: u64| {
             model.apply(
-                Event::Chunk {
+                Event::Transferred {
+                    bytes: covered.saturating_sub(previous),
+                },
+                t0 + at,
+            );
+            model.apply(
+                Event::Downloading {
                     index: 0,
-                    covered,
+                    received: 8_000 + covered,
                     total: 10_000,
                 },
                 t0 + at,
             );
+            previous = covered;
+            (
+                model.view.rate_bytes_per_second,
+                model.view.eta_seconds,
+                model.view.moved_bytes,
+            )
         };
-        tick(&mut model, Duration::from_millis(500), 50);
-        assert_eq!(model.view.rate_bytes_per_second, None, "under a second");
-        tick(&mut model, Duration::from_secs(2), 200);
-        assert_eq!(model.view.rate_bytes_per_second, Some(100));
-        assert_eq!(model.view.eta_seconds, None, "rate not yet held");
-        for second in 3..=11 {
-            tick(&mut model, Duration::from_secs(second), second * 100);
+        let (rate, eta, moved) = tick(Duration::from_millis(500), 50);
+        assert_eq!(rate, None, "under a second");
+        assert_eq!(eta, None);
+        assert_eq!(moved, 8_050);
+        let (rate, eta, moved) = tick(Duration::from_secs(2), 200);
+        assert_eq!(rate, Some(100));
+        assert_eq!(eta, None, "rate not yet held");
+        assert_eq!(moved, 8_200);
+        for second in 3..=10 {
+            tick(Duration::from_secs(second), second * 100);
         }
-        assert_eq!(model.view.rate_bytes_per_second, Some(100));
-        assert_eq!(model.view.eta_seconds, None, "held nine seconds only");
-        tick(&mut model, Duration::from_secs(12), 1_200);
-        assert_eq!(model.view.eta_seconds, Some(88), "(10000 - 1200) / 100");
+        let (rate, eta, moved) = tick(Duration::from_secs(11), 1_100);
+        assert_eq!(rate, Some(100));
+        assert_eq!(eta, None, "held nine seconds only");
+        assert_eq!(moved, 9_100);
+        let (rate, eta, moved) = tick(Duration::from_secs(12), 1_200);
+        assert_eq!(rate, Some(100));
+        assert_eq!(eta, Some(8), "(10000 - (8000 + 1200)) / 100");
+        assert_eq!(moved, 9_200);
         // The window drops old samples: a stall shows as a falling rate,
         // then the ETA goes away once the rate reaches zero.
-        tick(&mut model, Duration::from_secs(20), 1_200);
+        model.measure(t0 + Duration::from_secs(20));
         assert_eq!(model.view.rate_bytes_per_second, Some(0));
         assert_eq!(model.view.eta_seconds, None);
         assert!(model.rate_since.is_none(), "holding restarts after a stall");
         model.end(None, false);
         assert_eq!(model.view.phase, Phase::Done);
         assert_eq!(model.view.rate_bytes_per_second, None);
+    }
+
+    #[test]
+    fn fetch_carrier_progress_keeps_a_positive_live_rate_with_a_retained_prefix() {
+        let t0 = Instant::now();
+        let mut model = Model::new(journal::Kind::Receive);
+        model.apply(planned(&[10_000]), t0);
+        model.apply(Event::Transport(Transport::Fetch), t0);
+        model.apply(
+            Event::Bytes {
+                moved: 8_050,
+                total: Some(10_000),
+            },
+            t0 + Duration::from_millis(500),
+        );
+        assert_eq!(model.view.rate_bytes_per_second, None, "under a second");
+        model.apply(
+            Event::Bytes {
+                moved: 8_200,
+                total: Some(10_000),
+            },
+            t0 + Duration::from_secs(2),
+        );
+        assert!(
+            model
+                .view
+                .rate_bytes_per_second
+                .is_some_and(|rate| rate > 0),
+            "the pinned Fetch progress callback must keep the live rate visible"
+        );
+        let rate_before_terminal = model.view.rate_bytes_per_second;
+        model.apply(
+            Event::Transferred { bytes: 150 },
+            t0 + Duration::from_secs(2),
+        );
+        assert_eq!(
+            model.view.rate_bytes_per_second, rate_before_terminal,
+            "the terminal Fetch total must not be counted as another live transfer"
+        );
+        assert_eq!(model.view.moved_bytes, 8_200);
     }
 
     #[test]
@@ -1857,7 +1900,7 @@ mod tests {
         let done = model.snapshot();
         assert_eq!(
             done.status,
-            "Landed and verified, 1 file, 12.0 GB, 1 min 0 s, 1.2 GB/s average"
+            "Landed and verified, 1 file, 12.0 GB, 1 min 0 s"
         );
         assert!(done.finished_unix_seconds.is_some());
         model.end(None, false);
@@ -1866,7 +1909,7 @@ mod tests {
     }
 
     #[test]
-    fn resumed_average_excludes_bytes_retained_before_this_attempt() {
+    fn completion_summary_omits_attempt_average() {
         let mut model = Model::new(journal::Kind::Receive);
         let start = model.started;
         model.apply(planned(&[12_000_000_000]), start);
@@ -1883,7 +1926,10 @@ mod tests {
             Event::Finished { files: 1 },
             start + Duration::from_secs(60),
         );
-        assert!(model.snapshot().status.ends_with("60.0 MB/s average"));
+        assert_eq!(
+            model.snapshot().status,
+            "Landed and verified, 1 file, 12.0 GB, 1 min 0 s"
+        );
         assert!(!model.snapshot().finishing);
     }
 
@@ -2003,6 +2049,64 @@ mod tests {
             line: None,
         };
         assert_eq!(empty.with_line().line, None);
+    }
+
+    #[test]
+    fn exported_inspect_bounds_stalled_request_and_delivery_previews() {
+        use std::io::{self, Write};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        for (path, kind) in [("r", LinkKind::Request), ("s", LinkKind::Delivery)] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let (accepted_tx, accepted_rx) = mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(8);
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            accepted_tx.send(()).unwrap();
+                            // Outlast the preview timeout, then release the
+                            // stream so the owned server thread can join.
+                            std::thread::sleep(Duration::from_secs(6));
+                            let mut stream = stream;
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                            drop(stream);
+                            if let Ok((mut retry_stream, _)) = listener.accept() {
+                                accepted_tx.send(()).unwrap();
+                                let _ = retry_stream.write_all(
+                                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                );
+                            }
+                            return true;
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return false;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("preview listener failed: {error}"),
+                    }
+                }
+            });
+            let link = format!("{base}/{path}/{}", "ab".repeat(16));
+            let started = Instant::now();
+            let preview = inspect(link, Some(kind));
+            let elapsed = started.elapsed();
+            assert!(server.join().unwrap(), "inspect did not reach the listener");
+            assert_eq!(accepted_rx.try_iter().count(), 1, "preview was retried");
+            assert_eq!(preview.kind, Some(kind), "{preview:?}");
+            assert!(!preview.usable, "{preview:?}");
+            assert!(
+                elapsed < crate::api::PREVIEW_TIMEOUT + Duration::from_millis(500),
+                "stalled {kind:?} preview took {elapsed:?}"
+            );
+        }
     }
 
     #[test]

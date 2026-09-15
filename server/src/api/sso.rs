@@ -26,6 +26,7 @@ use openidconnect::{OAuth2TokenResponse as _, TokenResponse as _};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Digest as _;
+use votport_client_core::port::DESKTOP_SSO_TIMEOUT_SECS;
 
 use crate::app::App;
 use crate::auth;
@@ -379,7 +380,7 @@ impl DesktopSignIns {
             DesktopHandoff {
                 flow,
                 identity,
-                expires: now + 60,
+                expires: now.saturating_add(DESKTOP_SSO_TIMEOUT_SECS),
             },
         );
         Some(target)
@@ -910,13 +911,13 @@ mod tests {
         assert!(handoffs.exchange("short", &verifier, 101).is_none());
         assert!(handoffs.exchange(code, &"ef".repeat(32), 101).is_none());
         let successes = std::thread::scope(|scope| {
-            let first = scope.spawn(|| handoffs.exchange(code, &verifier, 159));
-            let second = scope.spawn(|| handoffs.exchange(code, &verifier, 159));
+            let first = scope.spawn(|| handoffs.exchange(code, &verifier, 161));
+            let second = scope.spawn(|| handoffs.exchange(code, &verifier, 161));
             usize::from(first.join().unwrap().is_some())
                 + usize::from(second.join().unwrap().is_some())
         });
         assert_eq!(successes, 1);
-        assert!(handoffs.exchange(code, &verifier, 159).is_none());
+        assert!(handoffs.exchange(code, &verifier, 161).is_none());
         let target = handoffs
             .issue(flow.clone(), AdminIdentity::local_admin(), 100)
             .unwrap();
@@ -926,17 +927,39 @@ mod tests {
             .split('?')
             .next()
             .unwrap();
-        assert!(handoffs.exchange(code, &verifier, 160).is_none());
+        assert!(handoffs
+            .exchange(code, &verifier, 100 + DESKTOP_SSO_TIMEOUT_SECS)
+            .is_none());
         for _ in 0..1024 {
             assert!(handoffs
                 .issue(flow.clone(), AdminIdentity::local_admin(), 200)
                 .is_some());
         }
         assert!(handoffs
-            .issue(flow.clone(), AdminIdentity::local_admin(), 259)
+            .issue(
+                flow.clone(),
+                AdminIdentity::local_admin(),
+                200 + DESKTOP_SSO_TIMEOUT_SECS - 1
+            )
             .is_none());
         assert!(handoffs
-            .issue(flow, AdminIdentity::local_admin(), 260)
+            .issue(
+                flow.clone(),
+                AdminIdentity::local_admin(),
+                200 + DESKTOP_SSO_TIMEOUT_SECS
+            )
+            .is_some());
+        let saturated = handoffs
+            .issue(flow, AdminIdentity::local_admin(), u64::MAX)
+            .unwrap();
+        let saturated_code = saturated
+            .strip_prefix("votport://signin/")
+            .unwrap()
+            .split('?')
+            .next()
+            .unwrap();
+        assert!(handoffs
+            .exchange(saturated_code, &verifier, u64::MAX - 1)
             .is_some());
     }
 

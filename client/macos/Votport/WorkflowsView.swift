@@ -154,7 +154,10 @@ struct WorkflowsView: View {
         guard let project else { return }
         if project.requiredMetadata.contains(where: { (metadata[$0] ?? "").trimmingCharacters(in: .whitespaces).isEmpty }) { problem = "Complete the required metadata fields."; return }
         let spec = WorkflowJobSpec(operationId: operation, projectId: project.id, label: label.trimmingCharacters(in: .whitespaces), metadata: metadata, recipients: recipients.sorted(), expiresDays: UInt64(days), notBefore: nil, deadline: nil)
-        run({ _ = try createWorkflowJob(spec: spec); return try workflowJobs(after: nil) }) { page in jobs = page.jobs; cursor = page.next }
+        run({ _ = try createWorkflowJob(spec: spec); return () }) { _ in
+            operation = UUID().uuidString
+            run({ try workflowJobs(after: nil) }) { page in jobs = page.jobs; cursor = page.next }
+        }
     }
     private func change(_ id: String, _ action: String, _ manifest: String?) {
         run({ _ = try changeWorkflowJob(id: id, action: action, manifest: manifest); return try workflowJobs(after: nil) }) { page in jobs = page.jobs; cursor = page.next }
