@@ -171,6 +171,7 @@ fn convert(data: &Path, public_url: &str) -> Result<Conversion> {
     )?;
     transaction.execute_batch(OUTBOUND_INDEXES)?;
     transaction.execute_batch(AUDIT_INDEXES)?;
+    transaction.execute_batch(AUDIT_COUNT_SCHEMA)?;
     rebuild(
         &transaction,
         &target,
@@ -1385,6 +1386,13 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
+        connection
+            .execute(
+                "INSERT INTO audit_log(at,tenant,actor,event,subject,detail)
+                 VALUES (12,'team','seed','conversion_audit','subject','{}')",
+                [],
+            )
+            .unwrap();
         connection.execute("INSERT INTO settings(key,value,updated_at,updated_by) VALUES ('fixture','unchanged',1,'operator')",[]).unwrap();
         drop(connection);
         assert!(Store::open(directory.path())
@@ -1424,6 +1432,7 @@ mod tests {
         );
         drop(converted);
         let store = Store::open(directory.path()).unwrap();
+        assert_eq!(store.audit_count().unwrap(), 4);
         let connection = store.connection.lock().unwrap();
         assert_eq!(read_uploads(&connection, "link").unwrap(), vec![upload]);
         assert_eq!(

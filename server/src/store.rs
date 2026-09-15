@@ -475,7 +475,7 @@ pub struct SettingsOverlay {
     pub draining_source: &'static str,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 43;
+pub(crate) const SCHEMA_VERSION: u64 = 44;
 pub(crate) const DELIVERED_CANDIDATE_PAGE: usize = 128;
 
 #[cfg(test)]
@@ -798,6 +798,26 @@ CREATE TABLE receive_workflows(link_id TEXT PRIMARY KEY REFERENCES links(id) ON 
 CREATE TABLE receive_workflow_uploads(link_id TEXT NOT NULL REFERENCES links(id) ON DELETE CASCADE, upload_id TEXT NOT NULL, PRIMARY KEY(link_id,upload_id));
 ";
 
+const AUDIT_COUNT_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS audit_log_count (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    rows INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO audit_log_count(id, rows)
+SELECT 1, (SELECT count(*) FROM audit_log)
+WHERE NOT EXISTS (SELECT 1 FROM audit_log_count WHERE id = 1);
+CREATE TRIGGER IF NOT EXISTS audit_log_count_insert
+AFTER INSERT ON audit_log
+BEGIN
+    UPDATE audit_log_count SET rows = rows + 1 WHERE id = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS audit_log_count_delete
+AFTER DELETE ON audit_log
+BEGIN
+    UPDATE audit_log_count SET rows = rows - 1 WHERE id = 1;
+END;
+";
+
 const QUOTA_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS tenant_quota_usage (
     tenant TEXT PRIMARY KEY,
@@ -1058,6 +1078,9 @@ impl Store {
             .map_err(|e| e.to_string())?;
         transaction
             .execute_batch(AUDIT_INDEXES)
+            .map_err(|e| e.to_string())?;
+        transaction
+            .execute_batch(AUDIT_COUNT_SCHEMA)
             .map_err(|e| e.to_string())?;
         transaction.commit().map_err(|e| e.to_string())?;
         connection
@@ -3006,7 +3029,7 @@ impl Store {
     pub fn audit_count(&self) -> Result<u64, String> {
         self.with(|connection| {
             connection
-                .query_row("SELECT count(*) FROM audit_log", [], |row| {
+                .query_row("SELECT rows FROM audit_log_count WHERE id = 1", [], |row| {
                     row.get::<_, i64>(0)
                 })
                 .map(|value| value.max(0) as u64)
@@ -5623,7 +5646,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
             .map_err(|e| e.to_string())?
             .parse()
             .map_err(|_| "database schema version is invalid; refusing to start")?;
-        if stored == 41 || stored == 42 {
+        if stored == 41 || stored == 42 || stored == 43 {
             validate_schema(connection, stored)?;
             let transaction = connection.transaction().map_err(|e| e.to_string())?;
             if stored == 41 {
@@ -5634,9 +5657,14 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
                     )
                     .map_err(|e| e.to_string())?;
             }
-            install_quota_schema(&transaction).map_err(|e| e.to_string())?;
+            if stored == 41 || stored == 42 {
+                install_quota_schema(&transaction).map_err(|e| e.to_string())?;
+            }
             transaction
-                .execute("UPDATE meta SET value='43' WHERE key='schema_version'", [])
+                .execute_batch(AUDIT_COUNT_SCHEMA)
+                .map_err(|e| e.to_string())?;
+            transaction
+                .execute("UPDATE meta SET value='44' WHERE key='schema_version'", [])
                 .map_err(|e| e.to_string())?;
             transaction.commit().map_err(|e| e.to_string())?;
         }
@@ -5645,6 +5673,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
     let transaction = connection.transaction().map_err(|e| e.to_string())?;
     for schema in [
         SCHEMA,
+        AUDIT_COUNT_SCHEMA,
         SETTINGS_SCHEMA,
         PRINCIPALS_SCHEMA,
         PRINCIPALS_IDENTITY_INDEX,
@@ -5721,7 +5750,7 @@ pub(crate) fn validate_schema(connection: &Connection, expected: u64) -> Result<
     if layout.as_deref() != Some("reserved-v1") {
         return Err("unsupported tenant storage layout; preserve the database and receiving files and use a matching release".into());
     }
-    if expected == SCHEMA_VERSION {
+    if expected >= 43 {
         validate_quota_schema(connection)?;
     }
     Ok(())
@@ -8640,6 +8669,65 @@ pub(crate) mod tests {
             .unwrap();
         assert!(store.audit_export(None, 0, 0, 100).is_err());
     }
+
+    #[test]
+    fn audit_count_tracks_mutations_rollbacks_pruning_and_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        assert_eq!(store.audit_count().unwrap(), 0);
+        store.audit("", "", "committed", "one", &serde_json::json!({}));
+        assert_eq!(store.audit_count().unwrap(), 1);
+
+        store
+            .with(|connection| {
+                connection.execute(
+                    "INSERT INTO audit_log(at,tenant,actor,event,subject,detail)
+                     VALUES (?1,'','',?2,'two','{}')",
+                    rusqlite::params![now_unix() as i64, "direct"],
+                )
+            })
+            .unwrap();
+        assert_eq!(store.audit_count().unwrap(), 2);
+
+        store
+            .with(|connection| {
+                connection.execute_batch("BEGIN")?;
+                connection.execute(
+                    "INSERT INTO audit_log(at,tenant,actor,event,subject,detail)
+                     VALUES (?1,'','',?2,'rolled-back','{}')",
+                    rusqlite::params![now_unix() as i64, "rollback"],
+                )?;
+                connection.execute_batch("ROLLBACK")
+            })
+            .unwrap();
+        assert_eq!(store.audit_count().unwrap(), 2);
+
+        store
+            .with(|connection| connection.execute("DELETE FROM audit_log WHERE event='direct'", []))
+            .unwrap();
+        assert_eq!(store.audit_count().unwrap(), 1);
+        assert_eq!(store.audit_prune(now_unix() + 1).unwrap(), 1);
+        assert_eq!(store.audit_count().unwrap(), 0);
+
+        drop(store);
+        let reopened = Store::open(directory.path()).unwrap();
+        assert_eq!(reopened.audit_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn audit_count_reads_retained_counter_after_audit_history_removed() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.audit("", "", "first", "one", &serde_json::json!({}));
+        store.audit("", "", "second", "two", &serde_json::json!({}));
+        store.audit("", "", "third", "three", &serde_json::json!({}));
+        assert_eq!(store.audit_count().unwrap(), 3);
+
+        store
+            .with(|connection| connection.execute_batch("DROP TABLE audit_log"))
+            .unwrap();
+        assert_eq!(store.audit_count().unwrap(), 3);
+    }
 }
 
 #[cfg(test)]
@@ -10450,6 +10538,64 @@ mod settings_tests {
         assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
         Store::open(directory.path()).unwrap();
         assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
+    }
+
+    #[test]
+    fn schema43_refusal_preserves_invalid_quota_schema() {
+        for damaged in [
+            "DROP INDEX files_quota_identity;",
+            "DROP TRIGGER tenant_quota_usage_insert;",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            drop(Store::open(directory.path()).unwrap());
+            let path = directory.path().join("votport.db");
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA journal_mode=DELETE;
+                     DROP TRIGGER audit_log_count_insert;
+                     DROP TRIGGER audit_log_count_delete;
+                     DROP TABLE audit_log_count;
+                     UPDATE meta SET value='43' WHERE key='schema_version';",
+                )
+                .unwrap();
+            connection.execute_batch(damaged).unwrap();
+            drop(connection);
+            let before = std::fs::read(&path).unwrap();
+
+            assert!(Store::open(directory.path()).is_err(), "{damaged}");
+            assert_eq!(schema_version(directory.path()), "43", "{damaged}");
+            assert!(
+                std::fs::read(&path).unwrap() == before,
+                "rejected schema43 database changed: {damaged}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema43_upgrade_backfills_and_maintains_audit_count() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.audit("", "", "first", "one", &serde_json::json!({}));
+        store.audit("", "", "second", "two", &serde_json::json!({}));
+        drop(store);
+
+        let connection = Connection::open(directory.path().join("votport.db")).unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER audit_log_count_insert;
+                 DROP TRIGGER audit_log_count_delete;
+                 DROP TABLE audit_log_count;
+                 UPDATE meta SET value='43' WHERE key='schema_version';",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = Store::open(directory.path()).unwrap();
+        assert_eq!(schema_version(directory.path()), "44");
+        assert_eq!(store.audit_count().unwrap(), 2);
+        store.audit("", "", "third", "three", &serde_json::json!({}));
+        assert_eq!(store.audit_count().unwrap(), 3);
     }
 
     #[test]
