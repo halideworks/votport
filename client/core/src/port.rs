@@ -28,6 +28,10 @@ const FILE: &str = "port.json";
 const MAX_UPLOAD_BACKWARD_RECOVERIES: u8 = 3;
 const LIBRARY_PAGE_SIZE: usize = 1000;
 
+/// The client allows this interval from browser launch to completion.
+/// The server allows it from the browser callback to the one-time exchange.
+pub const DESKTOP_SSO_TIMEOUT_SECS: u64 = 600;
+
 /// What a failed operator call tells a shell: the headline for the person,
 /// the detail behind it, and whether the session ended (so the operator
 /// screens fold). One shape for every call, since the shells hold no copy.
@@ -190,7 +194,7 @@ impl SsoLogin {
 
     fn complete_inner(&self, callback: &str) -> Result<Port> {
         let code = self.code(callback)?;
-        if self.started.elapsed() >= std::time::Duration::from_secs(600)
+        if self.started.elapsed() >= std::time::Duration::from_secs(DESKTOP_SSO_TIMEOUT_SECS)
             || !*self.active.lock().expect("SSO state poisoned")
         {
             return Err(Error::Other(
@@ -212,7 +216,9 @@ impl SsoLogin {
         // Cancellation can run during the network calls; only the final private
         // write holds the state lock, so a cancelled flow cannot replace a port.
         let mut active = self.active.lock().expect("SSO state poisoned");
-        if !*active || self.started.elapsed() >= std::time::Duration::from_secs(600) {
+        if !*active
+            || self.started.elapsed() >= std::time::Duration::from_secs(DESKTOP_SSO_TIMEOUT_SECS)
+        {
             return Err(Error::Other(
                 "Sign-in expired or was cancelled; start again".to_owned(),
             ));
@@ -1257,7 +1263,8 @@ mod tests {
         login.cancel();
         assert!(login.complete_inner(&callback).is_err());
         let expired = SsoLogin {
-            started: std::time::Instant::now() - std::time::Duration::from_secs(600),
+            started: std::time::Instant::now()
+                - std::time::Duration::from_secs(DESKTOP_SSO_TIMEOUT_SECS),
             active: std::sync::Mutex::new(true),
             ..login
         };

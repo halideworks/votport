@@ -82,7 +82,8 @@ goes over HTTP), and ends a failed transfer with a one-sentence
 `headline` for the person and the full error as `detail`. Hash progress
 itself is a VOT change (`build_manifest_from` collects and hashes with
 no callback). Both shells draw that preview: a pasted link is checked
-off the UI thread after typing settles, the line under the field names
+off the UI thread after typing settles, with one request and a five-second
+timeout. The line under the field names
 the label, the size or the cap, and the QUIC offer, the password field
 appears only when the link needs one, and the primary button is enabled
 only for a usable link, with the core's sentence shown for one that is
@@ -997,10 +998,10 @@ network bytes have arrived. Mac and Windows use the same core stage and counts.
 A file reaches 100 percent only after it is published or verified.
 
 Completed cards show the landed file count and size, total elapsed time,
-average transfer speed, and local completion time. Total time includes
-verification and publication. Average speed uses bytes moved in the current
-attempt and excludes post-transfer verification and publication; resumed bytes
-are excluded from its numerator.
+and local completion time. Total time includes verification and publication.
+Live HTTP and Push rates count bytes transferred in the current attempt.
+Fetch retains its placement-based live rate until the transport exposes
+per-attempt progress, so its rate can include a resumed prefix.
 
 The core reads up to 4 MiB at a time while verifying, resuming, or copying a
 received file, capped by its size. Native BLAKE3 and FEC libraries retain their

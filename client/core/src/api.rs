@@ -403,6 +403,12 @@ impl Client {
         Self::with_timeout(base, Some(std::time::Duration::from_secs(20)))
     }
 
+    /// The shell disables the link field during preview. Use a short timeout
+    /// and one attempt; transfers retain their longer retry budget.
+    pub(crate) fn for_preview(base: impl Into<String>) -> Result<Self> {
+        Self::with_timeout(base, Some(PREVIEW_TIMEOUT))
+    }
+
     pub(crate) fn with_timeout(
         base: impl Into<String>,
         timeout: Option<std::time::Duration>,
@@ -411,8 +417,8 @@ impl Client {
         let http = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("votport-client/", env!("CARGO_PKG_VERSION")))
-            // Transfers can legitimately run long; only authentication uses
-            // a total-request timeout.
+            // Transfers can legitimately run long. Authentication and the
+            // short interactive preview use total-request timeouts.
             .timeout(timeout)
             .connect_timeout(std::time::Duration::from_secs(20))
             .build()
@@ -442,13 +448,19 @@ impl Client {
         idempotent: bool,
         build: impl Fn() -> reqwest::blocking::RequestBuilder,
     ) -> Result<T> {
-        retry(idempotent, || {
-            let response = build().send().map_err(|source| Error::Http {
-                url: what.to_owned(),
-                source,
-            })?;
-            json(response, what)
-        })
+        retry(idempotent, || self.run_once(what, &build))
+    }
+
+    fn run_once<T: for<'de> Deserialize<'de>>(
+        &self,
+        what: &str,
+        build: impl Fn() -> reqwest::blocking::RequestBuilder,
+    ) -> Result<T> {
+        let response = build().send().map_err(|source| Error::Http {
+            url: what.to_owned(),
+            source,
+        })?;
+        json(response, what)
     }
 
     /// `GET /api/r/{token}`: what a sender may do with this link.
@@ -458,6 +470,11 @@ impl Client {
     pub fn link_info(&self, token: &str) -> Result<LinkInfo> {
         let url = self.url(&format!("/api/r/{token}"));
         self.run("link info", true, || self.http.get(&url))
+    }
+
+    pub(crate) fn link_info_for_preview(&self, token: &str) -> Result<LinkInfo> {
+        let url = self.url(&format!("/api/r/{token}"));
+        self.run_once("link info", || self.http.get(&url))
     }
 
     /// `POST /api/r/{token}/session`: opens an HTTP upload session.
@@ -621,6 +638,17 @@ impl Client {
     /// expired delivery).
     pub fn outbound_metadata(&self, token: &str, cookie: Option<&str>) -> Result<OutboundMetadata> {
         self.outbound_metadata_with_holder(token, cookie, None)
+    }
+
+    pub(crate) fn outbound_metadata_for_preview(
+        &self,
+        token: &str,
+        cookie: Option<&str>,
+    ) -> Result<OutboundMetadata> {
+        let url = self.url(&format!("/api/s/{token}"));
+        self.run_once("delivery metadata", || {
+            self.outbound_cookie(self.http.get(&url), cookie)
+        })
     }
 
     fn outbound_metadata_with_holder(
@@ -1059,6 +1087,9 @@ fn grant_cookie(response: &reqwest::blocking::Response) -> Option<String> {
 /// transfer survives a server restart: a rolling deploy takes longer than a
 /// few backoff steps, and the web sender holds for fifteen seconds a step.
 const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// The complete request bound for an interactive link preview.
+pub(crate) const PREVIEW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The longest a single backoff waits, so the budget is spent in many attempts
 /// rather than a few long sleeps.
