@@ -42,6 +42,7 @@ pub struct ScimError {
     detail: String,
     /// RFC 7644 3.12 scimType, set for the 400 and 409 classes it names.
     scim_type: Option<&'static str>,
+    retry_after_seconds: Option<u64>,
 }
 
 impl ScimError {
@@ -50,7 +51,13 @@ impl ScimError {
             status,
             detail: detail.into(),
             scim_type: None,
+            retry_after_seconds: None,
         }
+    }
+
+    fn with_retry_after(mut self, seconds: u64) -> Self {
+        self.retry_after_seconds = Some(seconds);
+        self
     }
 
     fn typed(status: StatusCode, scim_type: &'static str, detail: impl Into<String>) -> Self {
@@ -88,7 +95,14 @@ impl IntoResponse for ScimError {
         if let Some(scim_type) = self.scim_type {
             body["scimType"] = json!(scim_type);
         }
-        scim_json(self.status, body)
+        let retry_after = self.retry_after_seconds;
+        let mut response = scim_json(self.status, body);
+        if let Some(seconds) = retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
+        }
+        response
     }
 }
 
@@ -150,7 +164,8 @@ fn authorize(app: &App, headers: &HeaderMap, ip: &str) -> ScimResult<()> {
         return Err(ScimError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed attempts; wait a minute",
-        ));
+        )
+        .with_retry_after(60));
     }
     let presented = headers
         .get(header::AUTHORIZATION)

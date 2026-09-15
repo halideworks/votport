@@ -60,7 +60,8 @@ still leave only the tracing event.
 
 - Retention: `VOTPORT_AUDIT_RETENTION_DAYS` (default 400), swept daily.
 - Export: `GET /api/admin/audit?since=...&after_rowid=...&limit=...` returns a
-  capped, buffered JSONL page with a stable cursor, a format SIEMs ingest
+  capped, buffered JSONL page with a stable cursor in the
+  `X-Votport-Audit-Cursor: at,rowid` response header, a format SIEMs ingest
   without conversion.
 - Login, link lifecycle, file deletion, password-change, and upload-completion
   request paths persist rows alongside their tracing events.

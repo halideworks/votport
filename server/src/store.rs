@@ -32,6 +32,7 @@ mod workflows;
 pub use evidence::*;
 pub use routes::{InboundRoute, OutboundControl};
 pub use webhooks::*;
+pub use workflows::WorkflowMutationError;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FileRecord {

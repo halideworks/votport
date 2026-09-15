@@ -223,7 +223,8 @@ pub(super) async fn export(app: &Arc<App>, job: &Job, config: &storage::Storage)
             let route = app
                 .store
                 .trade_route(&job.tenant, &route_id)
-                .map_err(conflict)?;
+                .map_err(crate::api::store_unavailable)?
+                .ok_or_else(|| conflict("trade route is missing".into()))?;
             crate::api::trade::refresh_route(app, &route).await?;
             (
                 route.address.clone(),

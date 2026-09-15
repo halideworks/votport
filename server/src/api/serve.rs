@@ -739,7 +739,8 @@ pub async fn mint_fetch(
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many requests for this delivery",
-        ));
+        )
+        .with_retry_after(600));
     }
     let holder = hex::decode(&request.holder_key)
         .ok()

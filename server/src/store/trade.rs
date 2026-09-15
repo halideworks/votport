@@ -1,5 +1,6 @@
 use super::*;
 use crate::route_protocol::{RouteReceipt, SignedPortMessage, SignedRoute};
+use crate::store::workflows::WorkflowMutationError;
 use rusqlite::params;
 use sha2::{Digest, Sha256};
 
@@ -295,13 +296,17 @@ impl Store {
             .collect()
         })
     }
-    pub fn trade_route(&self, tenant: &str, id: &str) -> Result<TradeRoute, String> {
+    pub fn trade_route(&self, tenant: &str, id: &str) -> Result<Option<TradeRoute>, String> {
         let c = self.connection.lock().expect("store poisoned");
-        let route = route_in(&c, id)?;
-        if route.tenant != tenant {
-            return Err("route not found".into());
-        }
-        Ok(route)
+        let route = c
+            .query_row(
+                "SELECT document FROM trade_routes WHERE id=?1",
+                [id],
+                decode,
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        Ok(route.filter(|route: &TradeRoute| route.tenant == tenant))
     }
     pub fn trade_credential(&self, tenant: &str, id: &str) -> Result<String, String> {
         self.with(|c|c.query_row("SELECT credential FROM trade_routes WHERE tenant=?1 AND id=?2 AND direction='outgoing'",params![tenant,id],|r|r.get(0)))
@@ -739,12 +744,16 @@ pub(super) fn snapshot(
 pub(super) fn check_export(
     connection: &Connection,
     job: &crate::workflow::Job,
-) -> Result<(), String> {
+) -> Result<(), WorkflowMutationError> {
     if !job.project.destinations.is_empty() {
         if let Some(received) = &job.received {
-            let prohibited:bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM inbound_routes WHERE tenant=?1 AND upload_id=?2 AND json_extract(source,'$.document.permission.forwarding')=0)",params![job.tenant,received.upload_id],|r|r.get(0)).map_err(|e|e.to_string())?;
+            let prohibited: bool = connection
+                .query_row("SELECT EXISTS(SELECT 1 FROM inbound_routes WHERE tenant=?1 AND upload_id=?2 AND json_extract(source,'$.document.permission.forwarding')=0)",params![job.tenant,received.upload_id],|r|r.get(0))
+                .map_err(|error| WorkflowMutationError::store(error.to_string()))?;
             if prohibited {
-                return Err("source port does not permit managed forwarding".into());
+                return Err(WorkflowMutationError::conflict(
+                    "source port does not permit managed forwarding",
+                ));
             }
         }
     }
@@ -852,7 +861,7 @@ pub(super) fn check_destination(
     c: &Connection,
     job: &crate::workflow::Job,
     id: &str,
-) -> Result<(), String> {
+) -> Result<(), WorkflowMutationError> {
     if job.checks["destinations"][id]["state"] == "complete" {
         return Ok(());
     }
@@ -863,18 +872,19 @@ pub(super) fn check_destination(
             decode,
         )
         .optional()
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| WorkflowMutationError::store(error.to_string()))?;
     let Some(route) = route else {
         return Ok(());
     };
     let cancelled: bool = c.query_row(
         "SELECT EXISTS(SELECT 1 FROM outbound_routes WHERE job_id=?1 AND destination_id=?2 AND (revocation IS NOT NULL OR ack IS NOT NULL))",
         params![job.id, id], |row| row.get(0),
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|error| WorkflowMutationError::store(error.to_string()))?;
     if cancelled {
-        return Err(
-            "this delivery was permanently revoked; submit a new job for the resumed route".into(),
-        );
+        return Err(WorkflowMutationError::conflict(
+            "this delivery was permanently revoked; submit a new job for the resumed route",
+        ));
     }
     let admitted: bool = c
         .query_row(
@@ -882,13 +892,15 @@ pub(super) fn check_destination(
             params![job.id, id],
             |r| r.get(0),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| WorkflowMutationError::store(error.to_string()))?;
     if route.tenant != job.tenant
         || route.direction != "outgoing"
         || route.remote_grant.is_empty()
         || (route.state != "active" && (!admitted || route.cancel_active))
     {
-        return Err("trade route is not approved or has been paused or revoked".into());
+        return Err(WorkflowMutationError::conflict(
+            "trade route is not approved or has been paused or revoked",
+        ));
     }
     Ok(())
 }
@@ -912,7 +924,11 @@ impl Store {
         job: &crate::workflow::Job,
         id: &str,
     ) -> Result<(), String> {
-        check_destination(&self.connection.lock().expect("store poisoned"), job, id)
+        Ok(check_destination(
+            &self.connection.lock().expect("store poisoned"),
+            job,
+            id,
+        )?)
     }
 }
 
@@ -1069,7 +1085,7 @@ mod tests {
             .trade_contact("", &pending.id, "active", None)
             .unwrap();
         assert_eq!(
-            store.trade_route("", &pending.id).unwrap().state,
+            store.trade_route("", &pending.id).unwrap().unwrap().state,
             "pending_approval"
         );
         let mut document = RouteDocument {

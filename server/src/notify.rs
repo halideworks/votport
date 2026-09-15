@@ -46,7 +46,7 @@ fn title_brand(app: &App, tenant: &str) -> String {
 pub async fn trade_uploaded(app: &App, tenant: &str, upload: &str) {
     if let Ok(Some(incoming)) = app.store.received_route(tenant, upload) {
         if let Some(permission) = &incoming.source.document.permission {
-            if let (Ok(route), Ok(Some(policy))) = (
+            if let (Ok(Some(route)), Ok(Some(policy))) = (
                 app.store.trade_route(tenant, &permission.grant),
                 app.store.trade_delivery_policy(&incoming.id),
             ) {

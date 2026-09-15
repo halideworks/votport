@@ -232,7 +232,8 @@ pub(crate) async fn check_password(
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed attempts; wait a minute",
-        ));
+        )
+        .with_retry_after(60));
     }
     let password = password.unwrap_or_default().to_owned();
     let hash = hash.to_owned();
@@ -407,7 +408,8 @@ async fn prepare_session(
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many uploads started from your address; try again later",
-        ));
+        )
+        .with_retry_after(600));
     }
     if !link_authorized(app, &link, headers) {
         check_password(
@@ -607,6 +609,7 @@ fn session_insert_error(app: &App, tenant: &str, error: session::InsertError) ->
                 StatusCode::TOO_MANY_REQUESTS,
                 "too many concurrent uploads for this tenant",
             )
+            .with_retry_after(1)
         }
         session::InsertError::Capacity => {
             audit_session_rejected(app, tenant, "global or per-link session cap");
@@ -614,6 +617,7 @@ fn session_insert_error(app: &App, tenant: &str, error: session::InsertError) ->
                 StatusCode::TOO_MANY_REQUESTS,
                 "too many uploads in progress; try again shortly",
             )
+            .with_retry_after(1)
         }
         session::InsertError::Store(error) => super::store_unavailable(error),
     }
@@ -1269,6 +1273,7 @@ mod session_rate_tests {
             .unwrap();
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "600");
     }
 
     #[tokio::test]
@@ -1312,6 +1317,7 @@ mod session_rate_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
         assert_eq!(
             application.sessions.total(),
             application.config.max_link_sessions

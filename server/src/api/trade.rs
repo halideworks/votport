@@ -397,7 +397,8 @@ pub async fn accept(
     Ok(private(
         app.store
             .trade_route(&route.tenant, &route.id)
-            .map_err(store_unavailable)?,
+            .map_err(store_unavailable)?
+            .ok_or_else(ApiError::not_found)?,
     ))
 }
 pub(crate) async fn enroll_outgoing(app: &App, route: &TradeRoute) -> ApiResult<()> {
@@ -566,7 +567,8 @@ pub async fn test(
     let route = app
         .store
         .trade_route(&actor.tenant, &id)
-        .map_err(|_| ApiError::not_found())?;
+        .map_err(store_unavailable)?
+        .ok_or_else(ApiError::not_found)?;
     if route.direction != "outgoing" {
         return Err(invalid("test connections from the sending port"));
     }
@@ -574,7 +576,8 @@ pub async fn test(
     Ok(private(
         app.store
             .trade_route(&actor.tenant, &id)
-            .map_err(store_unavailable)?,
+            .map_err(store_unavailable)?
+            .ok_or_else(ApiError::not_found)?,
     ))
 }
 #[derive(Deserialize)]
@@ -596,7 +599,8 @@ pub async fn update(
     let previous = app
         .store
         .trade_route(&actor.tenant, &id)
-        .map_err(|_| ApiError::not_found())?;
+        .map_err(store_unavailable)?
+        .ok_or_else(ApiError::not_found)?;
     let route = app
         .store
         .update_trade_route(
@@ -657,7 +661,8 @@ pub async fn rotate(
     let route = app
         .store
         .trade_route(&actor.tenant, &id)
-        .map_err(|_| ApiError::not_found())?;
+        .map_err(store_unavailable)?
+        .ok_or_else(ApiError::not_found)?;
     if route.direction != "outgoing" || route.remote_grant.is_empty() || route.state == "revoked" {
         return Err(invalid(
             "only an enrolled outgoing route can rotate its credential",
@@ -706,7 +711,8 @@ pub async fn change_address(
     let route = app
         .store
         .trade_route(&actor.tenant, &id)
-        .map_err(|_| ApiError::not_found())?;
+        .map_err(store_unavailable)?
+        .ok_or_else(ApiError::not_found)?;
     let origin = address(&body.address).map_err(unprocessable)?;
     probe(&app, &origin, Some(&route.peer_key)).await?;
     app.store
@@ -820,6 +826,95 @@ mod tests {
     use axum::http::Request;
     use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
+
+    fn admin_cookie(app: &crate::app::App) -> String {
+        format!(
+            "votport_admin={}",
+            crate::auth::issue_admin_token(
+                &app.secret,
+                &crate::auth::AdminIdentity::local_admin(),
+                &app.config.admin_token_tag,
+            )
+        )
+    }
+
+    #[tokio::test]
+    async fn trade_test_route_distinguishes_missing_foreign_and_store_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let cookie = admin_cookie(&app);
+        let request = |id: &str| {
+            Request::post(format!("/api/trade-routes/{id}/test"))
+                .extension(ConnectInfo(
+                    "127.0.0.1:34567".parse::<std::net::SocketAddr>().unwrap(),
+                ))
+                .header("X-Votport", "1")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let response = crate::app::router(Arc::clone(&app))
+            .oneshot(request("missing"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let foreign = TradeRoute {
+            id: "foreign".into(),
+            revision: 1,
+            tenant: "other".into(),
+            direction: "outgoing".into(),
+            name: "Foreign".into(),
+            peer_name: "Foreign".into(),
+            peer_key: "peer".into(),
+            address: "http://127.0.0.1".into(),
+            endpoint: "endpoint".into(),
+            endpoint_name: "Endpoint".into(),
+            category: "external".into(),
+            forwarding: false,
+            metadata_keys: vec![],
+            state: "active".into(),
+            notifications: crate::store::NotificationPolicy::default(),
+            last_contact: None,
+            error: None,
+            remote_grant: "grant".into(),
+            remote_state: "active".into(),
+            cancel_active: false,
+        };
+        app.store
+            .with(|connection| {
+                connection.execute(
+                    "INSERT INTO trade_routes(id,tenant,direction,peer_key,endpoint,document,credential) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    rusqlite::params![
+                        foreign.id,
+                        foreign.tenant,
+                        foreign.direction,
+                        foreign.peer_key,
+                        foreign.endpoint,
+                        serde_json::to_string(&foreign).unwrap(),
+                        "credential",
+                    ],
+                )
+            })
+            .unwrap();
+        let response = crate::app::router(Arc::clone(&app))
+            .oneshot(request("foreign"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        app.store
+            .with(|connection| connection.execute_batch("DROP TABLE trade_routes"))
+            .unwrap();
+        let response = crate::app::router(app)
+            .oneshot(request("backend"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "database unavailable; try again");
+    }
 
     #[tokio::test]
     async fn discovery_limits_requests_before_identity_reads_and_signing() {
