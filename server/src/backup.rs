@@ -1256,6 +1256,22 @@ fn prune_local_root_protected(
     retention_count: u64,
     protected_id: Option<&str>,
 ) -> Result<(), String> {
+    prune_local_root_protected_at(
+        root,
+        retention_days,
+        retention_count,
+        protected_id,
+        SystemTime::now(),
+    )
+}
+
+fn prune_local_root_protected_at(
+    root: &Path,
+    retention_days: u64,
+    retention_count: u64,
+    protected_id: Option<&str>,
+    now: SystemTime,
+) -> Result<(), String> {
     let root = ensure_backup_root(root)?;
     let mut files = local_files(&root)?;
     files.sort_by(|left, right| {
@@ -1264,7 +1280,7 @@ fn prune_local_root_protected(
             .then_with(|| right.2.cmp(&left.2))
             .then_with(|| right.0.cmp(&left.0))
     });
-    let cutoff = SystemTime::now()
+    let cutoff = now
         .checked_sub(std::time::Duration::from_secs(
             retention_days.saturating_mul(86_400),
         ))
@@ -1488,7 +1504,7 @@ pub async fn prune_s3(
     prune_s3_store(
         store,
         config,
-        retention_days,
+        s3_age_cutoff(now(), retention_days),
         retention_count,
         protected_id,
         MAX_S3_LIST_ENTRIES,
@@ -1497,10 +1513,15 @@ pub async fn prune_s3(
     .await
 }
 
+fn s3_age_cutoff(now: u64, days: u64) -> Option<i64> {
+    (days > 0)
+        .then(|| i64::try_from(now.saturating_sub(days.saturating_mul(86_400))).unwrap_or(i64::MAX))
+}
+
 async fn prune_s3_store(
     store: Arc<dyn ObjectStore>,
     config: &BackupConfig,
-    retention_days: u64,
+    age_cutoff: Option<i64>,
     retention_count: u64,
     protected_id: Option<&str>,
     max_entries: usize,
@@ -1515,12 +1536,11 @@ async fn prune_s3_store(
             .then_with(|| right.last_modified.cmp(&left.last_modified))
             .then_with(|| right.location.cmp(&left.location))
     });
-    let cutoff = now().saturating_sub(retention_days.saturating_mul(86_400)) as i64;
     for (index, item) in files.into_iter().enumerate() {
         if owned_s3_id(config, &item.location) == protected_id {
             continue;
         }
-        if (retention_days > 0 && item.last_modified.timestamp() < cutoff)
+        if age_cutoff.is_some_and(|cutoff| item.last_modified.timestamp() < cutoff)
             || (retention_count > 0 && index >= retention_count as usize)
         {
             store
@@ -1557,11 +1577,12 @@ pub async fn run(
     secrets: BackupSecrets,
 ) -> Result<String, String> {
     ensure_no_pending_restore(&app.config.data_dir)?;
+    let retention = app.retention_observation()?;
     let mut status = read_status(&app.config.data_dir).unwrap_or_default();
     status.last_attempt_at = Some(now());
     status.last_error = None;
     write_status(&app.config.data_dir, status.clone())?;
-    let result = run_inner(Arc::clone(&app), config, secrets).await;
+    let result = run_inner(Arc::clone(&app), config, secrets, retention).await;
     match result {
         Ok(id) => {
             status.last_success_at = Some(now());
@@ -1607,6 +1628,7 @@ async fn run_inner(
     app: Arc<crate::app::App>,
     config: BackupConfig,
     secrets: BackupSecrets,
+    retention: crate::app::RetentionObservation,
 ) -> Result<String, RunFailure> {
     config
         .validate(&app.config.data_dir)
@@ -1664,14 +1686,20 @@ async fn run_inner(
     }
     sync_directory(&backups).map_err(RunFailure::before)?;
     let mut copies_complete = false;
+    let retention_days = if retention.allow_age {
+        config.retention_days
+    } else {
+        0
+    };
     if matches!(config.destination, Destination::Local | Destination::Both) {
         final_cleanup.keep();
         copies_complete = config.destination == Destination::Local;
-        prune_local_root_protected(
+        prune_local_root_protected_at(
             &backups,
-            config.retention_days,
+            retention_days,
             config.retention_count,
             Some(&id),
+            UNIX_EPOCH + std::time::Duration::from_secs(retention.effective_at),
         )
         .map_err(|error| RunFailure::after(error, copies_complete))?;
     }
@@ -1686,12 +1714,16 @@ async fn run_inner(
         final_cleanup.keep();
     }
     if matches!(config.destination, Destination::S3 | Destination::Both) {
-        prune_s3(
+        let store = s3_store(&config, &secrets)
+            .map_err(|error| RunFailure::after(error, copies_complete))?;
+        prune_s3_store(
+            store,
             &config,
-            &secrets,
-            config.retention_days,
+            s3_age_cutoff(retention.effective_at, retention_days),
             config.retention_count,
             Some(&id),
+            MAX_S3_LIST_ENTRIES,
+            S3_LIST_TIMEOUT,
         )
         .await
         .map_err(|error| RunFailure::after(error, copies_complete))?;
@@ -2882,6 +2914,31 @@ mod tests {
     }
 
     #[test]
+    fn local_backup_age_pruning_uses_the_guarded_time() {
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("votport-backup-v2-1-old.tar");
+        let recent = root.path().join("votport-backup-v2-2-recent.tar");
+        let base = 1_800_000_000;
+        for (path, at) in [(&old, base), (&recent, base + 9 * 86_400)] {
+            let file = File::create(path).unwrap();
+            file.set_times(
+                fs::FileTimes::new().set_modified(UNIX_EPOCH + std::time::Duration::from_secs(at)),
+            )
+            .unwrap();
+        }
+        prune_local_root_protected_at(
+            root.path(),
+            7,
+            0,
+            None,
+            UNIX_EPOCH + std::time::Duration::from_secs(base + 10 * 86_400),
+        )
+        .unwrap();
+        assert!(!old.exists());
+        assert!(recent.exists());
+    }
+
+    #[test]
     fn backup_lock_warnings_start_at_the_interval_and_reset() {
         use std::time::{Duration, Instant};
         let mut config = BackupConfig {
@@ -2957,7 +3014,7 @@ mod tests {
                 prune_s3_store(
                     store.clone(),
                     &config,
-                    0,
+                    None,
                     1,
                     None,
                     limit,
@@ -2982,7 +3039,7 @@ mod tests {
         prune_s3_store(
             store.clone(),
             &config,
-            0,
+            None,
             1,
             None,
             3,
@@ -2994,6 +3051,78 @@ mod tests {
         assert_eq!(
             usize::from(store.head(&keys[0]).await.is_ok())
                 + usize::from(store.head(&keys[1]).await.is_ok()),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn held_backup_run_preserves_count_pruning() {
+        let root = tempfile::tempdir().unwrap();
+        let config = crate::api::testing::config(root.path());
+        let store = crate::store::Store::open(&config.data_dir).unwrap();
+        store
+            .with(|connection| {
+                connection.execute(
+                    "DELETE FROM meta WHERE key = ?1",
+                    [crate::store::RETENTION_CLOCK_KEY],
+                )
+            })
+            .unwrap();
+        drop(store);
+        let app = crate::app::build(config).unwrap();
+        let backups = ensure_backups_dir(&app.config.data_dir).unwrap();
+        let old = backups.join("votport-backup-v2-1-old.tar");
+        fs::write(&old, b"old").unwrap();
+        let backup_config = BackupConfig {
+            retention_days: 7,
+            retention_count: 1,
+            destination: Destination::Local,
+            ..BackupConfig::default()
+        };
+        run(Arc::clone(&app), backup_config, BackupSecrets::default())
+            .await
+            .unwrap();
+        assert!(!old.exists());
+        assert_eq!(local_files(&backups).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn s3_age_cutoff_disables_zero_days_and_saturates_bounds() {
+        assert_eq!(s3_age_cutoff(100_000, 0), None);
+        assert_eq!(s3_age_cutoff(100_000, 1), Some(13_600));
+        assert_eq!(s3_age_cutoff(1, u64::MAX), Some(0));
+        assert_eq!(s3_age_cutoff(u64::MAX, 1), Some(i64::MAX));
+    }
+
+    #[tokio::test]
+    async fn s3_count_pruning_helper_preserves_policy_during_hold() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let config = BackupConfig {
+            s3_prefix: Some("backups".into()),
+            ..BackupConfig::default()
+        };
+        for id in ["votport-backup-v2-1-old.tar", "votport-backup-v2-2-new.tar"] {
+            store
+                .put(&s3_path(&config, id), "backup".into())
+                .await
+                .unwrap();
+        }
+        prune_s3_store(
+            Arc::clone(&store),
+            &config,
+            None,
+            1,
+            None,
+            MAX_S3_LIST_ENTRIES,
+            S3_LIST_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            list_s3_backups(&*store, &config, MAX_S3_LIST_ENTRIES, S3_LIST_TIMEOUT)
+                .await
+                .unwrap()
+                .len(),
             1
         );
     }
@@ -3031,7 +3160,7 @@ mod tests {
         prune_s3_store(
             Arc::clone(&store),
             &config,
-            0,
+            None,
             1,
             Some(protected),
             MAX_S3_LIST_ENTRIES,

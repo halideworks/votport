@@ -149,6 +149,68 @@ try {
   await page.locator('#retention-note').getByText('Using environment.', { exact: true }).waitFor();
   assert.notEqual(await page.inputValue('#audit-retention-days'), '41'); assert.equal(await page.inputValue('#smtp-host'), 'unsaved.example');
 
+  const clockPage = await context.newPage();
+  const clockSettings = structuredClone(await api('admin/settings'));
+  let clockPayload = { raw_wall_at: 1_700_000_000, held: true, capped: false };
+  let clockAckResponse = 'ok';
+  const clockAckBodies = [];
+  await clockPage.route('**/api/admin/settings', async (route) => {
+    const request = route.request();
+    if (request.method() !== 'GET' || new URL(request.url()).pathname !== '/api/admin/settings') {
+      await route.continue(); return;
+    }
+    const body = { ...clockSettings };
+    delete body.retention_clock;
+    if (clockPayload !== undefined) body.retention_clock = clockPayload;
+    await route.fulfill({ json: body });
+  });
+  await clockPage.route('**/api/admin/settings/retention-clock/acknowledge', async (route) => {
+    const request = route.request();
+    if (request.method() !== 'POST') { await route.continue(); return; }
+    clockAckBodies.push(request.postDataJSON());
+    if (clockAckResponse === 'conflict') {
+      await route.fulfill({ status: 409, json: { error: 'Clock changed fixture' } }); return;
+    }
+    clockPayload = { raw_wall_at: 1_700_000_000, held: false, capped: false };
+    await route.fulfill({ json: { ...clockSettings, retention_clock: clockPayload } });
+  });
+  await clockPage.goto(`${base}/system`); await clockPage.waitForFunction(() => !document.querySelector('#smtp-form').inert);
+  await clockPage.locator('#retention-clock-status').waitFor();
+  assert.match(await clockPage.locator('#retention-clock-status').textContent(), /Cleanup based on file and record age is paused/);
+  assert.equal(await clockPage.getByRole('button', { name: 'Confirm server time', exact: true }).isVisible(), true);
+  const displayedAt = Number(await clockPage.locator('#retention-clock-ack').getAttribute('data-observed-at'));
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  await clockPage.getByRole('button', { name: 'Confirm server time', exact: true }).click();
+  await clockPage.getByText('Server time confirmed.', { exact: true }).waitFor();
+  assert.deepEqual(clockAckBodies, [{ observed_at: displayedAt }], 'confirmation sends the displayed server observation');
+
+  clockPayload = { raw_wall_at: 1_700_000_001, held: false, capped: true };
+  await clockPage.reload(); await clockPage.locator('#retention-clock-status').waitFor();
+  assert.match(await clockPage.locator('#retention-clock-status').textContent(), /Cleanup based on file and record age is limited/);
+  assert.equal(await clockPage.getByRole('button', { name: 'Confirm server time', exact: true }).isVisible(), true);
+
+  const ackCountBeforeEmpty = clockAckBodies.length;
+  for (const emptyPayload of [undefined, {}]) {
+    clockPayload = emptyPayload;
+    await clockPage.reload();
+    await clockPage.waitForFunction(() => document.querySelector('#retention-clock-status').textContent.includes('unavailable'));
+    assert.equal(await clockPage.locator('#retention-clock-ack').isHidden(), true);
+    await clockPage.evaluate(() => document.querySelector('#retention-clock-ack').click());
+    assert.equal(await clockPage.locator('#retention-clock-note').textContent(), 'Refresh settings before confirming the server time.');
+  }
+  assert.equal(clockAckBodies.length, ackCountBeforeEmpty, 'empty clock data never sends a confirmation request');
+
+  clockPayload = { raw_wall_at: 1_700_000_002, held: true, capped: false };
+  clockAckResponse = 'conflict';
+  await clockPage.reload(); await clockPage.locator('#retention-clock-status').waitFor();
+  await clockPage.fill('#audit-retention-days', '73');
+  clockPayload = { raw_wall_at: 1_700_000_003, held: false, capped: true };
+  await clockPage.getByRole('button', { name: 'Confirm server time', exact: true }).click();
+  await clockPage.getByText('Clock changed fixture', { exact: true }).waitFor();
+  await clockPage.waitForFunction(() => document.querySelector('#retention-clock-status').textContent.includes('limited'));
+  assert.equal(await clockPage.inputValue('#audit-retention-days'), '73', 'a refresh keeps the dirty retention setting');
+  await clockPage.close();
+
   await api('admin/tenants', { key: id, label: id });
   await page.goto(`${base}/tenants`);
   const tenant = page.locator(`#tenants [data-tenant="${id}"]`);
@@ -182,5 +244,5 @@ try {
   for (const width of [320, 390, 768, 1440]) { await recipient.setViewportSize({ width, height: 1000 }); assert.ok(await recipient.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `Recipient overflow at ${width}`); }
   await recipient.screenshot({ path: path.join(root, 'recipient-verification.png'), fullPage: true });
   assert.deepEqual(errors, []);
-  console.log('Usability browser checks passed: grouped navigation at seven widths, accessible hints, private drafts, save/cancel protection, filter races, one port setup path, and recipient verification/acceptance.');
+  console.log('Usability browser checks passed: grouped navigation at seven widths, accessible hints, private drafts, save/cancel protection, filter races, retention clock confirmation and refresh flows, one port setup path, and recipient verification/acceptance.');
 } finally { await browser.close(); }

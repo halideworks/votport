@@ -20,6 +20,31 @@ function setSecret(id, isSet) {
   $(id).placeholder = isSet ? 'unchanged' : '';
 }
 
+function fillRetentionClock(data) {
+  const clock = data.retention_clock || {};
+  const status = $('retention-clock-status');
+  const confirm = $('retention-clock-ack');
+  const note = $('retention-clock-note');
+  const observedAt = Number.isSafeInteger(clock.raw_wall_at) ? clock.raw_wall_at : null;
+  confirm.dataset.observedAt = observedAt === null ? '' : String(observedAt);
+  if (observedAt === null) {
+    status.textContent = 'Cleanup status is unavailable. Refresh settings to see the server time.';
+    note.textContent = 'Refresh settings before confirming the server time.';
+    confirm.hidden = true;
+    return;
+  }
+  note.textContent = '';
+  const observed = ` Observed server time: ${formatWhen(clock.raw_wall_at)}.`;
+  if (clock.held) {
+    status.textContent = `Cleanup based on file and record age is paused until an administrator confirms the server's date and time.${observed}`;
+  } else if (clock.capped) {
+    status.textContent = `Cleanup based on file and record age is limited to trusted time and server uptime until an administrator confirms the current date and time.${observed}`;
+  } else {
+    status.textContent = `Cleanup is using the trusted server time.${observed}`;
+  }
+  confirm.hidden = !clock.held && !clock.capped;
+}
+
 function setBackupSecret(input, isSet) {
   setSecret(input, isSet);
   $(`${input}-source`).textContent = isSet ? 'saved' : 'not configured';
@@ -133,6 +158,7 @@ function preserveSettingsEdits(exclude) {
 function fillSettings(data, exclude = null) {
   const restore = preserveSettingsEdits(exclude);
   fillDeployment(data);
+  fillRetentionClock(data);
   $('smtp-host').value = data.smtp_host || '';
   setSource('smtp-host-source', data.smtp_host_source);
   $('smtp-port').value = data.smtp_port;
@@ -376,6 +402,32 @@ $('retention-form').addEventListener('submit', async (event) => {
   if (Number.isFinite(audit) && audit >= 0) body.audit_retention_days = audit;
   if (Number.isFinite(upload) && upload >= 0) body.upload_retention_days = upload;
   await saveSettings(event.currentTarget, body);
+});
+
+$('retention-clock-ack').addEventListener('click', async (event) => {
+  const button = event.currentTarget;
+  const observedText = button.dataset.observedAt;
+  const observedAt = observedText === '' ? NaN : Number(observedText);
+  if (!Number.isSafeInteger(observedAt)) {
+    $('retention-clock-note').textContent = 'Refresh settings before confirming the server time.';
+    return;
+  }
+  button.disabled = true;
+  $('retention-clock-note').textContent = '';
+  try {
+    fillSettings(await api('/api/admin/settings/retention-clock/acknowledge', {
+      method: 'POST',
+      body: JSON.stringify({ observed_at: observedAt }),
+    }));
+    $('retention-clock-note').textContent = 'Server time confirmed.';
+  } catch (error) {
+    if (error.status === 409) {
+      try { fillSettings(await api('/api/admin/settings')); } catch { /* retain the error */ }
+    }
+    $('retention-clock-note').textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
 });
 
 $('quotas-form').addEventListener('submit', async (event) => {

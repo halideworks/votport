@@ -2653,6 +2653,34 @@ pub async fn get_settings(
     settings_response(app, identity).await
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionClockAcknowledgement {
+    pub observed_at: u64,
+}
+
+pub async fn acknowledge_retention_clock(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(request): Json<RetentionClockAcknowledgement>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_platform_admin(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
+    match app.acknowledge_retention_clock_at(&identity.subject, request.observed_at, now_unix()) {
+        Ok(()) => {}
+        Err(crate::app::RetentionClockAcknowledgementError::FutureObservation) => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "displayed server time is in the future; refresh settings before confirming it",
+            ));
+        }
+        Err(crate::app::RetentionClockAcknowledgementError::Store(error)) => {
+            return Err(super::store_unavailable(error));
+        }
+    }
+    settings_response(app, identity).await
+}
+
 pub async fn get_receiving_storage(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -2906,6 +2934,7 @@ fn settings_json(app: &App) -> ApiResult<serde_json::Value> {
         "require_provisioning_source": overlay.require_provisioning_source,
         "draining": resolved.draining,
         "draining_source": overlay.draining_source,
+        "retention_clock": app.retention_clock_status(),
         "sso_configured": app.sso_config.is_some(),
         "deployment": deployment,
     }))
@@ -8219,6 +8248,106 @@ mod settings_api_tests {
         .await;
         assert_eq!(json["draining"], true);
         assert_eq!(json["draining_source"], "db");
+    }
+
+    #[tokio::test]
+    async fn retention_clock_acknowledgement_is_platform_admin_only_and_visible() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = testing::config(directory.path());
+        let store = crate::store::Store::open(&config.data_dir).unwrap();
+        store
+            .with(|connection| {
+                connection.execute(
+                    "DELETE FROM meta WHERE key = ?1",
+                    [crate::store::RETENTION_CLOCK_KEY],
+                )
+            })
+            .unwrap();
+        drop(store);
+        let application = app::build(config).unwrap();
+        let cookie = cookie_for(&application, "", "admin");
+        let (_, json) = send(
+            Arc::clone(&application),
+            Request::get("/api/admin/settings")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(json["retention_clock"]["held"], true);
+        assert!(application
+            .store
+            .audit_export(None, 0, 0, 10)
+            .unwrap()
+            .iter()
+            .any(|row| row.event == "retention_clock_held"));
+        let observed_at = json["retention_clock"]["raw_wall_at"]
+            .as_u64()
+            .expect("settings must expose the displayed wall observation");
+
+        let (status, _) = send(
+            Arc::clone(&application),
+            Request::post("/api/admin/settings/retention-clock/acknowledge")
+                .header("cookie", &cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"observed_at":{observed_at}}}"#)))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        assert_eq!(
+            application.acknowledge_retention_clock_at(
+                "platform-operator",
+                observed_at,
+                observed_at.saturating_sub(86_400),
+            ),
+            Err(crate::app::RetentionClockAcknowledgementError::FutureObservation),
+            "a backward correction makes the displayed observation invalid"
+        );
+
+        let future = observed_at.saturating_add(86_400);
+        let (status, _) = send(
+            Arc::clone(&application),
+            Request::post("/api/admin/settings/retention-clock/acknowledge")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"observed_at":{future}}}"#)))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            application.store.retention_clock_anchor().unwrap(),
+            None,
+            "a future displayed observation cannot acknowledge the clock"
+        );
+
+        let older = observed_at.saturating_sub(86_400);
+        let (status, json) = send(
+            Arc::clone(&application),
+            Request::post("/api/admin/settings/retention-clock/acknowledge")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"observed_at":{older}}}"#)))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["retention_clock"]["held"], false);
+        assert_eq!(
+            application.store.retention_clock_anchor().unwrap(),
+            Some(older),
+            "the acknowledgement must persist the displayed observation"
+        );
+        assert!(application
+            .store
+            .audit_export(None, 0, 0, 10)
+            .unwrap()
+            .iter()
+            .any(|row| row.event == "retention_clock_acknowledged"));
     }
 
     #[tokio::test]
