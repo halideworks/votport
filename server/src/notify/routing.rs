@@ -1,6 +1,11 @@
 use super::*;
 use crate::store::{NotificationDestination, NotificationMode, NotificationPolicy};
 use futures_util::{stream, StreamExt};
+use reqwest::header::{HeaderMap, RETRY_AFTER};
+use std::time::{Duration, SystemTime};
+
+const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(3);
 
 pub(super) struct Route<'a> {
     pub tenant: &'a str,
@@ -127,13 +132,54 @@ async fn send_destination(
             unavailable("Invalid notification destination");
             DESTINATION_FAILURE
         })?;
-    log_failure(
-        &destination.channel,
-        event,
-        transfer_id,
-        request.send().await,
-    )
-    .await
+    let result = request.send().await;
+    if let Ok(response) = &result {
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let Some(delay) = retry_after_delay(response.headers(), SystemTime::now()) else {
+                return log_failure(&destination.channel, event, transfer_id, result).await;
+            };
+            drop(result);
+            tokio::time::sleep(delay).await;
+            let Some(retry_request) =
+                destination_request(&app.http, destination, title, body, payload)
+            else {
+                unavailable("Invalid notification destination");
+                return Err(DESTINATION_FAILURE);
+            };
+            return log_failure(
+                &destination.channel,
+                event,
+                transfer_id,
+                retry_request.send().await,
+            )
+            .await;
+        }
+    }
+    log_failure(&destination.channel, event, transfer_id, result).await
+}
+
+fn retry_after_delay(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
+    let Some(value) = headers.get(RETRY_AFTER) else {
+        return Some(DEFAULT_RETRY_AFTER);
+    };
+    let Ok(value) = value.to_str() else {
+        return Some(DEFAULT_RETRY_AFTER);
+    };
+    let value = value.trim();
+    if value.starts_with('-') {
+        return None;
+    }
+    if let Ok(seconds) = value.parse::<f64>() {
+        if !seconds.is_finite() || seconds < 0.0 || seconds > MAX_RETRY_AFTER.as_secs_f64() {
+            return None;
+        }
+        return Duration::try_from_secs_f64(seconds).ok();
+    }
+    let Ok(date) = httpdate::parse_http_date(value) else {
+        return Some(DEFAULT_RETRY_AFTER);
+    };
+    let delay = date.duration_since(now).unwrap_or_default();
+    (delay <= MAX_RETRY_AFTER).then_some(delay)
 }
 
 fn destination_request(
@@ -237,7 +283,11 @@ mod tests {
     use super::*;
     use crate::api::testing;
     use crate::store::{NotificationRule, SettingWrite};
-    use axum::{extract::Path, routing::post, Json, Router};
+    use axum::{
+        body::to_bytes, extract::Path, response::IntoResponse, routing::post, Json, Router,
+    };
+    use reqwest::header::HeaderValue;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn push_destination(channel: &str) -> NotificationDestination {
         NotificationDestination {
@@ -321,6 +371,136 @@ mod tests {
             assert_eq!(fields["transfer_id"], "fixture-transfer");
             assert_eq!(fields["outcome"], "failed");
         }
+    }
+
+    #[test]
+    fn retry_after_delay_is_bounded_and_parses_provider_values() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let parse = |value: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = value {
+                headers.insert(RETRY_AFTER, HeaderValue::from_str(value).unwrap());
+            }
+            retry_after_delay(&headers, now)
+        };
+        assert_eq!(parse(None), Some(DEFAULT_RETRY_AFTER));
+        assert_eq!(parse(Some("malformed")), Some(DEFAULT_RETRY_AFTER));
+        assert_eq!(parse(Some("1.25")), Some(Duration::from_millis(1250)));
+        assert_eq!(parse(Some("3")), Some(MAX_RETRY_AFTER));
+        assert_eq!(
+            parse(Some(&httpdate::fmt_http_date(now + Duration::from_secs(2)))),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(parse(Some("-1")), None);
+        assert_eq!(parse(Some("NaN")), None);
+        assert_eq!(parse(Some("inf")), None);
+        assert_eq!(parse(Some("3.001")), None);
+        assert_eq!(
+            parse(Some(&httpdate::fmt_http_date(now - Duration::from_secs(1)))),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_retries_one_429_and_records_the_final_outcome() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = testing::build(directory.path());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn({
+            let attempts = attempts.clone();
+            let requests = requests.clone();
+            async move {
+                axum::serve(
+                    listener,
+                    Router::new().route(
+                        "/",
+                        post(move |request: axum::extract::Request| {
+                            let attempts = attempts.clone();
+                            let requests = requests.clone();
+                            async move {
+                                let (parts, body) = request.into_parts();
+                                let body = to_bytes(body, 16 * 1024).await.unwrap();
+                                requests.lock().unwrap().push((
+                                    body.to_vec(),
+                                    parts.headers.get("authorization").cloned(),
+                                ));
+                                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                                let status = match attempt {
+                                    1 | 3 => axum::http::StatusCode::TOO_MANY_REQUESTS,
+                                    2 => axum::http::StatusCode::NO_CONTENT,
+                                    4 => axum::http::StatusCode::TOO_MANY_REQUESTS,
+                                    _ => axum::http::StatusCode::BAD_REQUEST,
+                                };
+                                let mut response = (status, "response").into_response();
+                                if matches!(attempt, 1 | 3 | 4) {
+                                    response.headers_mut().insert(
+                                        axum::http::header::RETRY_AFTER,
+                                        axum::http::HeaderValue::from_static("0"),
+                                    );
+                                }
+                                response
+                            }
+                        }),
+                    ),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let mut destination = push_destination("webhook");
+        destination.url = format!("http://{address}/");
+        let payload = json!({"message":"body"});
+        assert!(
+            send_destination(&app, &destination, "title", "body", &payload, "event", None,)
+                .await
+                .is_ok()
+        );
+        let policy = NotificationPolicy {
+            mode: NotificationMode::Custom,
+            rules: vec![NotificationRule {
+                destination_id: destination.id.clone(),
+                events: vec!["event".into()],
+            }],
+        };
+        app.store
+            .save_notification_destination("", &mut destination)
+            .unwrap();
+        send_policy(
+            &app,
+            Route {
+                tenant: "",
+                policy: Some(&policy),
+            },
+            "title".into(),
+            "body".into(),
+            payload.clone(),
+            "event",
+            None,
+        )
+        .await;
+        assert_eq!(
+            app.store.notification_outcomes("").unwrap()["fixture"]["delivered"],
+            false
+        );
+        assert!(
+            send_destination(&app, &destination, "title", "body", &payload, "event", None,)
+                .await
+                .is_err()
+        );
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 5);
+            let expected_body = serde_json::to_vec(&payload).unwrap();
+            for (body, authorization) in requests.iter() {
+                assert_eq!(body, &expected_body);
+                assert_eq!(authorization.as_ref().unwrap(), "Bearer fixture-token");
+            }
+        }
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]
