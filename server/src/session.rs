@@ -3723,6 +3723,8 @@ struct SessionsInner {
     session_create_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
     #[cfg(test)]
     finish_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    #[cfg(test)]
+    finish_dispatch_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
 }
 
 pub struct OutboundOperation<'a> {
@@ -3874,6 +3876,8 @@ impl Sessions {
                 session_create_stall: None,
                 #[cfg(test)]
                 finish_stall: None,
+                #[cfg(test)]
+                finish_dispatch_stall: None,
             })),
         }
     }
@@ -4065,6 +4069,17 @@ impl Sessions {
     }
 
     #[cfg(test)]
+    pub fn arm_finish_dispatch_stall(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        self.inner
+            .lock()
+            .expect("sessions poisoned")
+            .finish_dispatch_stall = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(test)]
     pub async fn wait_delete_stall(&self) {
         let stall = self
             .inner
@@ -4099,6 +4114,20 @@ impl Sessions {
             .lock()
             .expect("sessions poisoned")
             .finish_stall
+            .take();
+        if let Some((entered, release)) = stall {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn wait_finish_dispatch_stall(&self) {
+        let stall = self
+            .inner
+            .lock()
+            .expect("sessions poisoned")
+            .finish_dispatch_stall
             .take();
         if let Some((entered, release)) = stall {
             let _ = entered.send(());
