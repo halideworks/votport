@@ -481,14 +481,66 @@ const previewInfo = {
   chunk_bytes: 8 * 1024 * 1024,
   push: false,
 };
+let previewInfoResponse = previewInfo;
 const previewInfoRoute = (route) => {
   if (new URL(route.request().url()).pathname === `/api/r/${linkToken}`) {
-    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(previewInfo) });
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(previewInfoResponse) });
   }
   return route.continue();
 };
 await page.route("**/api/r/*", previewInfoRoute);
 await page.goto(linkUrl);
+await page.waitForSelector("#uploader:not([hidden])", { timeout: 15000 });
+if (await page.textContent("#title") !== previewInfo.label
+  || await page.title() !== `VOTPort · ${previewInfo.label}`) {
+  throw new Error("open request should name itself in the heading and document title");
+}
+previewInfoResponse = { ...previewInfo, branding: { name: "branded recipient" } };
+await page.reload();
+await page.waitForSelector("#uploader:not([hidden])", { timeout: 15000 });
+if (await page.textContent("#title") !== "branded recipient"
+  || await page.title() !== `VOTPort · ${previewInfo.label}`) {
+  throw new Error("branding should change the heading without replacing the request title");
+}
+previewInfoResponse = { ...previewInfo, label: "password-gated fixture", needs_password: true, authorized: false };
+await page.reload();
+await page.waitForSelector("#gate:not([hidden])", { timeout: 15000 });
+if (await page.textContent("#title") !== previewInfoResponse.label
+  || await page.title() !== `VOTPort · ${previewInfoResponse.label}`
+  || await page.evaluate(() => document.activeElement?.id) !== "link-password") {
+  throw new Error("password-gated request should retain its label and focus the password");
+}
+previewInfoResponse = { ...previewInfo, usable: false, label: "hidden closed label" };
+await page.reload();
+await page.waitForSelector("#closed:not([hidden])", { timeout: 15000 });
+if (await page.textContent("#title") !== "Request closed"
+  || await page.textContent("#closed h2") !== "Request closed"
+  || await page.title() !== "VOTPort · Request closed"
+  || (await page.textContent("#title")).includes("hidden closed label")) {
+  throw new Error("closed request should use a clear fixed heading and title");
+}
+previewInfoResponse = previewInfo;
+await page.reload();
+await page.waitForSelector("#uploader:not([hidden])", { timeout: 15000 });
+
+const missingRequestUrl = `${base}/r/recipient-feedback-missing-${Date.now()}`;
+await page.goto(missingRequestUrl);
+await page.waitForSelector("#closed:not([hidden])", { timeout: 15000 });
+if (await page.textContent("#title") !== "Request not found"
+  || await page.title() !== "VOTPort · Request not found") {
+  throw new Error("missing request should identify its fixed not-found state");
+}
+const unavailableRoute = async (route) => route.fulfill({ status: 503, json: { error: "temporary fixture outage" } });
+await page.route(`**/api/r/${linkToken}`, unavailableRoute);
+await page.goto(linkUrl);
+await page.waitForSelector("#title");
+await page.waitForFunction(() => document.getElementById("title").textContent === "Request unavailable", null, { timeout: 15000, polling: 50 });
+if (await page.title() !== "VOTPort · Request unavailable"
+  || !(await page.textContent("#subtitle")).includes("Could not reach the server")) {
+  throw new Error("repeated request failure should identify an unavailable state");
+}
+await page.unroute(`**/api/r/${linkToken}`, unavailableRoute);
+await page.reload();
 await page.waitForSelector("#uploader:not([hidden])", { timeout: 15000 });
 
 for (const name of ["report.pdf.vot-receipt", "report.VOT-RECEIPT", "report.vot-receI\u0307pt", ".vot-receipt"]) {
@@ -547,6 +599,26 @@ await page.setInputFiles("#file-input", Array.from({ length: 201 }, (_, index) =
   buffer: Buffer.from("x"),
 })));
 const countPreview = await page.evaluate(() => {
+  window.__votportPreviewTest.setStatus("count-001.exr", "Sending", false, -0.2);
+  const sendingMeter = document.querySelector('[data-path="count-001.exr"] .row-meter');
+  const sending = {
+    state: document.querySelector('[data-path="count-001.exr"]').dataset.state,
+    role: sendingMeter?.getAttribute("role"),
+    label: sendingMeter?.getAttribute("aria-label"),
+    min: sendingMeter?.getAttribute("aria-valuemin"),
+    max: sendingMeter?.getAttribute("aria-valuemax"),
+    now: sendingMeter?.getAttribute("aria-valuenow"),
+  };
+  window.__votportPreviewTest.setStatus("count-001.exr", "Paused");
+  const paused = {
+    state: document.querySelector('[data-path="count-001.exr"]').dataset.state,
+    now: document.querySelector('[data-path="count-001.exr"] .row-meter')?.getAttribute("aria-valuenow"),
+  };
+  window.__votportPreviewTest.setStatus("count-001.exr", "Sending", false, 1.2);
+  const retried = document.querySelector('[data-path="count-001.exr"] .row-meter')?.getAttribute("aria-valuenow");
+  window.__votportPreviewTest.setStatus("count-001.exr", "delivered ✓", true);
+  const removed = !document.querySelector('[data-path="count-001.exr"] .row-meter');
+  window.__votportPreviewTest.setStatus("count-001.exr", "Preparing");
   window.__votportPreviewTest.setStatus("count-200.exr", "delivered ✓", true);
   window.__votportPreviewTest.renderNote();
   const progressNote = document.getElementById("progress-note").textContent;
@@ -570,6 +642,10 @@ const countPreview = await page.evaluate(() => {
     copiedProof,
     progressNote,
     retryNote,
+    sending,
+    paused,
+    retried,
+    removed,
     cancelDetail,
     doneSummary: document.getElementById("done-summary").textContent,
     doneRows: document.querySelectorAll("#done-list > li").length,
@@ -581,7 +657,13 @@ if (!countPreview.progressNote.includes("1 of 201 files verified")
   || !countPreview.doneSummary.includes("201 files")
   || !countPreview.doneSummary.includes("Showing first 200 of 201 delivered files below.")
   || !countPreview.copiedProof.includes("count-200.exr")
-  || countPreview.doneRows !== 200) {
+  || countPreview.doneRows !== 200
+  || JSON.stringify(countPreview.sending) !== JSON.stringify({
+    state: "sending", role: "progressbar", label: "count-001.exr upload progress",
+    min: "0", max: "100", now: "0",
+  })
+  || countPreview.paused.state !== "paused" || countPreview.paused.now !== "0"
+  || countPreview.retried !== "100" || !countPreview.removed) {
   throw new Error(`large count state failed: ${JSON.stringify(countPreview)}`);
 }
 console.log("hidden progress/cancel counts and 200-row completed preview: ok");
@@ -1071,6 +1153,14 @@ const receiptShare = await page.request.post(`${base}/api/admin/outbound-grants`
 if (!receiptShare.ok()) throw new Error(`received-file share: ${receiptShare.status()} ${await receiptShare.text()}`);
 await page.goto((await receiptShare.json()).url);
 await page.getByRole("button", { name: "Download file: Résumé Draft.pdf", exact: true }).waitFor();
+const [primaryDownload] = await collectDownloads(
+  () => page.click("#separate-download-button"), 1,
+);
+await page.waitForFunction(() => document.getElementById("separate-download-status").textContent
+  === "Download handed to the browser. Check browser downloads for completion.");
+if (primaryDownload.suggestedFilename() !== "Résumé Draft.pdf") {
+  throw new Error("single-file primary download changed the Unicode filename");
+}
 const [fileDownload] = await collectDownloads(
   () => page.getByRole("button", { name: "Download file: Résumé Draft.pdf", exact: true }).click(), 1,
 );

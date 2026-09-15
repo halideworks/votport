@@ -528,7 +528,10 @@ async function loadMetadata() {
     separateButton.textContent = 'Download file';
     separateNote.textContent = '';
     const only = metadataFiles[0];
-    separateButton.onclick = () => { window.location.assign(only.download_url); };
+    separateButton.onclick = () => {
+      setSeparateDownloadStatus('Download handed to the browser. Check browser downloads for completion.');
+      window.location.assign(only.download_url);
+    };
   }
   const fetchBlock = $('vot-fetch');
   fetchBlock.hidden = !body.fetch;

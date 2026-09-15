@@ -20,6 +20,7 @@
     <link rel="modulepreload" href="/assets/undo.js" />
   </head>
   <body>
+  <a class="skip-link" href="#main-content">Skip to content</a>
     <div class="sheet">
       <header class="masthead">
         <div class="hero-brand">
@@ -40,6 +41,7 @@
         </form>
       </div>
 
+      <main id="main-content" tabindex="-1">
       <div class="page-heading"><div><p class="eyebrow">Port to port</p><div class="field-heading"><h1>Trade routes</h1><button type="button" class="hint-button" aria-label="Help about trade routes" data-hint="The receiving team creates an invitation; the sending team accepts it. Once approved, choose the route by name in a workflow. Sending back needs a separate route.">?</button></div><p class="page-lead">Move files between your sites or partner organizations. Set up each direction once, then use it in your workflows.</p></div><button id="trade-refresh" class="ghost">Refresh</button></div>
       <p id="trade-error" class="error feedback" role="alert" tabindex="-1" hidden></p><p id="trade-notice" class="feedback" role="status"></p>
       <section class="card trade-port"><div class="section-heading"><div><h2>This port · <span id="port-display-name"></span></h2><p id="port-display-address" class="trade-key"></p></div><button type="button" id="port-copy-address" class="ghost">Copy port address</button></div>
@@ -88,6 +90,7 @@
       <section id="trade-invitation-result" class="card" hidden><h2 id="trade-invitation-title" tabindex="-1">Share this invitation privately</h2><p id="trade-invitation-next" class="field-help"></p><textarea id="trade-issued-invitation" rows="4" readonly aria-label="Generated route invitation"></textarea><div class="actions"><button type="button" id="trade-copy-invitation">Copy invitation</button><button type="button" id="trade-dismiss-invitation" class="ghost">Hide invitation</button></div><p class="field-help">The invitation contains private access information. Share it only with the intended sending team.</p></section>
       <div class="section-heading"><h2>Connected ports</h2><p id="trade-connection-count" class="field-help" role="status"></p></div><div id="trade-connections"></div>
       <details class="trade-advanced"><summary>How addresses, permissions and delivery status work</summary><p class="field-help">A port address tells VOTPort where to connect. A fingerprint verifies the port’s identity. An approved invitation grants permission to send files to one receiving endpoint.</p><p class="field-help">“Received and verified” means the files arrived intact. “Released” means the receiving workflow also finished; it may first need processing or approval. Pausing or revoking a route never deletes previously received files.</p><p class="field-help">For a one-off upload, open the receiving team’s ordinary receive link in your browser.</p></details>
+      </main>
       <p class="sheet-foot"><span class="footer-custom"></span><span>Powered by Verified Object Transport (VOT) · <a href="https://votport.com" target="_blank" rel="noopener noreferrer">VOTPort</a></span></p>
     </div>
 

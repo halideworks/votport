@@ -547,12 +547,26 @@ function setStatus(path, text, done = false, fraction = null) {
       meter.append(document.createElement('div'));
       item.append(meter);
     }
-    meter.firstChild.style.width = `${Math.min(100, Math.round(fraction * 100))}%`;
+    const percent = Math.max(0, Math.min(100, Math.round(fraction * 100)));
+    meter.setAttribute('role', 'progressbar');
+    meter.setAttribute('aria-label', `${path} upload progress`);
+    meter.setAttribute('aria-valuemin', '0');
+    meter.setAttribute('aria-valuemax', '100');
+    meter.setAttribute('aria-valuenow', String(percent));
+    meter.firstChild.style.width = `${percent}%`;
   } else if (meter && done) {
     // A state change without a fraction (a retry's Continuing) keeps the
     // last known progress on screen instead of flickering the bar away.
     meter.remove();
   }
+}
+
+function showClosed(label, message) {
+  $('title').textContent = label;
+  document.title = `VOTPort · ${label}`;
+  $('closed').querySelector('h2').textContent = label;
+  if (message) $('closed').querySelector('p').textContent = message;
+  $('closed').hidden = false;
 }
 
 // ------------------------------------------------------------------- network
@@ -1337,13 +1351,15 @@ $('resume-discard').addEventListener('click', () => {
     } catch (error) {
       if (error.status === 404 || error.status === 410) {
         if (error.status === 404) {
-          $('closed').querySelector('p').textContent =
-            'This link was not found. Check that the full URL was copied.';
+          showClosed('Request not found', 'This link was not found. Check that the full URL was copied.');
+        } else {
+          showClosed('Request closed');
         }
-        $('closed').hidden = false;
         return;
       }
       if (attempt >= 4) {
+        $('title').textContent = 'Request unavailable';
+        document.title = 'VOTPort · Request unavailable';
         $('subtitle').textContent =
           'Could not reach the server. Reload the page to try again.';
         return;
@@ -1353,9 +1369,10 @@ $('resume-discard').addEventListener('click', () => {
     }
   }
   if (!info.usable) {
-    $('closed').hidden = false;
+    showClosed('Request closed');
     return;
   }
+  document.title = `VOTPort · ${info.label}`;
   $('title').textContent = info.label;
   offerApp('r');
   $('subtitle').textContent = 'Files are verified on receipt.';

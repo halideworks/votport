@@ -20,6 +20,7 @@
     <link rel="modulepreload" href="/assets/undo.js" />
   </head>
   <body>
+  <a class="skip-link" href="#main-content">Skip to content</a>
     <div class="sheet">
       <header class="masthead">
         <div class="hero-brand">
@@ -40,6 +41,7 @@
         </form>
       </div>
 
+      <main id="main-content" tabindex="-1">
       <div class="page-heading"><div><p class="eyebrow">Team updates</p><h1>Notifications</h1><p class="page-lead">Choose who hears about received files, delivery progress, and failures.</p></div><button id="notification-new" type="button">Add destination</button></div>
       <p id="notification-error" class="error feedback" role="alert" hidden></p>
       <p id="notification-notice" class="feedback" role="status"></p>
@@ -65,6 +67,7 @@
         <div class="section-heading"><h2>Tenant defaults <button type="button" class="hint-button" aria-label="Help about notification defaults" data-hint="Items using tenant defaults follow changes here immediately. Items set to Off or custom destinations keep their own choices.">?</button></h2></div><p class="field-help">These settings apply only where “Use tenant defaults” is selected. Changes affect those subscriptions immediately.</p>
         <div id="notification-defaults"></div><button id="notification-defaults-save" type="submit">Save defaults</button><p id="notification-defaults-status" class="field-help" role="status"></p>
       </form>
+      </main>
       <p class="sheet-foot"><span class="footer-custom"></span><span>Powered by Verified Object Transport (VOT) · <a href="https://votport.com" target="_blank" rel="noopener noreferrer">VOTPort</a></span></p>
     </div>
 
