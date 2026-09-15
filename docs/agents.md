@@ -99,6 +99,8 @@ server/target/release/votport share project/render \
 The client CLI's existing `send`, `receive`, `inspect`, `status`, and `resume`
 commands remain available for moving local files through normal request and
 delivery links. File bytes travel through the existing verified transfer paths.
+`inspect` prints one JSON object and exits with status 1 when the link is unusable;
+a usable link that needs a password still exits with status 0.
 
 ## Retry and recovery
 

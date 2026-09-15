@@ -39,8 +39,13 @@ fn main() -> ExitCode {
         };
     }
 
-    match run(&args) {
-        Ok(()) => ExitCode::SUCCESS,
+    let result = if args.first().is_some_and(|arg| arg == "inspect") {
+        inspect(&args[1..])
+    } else {
+        run(&args).map(|()| ExitCode::SUCCESS)
+    };
+    match result {
+        Ok(status) => status,
         Err(message) => {
             if args.iter().any(|arg| arg == "--json") {
                 println!(
@@ -59,7 +64,6 @@ fn run(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("send") => send(&args[1..]),
         Some("receive") => receive(&args[1..]),
-        Some("inspect") => inspect(&args[1..]),
         Some("status") => status(),
         Some("evidence") => evidence(&args[1..]),
         Some("resume") => resume(&args[1..]),
@@ -161,31 +165,15 @@ Agent commands always return JSON and use VOTPORT_URL and VOTPORT_AUTOMATION_TOK
 }
 
 fn send(args: &[String]) -> Result<(), String> {
-    let mut link: Option<String> = None;
-    let mut password: Option<String> = None;
-    let mut json = false;
-    let mut paths: Vec<String> = Vec::new();
-
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--password" => {
-                password = Some(iter.next().ok_or("--password needs a value")?.clone());
-            }
-            "--json" => json = true,
-            value if value.starts_with("--") => {
-                return Err(format!("unknown option {value:?}"));
-            }
-            value if link.is_none() => link = Some(value.to_owned()),
-            value => paths.push(value.to_owned()),
-        }
-    }
-
-    let link = link.ok_or("send needs a link and at least one path")?;
+    let (mut options, positional, json) = parse(args, &["--password"])?;
+    let password = options.remove("--password");
+    let (link, paths) = positional
+        .split_first()
+        .ok_or("send needs a link and at least one path")?;
     if paths.is_empty() {
         return Err("send needs at least one file or folder".to_owned());
     }
-    let link = split_link_as(&link, LinkKind::Request).map_err(|error| error.to_string())?;
+    let link = split_link_as(link, LinkKind::Request).map_err(|error| error.to_string())?;
     let (base, token) = (link.base, link.token);
     let info = votport_client_core::api::Client::new(&base)
         .map_err(|error| error.to_string())?
@@ -193,7 +181,7 @@ fn send(args: &[String]) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
 
     let mut files = Vec::new();
-    for path in &paths {
+    for path in paths {
         votport_client_core::transfer::collect_for_link(
             Path::new(path),
             &mut files,
@@ -243,7 +231,7 @@ fn send(args: &[String]) -> Result<(), String> {
 }
 
 /// Prints what a link is as one JSON object, spending nothing on the server.
-fn inspect(args: &[String]) -> Result<(), String> {
+fn inspect(args: &[String]) -> Result<ExitCode, String> {
     let [link] = args else {
         return Err("inspect takes one link".to_owned());
     };
@@ -269,7 +257,11 @@ fn inspect(args: &[String]) -> Result<(), String> {
             "files": files,
         })
     );
-    Ok(())
+    Ok(if preview.usable {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 /// Prints the journalled transfers, one JSON object per line, oldest first.
@@ -293,25 +285,14 @@ fn status() -> Result<(), String> {
 
 /// Runs a journalled transfer again, through the same view the shells draw.
 fn resume(args: &[String]) -> Result<(), String> {
-    let mut id: Option<String> = None;
-    let mut password: Option<String> = None;
-    let mut json = false;
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--password" => {
-                password = Some(iter.next().ok_or("--password needs a value")?.clone());
-            }
-            "--json" => json = true,
-            value if value.starts_with("--") => return Err(format!("unknown option {value:?}")),
-            value if id.is_none() => id = Some(value.to_owned()),
-            value => return Err(format!("unexpected argument {value:?}")),
-        }
-    }
-    let id = id.ok_or("resume needs a transfer id from `votport status`")?;
+    let (mut options, positional, json) = parse(args, &["--password"])?;
+    let password = options.remove("--password");
+    let [id] = positional.as_slice() else {
+        return Err("resume needs one transfer id from `votport status`".to_owned());
+    };
     let listener = std::sync::Arc::new(ViewPrinter { json });
     let report = votport_client_core::ffi::resume(
-        id,
+        id.clone(),
         password,
         votport_client_core::ffi::Transfer::new(),
         listener,
@@ -364,35 +345,17 @@ impl votport_client_core::ffi::TransferListener for ViewPrinter {
 }
 
 fn receive(args: &[String]) -> Result<(), String> {
-    let mut link: Option<String> = None;
-    let mut dir: Option<String> = None;
-    let mut password: Option<String> = None;
-    let mut json = false;
-
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--password" => {
-                password = Some(iter.next().ok_or("--password needs a value")?.clone());
-            }
-            "--json" => json = true,
-            value if value.starts_with("--") => {
-                return Err(format!("unknown option {value:?}"));
-            }
-            value if link.is_none() => link = Some(value.to_owned()),
-            value if dir.is_none() => dir = Some(value.to_owned()),
-            value => return Err(format!("unexpected argument {value:?}")),
-        }
-    }
-
-    let link = link.ok_or("receive needs a delivery link and a directory")?;
-    let dir = dir.ok_or("receive needs a directory to land the files in")?;
-    let link = split_link_as(&link, LinkKind::Delivery).map_err(|error| error.to_string())?;
+    let (mut options, positional, json) = parse(args, &["--password"])?;
+    let password = options.remove("--password");
+    let [link, dir] = positional.as_slice() else {
+        return Err("receive needs one delivery link and one directory".to_owned());
+    };
+    let link = split_link_as(link, LinkKind::Delivery).map_err(|error| error.to_string())?;
     let (base, token) = (link.base, link.token);
 
     let delivery = Delivery { token, password };
     let mut observer = CliObserver { json };
-    let received = receive_with_device_or_http(&base, delivery, Path::new(&dir), &mut observer)
+    let received = receive_with_device_or_http(&base, delivery, Path::new(dir), &mut observer)
         .map_err(|error| error.to_string())?;
     if json {
         println!(
@@ -886,6 +849,40 @@ fn watch_json(item: &votport_client_core::watch::Watch) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::{is_absolute_filesystem_path, issue_delivery};
+
+    #[test]
+    fn transfer_commands_share_option_validation() {
+        for command in ["send", "receive", "resume"] {
+            for (arguments, expected) in [
+                (vec![command, "--password"], "--password needs a value"),
+                (vec![command, "--unknown"], "unknown option"),
+            ] {
+                let arguments = arguments.into_iter().map(str::to_owned).collect::<Vec<_>>();
+                assert!(super::run(&arguments).unwrap_err().contains(expected));
+            }
+        }
+        let args = [
+            "link",
+            "--password",
+            "first",
+            "a file",
+            "--json",
+            "--password",
+            "last",
+        ]
+        .map(str::to_owned);
+        let (options, positional, json) = super::parse(&args, &["--password"]).unwrap();
+        assert_eq!(options["--password"], "last");
+        assert_eq!(positional, ["link", "a file"]);
+        assert!(json);
+        for arguments in [
+            vec!["receive", "link", "dir", "extra"],
+            vec!["resume", "id", "extra"],
+        ] {
+            let args = arguments.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(super::run(&args).unwrap_err().contains("needs one"));
+        }
+    }
 
     #[test]
     fn issue_delivery_explains_unambiguous_local_paths_before_network() {
