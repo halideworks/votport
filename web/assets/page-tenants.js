@@ -55,6 +55,7 @@ function editTenantForm(tenant) {
   const details = document.createElement('details');
   const summary = document.createElement('summary');
   summary.textContent = 'Edit namespace';
+  summary.setAttribute('aria-label', `Edit namespace: ${tenant.key}`);
   details.append(summary);
   const form = document.createElement('form'); form.setAttribute('data-unsaved', '');
   form.className = 'tenant-edit';

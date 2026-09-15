@@ -119,7 +119,7 @@
             <label>Expires after <span class="muted">days</span>
               <input data-draft-field id="deliver-expires" type="number" min="1" max="30" value="7" required />
             </label>
-          </div><details class="form-advanced"><summary>Password and download limits <button type="button" class="hint-button" aria-label="Help about download access" data-hint="A password protects the link. A maximum of one request set limits each file to one request. Interrupted file downloads can resume without using another request. Share the password separately from the link.">?</button></summary><div class="grid">
+          </div><div class="form-advanced-with-hint"><details class="form-advanced"><summary>Password and download limits</summary><div class="grid">
             <label>Access password <span class="muted">optional</span>
               <input id="deliver-password" type="password" autocomplete="new-password" placeholder="none" />
             </label>
@@ -127,8 +127,8 @@
               <input data-draft-field id="deliver-max-downloads" type="number" min="1" max="10000" placeholder="unlimited" />
             </label>
           </div>
-          </details>
-          <details class="form-advanced"><summary>Notifications <button type="button" class="hint-button" aria-label="Help about download notifications" data-hint="First file requested means a recipient began fetching files. Every file requested is a separate event; neither is the recipient’s explicit acceptance.">?</button></summary><div id="deliver-notifications"></div></details>
+          </details><button type="button" class="hint-button" aria-label="Help about download access" data-hint="A password protects the link. A maximum of one request set limits each file to one request. Interrupted file downloads can resume without using another request. Share the password separately from the link.">?</button></div>
+          <div class="form-advanced-with-hint"><details class="form-advanced"><summary>Notifications</summary><div id="deliver-notifications"></div></details><button type="button" class="hint-button" aria-label="Help about download notifications" data-hint="First file requested means a recipient began fetching files. Every file requested is a separate event; neither is the recipient’s explicit acceptance.">?</button></div>
           <button type="submit" id="deliver-submit">Create download link</button>
           </fieldset>
         </form>

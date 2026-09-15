@@ -12,9 +12,12 @@ const storage = await readFile(new URL('../web/storage.html', import.meta.url), 
 const tradeRoutes = await readFile(new URL('../web/trade-routes.html', import.meta.url), 'utf8');
 const notifications = await readFile(new URL('../web/notifications.html', import.meta.url), 'utf8');
 const automation = await readFile(new URL('../web/automation.html', import.meta.url), 'utf8');
+const send = await readFile(new URL('../web/send.html', import.meta.url), 'utf8');
+const request = await readFile(new URL('../web/request.html', import.meta.url), 'utf8');
 const receiveScript = await readFile(new URL('../web/assets/page-receive.js', import.meta.url), 'utf8');
 const deliverScript = await readFile(new URL('../web/assets/page-deliver.js', import.meta.url), 'utf8');
 const tenantsScript = await readFile(new URL('../web/assets/page-tenants.js', import.meta.url), 'utf8');
+const workflowsScript = await readFile(new URL('../web/assets/page-workflows.js', import.meta.url), 'utf8');
 const systemScript = await readFile(new URL('../web/assets/page-system.js', import.meta.url), 'utf8');
 const commonScript = await readFile(new URL('../web/assets/admin-common.js', import.meta.url), 'utf8');
 const brandingScript = await readFile(new URL('../web/assets/branding.js', import.meta.url), 'utf8');
@@ -104,8 +107,29 @@ test('list actions announce their outcome and copy buttons confirm', () => {
   assert.match(commonScript, /export \{ copyToClipboard \}/);
 });
 
-const send = await readFile(new URL('../web/send.html', import.meta.url), 'utf8');
-const request = await readFile(new URL('../web/request.html', import.meta.url), 'utf8');
+test('repeated actions and help controls carry their context', () => {
+  const pages = { receive, deliver, workflows, storage, automation, tenants, system, send, request, notifications };
+  assert.equal(Object.values(pages).reduce((count, page) => count + (page.match(/class="hint-button"/g) || []).length, 0), 28);
+  assert.equal([receive, deliver, storage, workflows].reduce((count, page) => count + (page.match(/class="form-advanced-with-hint"/g) || []).length, 0), 6);
+  for (const [name, page] of Object.entries(pages)) {
+    for (const heading of page.matchAll(/<(h2|h3|legend|summary)\b[^>]*>[\s\S]*?<\/\1>/g)) {
+      assert.doesNotMatch(heading[0], /class="hint-button"/, `${name}: help control remains inside ${heading[1]}`);
+    }
+  }
+  assert.match(receiveScript, /copy\.setAttribute\('aria-label', `Copy receive link: \$\{link\.label\}`\)/);
+  assert.match(receiveScript, /qrButton\.setAttribute\('aria-label', `Show QR code: \$\{link\.label\}`\)/);
+  assert.match(receiveScript, /qrButton\.setAttribute\('aria-label', `\$\{qr\.hidden \? 'Show' : 'Hide'\} QR code: \$\{link\.label\}`\)/);
+  assert.match(receiveScript, /activeButton\.setAttribute\('aria-label', `\$\{link\.active \? 'Deactivate' : 'Reactivate'\} receive link: \$\{link\.label\}`\)/);
+  assert.match(receiveScript, /holdButton\.setAttribute\('aria-label', `\$\{link\.legal_hold \? 'Release hold' : 'Legal hold'\}: \$\{link\.label\}`\)/);
+  assert.match(receiveScript, /\$\('create-notification-options'\)\.closest\('\.form-advanced-with-hint'\)\.hidden = true/);
+  assert.match(deliverScript, /newAddress\.setAttribute\('aria-label', `New address: \$\{grant\.label \|\| grant\.name\}`\)/);
+  assert.match(deliverScript, /extend\.setAttribute\('aria-label', `Extend 7 days: \$\{grant\.label \|\| grant\.name\}`\)/);
+  assert.match(deliverScript, /revoke\.setAttribute\('aria-label', `Revoke: \$\{grant\.label \|\| grant\.name\}`\)/);
+  assert.equal((system.match(/<button[^>]*aria-label="Save [^"]+"[^>]*>Save<\/button>/g) || []).length, 7);
+  assert.match(workflowsScript, /row\.querySelector\(`\[data-key="\$\{subjectKey\}"\]`\)\.addEventListener\('input', updateRemoveName\)/);
+  assert.match(tenantsScript, /summary\.setAttribute\('aria-label', `Edit namespace: \$\{tenant\.key\}`\)/);
+});
+
 const verify = await readFile(new URL('../web/verify.html', import.meta.url), 'utf8');
 
 test('no page repeats an element id', () => {

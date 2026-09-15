@@ -13,6 +13,7 @@ const browser = await chromium.launch();
 try {
   const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, reducedMotion: 'reduce' });
   const page = await context.newPage(), errors = [], dialogs = [];
+  await page.addInitScript(() => Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async () => {} } }));
   let dismiss = false;
   page.on('pageerror', (error) => errors.push(error.message));
   page.on('dialog', async (dialog) => { dialogs.push(dialog.type()); if (dismiss) await dialog.dismiss(); else await dialog.accept(); });
@@ -20,6 +21,24 @@ try {
     const response = await context.request.fetch(`${base}/api/${route}`, { method, data, headers: { 'X-Votport': '1' } });
     assert.ok(response.ok(), `${route}: ${response.status()} ${await response.text()}`); return response.json();
   };
+  async function checkCollapsedFormHints(rootSelector) {
+    const wrappers = page.locator(`${rootSelector} .form-advanced-with-hint`);
+    for (let index = 0; index < await wrappers.count(); index += 1) {
+      const wrapper = wrappers.nth(index);
+      const details = wrapper.locator(':scope > details');
+      const summary = details.locator(':scope > summary');
+      const hint = wrapper.locator(':scope > button[data-hint]');
+      const tooltip = wrapper.locator(':scope > .field-hint');
+      await details.evaluate((node) => { node.open = false; });
+      assert.ok(await hint.isVisible(), `${rootSelector}: collapsed help stays visible`);
+      await hint.click(); await tooltip.waitFor(); await page.keyboard.press('Escape');
+      await summary.click();
+      assert.ok(await details.evaluate((node) => node.open), `${rootSelector}: help summary opens details`);
+      await summary.click();
+      assert.equal(await details.evaluate((node) => node.open), false, `${rootSelector}: help summary closes details`);
+      assert.ok(await hint.isVisible(), `${rootSelector}: help stays visible when collapsed`);
+    }
+  }
   await api('admin/login', { password: process.env.ADMIN_PASSWORD });
   await api('admin/login', { password: process.env.ADMIN_PASSWORD });
   await api('admin/login', { password: process.env.ADMIN_PASSWORD });
@@ -60,6 +79,7 @@ try {
   assert.ok(oldestRows.length >= 2);
   assert.ok(Number(oldestRows[0].rowid) < Number(oldestRows[1].rowid), 'oldest export order');
   await page.goto(`${base}/receive`); await page.locator('#create-password').waitFor({ state: 'attached' });
+  await checkCollapsedFormHints('#create-form');
   assert.equal(await page.locator('#create-password').getAttribute('autocomplete'), 'new-password');
   await page.goto(`${base}/r/${id}`, { waitUntil: 'domcontentloaded' }); await page.locator('#link-password').waitFor({ state: 'attached' });
   assert.equal(await page.locator('#link-password').getAttribute('autocomplete'), 'current-password');
@@ -78,6 +98,7 @@ try {
   await assertStorageNavigation({ ...session, role: 'admin', tenant: 'named-tenant' }, 'View available storage connections.', false);
   for (const route of ['receive', 'workflows', 'trade-routes', 'notifications', 'system']) {
     await page.goto(`${base}/${route}`); await page.waitForLoadState('networkidle');
+    assert.equal(await page.locator('h2 button[data-hint], h3 button[data-hint], legend button[data-hint], summary button[data-hint]').count(), 0, `${route}: help controls stay outside semantic headings`);
     const labels = await page.locator('button[data-hint]').evaluateAll((buttons) => buttons.map((button) => button.getAttribute('aria-label')));
     assert.equal(new Set(labels).size, labels.length, `${route}: duplicate help controls`);
     assert.equal(await page.locator('#nav a[data-hint]').count(), 10);
@@ -160,12 +181,30 @@ try {
   await page.getByText('Save refused fixture', { exact: true }).waitFor();
   assert.equal(await page.inputValue('#create-label'), id);
   await page.getByRole('button', { name: 'Create receive link', exact: true }).click(); await page.locator('#new-link').waitFor();
+  const createdLink = (await api('admin/links')).links.find((link) => link.label === id);
+  assert.ok(createdLink);
+  const createdCard = page.locator(`#link-${createdLink.id}`);
+  await createdCard.waitFor();
+  const copyLink = createdCard.getByRole('button', { name: /^Copy receive link: / });
+  assert.equal(await copyLink.count(), 1);
+  await copyLink.click();
+  await createdCard.getByRole('button', { name: 'Copied', exact: true }).waitFor();
+  await createdCard.getByRole('button', { name: /^Copy receive link: / }).waitFor();
+  assert.equal(await createdCard.getByRole('button', { name: /^Show QR code: / }).count(), 1);
   const before = dialogs.length; await page.goto(`${base}/workflows`); assert.equal(dialogs.length, before, 'Successful save clears the leave warning');
 
   await api('workflows/projects', { id, label: id, directory: id }, 'PUT');
   const issued = await api('workflows/jobs', { operation_id: id, project_id: id, label: `Cargo ${id}`, expires_days: 1 });
-  await page.reload(); await page.click('#workflow-new'); await page.selectOption('#workflow-project', id);
-  await page.getByRole('button', { name: 'Help about enrolled recipients', exact: true }).click();
+  await page.reload(); await page.click('#workflow-new');
+  await page.locator('#workflow-create').waitFor();
+  await checkCollapsedFormHints('#workflow-create');
+  const recipientHelp = page.getByRole('button', { name: /Help about enrolled recipients/ });
+  assert.equal(await recipientHelp.count(), 1);
+  await page.selectOption('#workflow-project', '');
+  assert.equal(await recipientHelp.count(), 1);
+  await page.selectOption('#workflow-project', id);
+  assert.equal(await recipientHelp.count(), 1);
+  await recipientHelp.click();
   await page.getByRole('tooltip').filter({ hasText: 'An enrolled recipient proves access' }).waitFor();
   await page.keyboard.press('Escape'); await page.click('#workflow-close-create');
   await page.selectOption('#workflow-filter-project', id);
@@ -196,6 +235,7 @@ try {
   assert.equal(await jobEditor.locator('.notification-mode').inputValue(), 'off', 'Project save keeps the unsaved delivery notification editor');
 
   await page.goto(`${base}/system`); await page.waitForFunction(() => !document.querySelector('#smtp-form').inert);
+  assert.equal(await page.locator('button[type=submit][aria-label^="Save "]').count(), 7, 'System save buttons identify their settings');
   await page.fill('#smtp-host', 'unsaved.example'); await page.fill('#smtp-password', 'unsaved-smtp-secret');
   await page.fill('#audit-retention-days', '40'); await page.locator('#retention-form button[type=submit]').click();
   await page.locator('#retention-note').getByText('Saved.', { exact: true }).waitFor();
@@ -273,6 +313,7 @@ try {
   await api('admin/tenants', { key: id, label: id });
   await page.goto(`${base}/tenants`);
   const tenant = page.locator(`#tenants [data-tenant="${id}"]`);
+  assert.equal(await tenant.locator('summary[aria-label^="Edit namespace: "]').count(), 1, 'Tenant edit control names its namespace');
   await tenant.getByText('Branding', { exact: true }).click();
   await page.waitForFunction((id) => !document.querySelector(`[data-tenant="${id}"]`).querySelectorAll('form')[1].inert, id);
   await tenant.getByLabel('Footer message', { exact: true }).fill('Unsaved tenant footer');

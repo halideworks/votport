@@ -155,7 +155,7 @@
                 sign-in row cannot sign in; the local password is unaffected.
               </p>
               <div class="actions">
-                <button type="submit" id="signin-save" disabled>Save</button>
+                <button type="submit" id="signin-save" aria-label="Save sign-in settings" disabled>Save</button>
                 <span id="signin-note" class="muted"></span>
               </div>
               <p class="error" id="signin-error" role="alert" hidden></p>
@@ -225,7 +225,7 @@
           </section>
 
           <section class="settings-group" id="email" data-group="email">
-            <h2>Email <button type="button" class="hint-button" aria-label="Help about email delivery" data-hint="These settings connect the server to an SMTP relay. Choose recipients and events in Notifications, then select those destinations on requests or workflows.">?</button></h2>
+            <div class="section-heading"><h2>Email</h2><button type="button" class="hint-button" aria-label="Help about email delivery" data-hint="These settings connect the server to an SMTP relay. Choose recipients and events in Notifications, then select those destinations on requests or workflows.">?</button></div>
             <form inert data-unsaved id="smtp-form" class="card">
               <p class="muted">
                 Configure the shared email relay here. Choose recipients on each named destination in Notifications. Port
@@ -306,7 +306,7 @@
                 </div>
               </div>
               <div class="actions">
-                <button type="submit" id="smtp-save" disabled>Save</button>
+                <button type="submit" id="smtp-save" aria-label="Save email settings" disabled>Save</button>
                 <span id="smtp-note" class="muted"></span>
               </div>
               <p class="error" id="smtp-error" role="alert" hidden></p>
@@ -314,7 +314,7 @@
           </section>
 
           <section class="settings-group" id="retention" data-group="retention">
-            <h2>Retention <button type="button" class="hint-button" aria-label="Help about retention" data-hint="Retention controls how long records or received files are kept. Zero keeps them indefinitely. Check the field description before changing a setting that removes files.">?</button></h2>
+            <div class="section-heading"><h2>Retention</h2><button type="button" class="hint-button" aria-label="Help about retention" data-hint="Retention controls how long records or received files are kept. Zero keeps them indefinitely. Check the field description before changing a setting that removes files.">?</button></div>
             <div class="card">
               <strong>Automatic cleanup</strong>
               <p class="muted" id="retention-clock-status" role="status"></p>
@@ -361,7 +361,7 @@
                 </div>
               </div>
               <div class="actions">
-                <button type="submit">Save</button>
+                <button type="submit" aria-label="Save retention settings">Save</button>
                 <span id="retention-note" class="muted"></span>
               </div>
               <p class="error" id="retention-error" role="alert" hidden></p>
@@ -369,7 +369,7 @@
           </section>
 
           <section class="settings-group" id="default-tenant-quotas" data-group="default-tenant-quotas">
-            <h2>Default tenant quotas <button type="button" class="hint-button" aria-label="Help about tenant quotas" data-hint="These are the default limits for storage, receive requests and active upload sessions. Individual tenants can have their own limits.">?</button></h2>
+            <div class="section-heading"><h2>Default tenant quotas</h2><button type="button" class="hint-button" aria-label="Help about tenant quotas" data-hint="These are the default limits for storage, receive requests and active upload sessions. Individual tenants can have their own limits.">?</button></div>
             <form inert data-unsaved id="quotas-form" class="card">
               <p class="muted">Applied to tenants without their own limits. Blank means no limit.</p>
               <div class="grid">
@@ -420,7 +420,7 @@
                 </div>
               </div>
               <div class="actions">
-                <button type="submit">Save</button>
+                <button type="submit" aria-label="Save default tenant quotas">Save</button>
                 <span id="quotas-note" class="muted"></span>
               </div>
               <p class="error" id="quotas-error" role="alert" hidden></p>
@@ -482,13 +482,13 @@
                   </button>
                 </div>
               </div>
-              <fieldset><legend>Footer <button type="button" class="hint-button" aria-label="Help about footer branding" data-hint="Use a short message and one HTTP or HTTPS link, such as your privacy policy or support page. Text is displayed as written; HTML and scripts are not supported.">?</button></legend>
+              <fieldset><legend>Footer</legend><button type="button" class="hint-button" aria-label="Help about footer branding" data-hint="Use a short message and one HTTP or HTTPS link, such as your privacy policy or support page. Text is displayed as written; HTML and scripts are not supported.">?</button>
                 <p class="field-help">Add a short message and one optional link. VOT and VOTPort credits remain visible. Leave fields blank to use the standard footer.</p>
                 <label>Footer message<input id="branding-footer-text" maxlength="160" placeholder="© Your studio · Secure file delivery" /></label>
                 <div class="grid"><label>Link label<input id="branding-footer-link-label" maxlength="40" placeholder="Privacy policy" /></label><label>Link URL<input id="branding-footer-link-url" type="url" maxlength="2048" placeholder="https://studio.example/privacy" /></label></div>
               </fieldset>
               <div class="actions">
-                <button type="submit">Save</button>
+                <button type="submit" aria-label="Save branding settings">Save</button>
                 <button type="button" class="danger" id="branding-remove">
                   Remove branding
                 </button>
@@ -580,7 +580,7 @@
                 </button>
               </div>
               <div class="actions">
-                <button type="submit" id="replica-save">Save</button>
+                <button type="submit" id="replica-save" aria-label="Save replica settings">Save</button>
                 <span id="replica-note" class="muted"></span>
               </div>
               <p class="error" id="replica-error" role="alert" hidden></p>
@@ -601,7 +601,7 @@
                 <span class="muted" id="drain-source"></span>
               </label>
               <div class="actions">
-                <button type="submit" id="drain-save">Save</button>
+                <button type="submit" id="drain-save" aria-label="Save drain settings">Save</button>
                 <span id="drain-note" class="muted"></span>
               </div>
               <p class="error" id="drain-error" role="alert" hidden></p>
@@ -619,7 +619,7 @@
           </section>
 
           <section class="settings-group" id="backups">
-            <h2>Backups <button type="button" class="hint-button" aria-label="Help about backups" data-hint="Save config changes before running a backup. A snapshot protects the control database and keys; received files and external storage need their own backup policy.">?</button></h2>
+          <div class="section-heading"><h2>Backups</h2><button type="button" class="hint-button" aria-label="Help about backups" data-hint="Save config changes before running a backup. A snapshot protects the control database and keys; received files and external storage need their own backup policy.">?</button></div>
             <div class="card" id="backup-status-card">
               <h3>Status</h3>
               <p id="backup-status" class="muted">Loading backup status…</p>

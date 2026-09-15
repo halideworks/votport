@@ -436,6 +436,9 @@ section > h2 {
 .hint-button { position: relative; display: inline-grid; place-items: center; flex: none; width: 1.75rem; height: 1.75rem; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--muted); font: 500 .75rem/1 "Plus Jakarta Sans", sans-serif; letter-spacing: 0; text-transform: none; vertical-align: middle; box-shadow: none; }
 .hint-button::before { content: ""; position: absolute; width: 1.15rem; height: 1.15rem; border: 1px solid currentColor; border-radius: 50%; opacity: .55; }
 .hint-button:hover:not(:disabled), .hint-button:active:not(:disabled) { color: var(--text); background: var(--panel-hover); transform: none; filter: none; box-shadow: none; }
+.form-advanced-with-hint { display: flex; align-items: flex-start; gap: .25rem; }
+.form-advanced-with-hint > .form-advanced { flex: 1 1 auto; }
+.form-advanced-with-hint > .hint-button { margin-top: 1.25rem; }
 .field-heading { display: flex; align-items: center; gap: 0.45rem; margin-bottom: 0.35rem; }
 .field-heading label { margin: 0; }
 .field-hint { position: fixed; inset: auto; margin: 0; padding: .75rem .9rem; width: max-content; max-width: min(22rem, calc(100vw - 24px)); color: var(--text-soft); background: var(--bg); border: 1px solid var(--border); border-radius: .5rem; font: 400 .82rem/1.6 "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif; text-transform: none; letter-spacing: normal; text-align: left; white-space: normal; box-shadow: 0 4px 16px var(--shadow-soft); overflow-wrap: anywhere; }

@@ -89,5 +89,7 @@ test('accessible controls keep names, focus cues, and quiet list updates', () =>
   assert.match(objectCardScript, /aria-label\", `Copied file hash: \$\{file\.name\}`/);
   assert.match(objectCardScript, /aria-label\", `Copy failed: \$\{file\.name\}`/);
   assert.match(objectCardScript, /catch \{[\s\S]+Copy failed/);
+  assert.match(objectCardScript, /element\.dataset\.ariaLabel \?\?= element\.getAttribute\('aria-label'\)/);
+  assert.match(objectCardScript, /element\.setAttribute\('aria-label', 'Copied'\)/);
   assert.match(objectCardScript, /if \(copyPending\) return/);
 });

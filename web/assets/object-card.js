@@ -16,8 +16,15 @@ export function formatBytes(bytes) {
 export async function copyToClipboard(element, text) {
   await navigator.clipboard.writeText(text);
   element.dataset.label ??= element.textContent;
+  if (element.getAttribute('aria-label')) {
+    element.dataset.ariaLabel ??= element.getAttribute('aria-label');
+    element.setAttribute('aria-label', 'Copied');
+  }
   element.textContent = 'Copied';
-  setTimeout(() => { element.textContent = element.dataset.label; }, 1500);
+  setTimeout(() => {
+    element.textContent = element.dataset.label;
+    if (element.dataset.ariaLabel) element.setAttribute('aria-label', element.dataset.ariaLabel);
+  }, 1500);
 }
 
 export function identityLine(file) {

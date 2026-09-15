@@ -29,7 +29,7 @@ $('trade-return-guide').hidden = !creatingRoute;
 if (creatingRoute) {
   $('trade-return-guide').tabIndex = -1;
   $('create-password').disabled = true; $('create-password').closest('label').hidden = true;
-  $('create-notification-options').hidden = true;
+  $('create-notification-options').closest('.form-advanced-with-hint').hidden = true;
   $('create-form').querySelector('button[type="submit"]').textContent = 'Continue to route permissions';
 }
 let createNotifications = notificationEditor({ events: uploadEvents });
@@ -639,20 +639,24 @@ function renderLink(link) {
   const actions = document.createElement('div');
   actions.className = 'actions';
   const copy = button('Copy', 'tiny', () => copyToClipboard(copy, link.url));
+  copy.setAttribute('aria-label', `Copy receive link: ${link.label}`);
+  const qrButton = button('QR', 'tiny ghost', async () => {
+    qr.hidden = !qr.hidden;
+    qrButton.setAttribute('aria-label', `${qr.hidden ? 'Show' : 'Hide'} QR code: ${link.label}`);
+    if (!qr.hidden && !qr.firstChild) {
+      const image = document.createElement('img');
+      image.alt = `QR code for ${link.url}`;
+      image.src = `/api/admin/links/${link.id}/qr`;
+      qr.append(image);
+    }
+  });
+  qrButton.setAttribute('aria-label', `Show QR code: ${link.label}`);
   actions.append(
     copy,
-    button('QR', 'tiny ghost', async () => {
-      qr.hidden = !qr.hidden;
-      if (!qr.hidden && !qr.firstChild) {
-        const image = document.createElement('img');
-        image.alt = `QR code for ${link.url}`;
-        image.src = `/api/admin/links/${link.id}/qr`;
-        qr.append(image);
-      }
-    }),
+    qrButton,
   );
-  if (receiveAdministrator) actions.append(
-    button(link.active ? 'Deactivate' : 'Reactivate', 'tiny ghost', (control) => {
+  if (receiveAdministrator) {
+    const activeButton = button(link.active ? 'Deactivate' : 'Reactivate', 'tiny ghost', (control) => {
       if (pending) return;
       return deferred(control, {
         text: link.active ? 'Request deactivated.' : 'Request reactivated.',
@@ -666,8 +670,9 @@ function renderLink(link) {
           });
         },
       });
-    }),
-    button(link.legal_hold ? 'Release hold' : 'Legal hold', 'tiny ghost', async (control) => {
+    });
+    activeButton.setAttribute('aria-label', `${link.active ? 'Deactivate' : 'Reactivate'} receive link: ${link.label}`);
+    const holdButton = button(link.legal_hold ? 'Release hold' : 'Legal hold', 'tiny ghost', async (control) => {
       if (pending) return;
       if (!link.legal_hold) {
         await api(`/api/admin/links/${link.id}`, {
@@ -691,11 +696,12 @@ function renderLink(link) {
           });
         },
       });
-    }),
-  );
+    });
+    holdButton.setAttribute('aria-label', `${link.legal_hold ? 'Release hold' : 'Legal hold'}: ${link.label}`);
+    actions.append(activeButton, holdButton);
+  }
   if (receiveAdministrator && !link.legal_hold) {
-    actions.append(
-      button('Delete', 'tiny danger', async () => {
+    const deleteButton = button('Delete', 'tiny danger', async () => {
         if (
           !(await confirmModal(
             'Delete request',
@@ -710,8 +716,9 @@ function renderLink(link) {
         card.remove();
         await refreshLinks();
         announce('links-action-status', `Request "${link.label}" deleted.`);
-      }),
-    );
+    });
+    deleteButton.setAttribute('aria-label', `Delete receive link: ${link.label}`);
+    actions.append(deleteButton);
   }
   // Inside an undo window only Copy stays live; disabled buttons leave the
   // tab order as well as the pointer.

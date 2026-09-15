@@ -107,7 +107,9 @@ try {
   await adminPage.goto(`${base}/receive`);
   const adminCard = adminPage.locator(`#link-${link.id}`);
   await adminCard.waitFor();
-  assert.ok(await adminCard.getByRole('button', { name: 'Deactivate', exact: true }).isEnabled());
+  for (const name of [/^Deactivate receive link: /, /^Legal hold: /, /^Delete receive link: /]) {
+    assert.equal(await adminCard.getByRole('button', { name }).count(), 1, `admin receive action is named ${name}`);
+  }
   assert.ok(await adminPage.locator('#create-form').isVisible());
   assert.match(await adminPage.locator('#create-error').textContent(), /Could not load reception projects/);
   await adminPage.close();
@@ -150,11 +152,11 @@ try {
   assert.deepEqual(await viewerPage.locator('#admin-session').evaluate((node) => JSON.parse(node.textContent)), expectedSession);
   assert.ok(await viewerPage.locator('#create-form').isHidden());
   const receiveCard = viewerPage.locator(`#link-${link.id}`);
-  for (const name of ['Deactivate', 'Reactivate', 'Legal hold', 'Release hold', 'Delete']) {
-    assert.equal(await receiveCard.getByRole('button', { name, exact: true }).count(), 0, `viewer receive exposes ${name}`);
+  for (const name of [/^Deactivate receive link: /, /^Reactivate receive link: /, /^Legal hold: /, /^Release hold: /, /^Delete receive link: /]) {
+    assert.equal(await receiveCard.getByRole('button', { name }).count(), 0, `viewer receive exposes ${name}`);
   }
-  assert.equal(await receiveCard.getByRole('button', { name: 'Copy', exact: true }).count(), 1);
-  await receiveCard.getByRole('button', { name: 'QR', exact: true }).click();
+  assert.equal(await receiveCard.getByRole('button', { name: /^Copy receive link: / }).count(), 1);
+  await receiveCard.getByRole('button', { name: /^Show QR code: / }).click();
   await receiveCard.locator('img[alt^="QR code"]').waitFor();
   await receiveCard.locator('.upload-history > summary').click();
   await receiveCard.locator('.upload-history .upload-head').waitFor();
@@ -177,8 +179,8 @@ try {
   assert.equal(await viewerPage.locator('#library-add-files').isDisabled(), true);
   assert.equal(await viewerPage.locator('#library-add-folder').isDisabled(), true);
   const grantCard = viewerPage.locator(`#grant-${grant.grant.id}`);
-  for (const name of ['New address', 'Extend 7 days', 'Revoke']) {
-    assert.equal(await grantCard.getByRole('button', { name, exact: true }).count(), 0, `viewer deliver exposes ${name}`);
+  for (const name of [/^New address: /, /^Extend 7 days: /, /^Revoke: /]) {
+    assert.equal(await grantCard.getByRole('button', { name }).count(), 0, `viewer deliver exposes ${name}`);
   }
   await grantCard.getByRole('button', { name: 'Copy link', exact: true }).click();
   await viewerPage.locator('#library-refresh').click();
