@@ -8291,6 +8291,7 @@ mod settings_api_tests {
                 "<html><head></head><body><nav id=\"nav\" class=\"nav\"></nav></body></html>",
             ),
             ("request.html", "<html><head></head><body></body></html>"),
+            ("tenants.html", include_str!("../../../web/tenants.html")),
         ] {
             std::fs::write(web.join(page), contents).unwrap();
         }
