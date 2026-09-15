@@ -20,10 +20,7 @@ struct DeliverView: View {
     // The local day, not the core's UTC one: an evening drop belongs to today.
     @State private var into = Date.now.formatted(Date.ISO8601FormatStyle(timeZone: .current).year().month().day())
     @State private var targeted = false
-    /// The cancel handle of the upload in flight, and the core's last word
-    /// on it (its line stays up after the end until the next one starts).
-    @State private var uploading: Transfer?
-    @State private var lastUpload: UploadView?
+    @State private var handledUploadID: UUID?
     @State private var label = ""
     @State private var password = ""
     @State private var expiresDays = "7"
@@ -51,22 +48,22 @@ struct DeliverView: View {
             form
         }
         .padding(20)
-        .onAppear { open("") }
+        .onAppear { open(""); absorbCompletedUpload() }
+        .onChange(of: port.libraryUploadID) { _, _ in absorbCompletedUpload() }
+        .onChange(of: port.libraryUploadActive) { _, _ in absorbCompletedUpload() }
     }
 
     /// Files from this machine go up to the port first, then get ticked
     /// below like anything already there.
     private var dropZone: some View {
         VStack(alignment: .leading, spacing: 8) {
-            // The core's line stays up after the upload ends ("Added 2 files
-            // to the port, 21 MB") until the next one starts.
-            Text(lastUpload?.status ?? Self.dropPrompt)
+            Text(port.libraryUploadOutcome ?? port.libraryUploadView?.status ?? Self.dropPrompt)
                 .foregroundStyle(Tokens.muted)
                 .lineLimit(1)
                 .truncationMode(.middle)
             HStack(spacing: 8) {
-                if let uploading {
-                    Button("Cancel") { uploading.cancel() }
+                if port.libraryUploadActive {
+                    Button("Cancel") { port.cancelLibraryUpload() }
                 } else {
                     Button("Choose") { choose() }
                     Button("Paste") { paste() }
@@ -75,7 +72,7 @@ struct DeliverView: View {
                 TextField("Folder on the port", text: $into)
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 170)
-                    .disabled(uploading != nil)
+                    .disabled(port.libraryUploadActive)
                     .help("The folder on the port the files go into")
             }
         }
@@ -84,8 +81,7 @@ struct DeliverView: View {
         .background(targeted ? Tokens.panelHover : Tokens.panel)
         .overlay(RoundedRectangle(cornerRadius: 6).stroke(Tokens.border))
         .dropDestination(for: URL.self) { urls, _ in
-            upload(urls.filter(\.isFileURL).map(\.path))
-            return true
+            port.startLibraryUpload(urls.filter(\.isFileURL).map(\.path), into: into.trimmingCharacters(in: .whitespaces))
         } isTargeted: { targeted = $0 }
     }
 
@@ -110,26 +106,16 @@ struct DeliverView: View {
     /// Sends the paths up to the port under the named folder; what lands is
     /// ticked and its folder opened so the ticks are seen.
     private func upload(_ paths: [String]) {
-        guard !paths.isEmpty, uploading == nil else { return }
-        let transfer = Transfer()
-        uploading = transfer
-        lastUpload = nil
-        let hop = UploadHop { view in lastUpload = view }
-        // What landed is ticked whether the upload ended well or not: a
-        // failure or a cancel midway still put the earlier files on the port.
-        port.upload(paths, into: into.trimmingCharacters(in: .whitespaces), transfer: transfer, listener: hop) { made in
-            uploading = nil
-            let landed = lastUpload?.landed ?? []
-            chosen.formUnion(landed)
-            guard made != nil else {
-                // The problem line below says what went wrong; the prompt
-                // returns. No reload here: a library call would clear that line.
-                lastUpload = nil
-                return
-            }
-            if let first = landed.first {
-                open(first.split(separator: "/").dropLast().joined(separator: "/"))
-            }
+        _ = port.startLibraryUpload(paths, into: into.trimmingCharacters(in: .whitespaces))
+    }
+
+    private func absorbCompletedUpload() {
+        guard !port.libraryUploadActive, let id = port.libraryUploadID, handledUploadID != id else { return }
+        handledUploadID = id
+        let landed = port.libraryUploadView?.landed ?? []
+        chosen.formUnion(landed)
+        if let first = landed.first {
+            open(first.split(separator: "/").dropLast().joined(separator: "/"))
         }
     }
 
@@ -304,22 +290,6 @@ struct DeliverView: View {
             chosen = []
             label = ""
             password = ""
-        }
-    }
-}
-
-/// The core's progress callback for an upload. Called on the core's thread;
-/// hops to the main actor before touching the view's state.
-final class UploadHop: UploadListener, @unchecked Sendable {
-    private let apply: @MainActor (UploadView) -> Void
-
-    init(_ apply: @escaping @MainActor (UploadView) -> Void) {
-        self.apply = apply
-    }
-
-    func update(view: UploadView) {
-        DispatchQueue.main.async {
-            MainActor.assumeIsolated { self.apply(view) }
         }
     }
 }

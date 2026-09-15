@@ -46,16 +46,17 @@ public sealed partial class DeliverPage : Page
     private string? nextPage;
     private long pageGeneration;
     private string? issued;
-    /// The cancel handle of the upload in flight, if any, and the core's
-    /// last word on it.
-    private Transfer? uploading;
-    private UploadView? lastUpload;
+    private Guid? handledUploadId;
 
     public DeliverPage()
     {
         InitializeComponent();
         Entries.ItemsSource = entries;
-        Loaded += (_, _) => PortStore.Shared.Changed += Refresh;
+        Loaded += (_, _) =>
+        {
+            PortStore.Shared.Changed += Refresh;
+            Refresh();
+        };
         Unloaded += (_, _) => PortStore.Shared.Changed -= Refresh;
         ActualThemeChanged += (_, _) => Refresh();
         LabelBox.TextChanged += (_, _) => Refresh();
@@ -70,10 +71,12 @@ public sealed partial class DeliverPage : Page
     private void Refresh()
     {
         var port = PortStore.Shared;
+        AbsorbCompletedUpload();
         // The button carries the count, so the row has one control to read.
         IssueButton.Content = chosen.Count == 0 ? "Choose files to share" : chosen.Count == 1 ? "Share 1 file" : $"Share {chosen.Count} files";
         IssueButton.IsEnabled = !port.Busy && chosen.Count > 0 && LabelBox.Text.Trim().Length > 0;
-        var busy = uploading is not null;
+        var busy = port.LibraryUploadActive;
+        DropText.Text = port.LibraryUploadStatus ?? DropPrompt;
         ChooseButton.IsEnabled = !busy;
         ChooseFolderButton.Visibility = busy ? Visibility.Collapsed : Visibility.Visible;
         PasteButton.IsEnabled = !busy;
@@ -155,7 +158,7 @@ public sealed partial class DeliverPage : Page
 
     private void DropZone_DragOver(object sender, DragEventArgs e)
     {
-        e.AcceptedOperation = uploading is null && e.DataView.Contains(StandardDataFormats.StorageItems)
+        e.AcceptedOperation = !PortStore.Shared.LibraryUploadActive && e.DataView.Contains(StandardDataFormats.StorageItems)
             ? DataPackageOperation.Copy
             : DataPackageOperation.None;
     }
@@ -163,6 +166,7 @@ public sealed partial class DeliverPage : Page
     private async void DropZone_Drop(object sender, DragEventArgs e)
     {
         if (!e.DataView.Contains(StandardDataFormats.StorageItems)) return;
+        if (PortStore.Shared.LibraryUploadActive) return;
         Upload(await e.DataView.GetStorageItemsAsync());
     }
 
@@ -189,53 +193,24 @@ public sealed partial class DeliverPage : Page
         if (data.Contains(StandardDataFormats.StorageItems)) Upload(await data.GetStorageItemsAsync());
     }
 
-    private void CancelUpload_Click(object sender, RoutedEventArgs e) => uploading?.Cancel();
+    private void CancelUpload_Click(object sender, RoutedEventArgs e) => PortStore.Shared.CancelLibraryUpload();
 
     /// Sends the items up to the port under the folder named in the box;
     /// what lands is ticked and its folder opened so the ticks are seen.
     private void Upload(IEnumerable<IStorageItem> items)
     {
         var paths = items.Select(item => item.Path).Where(path => path.Length > 0).ToArray();
-        if (paths.Length == 0 || uploading is not null) return;
-        var transfer = new Transfer();
-        uploading = transfer;
-        lastUpload = null;
-        Refresh();
-        // What landed is ticked whether the upload ended well or not: a
-        // failure or a cancel midway still put the earlier files on the port.
-        PortStore.Shared.Upload(paths, FolderBox.Text.Trim(), transfer, new UploadHop(this), _ => Landed(reopen: true), () =>
-        {
-            // The problem line below says what went wrong; the prompt returns.
-            // No reload here: a library call would clear that line.
-            DropText.Text = DropPrompt;
-            Landed(reopen: false);
-        });
+        PortStore.Shared.StartLibraryUpload(paths, FolderBox.Text.Trim());
     }
 
-    private void Landed(bool reopen)
+    private void AbsorbCompletedUpload()
     {
-        uploading = null;
-        var landed = lastUpload?.Landed ?? Array.Empty<string>();
+        var port = PortStore.Shared;
+        if (port.LibraryUploadActive || port.LibraryUploadId is not Guid id || handledUploadId == id) return;
+        handledUploadId = id;
+        var landed = port.LibraryUploadView?.Landed ?? Array.Empty<string>();
         foreach (var path in landed) chosen.Add(path);
-        if (reopen && landed.Length > 0) Open(landed[0][..Math.Max(landed[0].LastIndexOf('/'), 0)]);
-        Refresh();
-    }
-
-    /// The core's line stays up after the upload ends ("Added 2 files to
-    /// the port, 21 MB") until the next one starts.
-    private void ShowUpload(UploadView view)
-    {
-        lastUpload = view;
-        DropText.Text = view.Status;
-    }
-
-    /// The core's progress callback for an upload. Called on the core's
-    /// thread; hops to the UI thread before touching the page.
-    private sealed class UploadHop : UploadListener
-    {
-        private readonly DeliverPage page;
-        public UploadHop(DeliverPage page) => this.page = page;
-        public void Update(UploadView view) => page.DispatcherQueue.TryEnqueue(() => page.ShowUpload(view));
+        if (landed.Length > 0) Open(landed[0][..Math.Max(landed[0].LastIndexOf('/'), 0)]);
     }
 
     /// The path into what is on the port, in the path type: every directory
