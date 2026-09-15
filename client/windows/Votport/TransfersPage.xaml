@@ -7,7 +7,10 @@
       <RowDefinition Height="Auto" />
       <RowDefinition Height="*" />
     </Grid.RowDefinitions>
-    <TextBlock Text="TRANSFERS" Style="{StaticResource SectionLabel}" />
+    <Grid>
+      <TextBlock Text="TRANSFERS" Style="{StaticResource SectionLabel}" />
+      <Button x:Name="ClearFinishedButton" HorizontalAlignment="Right" Content="Clear finished" ToolTipService.ToolTip="Remove finished transfers from this list. Paused and retryable transfers stay." Click="ClearFinished_Click" />
+    </Grid>
     <TextBlock x:Name="EmptyText" Grid.Row="1" Text="Nothing under way. Ship files or receive a delivery."
         Foreground="{ThemeResource VotMutedBrush}" VerticalAlignment="Center" HorizontalAlignment="Center" />
     <ListView x:Name="List" Grid.Row="1" SelectionMode="None" IsItemClickEnabled="True"
@@ -37,7 +40,7 @@
                 <Button Content="Cancel" Visibility="{x:Bind Running, Mode=OneWay}" Click="Cancel_Click" />
                 <PasswordBox PlaceholderText="Password" Width="160" Visibility="{x:Bind ShowPassword, Mode=OneWay}" />
                 <Button Content="{x:Bind ResumeLabel, Mode=OneWay}" Visibility="{x:Bind CanResume, Mode=OneWay}" Click="Resume_Click" />
-                <Button Content="Show in Explorer" Visibility="{x:Bind CanReveal, Mode=OneWay}" Click="Reveal_Click" />
+                <Button Content="{x:Bind RevealLabel, Mode=OneWay}" Visibility="{x:Bind CanReveal, Mode=OneWay}" Click="Reveal_Click" />
                 <Button Content="Remove" Visibility="{x:Bind NotRunning, Mode=OneWay}" Click="Remove_Click" />
               </StackPanel>
             </Grid>

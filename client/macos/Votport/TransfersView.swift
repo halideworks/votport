@@ -11,10 +11,16 @@ struct TransfersView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("TRANSFERS")
-                .font(Type.label)
-                .tracking(1.5)
-                .foregroundStyle(Tokens.muted)
+            HStack {
+                Text("TRANSFERS")
+                    .font(Type.label)
+                    .tracking(1.5)
+                    .foregroundStyle(Tokens.muted)
+                Spacer()
+                Button("Clear finished") { store.clearFinished() }
+                    .help("Remove finished transfers from this list. Paused and retryable transfers stay.")
+                    .disabled(!store.hasFinished)
+            }
             if store.items.isEmpty {
                 Spacer()
                 Text("Nothing under way. Ship files or receive a delivery.")
@@ -36,6 +42,9 @@ struct TransfersView: View {
         }
         .padding(20)
         .onAppear { expanded = expanded ?? store.items.first?.id }
+        .onChange(of: store.items.map(\.id)) { _, ids in
+            if let expanded, !ids.contains(expanded) { self.expanded = nil }
+        }
     }
 }
 
@@ -92,10 +101,14 @@ struct TransferCard: View {
                         }
                         .disabled(item.needsPassword && password.isEmpty)
                     }
-                    if item.kind == .receive, !item.landed.isEmpty {
-                        Button("Reveal in Finder") {
-                            NSWorkspace.shared.activateFileViewerSelecting(
-                                item.landed.map { URL(fileURLWithPath: $0) })
+                    if item.canReveal, let landed = item.landed {
+                        Button(item.revealLabel) {
+                            let url = URL(fileURLWithPath: landed)
+                            if item.revealDestinationFolder {
+                                NSWorkspace.shared.open(url)
+                            } else {
+                                NSWorkspace.shared.activateFileViewerSelecting([url])
+                            }
                         }
                     }
                     Button("Remove") { store.remove(item.id) }

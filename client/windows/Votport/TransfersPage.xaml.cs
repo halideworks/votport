@@ -12,8 +12,16 @@ public sealed partial class TransfersPage : Page
         InitializeComponent();
         List.ItemsSource = TransferStore.Shared.Items;
         // Every visit is a new page; the handler leaves with it.
-        Loaded += (_, _) => TransferStore.Shared.Items.CollectionChanged += OnItemsChanged;
-        Unloaded += (_, _) => TransferStore.Shared.Items.CollectionChanged -= OnItemsChanged;
+        Loaded += (_, _) =>
+        {
+            TransferStore.Shared.Items.CollectionChanged += OnItemsChanged;
+            TransferStore.Shared.ActiveChanged += OnActiveChanged;
+        };
+        Unloaded += (_, _) =>
+        {
+            TransferStore.Shared.Items.CollectionChanged -= OnItemsChanged;
+            TransferStore.Shared.ActiveChanged -= OnActiveChanged;
+        };
         Refresh();
         if (TransferStore.Shared.Items.FirstOrDefault() is TransferItem first && !TransferStore.Shared.Items.Any(item => item.Expanded))
         {
@@ -23,11 +31,14 @@ public sealed partial class TransfersPage : Page
 
     private void OnItemsChanged(object? sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs e) => Refresh();
 
+    private void OnActiveChanged(int _) => Refresh();
+
     private void Refresh()
     {
         var any = TransferStore.Shared.Items.Count > 0;
         EmptyText.Visibility = any ? Visibility.Collapsed : Visibility.Visible;
         List.Visibility = any ? Visibility.Visible : Visibility.Collapsed;
+        ClearFinishedButton.IsEnabled = TransferStore.Shared.Items.Any(item => !item.Running && !item.Journalled);
     }
 
     /// A click expands the card and collapses the others; nothing is
@@ -61,14 +72,17 @@ public sealed partial class TransfersPage : Page
 
     private void Reveal_Click(object sender, RoutedEventArgs e)
     {
-        if ((sender as FrameworkElement)?.DataContext is TransferItem item && item.Landed.Length > 0)
+        if ((sender as FrameworkElement)?.DataContext is TransferItem item && item.Landed is string landed)
         {
             // A --receive launch may have named a relative folder; explorer
             // wants the full path.
-            var path = System.IO.Path.GetFullPath(item.Landed[0]);
-            System.Diagnostics.Process.Start("explorer.exe", $"/select,\"{path}\"");
+            var path = System.IO.Path.GetFullPath(landed);
+            var arguments = item.RevealDestinationFolder ? $"\"{path}\"" : $"/select,\"{path}\"";
+            System.Diagnostics.Process.Start("explorer.exe", arguments);
         }
     }
+
+    private void ClearFinished_Click(object sender, RoutedEventArgs e) => TransferStore.Shared.ClearFinished();
 
     private void Remove_Click(object sender, RoutedEventArgs e)
     {

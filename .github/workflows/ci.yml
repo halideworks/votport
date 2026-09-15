@@ -165,6 +165,15 @@ jobs:
           .\build-core.ps1 -BuildProfile dev
           dotnet build Votport\Votport.csproj -c Release -p:Platform=x64 -p:WindowsPackageType=None
           if ($LASTEXITCODE -ne 0) { throw "unpackaged shell build failed" }
+          dotnet build RetentionTests\RetentionTests.csproj -c Release -p:Platform=x64 -p:WindowsPackageType=None -p:TreatWarningsAsErrors=true
+          if ($LASTEXITCODE -ne 0) { throw "transfer retention test build failed" }
+          $retention = Start-Process dotnet -ArgumentList @('run', '--no-build', '--project', 'RetentionTests\RetentionTests.csproj', '-c', 'Release', '-p:Platform=x64', '-p:WindowsPackageType=None') -NoNewWindow -PassThru
+          if (!$retention.WaitForExit(60000)) {
+            $retention.Kill($true)
+            $retention.WaitForExit()
+            throw "transfer retention checks timed out"
+          }
+          if ($retention.ExitCode -ne 0) { throw "transfer retention checks failed" }
           dotnet build Votport\Votport.csproj -c Release -p:Platform=x64 -p:WindowsPackageType=MSIX -p:GenerateAppxPackageOnBuild=true
           if ($LASTEXITCODE -ne 0) { throw "MSIX shell build failed" }
 

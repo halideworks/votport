@@ -1358,7 +1358,16 @@ await page.route("**/api/admin/outbound-files?directory=*", async (route) => {
   await page.focus("#library-search");
   await route.fulfill({ status: 503 });
 }, { times: 1 });
+const oldDirectoryAlert = await page.locator("#library-files [role=alert]").elementHandle();
+const failedDirectoryResponse = page.waitForResponse((response) => {
+  const url = new URL(response.url());
+  return url.pathname === "/api/admin/outbound-files"
+    && url.searchParams.get("directory") === PROJECT
+    && response.status() === 503;
+});
 await page.getByRole("button", { name: `Open folder ${PROJECT}` }).click();
+await failedDirectoryResponse;
+await page.waitForFunction((alert) => !alert.isConnected, oldDirectoryAlert);
 await page.locator("#library-files [role=alert]").waitFor();
 if (await page.evaluate(() => document.activeElement.id) !== "library-search") {
   throw new Error("failed folder navigation stole external focus");

@@ -19,12 +19,20 @@ public sealed class TransferItem : INotifyPropertyChanged
     public string Link { get; init; } = "";
     internal string? SnapshotPath { get; set; }
     public DateTime Started { get; init; } = DateTime.Now;
-    private string[] landed = Array.Empty<string>();
+    private string? landed;
 
-    public string[] Landed
+    public string? Landed
     {
         get => landed;
-        set { landed = value; Changed(); Changed(nameof(CanReveal)); }
+        internal set { landed = value; Changed(); Changed(nameof(CanReveal)); }
+    }
+
+    private bool revealDestinationFolder;
+
+    public bool RevealDestinationFolder
+    {
+        get => revealDestinationFolder;
+        internal set { revealDestinationFolder = value; Changed(); Changed(nameof(RevealLabel)); }
     }
 
     private TransferView? view;
@@ -65,6 +73,7 @@ public sealed class TransferItem : INotifyPropertyChanged
     /// Resume without a password prompt: what the tray panel offers.
     public bool CanResumeNow => CanResume && !NeedsPassword;
     public string ResumeLabel => interrupted || view?.Phase == Phase.Paused ? "Resume" : "Retry";
+    public string RevealLabel => RevealDestinationFolder ? "Show destination folder" : "Show in Explorer";
     public bool HasTotal => view?.TotalBytes is not null;
 
     public bool Expanded
@@ -103,7 +112,7 @@ public sealed class TransferItem : INotifyPropertyChanged
     }
 
     public bool NotRunning => !running;
-    public bool CanReveal => !running && Kind == Kinds.Receive && landed.Length > 0;
+    public bool CanReveal => !running && Kind == Kinds.Receive && landed is not null;
     public string StartedLabel => $"Started {Started:g}";
     /// The full error text behind a failed card's headline.
     public string Detail => view?.Detail ?? "";
@@ -117,6 +126,47 @@ public sealed class TransferItem : INotifyPropertyChanged
     public List<FileRow> Files { get; private set; } = new();
     private readonly Dictionary<ulong, FileRow> filesByIndex = new();
     public bool Done => view?.Phase == Phase.Done;
+
+    internal void SetRevealDestination(string[] paths)
+    {
+        Landed = paths.Length switch
+        {
+            0 => null,
+            1 => paths[0],
+            _ => Subject,
+        };
+        RevealDestinationFolder = paths.Length > 1;
+    }
+
+    internal void CompactStopped(string[] paths)
+    {
+        SetRevealDestination(paths);
+        if (Running || Journalled) return;
+        Files = new();
+        filesByIndex.Clear();
+        filesByIndex.TrimExcess();
+        if (view is TransferView retained)
+        {
+            view = new TransferView(
+                retained.EvidenceStatus,
+                retained.Phase,
+                retained.Transport,
+                retained.FilesReset,
+                Array.Empty<FileView>(),
+                retained.MovedBytes,
+                retained.TotalBytes,
+                retained.RateBytesPerSecond,
+                retained.EtaSeconds,
+                retained.FinishedUnixSeconds,
+                retained.Finishing,
+                retained.Headline,
+                retained.Detail,
+                retained.Status,
+                retained.Route,
+                retained.RateText);
+        }
+        Changed(nameof(Files));
+    }
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
@@ -272,7 +322,8 @@ public sealed class TransferStore
         item.Running = true;
         item.Interrupted = false;
         item.View = null;
-        item.Landed = Array.Empty<string>();
+        item.Landed = null;
+        item.RevealDestinationFolder = false;
         ActiveChanged?.Invoke(ActiveCount);
         Run(item, (transfer, listener) =>
         {
@@ -300,6 +351,12 @@ public sealed class TransferStore
         if (item.Running) return;
         if (item.JournalId is string id) VotportClientCoreMethods.Forget(id);
         Items.Remove(item);
+    }
+
+    public void ClearFinished()
+    {
+        foreach (var item in Items.Where(item => !item.Running && !item.Journalled).ToList())
+            Items.Remove(item);
     }
 
     private TransferItem Start(TransferItem.Kinds kind, string subject, string link)
@@ -346,7 +403,6 @@ public sealed class TransferStore
     private void Finished(TransferItem item, string[] landed)
     {
         item.Running = false;
-        item.Landed = landed;
         if (handles.TryGetValue(item.Id, out var handle))
         {
             item.JournalId = handle.JournalId();
@@ -355,6 +411,7 @@ public sealed class TransferStore
             item.Journalled = handle.JournalKept();
             item.NeedsPassword = handle.JournalNeedsPassword();
         }
+        item.CompactStopped(landed);
         handles.Remove(item.Id);
         ActiveChanged?.Invoke(ActiveCount);
         Notifier.TransferEnded(item);

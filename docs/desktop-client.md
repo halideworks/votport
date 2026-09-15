@@ -1002,6 +1002,9 @@ and local completion time. Total time includes verification and publication.
 Live HTTP and Push rates count bytes transferred in the current attempt.
 Fetch retains its placement-based live rate until the transport exposes
 per-attempt progress, so its rate can include a resumed prefix.
+Finished cards release their per-file rows and retain the summary and reveal
+action. Clear finished removes those cards while keeping paused or retryable
+transfers. Multi-file receives reveal the destination folder.
 
 The core reads up to 4 MiB at a time while verifying, resuming, or copying a
 received file, capped by its size. Native BLAKE3 and FEC libraries retain their
