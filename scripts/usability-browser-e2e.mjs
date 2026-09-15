@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { chromium } from 'playwright';
-import { openAncestors } from './browser-helpers.mjs';
+import { apiClient, openAncestors } from './browser-helpers.mjs';
 
 const base = process.env.BASE_URL, root = process.env.WORKFLOW_TEST_ROOT;
 if (!base || !root || !process.env.ADMIN_PASSWORD) throw new Error('Use an isolated instance with BASE_URL, WORKFLOW_TEST_ROOT and ADMIN_PASSWORD.');
@@ -17,10 +17,7 @@ try {
   let dismiss = false;
   page.on('pageerror', (error) => errors.push(error.message));
   page.on('dialog', async (dialog) => { dialogs.push(dialog.type()); if (dismiss) await dialog.dismiss(); else await dialog.accept(); });
-  const api = async (route, data, method = data ? 'POST' : 'GET') => {
-    const response = await context.request.fetch(`${base}/api/${route}`, { method, data, headers: { 'X-Votport': '1' } });
-    assert.ok(response.ok(), `${route}: ${response.status()} ${await response.text()}`); return response.json();
-  };
+  const api = apiClient(context, base);
   async function checkCollapsedFormHints(rootSelector) {
     const wrappers = page.locator(`${rootSelector} .form-advanced-with-hint`);
     for (let index = 0; index < await wrappers.count(); index += 1) {

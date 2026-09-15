@@ -1,4 +1,4 @@
-import { openAncestors } from './browser-helpers.mjs';
+import { apiClient, openAncestors } from './browser-helpers.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -14,11 +14,7 @@ const context = await browser.newContext({ viewport: { width: 1440, height: 1000
 const page = await context.newPage(), errors = [];
 page.on('dialog', (dialog) => dialog.accept());
 page.on('pageerror', (error) => errors.push(error.message));
-const api = async (route, data, method = data ? 'POST' : 'GET') => {
-  const response = await context.request.fetch(`${base}/api/${route}`, { method, data, headers: { 'X-Votport': '1' } });
-  assert.ok(response.ok(), `${route}: ${response.status()} ${await response.text()}`);
-  return response.json();
-};
+const api = apiClient(context, base);
 async function layout(name) {
   for (const width of [1440, 900, 640, 390, 320]) {
     await page.setViewportSize({ width, height: 1000 });
