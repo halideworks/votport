@@ -86,7 +86,7 @@ try {
   await page.goto(`${base}/deliver`);
   await page.locator('#library-files input[type=checkbox][value="notification-clip.txt"]').check();
   await page.locator('#deliver-label').fill(downloadLabel);
-  await choose(page.locator('#deliver-notifications'), 'Incoming', 'First download started');
+  await choose(page.locator('#deliver-notifications'), 'Incoming', 'First file requested');
   await page.getByRole('button', { name: 'Create download link', exact: true }).click();
   await page.getByRole('heading', { name: downloadLabel, exact: true }).waitFor();
   const grants = await api('admin/outbound-grants'); const grant = grants.grants.find((grant) => grant.label === downloadLabel);
@@ -109,7 +109,7 @@ try {
   const jobCard = page.locator(`#job-${job.id}`);
   await jobCard.locator('.notification-details > summary').click();
   assert.equal(await jobCard.locator('.notification-details .notification-mode').inputValue(), 'inherit');
-  await choose(jobCard.locator('.notification-details'), 'Incoming', 'Delivery completed');
+  await choose(jobCard.locator('.notification-details'), 'Incoming', 'Every file requested');
   await jobCard.getByRole('button', { name: 'Save notifications', exact: true }).click();
   await jobCard.getByText('Notification settings saved.', { exact: true }).waitFor();
   let detail = await api(`workflows/jobs/${job.id}`);
@@ -128,7 +128,7 @@ try {
   const silent = (await api('workflows/jobs', { operation_id: `${id}-off`, project_id: `${id}-off`, label: 'Silent workflow', expires_days: 1 })).job;
   await page.goto(`${base}/workflows#job-${silent.id}`);
   const silentCard = page.locator(`#job-${silent.id}`);
-  await choose(silentCard.locator('.notification-details'), 'Incoming', 'Delivery completed');
+  await choose(silentCard.locator('.notification-details'), 'Incoming', 'Every file requested');
   await silentCard.getByRole('button', { name: 'Save notifications', exact: true }).click();
   await silentCard.getByText('Notification settings saved.', { exact: true }).waitFor();
   await silentCard.locator('.notification-details .notification-mode').selectOption('inherit');

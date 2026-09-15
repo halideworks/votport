@@ -64,7 +64,7 @@ function renderGrants() {
     for (const text of [
       'Add files to the library, or pick ones that already arrived.',
       'Issue a download link, with a password or expiry if you like.',
-      'Recipients download verified files; each download is recorded here.',
+      'Recipients request verified files; each file request is recorded here.',
     ]) {
       const item = document.createElement('li');
       item.textContent = text;
@@ -105,8 +105,8 @@ function renderGrants() {
     const expiry = `expires ${formatWhen(grant.expires_at)}`;
     const downloads = grant.downloads ?? 0;
     const downloadSummary = Number.isFinite(grant.max_downloads)
-      ? `${downloads} / ${grant.max_downloads} complete deliveries`
-      : `${downloads} complete deliver${downloads === 1 ? 'y' : 'ies'} · unlimited`;
+      ? `${downloads} / ${grant.max_downloads} request set${grant.max_downloads === 1 ? '' : 's'}`
+      : `${downloads} request set${downloads === 1 ? '' : 's'} · unlimited`;
     const metaParts = [expiry, downloadSummary];
     if (Number.isFinite(grant.first_download_at)) {
       metaParts.push(`first ${formatWhen(grant.first_download_at)}`);
@@ -141,7 +141,7 @@ function renderGrants() {
         fileMeta.className = 'muted';
         const fileDownloads = file.downloads ?? 0;
         const fileParts = [
-          `${fileDownloads} download start${fileDownloads === 1 ? '' : 's'}`,
+          `${fileDownloads} file request${fileDownloads === 1 ? '' : 's'}`,
         ];
         if (Number.isFinite(file.first_download_at)) {
           fileParts.push(`first ${formatWhen(file.first_download_at)}`);

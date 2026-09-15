@@ -133,7 +133,10 @@ request links; each link can opt in to notification when a receive completes
 or fails (a refused request, or a transfer that stopped after bytes arrived; a
 sender's cancel does not notify).
 Deliver issues links for one or more outbound files; each delivery link can opt
-in to notification on its first download and when the delivery completes.
+in to notification when its first file is requested and when every file is
+requested. These request counters record transport handoff and do not prove
+recipient-side verification or acceptance; signed Verify/Accept evidence is
+separate.
 
 Multi-file deliveries offer a payload-only ZIP or separate-file bulk streaming.
 Receipts remain optional individual downloads. `max_downloads` applies per file
