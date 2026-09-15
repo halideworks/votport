@@ -9,7 +9,7 @@ members = ["core", "cli", "uniffi-bindgen"]
 # quiche fork VOT's workspace patches to. A git dependency's own patch is not
 # inherited, so it is declared here at the workspace root.
 [patch.crates-io]
-quiche = { git = "https://github.com/halideworks/quiche.git", rev = "ce7e5b71f3198125ab92a1626390bbe3a2c7faa0" }
+quiche = { git = "https://github.com/halideworks/quiche.git", rev = "2c9e98611ceafec3b8050b1d59ad738dab290d8f" }
 
 [profile.release]
 lto = "thin"
