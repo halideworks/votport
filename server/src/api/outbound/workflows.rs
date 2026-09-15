@@ -864,6 +864,7 @@ pub(super) fn payload_path(app: &App, tenant: &str, id: &str, name: &str) -> Api
         crate::paths::admit_component(component, app.config.allow_hidden)
             .map_err(|_| ApiError::not_found())?;
     }
+    crate::paths::admit_portable_paths([name]).map_err(|_| ApiError::not_found())?;
     let path = payload_root(app, tenant, id).join(name);
     if !library_components_safe(&library_root(app, tenant), &path) {
         return Err(ApiError::not_found());
@@ -1679,6 +1680,27 @@ mod tests {
         assert_eq!(store.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(store.code, "request_failed");
         assert_eq!(store.message, "database unavailable; try again");
+    }
+
+    #[test]
+    fn payload_paths_use_the_portable_profile_before_path_construction() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        std::fs::create_dir_all(payload_root(&app, "", "job")).unwrap();
+        for name in [
+            "XML:EDL/clip.mov",
+            "trailing.",
+            "trailing ",
+            "CON.txt",
+            "a<b>.mov",
+            "\u{ff0e}/clip.mov",
+            "\u{202e}fdp.exe",
+        ] {
+            let error = payload_path(&app, "", "job", name).unwrap_err();
+            assert_eq!(error.status, StatusCode::NOT_FOUND, "{name}");
+            assert!(!payload_root(&app, "", "job").join(name).exists(), "{name}");
+        }
+        assert!(payload_path(&app, "", "job", "nested/Café.mov").is_ok());
     }
 
     #[tokio::test]

@@ -1395,6 +1395,8 @@ pub(crate) fn safe_library_path(app: &App, tenant: &str, input: &str) -> ApiResu
             .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error))?;
         path.push(component);
     }
+    crate::paths::admit_portable_path(input)
+        .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error))?;
     Ok(path)
 }
 
@@ -8480,6 +8482,181 @@ mod tests {
         assert_eq!(bundle.status(), StatusCode::NOT_FOUND);
     }
 
+    fn outbound_query(pairs: &[(&str, &str)]) -> String {
+        let mut url = reqwest::Url::parse("http://localhost/api/admin/outbound-files").unwrap();
+        {
+            let mut query = url.query_pairs_mut();
+            for (key, value) in pairs {
+                query.append_pair(key, value);
+            }
+        }
+        format!("{}?{}", url.path(), url.query().unwrap())
+    }
+
+    fn outbound_file_path(path: &str) -> String {
+        outbound_query(&[("path", path)])
+    }
+
+    #[tokio::test]
+    async fn library_uploads_refuse_nonportable_names_before_staging() {
+        let (_directory, app, cookie, _) = fixture().await;
+        let portable = "unicode/Café.mov";
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::post(outbound_file_path(portable))
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .body(Body::from("portable"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::read(app.config.outbound_dir.join(portable)).unwrap(),
+            b"portable"
+        );
+
+        let invalid = [
+            "XML:EDL/clip.mov",
+            "trailing.",
+            "trailing ",
+            "CON.txt",
+            "a<b>.mov",
+            "\u{ff0e}/clip.mov",
+            "\u{202e}fdp.exe",
+        ];
+        for (index, path) in invalid.iter().enumerate() {
+            let response = crate::app::router(app.clone())
+                .oneshot(
+                    Request::post(outbound_file_path(path))
+                        .header("cookie", &cookie)
+                        .header("x-votport", "1")
+                        .body(Body::from("rejected"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{path}"
+            );
+            let destination = app.config.outbound_dir.join(path);
+            assert!(!destination.exists(), "{path}");
+            let upload_id = format!("{index:064x}");
+            let stage = outbound_stage_name(&destination, &upload_id);
+            assert!(
+                !destination.parent().unwrap().join(stage).exists(),
+                "{path}"
+            );
+        }
+
+        for (index, path) in invalid.iter().enumerate() {
+            let upload_id = format!("{:064x}", index + invalid.len());
+            let response = crate::app::router(app.clone())
+                .oneshot(chunk_request(
+                    &cookie,
+                    path,
+                    &upload_id,
+                    0,
+                    7,
+                    8,
+                    b"rejected",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{path}"
+            );
+            let destination = app.config.outbound_dir.join(path);
+            assert!(!destination.exists(), "{path}");
+            let stage = outbound_stage_name(&destination, &upload_id);
+            assert!(
+                !destination.parent().unwrap().join(stage).exists(),
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn library_255_byte_directory_remains_browseable_and_selectable() {
+        let (_directory, app, cookie, _) = fixture().await;
+        let directory = "d".repeat(255);
+        let file = format!("{directory}/clip.mov");
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::post(outbound_file_path(&file))
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .body(Body::from("portable"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let listed = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(outbound_query(&[("directory", &directory)]))
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        assert_eq!(body(listed).await["files"][0]["path"], file);
+
+        let paged = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(outbound_query(&[("directory", &directory), ("limit", "1")]))
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(paged.status(), StatusCode::OK);
+        let paged = body(paged).await;
+        assert_eq!(paged["files"][0]["path"], file);
+        assert_eq!(paged["truncated"], false);
+
+        let selected = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(outbound_query(&[("selection", &directory)]))
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected.status(), StatusCode::OK);
+        assert_eq!(body(selected).await["files"][0]["path"], file);
+
+        let grant = crate::app::router(app)
+            .oneshot(
+                Request::post("/api/admin/outbound-grants")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "directory": directory,
+                            "label": "long directory",
+                            "expires_days": 1
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn library_grant_restore_requires_outbound_volume() {
         let (directory, app, cookie, expected) = fixture().await;
@@ -8728,7 +8905,7 @@ mod tests {
         total: u64,
         bytes: &[u8],
     ) -> Request<Body> {
-        Request::post(format!("/api/admin/outbound-files?path={path}"))
+        Request::post(outbound_file_path(path))
             .header("cookie", cookie)
             .header("x-votport", "1")
             .header(OUTBOUND_UPLOAD_ID, upload_id)

@@ -20,8 +20,9 @@ struct TransferItem: Identifiable {
     var filesByIndex: [UInt64: TransferFile] = [:]
     var view: TransferView?
     var running = true
-    /// The landed paths, for Reveal in Finder after a receive.
-    var landed: [String] = []
+    /// One file to select, or the receive destination for multiple files.
+    var landed: String?
+    var revealDestinationFolder = false
     /// The journal id, once the core recorded the transfer.
     var journalId: String?
     /// A transfer the journal held at launch, cut by a quit or a failure and
@@ -33,6 +34,35 @@ struct TransferItem: Identifiable {
     var journalled = false
 
     var canResume: Bool { !running && journalled }
+    var canReveal: Bool { !running && kind == .receive && landed != nil }
+    var revealLabel: String {
+        revealDestinationFolder ? "Show destination folder" : "Reveal in Finder"
+    }
+
+    mutating func setRevealDestination(_ paths: [String]) {
+        switch paths.count {
+        case 0:
+            landed = nil
+            revealDestinationFolder = false
+        case 1:
+            landed = paths[0]
+            revealDestinationFolder = false
+        default:
+            landed = subject
+            revealDestinationFolder = true
+        }
+    }
+
+    mutating func compactStopped(landed paths: [String]) {
+        setRevealDestination(paths)
+        guard !running && !journalled else { return }
+        files.removeAll(keepingCapacity: false)
+        filesByIndex.removeAll(keepingCapacity: false)
+        if var retainedView = view {
+            retainedView.files.removeAll(keepingCapacity: false)
+            view = retainedView
+        }
+    }
 }
 
 @MainActor
@@ -138,7 +168,8 @@ final class TransferStore: ObservableObject {
         items[index].view = nil
         items[index].files = []
         items[index].filesByIndex = [:]
-        items[index].landed = []
+        items[index].landed = nil
+        items[index].revealDestinationFolder = false
         run(id) { transfer, listener in
             let report = try? VotportCore.resume(
                 id: journalId, password: password, transfer: transfer, listener: listener)
@@ -165,6 +196,12 @@ final class TransferStore: ObservableObject {
             VotportCore.forget(id: journalId)
         }
         items.remove(at: index)
+    }
+
+    var hasFinished: Bool { items.contains { !$0.running && !$0.journalled } }
+
+    func clearFinished() {
+        items.removeAll { !$0.running && !$0.journalled }
     }
 
     private func start(kind: TransferItem.Kind, subject: String, link: String) -> TransferItem {
@@ -215,7 +252,6 @@ final class TransferStore: ObservableObject {
     func finished(_ id: UUID, landed: [String]) {
         guard let index = items.firstIndex(where: { $0.id == id }) else { return }
         items[index].running = false
-        items[index].landed = landed
         if let handle = handles[id] {
             items[index].journalId = handle.journalId()
             // The core keeps the entry only for a failure worth trying again,
@@ -223,6 +259,7 @@ final class TransferStore: ObservableObject {
             items[index].journalled = handle.journalKept()
             items[index].needsPassword = handle.journalNeedsPassword()
         }
+        items[index].compactStopped(landed: landed)
         handles[id] = nil
         let item = items[index]
         log.notice("ended: \(String(describing: item.view?.phase), privacy: .public)")

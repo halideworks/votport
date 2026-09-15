@@ -429,16 +429,11 @@ pub(crate) fn admit_portable_paths<'a>(
         crate::protocol_paths::check_payload_name_length(
             name.rsplit('/').next().unwrap_or_default(),
         )?;
-        if name.split('/').any(is_receipt_name) {
-            return Err(format!(
-                "filename {name:?} is reserved for signed receipts; rename it before sharing"
-            ));
-        }
-        let invalid = || format!("filename {name:?} is not portable; rename it before sharing");
-        let path = vot_manifest::PackagePath::portable(name.split('/')).map_err(|_| invalid())?;
+        let path = admit_portable_path(name)?;
         let key = vot_manifest::canonical_path_key(&path, vot_manifest::PathProfile::Portable)
-            .map_err(|_| invalid())?;
-        let key = String::from_utf8(key).map_err(|_| invalid())?;
+            .map_err(|_| format!("filename {name:?} is not portable; rename it before sharing"))?;
+        let key = String::from_utf8(key)
+            .map_err(|_| format!("filename {name:?} is not portable; rename it before sharing"))?;
         // Preserve VOT's Turkish-I rule and NUL separators while strengthening Unicode folding.
         let folded: String = unicase::UniCase::new(key).to_folded_case().nfc().collect();
         keyed.push((folded.into_bytes(), name));
@@ -453,6 +448,17 @@ pub(crate) fn admit_portable_paths<'a>(
         }
     }
     Ok(())
+}
+
+/// Validates a path with the portable profile without a payload leaf limit.
+pub(crate) fn admit_portable_path(name: &str) -> Result<vot_manifest::PackagePath, String> {
+    if name.split('/').any(is_receipt_name) {
+        return Err(format!(
+            "filename {name:?} is reserved for signed receipts; rename it before sharing"
+        ));
+    }
+    let invalid = || format!("filename {name:?} is not portable; rename it before sharing");
+    vot_manifest::PackagePath::portable(name.split('/')).map_err(|_| invalid())
 }
 
 /// Produces `name`, `name-1`, `name-2`, ... keeping the extension.
