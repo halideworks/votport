@@ -502,6 +502,27 @@ async fn revoke_remote(
     Ok(ack)
 }
 
+pub(super) async fn attempt_revocation(
+    app: &App,
+    control: &crate::store::OutboundControl,
+) -> Result<(), String> {
+    let (ack, failure) = match revoke_remote(app, control).await {
+        Ok(ack) => (Some(ack), None),
+        Err(error) => {
+            tracing::warn!(
+                job_id = %control.job_id,
+                destination = %control.destination,
+                attempt = control.attempts,
+                reason = %error.message,
+                "route revocation attempt failed"
+            );
+            (None, Some(error.message))
+        }
+    };
+    app.store
+        .finish_route_revocation(control, ack.as_ref(), failure.as_deref(), now_unix())
+}
+
 pub async fn control_worker(app: Arc<App>) {
     loop {
         if app.lease_lost.load(std::sync::atomic::Ordering::Relaxed) || app.is_stopping() {
@@ -510,11 +531,7 @@ pub async fn control_worker(app: Arc<App>) {
         if let Ok(_operation) = begin_outbound_operation(&app, "") {
             match app.store.claim_route_revocation(now_unix()) {
                 Ok(Some(control)) => {
-                    let ack = revoke_remote(&app, &control).await.ok();
-                    if let Err(error) =
-                        app.store
-                            .finish_route_revocation(&control, ack.as_ref(), now_unix())
-                    {
+                    if let Err(error) = attempt_revocation(&app, &control).await {
                         tracing::error!(%error,"record route revocation status");
                     }
                     continue;

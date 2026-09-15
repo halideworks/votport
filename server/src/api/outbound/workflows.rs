@@ -3490,36 +3490,59 @@ mod tests {
                 .claim_route_revocation(now_unix())
                 .unwrap()
                 .unwrap();
-            let mut forged = control.request.clone();
-            forged.document.source.document.label = "different".into();
-            assert_eq!(
-                call(
-                    &receiver,
-                    Method::POST,
-                    &format!("/api/route/{}/revoke", control.route_id),
-                    None,
-                    Some(json!(forged))
-                )
+            let mut refused_request = control.request.clone();
+            refused_request.document.source.document.label = "different".into();
+            let refused_control = crate::store::OutboundControl {
+                job_id: control.job_id.clone(),
+                destination: control.destination.clone(),
+                origin: control.origin.clone(),
+                route_id: control.route_id.clone(),
+                request: refused_request,
+                attempts: control.attempts,
+            };
+            routes::attempt_revocation(&source, &refused_control)
                 .await
-                .0,
-                StatusCode::CONFLICT
+                .unwrap();
+            let pending = source.store.delivery_job(&ready.id).unwrap().unwrap();
+            assert_eq!(
+                pending.checks["route_revocations"]["nyc"]["state"],
+                "pending"
             );
+            assert_eq!(
+                pending.checks["route_revocations"]["nyc"]["error"],
+                "destination has not acknowledged revocation"
+            );
+            assert!(pending.checks["route_revocations"]["nyc"]["retry_at"]
+                .as_u64()
+                .is_some_and(|retry_at| retry_at > now_unix()));
+            source
+                .store
+                .with(|connection| {
+                    connection.execute(
+                        "UPDATE outbound_routes SET next_attempt=0 WHERE job_id=?1 AND destination_id=?2",
+                        [&control.job_id, &control.destination],
+                    )
+                })
+                .unwrap();
+            let retry = source
+                .store
+                .claim_route_revocation(now_unix())
+                .unwrap()
+                .unwrap();
+            assert_eq!(retry.attempts, control.attempts + 1);
+            routes::attempt_revocation(&source, &retry).await.unwrap();
             let path = format!("/api/route/{}/revoke", control.route_id);
             let (status, _, body) = call(
                 &receiver,
                 Method::POST,
                 &path,
                 None,
-                Some(json!(control.request)),
+                Some(json!(retry.request)),
             )
             .await;
             assert_eq!(status, StatusCode::OK);
             let ack: crate::route_protocol::RouteRevoked = serde_json::from_slice(&body).unwrap();
-            assert!(ack.verify(&control.request));
-            source
-                .store
-                .finish_route_revocation(&control, Some(&ack), now_unix())
-                .unwrap();
+            assert!(ack.verify(&retry.request));
             assert!(source
                 .store
                 .claim_route_revocation(now_unix() + 10000)
@@ -3546,6 +3569,13 @@ mod tests {
                     .checks["route_revocations"]["nyc"]["state"],
                 "acknowledged"
             );
+            assert!(source
+                .store
+                .delivery_job(&ready.id)
+                .unwrap()
+                .unwrap()
+                .checks["route_revocations"]["nyc"]["error"]
+                .is_null());
             assert!(receiver
                 .store
                 .inbound_route(&control.route_id)

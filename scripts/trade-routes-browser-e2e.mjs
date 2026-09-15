@@ -250,6 +250,25 @@ try {
   await source(`trade-routes/${route.id}/test`, {}); assert.equal((await source('trade-routes')).routes.find((r) => r.id === route.id).remote_state, 'revoked');
   await until(async () => notices, (v) => v.includes('/receiver') && v.includes('/sender'));
   assert.deepEqual(notices.sort(), ['/receiver', '/sender']);
+  const pendingReason = 'Destination refused <revocation> & retry';
+  const pendingRevocation = async (request) => {
+    const response = await request.fetch(), data = await response.json();
+    const entry = data.jobs.find((entry) => entry.job.id === issued.job.id);
+    assert.ok(entry, 'The route delivery is present in the workflow list');
+    entry.job.checks.route_revocations = { [route.id]: { state: 'pending', error: pendingReason } };
+    await request.fulfill({ response, json: data });
+  };
+  await page.route('**/api/workflows/jobs?*', pendingRevocation);
+  try {
+    await page.goto(`${base}/workflows#job-${issued.job.id}`);
+    await page.locator(`#job-${issued.job.id}`).getByText(pendingReason, { exact: false }).waitFor();
+    assert.equal(await page.locator(`#job-${issued.job.id} revocation`).count(), 0, 'Remote failure text must not become markup');
+    await source(`workflows/jobs/${issued.job.id}`, { action: 'cancel' });
+    await until(() => source(`workflows/jobs/${issued.job.id}`), (entry) => entry.job.checks.route_revocations?.[route.id]?.state === 'acknowledged');
+  } finally { await page.unroute('**/api/workflows/jobs?*', pendingRevocation); }
+  await page.click('#workflow-refresh');
+  await page.locator(`#job-${issued.job.id}`).getByText('Revocation acknowledged by the destination port.', { exact: true }).waitFor();
+  assert.equal(await page.locator(`#job-${issued.job.id}`).getByText(pendingReason, { exact: false }).count(), 0, 'Acknowledgement clears the displayed failure reason');
   await receiving.route(`**/api/admin/links/${olderRequest.id}`, (route) => route.fulfill({ status: 503, json: { error: 'Returned request unavailable fixture' } }), { times: 1 });
   await receiving.goto(`${peer}/trade-routes?receive=${olderRequest.id}#receive`);
   await receiving.locator('#trade-request-help').getByText(/Returned request unavailable fixture/).waitFor();

@@ -272,7 +272,7 @@ async function refreshJobs(more = false, background = false, discardEdits = fals
       leg.append(node('p', `${name}: ${status}`, result?.error ? 'error' : 'connection-meta'));
       const cancelled = job.state === 'cancelled' || Number.isFinite(job.checks.source_revoked_at) || (['retiring', 'retired'].includes(job.state) && job.checks.retired_from === 'cancelled');
       if (job.state !== 'suspended' && (revoked || (receipt && cancelled))) {
-        leg.append(node('p', revoked?.state === 'acknowledged' ? 'Revocation acknowledged by the destination port.' : `Revocation awaiting destination acknowledgment.${revoked?.retry_at ? ` Next attempt ${formatWhen(revoked.retry_at)}.` : ''}`, 'field-help'));
+        leg.append(node('p', revoked?.state === 'acknowledged' ? 'Revocation acknowledged by the destination port.' : `Revocation awaiting destination acknowledgment.${revoked?.error ? ` Reason: ${revoked.error}.` : ''}${revoked?.retry_at ? ` Next attempt ${formatWhen(revoked.retry_at)}.` : ''}`, 'field-help'));
       }
       if (receipt) leg.append(button('Download custody evidence', 'tiny ghost', () => download(`trade-route-${job.id}-${id}.json`, {
         format: 'votport-route-evidence-v1', receipt, ancestors: [...(job.checks.source_ancestry || []), ...(job.checks.source_receipt ? [job.checks.source_receipt] : [])], revocation: revoked?.acknowledgement || null,

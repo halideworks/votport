@@ -10,6 +10,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use age::secrecy::SecretString;
@@ -426,6 +428,229 @@ fn read_pending_restore(data_dir: &Path) -> Result<Option<PendingRestore>, Strin
 
 pub(crate) fn pending_restore_stage(data_dir: &Path) -> Result<Option<String>, String> {
     read_pending_restore(data_dir).map(|marker| marker.map(|marker| marker.stage))
+}
+
+fn generated_scratch_name(name: &str, prefix: &str, suffix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .and_then(|name| name.strip_suffix(suffix))
+        .is_some_and(|token| {
+            token.len() == 32
+                && token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
+fn data_scratch_kind(name: &str) -> Option<bool> {
+    if generated_scratch_name(name, ".votport-backup-db-", "")
+        || generated_scratch_name(name, ".votport-replica-", ".tar")
+        || generated_scratch_name(name, ".votport-restore-", ".download")
+        || generated_scratch_name(name, ".votport-restore-", ".tar")
+    {
+        return Some(false);
+    }
+    generated_scratch_name(name, ".votport-restore-stage-", "").then_some(true)
+}
+
+const BACKUP_ROOT_LOCK: &str = ".votport-backup.lock";
+const BACKUP_ROOT_STAGE_PREFIX: &str = ".votport-backup-stage-";
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackupPausePoint {
+    Archive,
+    Encrypt,
+}
+
+#[cfg(test)]
+struct BackupWorkerPause {
+    data_dir: PathBuf,
+    point: BackupPausePoint,
+    started: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static BACKUP_WORKER_PAUSE: OnceLock<Mutex<Vec<BackupWorkerPause>>> = OnceLock::new();
+
+#[cfg(test)]
+fn pause_backup_worker(data_dir: &Path, point: BackupPausePoint) {
+    let mut guard = BACKUP_WORKER_PAUSE
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("backup worker pause lock");
+    let Some(index) = guard
+        .iter()
+        .position(|pause| pause.data_dir == data_dir && pause.point == point)
+    else {
+        return;
+    };
+    let pause = guard.swap_remove(index);
+    drop(guard);
+    let _ = pause.started.send(());
+    let _ = pause
+        .release
+        .recv_timeout(std::time::Duration::from_secs(10));
+}
+
+/// Stable cross-process fence for one local backup root.
+#[derive(Clone)]
+pub(crate) struct BackupRootLock {
+    pub(crate) file: Arc<File>,
+}
+
+#[cfg(unix)]
+fn open_backup_root_lock(path: &Path) -> Result<File, String> {
+    match crate::paths::create_private_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(format!("create backup root lock: {error}")),
+    }
+    let file = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDWR
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| format!("open backup root lock: {error}"))?;
+    let file = File::from(file);
+    if !vot_platform_fs::same_file_handle(&file, path)
+        .map_err(|error| format!("check backup root lock: {error}"))?
+    {
+        return Err("backup root lock changed while opening".into());
+    }
+    crate::paths::tighten_private_file(path)?;
+    if !vot_platform_fs::same_file_handle(&file, path)
+        .map_err(|error| format!("check backup root lock: {error}"))?
+    {
+        return Err("backup root lock changed while protecting".into());
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_backup_root_lock(_path: &Path) -> Result<File, String> {
+    Err("backup root fencing is unavailable on this platform".into())
+}
+
+pub(crate) fn try_lock_backup_root(root: &Path) -> Result<Option<BackupRootLock>, String> {
+    let root = ensure_backup_root(root)?;
+    let path = root.join(BACKUP_ROOT_LOCK);
+    let file = open_backup_root_lock(&path)?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => {
+            return Err(format!("lock backup root: {error}"))
+        }
+    }
+    if !vot_platform_fs::same_file_handle(&file, &path)
+        .map_err(|error| format!("check locked backup root: {error}"))?
+    {
+        let _ = file.unlock();
+        return Err("backup root lock changed while locking".into());
+    }
+    Ok(Some(BackupRootLock {
+        file: Arc::new(file),
+    }))
+}
+
+fn backup_root_stage(name: &str) -> bool {
+    generated_scratch_name(name, BACKUP_ROOT_STAGE_PREFIX, ".tar")
+        || generated_scratch_name(name, BACKUP_ROOT_STAGE_PREFIX, ".tar.age")
+}
+
+/// Removes new fenced archive stages when the root is not busy.
+pub(crate) fn sweep_backup_root_orphans(root: &Path) -> Result<Option<usize>, String> {
+    let Some(_lock) = try_lock_backup_root(root)? else {
+        return Ok(None);
+    };
+    let mut removed = 0;
+    for entry in fs::read_dir(root).map_err(|error| error.to_string())? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(%error, "backup root stage entry could not be inspected");
+                continue;
+            }
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !backup_root_stage(&name) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "backup root stage metadata failed");
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "backup root stage cleanup failed")
+            }
+        }
+    }
+    Ok(Some(removed))
+}
+
+/// Removes interrupted scratch owned by this locked data directory; bad markers preserve evidence.
+pub(crate) fn sweep_data_dir_orphans(data_dir: &Path) -> Result<usize, String> {
+    let keep = pending_restore_stage(data_dir)?;
+    let mut removed = 0;
+    for entry in fs::read_dir(data_dir).map_err(|error| error.to_string())? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(%error, "data scratch entry could not be inspected");
+                continue;
+            }
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(directory) = data_scratch_kind(&name) else {
+            continue;
+        };
+        if keep.as_deref() == Some(name.as_str()) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "data scratch entry metadata failed");
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink()
+            || (directory && !metadata.is_dir())
+            || (!directory && !metadata.is_file())
+        {
+            continue;
+        }
+        let result = if directory {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        match result {
+            Ok(()) => removed += 1,
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "data scratch cleanup failed")
+            }
+        }
+    }
+    Ok(removed)
 }
 
 pub fn read_secrets(data_dir: &Path) -> Result<BackupSecrets, String> {
@@ -1247,6 +1472,9 @@ pub fn prune_local_root(
     retention_days: u64,
     retention_count: u64,
 ) -> Result<(), String> {
+    let Some(_lock) = try_lock_backup_root(root)? else {
+        return Err("backup root is busy".into());
+    };
     prune_local_root_protected(root, retention_days, retention_count, None)
 }
 
@@ -1576,6 +1804,29 @@ pub async fn run(
     config: BackupConfig,
     secrets: BackupSecrets,
 ) -> Result<String, String> {
+    let guard = Arc::clone(&app.backup_lock)
+        .try_lock_owned()
+        .map_err(|_| "backup already running".to_owned())?;
+    run_with_guard(app, config, secrets, guard).await
+}
+
+pub(crate) async fn run_with_guard(
+    app: Arc<crate::app::App>,
+    config: BackupConfig,
+    secrets: BackupSecrets,
+    guard: tokio::sync::OwnedMutexGuard<()>,
+) -> Result<String, String> {
+    tokio::spawn(run_operation(app, config, secrets, guard))
+        .await
+        .map_err(|error| format!("backup operation task failed: {error}"))?
+}
+
+async fn run_operation(
+    app: Arc<crate::app::App>,
+    config: BackupConfig,
+    secrets: BackupSecrets,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+) -> Result<String, String> {
     ensure_no_pending_restore(&app.config.data_dir)?;
     let retention = app.retention_observation()?;
     let mut status = read_status(&app.config.data_dir).unwrap_or_default();
@@ -1637,6 +1888,9 @@ async fn run_inner(
         .local_root(&app.config.data_dir)
         .map_err(RunFailure::before)?;
     let backups = ensure_backup_root(&backups).map_err(RunFailure::before)?;
+    let Some(root_lock) = try_lock_backup_root(&backups).map_err(RunFailure::before)? else {
+        return Err(RunFailure::before("backup root is busy"));
+    };
     let encrypted = config.encrypt;
     if encrypted && secrets.passphrase.is_none() {
         return Err(RunFailure::before(
@@ -1645,17 +1899,24 @@ async fn run_inner(
     }
     let id = backup_filename(encrypted);
     let final_path = backups.join(&id);
-    let raw = backups.join(format!(".{id}.stage"));
+    let stage_token = crate::auth::random_token();
+    let raw = backups.join(format!("{BACKUP_ROOT_STAGE_PREFIX}{stage_token}.tar"));
     let store = Arc::clone(&app.store);
     let data_dir = app.config.data_dir.clone();
+    let archive_data_dir = data_dir.clone();
     let raw_for_archive = raw.clone();
+    let root_file = Arc::clone(&root_lock.file);
     tokio::task::spawn_blocking(move || {
-        create_archive(
+        let _root_file = root_file;
+        let result = create_archive(
             &store,
-            &data_dir,
+            &archive_data_dir,
             &raw_for_archive,
             crate::store::SCHEMA_VERSION,
-        )
+        );
+        #[cfg(test)]
+        pause_backup_worker(&archive_data_dir, BackupPausePoint::Archive);
+        result
     })
     .await
     .map_err(RunFailure::before)?
@@ -1669,14 +1930,23 @@ async fn run_inner(
             .ok_or_else(|| RunFailure::before("encryption passphrase is not configured"))?
             .to_owned();
         let input = raw.clone();
-        let output = backups.join(format!(".{id}.age.stage"));
+        let output = backups.join(format!("{BACKUP_ROOT_STAGE_PREFIX}{stage_token}.tar.age"));
         let _output_cleanup = CleanupPath::new(output.clone());
         let published = final_path.clone();
         let output_for_encrypt = output.clone();
-        tokio::task::spawn_blocking(move || encrypt_file(&input, &output_for_encrypt, &pass))
-            .await
-            .map_err(RunFailure::before)?
-            .map_err(RunFailure::before)?;
+        let root_file = Arc::clone(&root_lock.file);
+        #[cfg(test)]
+        let encrypt_data_dir = data_dir;
+        tokio::task::spawn_blocking(move || {
+            let _root_file = root_file;
+            let result = encrypt_file(&input, &output_for_encrypt, &pass);
+            #[cfg(test)]
+            pause_backup_worker(&encrypt_data_dir, BackupPausePoint::Encrypt);
+            result
+        })
+        .await
+        .map_err(RunFailure::before)?
+        .map_err(RunFailure::before)?;
         fs::remove_file(&raw).map_err(RunFailure::before)?;
         raw_cleanup.keep();
         publish_new(&output, &published).map_err(RunFailure::before)?;
@@ -1773,8 +2043,14 @@ async fn scheduler_with_interval(app: Arc<crate::app::App>, interval: std::time:
     let mut busy_since = None;
     let mut ticker = tokio::time::interval(interval);
     loop {
-        ticker.tick().await;
-        let Ok(_guard) = app.backup_lock.try_lock() else {
+        tokio::select! {
+            _ = app.wait_for_shutdown() => return,
+            _ = ticker.tick() => {}
+        }
+        if app.is_stopping() {
+            return;
+        }
+        let Ok(guard) = Arc::clone(&app.backup_lock).try_lock_owned() else {
             match app
                 .store
                 .setting(SETTING_KEY)
@@ -1794,6 +2070,9 @@ async fn scheduler_with_interval(app: Arc<crate::app::App>, interval: std::time:
             }
             continue;
         };
+        if app.is_stopping() {
+            return;
+        }
         busy_since = None;
         if let Err(error) = ensure_no_pending_restore(&app.config.data_dir) {
             tracing::error!("backup scheduler paused: {error}");
@@ -1830,7 +2109,10 @@ async fn scheduler_with_interval(app: Arc<crate::app::App>, interval: std::time:
                 continue;
             }
         };
-        match run(Arc::clone(&app), config, secrets).await {
+        if app.is_stopping() {
+            return;
+        }
+        match run_with_guard(Arc::clone(&app), config, secrets, guard).await {
             Ok(id) => {
                 tracing::info!(target: "audit", event = "backup_scheduled", id = %id, "scheduled backup completed");
             }
@@ -1843,6 +2125,67 @@ async fn scheduler_with_interval(app: Arc<crate::app::App>, interval: std::time:
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct ReapedChild(Option<std::process::Child>);
+
+    impl ReapedChild {
+        fn new(child: std::process::Child) -> Self {
+            Self(Some(child))
+        }
+
+        fn wait_bounded(
+            &mut self,
+            timeout: std::time::Duration,
+        ) -> std::io::Result<std::process::ExitStatus> {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                let status = self.0.as_mut().expect("child already reaped").try_wait()?;
+                if let Some(status) = status {
+                    self.0 = None;
+                    return Ok(status);
+                }
+                if std::time::Instant::now() >= deadline {
+                    let child = self.0.as_mut().expect("child already reaped");
+                    let _ = child.kill();
+                    let status = child.wait()?;
+                    self.0 = None;
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("child did not exit after {timeout:?}: {status}"),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+
+    impl Drop for ReapedChild {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    fn install_backup_pause(
+        data_dir: &Path,
+        point: BackupPausePoint,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        BACKUP_WORKER_PAUSE
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap()
+            .push(BackupWorkerPause {
+                data_dir: data_dir.to_owned(),
+                point,
+                started: started_tx,
+                release: release_rx,
+            });
+        (started_rx, release_tx)
+    }
 
     #[derive(Debug)]
     struct FailingMultipart {
@@ -1882,6 +2225,410 @@ mod tests {
         fs::write(root.path().join("receipt.key"), [8; 32]).unwrap();
         crate::paths::tighten_private_file(&root.path().join("receipt.key")).unwrap();
         (root, store)
+    }
+
+    #[test]
+    fn data_scratch_sweep_removes_only_complete_owned_names() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path();
+        let token = "a".repeat(32);
+        let other = "b".repeat(32);
+        let removed = [
+            format!(".votport-backup-db-{token}"),
+            format!(".votport-replica-{token}.tar"),
+            format!(".votport-restore-{token}.download"),
+            format!(".votport-restore-{token}.tar"),
+        ];
+        for name in &removed {
+            fs::write(data.join(name), b"scratch").unwrap();
+        }
+        let orphan_stage = data.join(format!(".votport-restore-stage-{other}"));
+        fs::create_dir(&orphan_stage).unwrap();
+        let kept_stage_name = format!(".votport-restore-stage-{token}");
+        let kept_stage = data.join(&kept_stage_name);
+        fs::create_dir(&kept_stage).unwrap();
+        write_pending_restore(
+            data,
+            CleanupPath::directory(kept_stage),
+            Manifest {
+                version: VERSION,
+                created_at: 1,
+                schema_version: crate::store::SCHEMA_VERSION,
+                entries: Vec::new(),
+            },
+            RestoreMode::Replica,
+        )
+        .unwrap();
+
+        fs::create_dir(data.join(format!(".votport-restore-{other}.tar"))).unwrap();
+        fs::write(data.join(".votport-restore-stage-not-hex"), b"foreign").unwrap();
+        fs::write(data.join(".votport-restore-not-hex.download"), b"foreign").unwrap();
+        fs::create_dir(data.join(format!(".votport-restore-rollback-{other}"))).unwrap();
+        fs::write(data.join(format!(".status-{other}.stage")), b"unrelated").unwrap();
+
+        assert_eq!(sweep_data_dir_orphans(data).unwrap(), 5);
+        for name in removed {
+            assert!(!data.join(name).exists());
+        }
+        assert!(data.join(&kept_stage_name).is_dir());
+        assert!(data.join(format!(".votport-restore-{other}.tar")).is_dir());
+        assert!(data.join(".votport-restore-stage-not-hex").is_file());
+        assert!(data.join(".votport-restore-not-hex.download").is_file());
+        assert!(data
+            .join(format!(".votport-restore-rollback-{other}"))
+            .is_dir());
+        assert!(data.join(format!(".status-{other}.stage")).is_file());
+    }
+
+    #[test]
+    fn data_scratch_sweep_skips_everything_when_marker_is_invalid() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root
+            .path()
+            .join(format!(".votport-backup-db-{}", "c".repeat(32)));
+        fs::write(&scratch, b"scratch").unwrap();
+        fs::write(root.path().join(PENDING_FILE), b"invalid").unwrap();
+
+        assert!(sweep_data_dir_orphans(root.path()).is_err());
+        assert!(scratch.exists());
+    }
+
+    #[test]
+    fn backup_root_sweep_removes_only_owned_archive_stages() {
+        let root = tempfile::tempdir().unwrap();
+        let token = "a".repeat(32);
+        let plain = format!("{BACKUP_ROOT_STAGE_PREFIX}{token}.tar");
+        let encrypted = format!("{BACKUP_ROOT_STAGE_PREFIX}{}.tar.age", "b".repeat(32));
+        for name in [&plain, &encrypted] {
+            fs::write(root.path().join(name), b"stage").unwrap();
+        }
+        for name in [
+            format!("votport-backup-v2-1-{token}.tar"),
+            format!(".votport-backup-v2-1-{token}.tar.rollback"),
+            format!(".votport-backup-v2-1-{token}.tar.stage"),
+            format!(".votport-backup-v2-1-{token}.tar.age.stage"),
+            format!(".votport-backup-v2-1-{token}.tar.age.age.stage"),
+            format!("{BACKUP_ROOT_STAGE_PREFIX}{}-foreign.tar", "c".repeat(32)),
+            format!("{BACKUP_ROOT_STAGE_PREFIX}{}x.tar", "d".repeat(32)),
+        ] {
+            fs::write(root.path().join(name), b"keep").unwrap();
+        }
+        fs::create_dir(
+            root.path()
+                .join(format!("{BACKUP_ROOT_STAGE_PREFIX}{}.tar", "e".repeat(32))),
+        )
+        .unwrap();
+
+        assert_eq!(sweep_backup_root_orphans(root.path()).unwrap(), Some(2));
+        assert!(!root.path().join(plain).exists());
+        assert!(!root.path().join(encrypted).exists());
+        assert!(root
+            .path()
+            .join(format!("votport-backup-v2-1-{token}.tar"))
+            .exists());
+        assert!(root
+            .path()
+            .join(format!(".votport-backup-v2-1-{token}.tar.rollback"))
+            .exists());
+        assert!(root
+            .path()
+            .join(format!("{BACKUP_ROOT_STAGE_PREFIX}{}.tar", "e".repeat(32)))
+            .is_dir());
+        assert!(root.path().join(BACKUP_ROOT_LOCK).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_root_sweep_preserves_symlink_stage() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let token = "c".repeat(32);
+        let target = root.path().join("target");
+        fs::write(&target, b"target").unwrap();
+        let link = root
+            .path()
+            .join(format!("{BACKUP_ROOT_STAGE_PREFIX}{token}.tar"));
+        symlink(&target, &link).unwrap();
+
+        assert_eq!(sweep_backup_root_orphans(root.path()).unwrap(), Some(0));
+        assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_root_lock_rejects_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("outside");
+        fs::write(&target, b"target").unwrap();
+        let lock = root.path().join(BACKUP_ROOT_LOCK);
+        symlink(&target, &lock).unwrap();
+
+        assert!(try_lock_backup_root(root.path()).is_err());
+        assert!(fs::symlink_metadata(&lock)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), b"target");
+    }
+
+    #[test]
+    fn primary_boot_sweeps_the_configured_custom_backup_root() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        crate::paths::tighten_private_dir(&data_dir).unwrap();
+        let backup_root = data_dir.join("custom-backups");
+        fs::create_dir(&backup_root).unwrap();
+        crate::paths::tighten_private_dir(&backup_root).unwrap();
+        let app = crate::api::testing::build(root.path());
+        let config = BackupConfig {
+            local_path: Some(backup_root.to_string_lossy().into_owned()),
+            ..BackupConfig::default()
+        };
+        app.store
+            .put_settings(
+                "test",
+                &[(
+                    SETTING_KEY.to_owned(),
+                    crate::store::SettingWrite::Set(serde_json::to_string(&config).unwrap()),
+                )],
+            )
+            .unwrap();
+        let stored = app.store.setting(SETTING_KEY).unwrap();
+        assert_eq!(
+            parse_config(stored, &data_dir)
+                .unwrap()
+                .local_root(&data_dir)
+                .unwrap(),
+            backup_root
+        );
+        crate::app::release_data_lock(&app);
+        drop(app);
+
+        let stage = backup_root.join(format!("{BACKUP_ROOT_STAGE_PREFIX}{}.tar", "e".repeat(32)));
+        fs::write(&stage, b"orphan").unwrap();
+        let app = crate::api::testing::build(root.path());
+        assert!(!stage.exists());
+        crate::app::release_data_lock(&app);
+    }
+
+    #[test]
+    fn backup_root_sweep_waits_for_competing_process_fence() {
+        const ROOT_ENV: &str = "VOTPORT_TEST_BACKUP_ROOT_FENCE";
+        const READY_ENV: &str = "VOTPORT_TEST_BACKUP_ROOT_FENCE_READY";
+        const RELEASE_ENV: &str = "VOTPORT_TEST_BACKUP_ROOT_FENCE_RELEASE";
+        if let Some(root) = std::env::var_os(ROOT_ENV) {
+            let root = PathBuf::from(root);
+            let _lock = try_lock_backup_root(&root).unwrap().unwrap();
+            let stage = root.join(format!("{BACKUP_ROOT_STAGE_PREFIX}{}.tar", "d".repeat(32)));
+            fs::write(&stage, b"live writer stage").unwrap();
+            fs::write(std::env::var_os(READY_ENV).unwrap(), b"ready").unwrap();
+            let release = PathBuf::from(std::env::var_os(RELEASE_ENV).unwrap());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while !release.exists() {
+                if std::time::Instant::now() >= deadline {
+                    eprintln!("backup root fence child timed out waiting for release");
+                    std::process::exit(2);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("ready");
+        let release = root.path().join("release");
+        let mut child = ReapedChild::new(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backup::tests::backup_root_sweep_waits_for_competing_process_fence",
+                ])
+                .env(ROOT_ENV, root.path())
+                .env(READY_ENV, &ready)
+                .env(RELEASE_ENV, &release)
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "competing process did not acquire the backup root fence"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert_eq!(sweep_backup_root_orphans(root.path()).unwrap(), None);
+        let stage = root
+            .path()
+            .join(format!("{BACKUP_ROOT_STAGE_PREFIX}{}.tar", "d".repeat(32)));
+        assert!(stage.exists());
+        fs::write(&release, b"release").unwrap();
+        assert!(child
+            .wait_bounded(std::time::Duration::from_secs(15))
+            .unwrap()
+            .success());
+        assert_eq!(sweep_backup_root_orphans(root.path()).unwrap(), Some(1));
+        assert!(!stage.exists());
+    }
+
+    #[tokio::test]
+    async fn cancelled_backup_request_keeps_worker_fence_until_archive_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(root.path());
+        let backups = app.config.data_dir.join("backups");
+        let data_dir = app.config.data_dir.clone();
+        let (archive_started, archive_release) =
+            install_backup_pause(&data_dir, BackupPausePoint::Archive);
+
+        let request = tokio::spawn(run(
+            Arc::clone(&app),
+            BackupConfig {
+                encrypt: true,
+                ..BackupConfig::default()
+            },
+            BackupSecrets {
+                passphrase: Some("test passphrase".to_owned()),
+                ..BackupSecrets::default()
+            },
+        ));
+        tokio::task::spawn_blocking(move || {
+            archive_started.recv_timeout(std::time::Duration::from_secs(15))
+        })
+        .await
+        .unwrap()
+        .expect("archive worker did not reach the cancellation barrier");
+        let stage = fs::read_dir(&backups)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(backup_root_stage)
+            })
+            .expect("paused archive stage was not visible");
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(app.backup_lock.try_lock().is_err());
+        assert!(try_lock_backup_root(&backups).unwrap().is_none());
+        assert!(stage.exists());
+
+        let (encrypt_started, encrypt_release) =
+            install_backup_pause(&data_dir, BackupPausePoint::Encrypt);
+        archive_release.send(()).unwrap();
+        tokio::task::spawn_blocking(move || {
+            encrypt_started.recv_timeout(std::time::Duration::from_secs(15))
+        })
+        .await
+        .unwrap()
+        .expect("encryption worker did not reach the cancellation barrier");
+        let encrypted_stage = fs::read_dir(&backups)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(backup_root_stage)
+                    && path.extension().and_then(|ext| ext.to_str()) == Some("age")
+            })
+            .expect("paused encrypted stage was not visible");
+        assert!(app.backup_lock.try_lock().is_err());
+        assert!(try_lock_backup_root(&backups).unwrap().is_none());
+        assert!(encrypted_stage.exists());
+
+        encrypt_release.send(()).unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if app.backup_lock.try_lock().is_ok() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "backup worker did not finish"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!stage.exists());
+        assert!(!encrypted_stage.exists());
+        assert_eq!(local_files(&backups).unwrap().len(), 1);
+        let status = read_status(&app.config.data_dir).unwrap();
+        assert!(status.last_success_at.is_some());
+        assert_eq!(status.last_error, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_next_primary_boot_reaps_scratch_left_by_a_forced_exit() {
+        const CHILD_ROOT: &str = "VOTPORT_TEST_BACKUP_SCRATCH_EXIT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let data = PathBuf::from(root);
+            fs::create_dir_all(&data).unwrap();
+            let token = "e".repeat(32);
+            for name in [
+                format!(".votport-backup-db-{token}"),
+                format!(".votport-replica-{token}.tar"),
+                format!(".votport-restore-{token}.download"),
+                format!(".votport-restore-{token}.tar"),
+            ] {
+                fs::write(data.join(name), b"interrupted").unwrap();
+            }
+            fs::create_dir(data.join(format!(".votport-restore-stage-{token}"))).unwrap();
+            std::process::exit(0);
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "backup::tests::a_next_primary_boot_reaps_scratch_left_by_a_forced_exit",
+            ])
+            .env(CHILD_ROOT, &data)
+            .status()
+            .unwrap();
+        assert!(status.success(), "child exited with {status}");
+
+        let app = crate::api::testing::build(root.path());
+        let token = "e".repeat(32);
+        for name in [
+            format!(".votport-backup-db-{token}"),
+            format!(".votport-replica-{token}.tar"),
+            format!(".votport-restore-{token}.download"),
+            format!(".votport-restore-{token}.tar"),
+            format!(".votport-restore-stage-{token}"),
+        ] {
+            assert!(!data.join(name).exists());
+        }
+        crate::app::release_data_lock(&app);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_scratch_sweep_preserves_symlink_and_non_utf8_entries() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::Builder::new()
+            .prefix("votport-non-utf8-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let token = "d".repeat(32);
+        let target = root.path().join("target");
+        fs::write(&target, b"target").unwrap();
+        let link = root.path().join(format!(".votport-backup-db-{token}"));
+        symlink(&target, &link).unwrap();
+        let non_utf = std::ffi::OsString::from_vec(b".votport-replica-\xff.tar".to_vec());
+        let non_utf_path = root.path().join(&non_utf);
+        fs::write(&non_utf_path, b"foreign").unwrap();
+
+        assert_eq!(sweep_data_dir_orphans(root.path()).unwrap(), 0);
+        assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+        assert!(non_utf.to_str().is_none());
+        assert!(fs::symlink_metadata(non_utf_path).is_ok());
     }
 
     #[test]
@@ -3346,6 +4093,22 @@ mod tests {
         .await
         .expect("same scheduler must resume and complete a backup");
         assert_eq!(local_files(&archive_root).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn scheduler_exits_before_a_shutdown_tick_starts_backup() {
+        let root = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(root.path());
+        app.request_shutdown();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            scheduler_with_interval(Arc::clone(&app), std::time::Duration::from_millis(1)),
+        )
+        .await
+        .expect("scheduler must observe shutdown");
+        assert!(!root.path().join("backups").exists());
+        assert!(read_status(&app.config.data_dir).is_ok());
     }
 
     #[test]
