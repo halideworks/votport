@@ -2189,6 +2189,9 @@ mod push_preflight_tests {
     #[tokio::test]
     async fn disabled_push_is_not_advertised_or_admitted() {
         let directory = tempfile::tempdir().unwrap();
+        let assets = directory.path().join("web/assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::write(assets.join("fixture.js"), b"").unwrap();
         let application = testing::build(directory.path());
         application
             .store

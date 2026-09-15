@@ -380,7 +380,7 @@ pub(crate) mod testing {
             data_dir: directory.join("data"),
             receive_dir: directory.join("received"),
             outbound_dir: directory.join("outbound"),
-            web_root: std::path::PathBuf::from("../web"),
+            web_root: directory.join("web"),
             admin_password_hash: crate::auth::hash_password(TEST_PASSWORD).unwrap(),
             admin_token_tag: "test-tag".to_owned(),
 

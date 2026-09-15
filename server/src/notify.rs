@@ -1326,9 +1326,30 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn outbound_downloaded_ignores_nontransitions() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&hits);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                observed.fetch_add(1, Ordering::SeqCst);
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            }
+        });
         let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        test_destination_config(
+            &application,
+            "webhook",
+            format!("http://{address}/outbound"),
+        );
         outbound_downloaded(
-            testing::build(directory.path()),
+            application,
             test_grant(Vec::new()),
             OutboundDownloadResult {
                 first_download: false,
@@ -1336,6 +1357,10 @@ pub(crate) mod tests {
             },
         )
         .await;
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        server.abort();
+        let result = server.await;
+        assert!(result.is_err_and(|error| error.is_cancelled()));
     }
 
     #[tokio::test]

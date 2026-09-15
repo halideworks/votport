@@ -3816,12 +3816,42 @@ mod asset_cache_tests {
 
     #[tokio::test]
     async fn unstamped_assets_revalidate_and_stamped_assets_are_immutable() {
-        let plain = fetch("/assets/fonts.css").await;
+        let directory = tempfile::tempdir().unwrap();
+        let assets = directory.path().join("web/assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::write(assets.join("fonts.css"), b"body {}").unwrap();
+        std::fs::write(assets.join("favicon.png"), b"fixture").unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let plain = router(app.clone())
+            .oneshot(
+                Request::get("/assets/fonts.css")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(plain.status(), StatusCode::OK);
         assert_eq!(plain.headers()[header::CACHE_CONTROL], "no-cache");
         assert_eq!(plain.headers()[header::REFERRER_POLICY], "no-referrer");
+        assert_eq!(
+            plain
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .as_ref(),
+            b"body {}"
+        );
 
-        let stamped = fetch("/assets/favicon.png?v=0011223344556677").await;
+        let stamped = router(app.clone())
+            .oneshot(
+                Request::get("/assets/favicon.png?v=0011223344556677")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(stamped.status(), StatusCode::OK);
         assert_eq!(
             stamped.headers()[header::CACHE_CONTROL],
@@ -3829,7 +3859,14 @@ mod asset_cache_tests {
         );
         assert_eq!(stamped.headers()[header::REFERRER_POLICY], "no-referrer");
 
-        let missing = fetch("/assets/no-such-file.png?v=0011223344556677").await;
+        let missing = router(app.clone())
+            .oneshot(
+                Request::get("/assets/no-such-file.png?v=0011223344556677")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
         assert_eq!(missing.headers()[header::CACHE_CONTROL], "no-cache");
         assert_eq!(
@@ -3839,9 +3876,7 @@ mod asset_cache_tests {
         let body = missing.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), b"asset not found\n");
 
-        let directory = tempfile::tempdir().unwrap();
-        let application = crate::api::testing::build(directory.path());
-        let head = router(application)
+        let head = router(app)
             .oneshot(
                 Request::head("/assets/no-such-file.png")
                     .body(Body::empty())

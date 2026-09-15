@@ -1079,6 +1079,9 @@ mod status_cache_tests {
     #[tokio::test]
     async fn stuck_refresh_keeps_live_status_response_available() {
         let directory = tempfile::tempdir().unwrap();
+        let assets = directory.path().join("web/assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::write(assets.join("status-strip.js"), b"").unwrap();
         let application = crate::api::testing::build(directory.path());
         let cookie = test_admin_cookie(&application, &auth::AdminIdentity::local_admin());
         application.admin_status.state.lock().unwrap().running = true;
@@ -8279,6 +8282,18 @@ mod settings_api_tests {
     #[tokio::test]
     async fn admin_html_bootstraps_only_the_authenticated_navigation() {
         let directory = tempfile::tempdir().unwrap();
+        let web = directory.path().join("web");
+        std::fs::create_dir_all(&web).unwrap();
+        for (page, contents) in [
+            ("index.html", "<html><head></head><body></body></html>"),
+            (
+                "audit.html",
+                "<html><head></head><body><nav id=\"nav\" class=\"nav\"></nav></body></html>",
+            ),
+            ("request.html", "<html><head></head><body></body></html>"),
+        ] {
+            std::fs::write(web.join(page), contents).unwrap();
+        }
         let application = testing::build(directory.path());
         for key in ["team", "</script><script>oops</script>"] {
             application
