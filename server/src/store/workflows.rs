@@ -617,9 +617,14 @@ impl Store {
             _ => {}
         }
         let count: i64 = tx
-            .query_row("SELECT COUNT(*) FROM delivery_storage", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM delivery_storage AS storage
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM trade_routes AS route WHERE route.id=storage.id
+                 )",
+                [],
+                |row| row.get(0),
+            )
             .map_err(|e| e.to_string())?;
         if previous.is_none() && count >= 100 {
             return Err("storage connection limit reached".into());

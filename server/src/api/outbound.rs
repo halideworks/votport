@@ -109,6 +109,37 @@ const LIBRARY_SELECTION_BUDGET: LibraryEnumerationBudget = LibraryEnumerationBud
 static LIBRARY_MUTATION_LOCK: Mutex<()> = Mutex::new(());
 static LIBRARY_HASH_PERMITS: Semaphore = Semaphore::const_new(LIBRARY_HASH_CONCURRENCY);
 
+#[cfg(test)]
+struct LibraryMutationStall {
+    root: PathBuf,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static LIBRARY_MUTATION_STALL: Mutex<Option<LibraryMutationStall>> = Mutex::new(None);
+
+#[cfg(test)]
+fn wait_library_mutation_stall(root: &Path) {
+    let stall = {
+        let mut pending = LIBRARY_MUTATION_STALL
+            .lock()
+            .expect("library mutation stall poisoned");
+        if pending.as_ref().is_some_and(|stall| stall.root == root) {
+            pending.take()
+        } else {
+            None
+        }
+    };
+    if let Some(stall) = stall {
+        let _ = stall.entered.send(());
+        stall
+            .release
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("library mutation stall was not released");
+    }
+}
+
 pub(crate) static OUTBOUND_INTEGRITY_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
@@ -983,14 +1014,21 @@ pub async fn delete_outbound_file(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = admin::require_operator(&app, &headers)?;
     admin::require_admin_write(&headers, &identity)?;
-    let _operation = begin_outbound_operation(&app, &identity.tenant)?;
+    let operation = begin_outbound_operation_owned(&app, &identity.tenant)?;
     let relative_path = query.path.trim_matches('/').to_owned();
     let path = safe_library_path(&app, &identity.tenant, &relative_path)?;
-    let bytes = {
+    let worker = Arc::clone(&app);
+    let tenant = identity.tenant.clone();
+    let subject = identity.subject.clone();
+    let relative_path_for_worker = relative_path.clone();
+    let bytes = tokio::task::spawn_blocking(move || {
+        let _operation = operation;
         let _lock = LIBRARY_MUTATION_LOCK
             .lock()
             .expect("library mutation lock poisoned");
-        let root = library_root(&app, &identity.tenant);
+        let root = library_root(&worker, &tenant);
+        #[cfg(test)]
+        wait_library_mutation_stall(&root);
         if !library_components_safe(&root, &path) {
             return Err(ApiError::not_found());
         }
@@ -998,9 +1036,9 @@ pub async fn delete_outbound_file(
         if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
             return Err(ApiError::not_found());
         }
-        if app
+        if worker
             .store
-            .has_active_library_grant(&identity.tenant, &relative_path, now_unix())
+            .has_active_library_grant(&tenant, &relative_path_for_worker, now_unix())
             .map_err(super::store_unavailable)?
         {
             return Err(ApiError::new(
@@ -1010,15 +1048,18 @@ pub async fn delete_outbound_file(
         }
         std::fs::remove_file(&path)
             .map_err(|_| ApiError::internal("delete outbound file failed"))?;
-        metadata.len()
-    };
-    app.store.audit(
-        &identity.tenant,
-        &identity.subject,
-        "outbound_file_deleted",
-        &relative_path,
-        &json!({ "path": relative_path, "bytes": bytes }),
-    );
+        drop(_lock);
+        worker.store.audit(
+            &tenant,
+            &subject,
+            "outbound_file_deleted",
+            &relative_path_for_worker,
+            &json!({ "path": relative_path_for_worker, "bytes": metadata.len() }),
+        );
+        Ok::<_, ApiError>(metadata.len())
+    })
+    .await
+    .map_err(|_| ApiError::internal("delete outbound file failed"))??;
     Ok(Json(json!({ "path": query.path, "bytes": bytes })))
 }
 
@@ -1558,7 +1599,7 @@ pub async fn list_outbound_grants(
     Ok(Json(json!({
         "grants": grants
             .into_iter()
-            .map(|(grant, file_count)| public_grant_with_file_count(grant, file_count))
+            .map(|(grant, file_count)| public_grant_with_file_count(&grant, file_count))
             .collect::<Vec<_>>(),
         "total": total,
         "offset": offset,
@@ -1938,7 +1979,7 @@ pub async fn create_outbound_grant(
     let base = admin::base_url(&app, &headers);
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
-        Json(json!({ "grant": public_grant(grant), "url": format!("{base}/s/{token}") })),
+        Json(json!({ "grant": public_grant(&grant), "url": format!("{base}/s/{token}") })),
     )
         .into_response())
 }
@@ -2122,7 +2163,7 @@ async fn create_library_grant(
     max_files: usize,
     options: GrantOptions,
 ) -> ApiResult<Response> {
-    let _operation = begin_outbound_operation(app, &identity.tenant)?;
+    let operation = begin_outbound_operation_owned(app, &identity.tenant)?;
     if requested.is_empty() || requested.len() > max_files {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -2376,33 +2417,55 @@ async fn create_library_grant(
             "label must be 1..=200 characters",
         ));
     }
-    {
+    let public = public_grant(&grant);
+    let grant_id = grant.id.clone();
+    let grant_file_count = grant.files.len();
+    let operation_id = options
+        .automation
+        .as_ref()
+        .map(|(operation, _)| operation.operation_id.clone());
+    let automation = options.automation;
+    let workflow = options.workflow;
+    let worker = Arc::clone(app);
+    let token_for_worker = token.clone();
+    let tenant = identity.tenant.clone();
+    let subject = identity.subject.clone();
+    let audit_detail = json!({ "files": grant_file_count, "operation_id": operation_id });
+    tokio::task::spawn_blocking(move || {
+        let _operation = operation;
         let _lock = LIBRARY_MUTATION_LOCK
             .lock()
             .expect("library mutation lock poisoned");
+        #[cfg(test)]
+        wait_library_mutation_stall(&root);
         if !library_sources_match(&root, &revalidation, &grant.files) {
             return Err(ApiError::not_found());
         }
-        app.store
+        worker
+            .store
             .insert_workflow_grant(
-                grant.clone(),
-                options.automation.as_ref().map(|(op, _)| op),
-                options.workflow.as_ref(),
-                Some(&token),
+                grant,
+                automation.as_ref().map(|(operation, _)| operation),
+                workflow.as_ref(),
+                Some(&token_for_worker),
             )
             .map_err(super::store_unavailable)?;
-    }
-    app.store.audit(
-        &identity.tenant,
-        &identity.subject,
-        "outbound_grant_created",
-        &grant.id,
-        &json!({ "files": grant.files.len(), "operation_id": options.automation.as_ref().map(|(op, _)| &op.operation_id) }),
-    );
+        drop(_lock);
+        worker.store.audit(
+            &tenant,
+            &subject,
+            "outbound_grant_created",
+            &grant_id,
+            &audit_detail,
+        );
+        Ok::<_, ApiError>(())
+    })
+    .await
+    .map_err(|_| ApiError::internal("create outbound grant failed"))??;
     let base = admin::base_url(app, headers);
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
-        Json(json!({ "grant": public_grant(grant), "url": format!("{base}/s/{token}"), "operation_id": options.automation.as_ref().map(|(op, _)| &op.operation_id) })),
+        Json(json!({ "grant": public, "url": format!("{base}/s/{token}"), "operation_id": operation_id })),
     )
         .into_response())
 }
@@ -4762,7 +4825,7 @@ pub(super) fn attachment_filename(name: &str) -> ApiResult<HeaderValue> {
     }
     HeaderValue::try_from(value).map_err(|_| ApiError::internal("download filename invalid"))
 }
-fn public_grant(grant: OutboundGrant) -> serde_json::Value {
+fn public_grant(grant: &OutboundGrant) -> serde_json::Value {
     let file_count = if grant.files.is_empty() {
         1
     } else {
@@ -4771,7 +4834,7 @@ fn public_grant(grant: OutboundGrant) -> serde_json::Value {
     public_grant_with_file_count(grant, file_count)
 }
 
-fn public_grant_with_file_count(grant: OutboundGrant, file_count: usize) -> serde_json::Value {
+fn public_grant_with_file_count(grant: &OutboundGrant, file_count: usize) -> serde_json::Value {
     let files_truncated = file_count > OUTBOUND_GRANT_PREVIEW_FILES
         || (file_count > 1 && grant.files.len() < file_count);
     let files = if files_truncated {
@@ -5054,6 +5117,39 @@ mod tests {
         format!("votport_admin={token}")
     }
 
+    fn named_admin_cookie(app: &App, tenant: &str) -> String {
+        let identity = auth::AdminIdentity {
+            subject: "local".to_owned(),
+            tenant: tenant.to_owned(),
+            role: "admin".to_owned(),
+            grants: vec![auth::TenantGrant {
+                incarnation: None,
+                tenant: tenant.to_owned(),
+                role: "admin".to_owned(),
+            }],
+            credential_version: 1,
+        };
+        let token = auth::issue_admin_token(&app.secret, &identity, &app.config.admin_token_tag);
+        format!("votport_admin={token}")
+    }
+
+    fn arm_library_mutation_stall(
+        root: &Path,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        assert!(LIBRARY_MUTATION_STALL
+            .lock()
+            .expect("library mutation stall poisoned")
+            .replace(LibraryMutationStall {
+                root: root.to_owned(),
+                entered: entered_tx,
+                release: release_rx,
+            })
+            .is_none());
+        (entered_rx, release_tx)
+    }
+
     #[test]
     fn outbound_operation_refusal_is_retryable_during_tenant_purge() {
         let directory = tempfile::tempdir().unwrap();
@@ -5068,6 +5164,99 @@ mod tests {
         assert_eq!(error.retry_after_seconds, Some(1));
         assert_eq!(error.code, "unavailable");
         drop(operation);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_library_mutation_keeps_admission_until_worker_finishes() {
+        use std::time::{Duration, Instant};
+
+        for deleting in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let app = crate::api::testing::build(directory.path());
+            app.store
+                .insert_tenant(crate::store::tests::test_tenant("acme"))
+                .unwrap();
+            let root = library_root(&app, "acme");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("held.bin"), b"library fixture").unwrap();
+            let cookie = named_admin_cookie(&app, "acme");
+
+            let (entered, release) = arm_library_mutation_stall(&root);
+            let (cancel_watchdog, watchdog_wait) = std::sync::mpsc::channel();
+            let watchdog_release = release.clone();
+            let watchdog = std::thread::spawn(move || {
+                if watchdog_wait.recv_timeout(Duration::from_secs(5)).is_err() {
+                    let _ = watchdog_release.send(());
+                }
+            });
+            let request = if deleting {
+                Request::delete("/api/admin/outbound-files?path=held.bin")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .body(Body::empty())
+                    .unwrap()
+            } else {
+                Request::post("/api/admin/outbound-grants")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"paths":["held.bin"],"expires_days":1}"#))
+                    .unwrap()
+            };
+            let serving = tokio::spawn(crate::app::router(app.clone()).oneshot(request));
+
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if entered.try_recv().is_ok() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("library mutation worker did not enter its critical section");
+            let heartbeat_started = Instant::now();
+            let heartbeat = tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Instant::now()
+            });
+            let heartbeat_at = heartbeat.await.unwrap();
+            assert!(
+                !serving.is_finished(),
+                "mutation must still be held by the barrier"
+            );
+            assert!(
+                heartbeat_at.duration_since(heartbeat_started) < Duration::from_secs(1),
+                "the runtime stalled in the library mutation critical section"
+            );
+            serving.abort();
+            assert!(matches!(
+                serving.await,
+                Err(error) if error.is_cancelled()
+            ));
+            assert_eq!(app.sessions.active_outbound_for_tenant("acme"), 1);
+
+            release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while app.sessions.active_outbound_for_tenant("acme") != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancelled mutation did not release admission after worker completion");
+            let _ = cancel_watchdog.send(());
+            watchdog.join().unwrap();
+            let grants = app.store.outbound_grants("acme").unwrap();
+            assert_eq!(grants.len(), usize::from(!deleting));
+            assert_eq!(root.join("held.bin").exists(), !deleting);
+            let audit = app.store.audit_recent(Some("acme"), 0, 10).unwrap();
+            let event = if deleting {
+                "outbound_file_deleted"
+            } else {
+                "outbound_grant_created"
+            };
+            assert_eq!(audit.iter().filter(|row| row.event == event).count(), 1);
+        }
     }
 
     async fn body(response: Response) -> serde_json::Value {
