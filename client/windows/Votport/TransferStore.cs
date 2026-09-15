@@ -152,7 +152,7 @@ public sealed class TransferItem : INotifyPropertyChanged
                 retained.Phase,
                 retained.Transport,
                 retained.FilesReset,
-                new List<FileView>(),
+                Array.Empty<FileView>(),
                 retained.MovedBytes,
                 retained.TotalBytes,
                 retained.RateBytesPerSecond,

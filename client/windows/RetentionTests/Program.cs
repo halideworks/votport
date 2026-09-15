@@ -13,7 +13,7 @@ static TransferView View(IReadOnlyList<FileView> files, Phase phase = Phase.Done
     phase,
     Transport.Fetch,
     true,
-    files.ToList(),
+    files.ToArray(),
     (ulong)files.Count,
     (ulong)files.Count,
     null,
@@ -59,14 +59,14 @@ var terminal = new TransferItem
 var files = new[] { File(0, "a"), File(1, "b"), File(2, "c"), File(3, "d") };
 var before = View(files, Phase.Failed);
 SetView(terminal, before);
-Check(terminal.Files.Count == 4 && Index(terminal).Count == 4 && GetView(terminal).Files.Count == 4,
+Check(terminal.Files.Count == 4 && Index(terminal).Count == 4 && GetView(terminal).Files.Length == 4,
     "production View setter did not populate all file owners");
 var emptyIndexCapacity = new Dictionary<ulong, FileRow>(1).EnsureCapacity(0);
 Check(Index(terminal).EnsureCapacity(0) > emptyIndexCapacity,
     "fixture must allocate more than an empty index");
 Compact(terminal, new[] { @"C:\received\a", @"C:\received\b", @"C:\received\c", @"C:\received\d" });
 var after = GetView(terminal);
-Check(terminal.Files.Count == 0 && after.Files.Count == 0 && Index(terminal).Count == 0,
+Check(terminal.Files.Count == 0 && after.Files.Length == 0 && Index(terminal).Count == 0,
     "terminal compaction did not release rendered rows, view files, and index");
 Check(Index(terminal).EnsureCapacity(0) <= emptyIndexCapacity,
     "terminal compaction retained its per-file index allocation");
@@ -100,7 +100,7 @@ var activeBefore = View(files);
 SetView(active, activeBefore);
 Compact(active, new[] { @"C:\active\a" });
 var activeAfter = GetView(active);
-Check(active.Files.Count == 4 && activeAfter.Files.Count == 4 && Index(active).Count == 4
+Check(active.Files.Count == 4 && activeAfter.Files.Length == 4 && Index(active).Count == 4
     && activeAfter.Headline == activeBefore.Headline && activeAfter.Status == activeBefore.Status,
     "active compaction changed rendered rows or aggregate view");
 
@@ -115,7 +115,7 @@ var pausedBefore = View(files, Phase.Paused);
 SetView(paused, pausedBefore);
 Compact(paused, new[] { @"C:\paused\a" });
 var pausedAfter = GetView(paused);
-Check(paused.Files.Count == 4 && pausedAfter.Files.Count == 4 && Index(paused).Count == 4
+Check(paused.Files.Count == 4 && pausedAfter.Files.Length == 4 && Index(paused).Count == 4
     && pausedAfter.Phase == pausedBefore.Phase && pausedAfter.Headline == pausedBefore.Headline
     && pausedAfter.Detail == pausedBefore.Detail && pausedAfter.Status == pausedBefore.Status,
     "journalled compaction changed rendered rows or aggregate view");
@@ -128,7 +128,7 @@ store.ClearFinished();
 Check(store.Items.Count == 2 && store.Items.Contains(active) && store.Items.Contains(paused)
     && !store.Items.Contains(terminal),
     "Clear finished did not preserve active and journalled cards");
-Check(paused.Files.Count == 4 && GetView(paused).Files.Count == 4,
+Check(paused.Files.Count == 4 && GetView(paused).Files.Length == 4,
     "journalled card lost its file rows");
 Check(paused.CanResume, "journalled card is not resumable");
 
