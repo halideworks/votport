@@ -82,13 +82,23 @@ try {
   await page.click('#wp-add-recipient');
   await page.locator('#wp-recipients input[type=email]').fill('client@example.com');
   await page.locator('#wp-recipients input[data-key=holder]').fill('a'.repeat(64));
+  assert.equal(await page.getByRole('button', { name: 'Remove team member: producer@example.com', exact: true }).count(), 1);
+  assert.equal(await page.getByRole('button', { name: 'Remove required field: Client', exact: true }).count(), 1);
+  assert.equal(await page.getByRole('button', { name: 'Remove recipient: client@example.com', exact: true }).count(), 1);
   await page.check('#wp-sequence-enabled'); await page.check('#wp-media-enabled');
   await layout('project-editor');
   await page.uncheck('#wp-sequence-enabled'); await page.uncheck('#wp-media-enabled');
-  await page.getByRole('button', { name: 'Remove recipient', exact: true }).click();
+  await page.getByRole('button', { name: /^Remove recipient/ }).click();
   await saveProject();
   assert.equal((await api('workflows/projects')).projects.find((p) => p.id === id).members['producer@example.com'], 'approver');
-  await page.click('#workflow-new'); await page.selectOption('#workflow-project', id);
+  await page.click('#workflow-new');
+  await page.locator('#workflow-create').waitFor();
+  const recipientHelp = page.getByRole('button', { name: /Help about enrolled recipients/ });
+  assert.equal(await recipientHelp.count(), 1, 'New delivery keeps the enrolled recipient help');
+  await page.selectOption('#workflow-project', '');
+  assert.equal(await recipientHelp.count(), 1, 'Changing to no project keeps the enrolled recipient help');
+  await page.selectOption('#workflow-project', id);
+  assert.equal(await recipientHelp.count(), 1, 'Changing project keeps the enrolled recipient help');
   await page.fill('#workflow-label', 'Final master'); await page.locator('#workflow-metadata input').fill('Example studio');
   await layout('delivery-editor');
   let issued;
@@ -395,7 +405,7 @@ try {
 
   await page.goto(`${base}/receive?search=${incoming.id}#link-${incoming.id}`);
   const actionCard = page.locator(`#link-${incoming.id}`);
-  await actionCard.getByRole('button', { name: 'Deactivate', exact: true }).focus();
+  await actionCard.getByRole('button', { name: /^Deactivate receive link: / }).focus();
   await page.keyboard.press('Enter');
   const undo = page.locator('#toast-stack').getByRole('button', { name: /^Undo / });
   await undo.waitFor();
@@ -407,10 +417,10 @@ try {
   assert.ok(await page.locator('#links-action-status').evaluate((node) => node === document.activeElement), 'Undo returns focus to the request status');
   await page.route('**/api/admin/links?*', async (route) => {
     const response = await route.fetch();
-    await actionCard.getByRole('button', { name: 'Copy', exact: true }).focus();
+    await actionCard.getByRole('button', { name: /^Copy receive link: / }).focus();
     await route.fulfill({ response });
   }, { times: 1 });
-  await actionCard.getByRole('button', { name: 'Deactivate', exact: true }).focus();
+  await actionCard.getByRole('button', { name: /^Deactivate receive link: / }).focus();
   await page.keyboard.press('Enter'); await undo.waitFor();
   assert.ok(await page.locator('#links-action-status').evaluate((node) => node === document.activeElement), 'Undo must not steal the fallback of a newly focused row control');
   await undo.focus(); await page.keyboard.press('Enter'); await undo.waitFor({ state: 'detached' });
@@ -421,7 +431,7 @@ try {
       if (moveFocus) await page.locator('#links-query').focus();
       await route.fulfill({ status: 503, json: { error: 'Lost action response fixture' } });
     }, { times: 1 });
-    await actionCard.getByRole('button', { name: 'Deactivate', exact: true }).focus();
+    await actionCard.getByRole('button', { name: /^Deactivate receive link: / }).focus();
     await page.keyboard.press('Enter'); await undo.waitFor();
     await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide')));
     await page.getByRole('dialog', { name: 'Something went wrong', exact: true }).waitFor();
@@ -432,11 +442,11 @@ try {
     await api(`admin/links/${incoming.id}`, { active: true });
     await page.reload();
   }
-  await actionCard.getByRole('button', { name: 'Legal hold', exact: true }).focus();
+  await actionCard.getByRole('button', { name: /^Legal hold: / }).focus();
   await page.keyboard.press('Enter');
   await page.getByText('Legal hold set.', { exact: true }).waitFor();
   assert.ok(await page.locator('#links-action-status').evaluate((node) => node === document.activeElement), 'Immediate row replacement retains keyboard position');
-  await actionCard.getByRole('button', { name: 'Release hold', exact: true }).focus();
+  await actionCard.getByRole('button', { name: /^Release hold: / }).focus();
   await page.keyboard.press('Enter'); await undo.waitFor();
   assert.ok(await undo.evaluate((node) => node === document.activeElement));
   await page.goto(`${base}/storage`);
@@ -450,7 +460,7 @@ try {
     await page.locator('#links-query').focus();
     await route.fulfill({ response });
   }, { times: 1 });
-  await actionCard.getByRole('button', { name: 'Deactivate', exact: true }).focus();
+  await actionCard.getByRole('button', { name: /^Deactivate receive link: / }).focus();
   await page.keyboard.press('Enter'); await undo.waitFor();
   assert.ok(await page.locator('#links-query').evaluate((node) => node === document.activeElement), 'A delayed refresh must not steal newly moved focus');
   await undo.hover(); await undo.focus(); await page.locator('#links-query').focus();
@@ -668,7 +678,7 @@ try {
   releaseOld(); await page.waitForLoadState('networkidle');
   assert.equal(await editor.locator('input[data-metadata]').inputValue(), 'Preserved by manual refresh', 'An older refresh cannot roll back a completed save');
   await editor.locator('input[data-metadata]').fill('Discard with request');
-  await card.getByRole('button', { name: 'Delete', exact: true }).click();
+  await card.getByRole('button', { name: /^Delete receive link: / }).click();
   const extraDialogs = []; const onExtra = (dialog) => extraDialogs.push(dialog.message()); page.on('dialog', onExtra);
   await page.locator('#confirm-ok').click(); await card.waitFor({ state: 'detached' }); await page.waitForLoadState('networkidle');
   page.off('dialog', onExtra); assert.deepEqual(extraDialogs, [], 'Confirmed deletion removes the request draft without another discard prompt');

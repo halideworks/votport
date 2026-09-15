@@ -64,6 +64,12 @@ connection does not prevent the other selected destinations from receiving their
 messages. These notifications do not replace the signed, retrying delivery-event
 webhook under Workflows.
 
+An HTTP 429 response receives at most one retry. Votport waits for a valid
+`Retry-After` delay of at most three seconds, including fractional seconds or an
+HTTP date. A missing or malformed value uses a one-second delay; negative,
+non-finite, or longer delays fail without an early retry. Other HTTP statuses and
+ambiguous transport failures are not retried.
+
 Long text summaries end with an ellipsis at the destination's limit. [Pushover](https://pushover.net/api#limits)
 allows 250 characters in the title and 1,024 in the message; [ntfy](https://docs.ntfy.sh/publish/#limitations) allows 1 KiB
 in the title and 4 KiB in the message, measured in UTF-8 bytes. ntfy titles
@@ -73,12 +79,18 @@ its file list is shortened. JSON webhook records keep their structured fields.
 Upload completion records include `link_id` and the persisted `completed_at`;
 outbound download records include `event_at`. Both times are Unix seconds.
 Trade route records include `detail` when an error or receipt identity is available.
-Slack, Teams, Discord and Google Chat summaries use character limits of 150 for
-titles and 1,500 for bodies, preserving Unicode characters within those limits.
+Slack summaries use native plain-text fields. Teams, Discord and Google Chat
+escape their documented Markdown fields so filenames remain literal. Summaries
+use character limits of 150 for titles and 1,500 for bodies, preserving Unicode
+characters within those limits; Discord keeps the encoded message within its
+2,000-character content limit.
 
 Email uses a UTF-8 plain-text MIME part. Votport bounds email summaries to
 64 KiB before MIME encoding and subjects to 250 characters; these are application
-bounds, not SMTP protocol limits. Individual mail providers can impose other
+bounds, not SMTP protocol limits. Each configured recipient gets a separate
+message with only that address in its `To` header. A relay rejection for one
+recipient does not stop attempts to the others, and the notification succeeds
+when at least one recipient accepts. Individual mail providers can impose other
 limits.
 
 ## Named-destination API

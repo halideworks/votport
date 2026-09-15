@@ -11,7 +11,8 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
-use lettre::message::SinglePart;
+use futures_util::{stream, StreamExt};
+use lettre::message::{Mailbox, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::client::{Tls, TlsParameters};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
@@ -317,9 +318,68 @@ fn clipped_chars(text: &str, limit: usize) -> Cow<'_, str> {
     }
 }
 
+const DISCORD_CONTENT_LIMIT: usize = 2000;
+
+fn escape_chat_markdown(text: &str, escape_ampersands: bool) -> String {
+    text.chars().fold(
+        String::with_capacity(text.len()),
+        |mut escaped, character| {
+            if (escape_ampersands && character == '&')
+                || matches!(
+                    character,
+                    '\\' | '*'
+                        | '_'
+                        | '~'
+                        | '`'
+                        | '['
+                        | ']'
+                        | '('
+                        | ')'
+                        | '<'
+                        | '>'
+                        | '#'
+                        | '+'
+                        | '-'
+                        | '.'
+                        | '!'
+                        | '|'
+                )
+            {
+                escaped.push('\\');
+            }
+            escaped.push(character);
+            escaped
+        },
+    )
+}
+
+fn clip_escaped(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_owned();
+    }
+    let mut clipped = String::new();
+    let mut length = 0;
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        let escaped_character = character == '\\' && characters.peek().is_some();
+        let token_length = if escaped_character { 2 } else { 1 };
+        if length + token_length + 1 > limit {
+            break;
+        }
+        clipped.push(character);
+        length += 1;
+        if escaped_character {
+            clipped.push(characters.next().expect("peeked escaped character"));
+            length += 1;
+        }
+    }
+    clipped.push('…');
+    clipped
+}
+
 fn chat_payload(channel: &str, title: &str, body: &str) -> serde_json::Value {
-    let title = clipped_chars(title, 150);
-    let body = clipped_chars(body, 1500);
+    let title = clipped_chars(title, 150).into_owned();
+    let body = clipped_chars(body, 1500).into_owned();
     let text = format!("{title}\n{body}");
     match channel {
         "slack" => json!({
@@ -330,18 +390,36 @@ fn chat_payload(channel: &str, title: &str, body: &str) -> serde_json::Value {
                 {"type":"section", "text":{"type":"plain_text", "text":body}}
             ]
         }),
-        "teams" => json!({
-            "type":"message", "text":text,
-            "attachments":[{"contentType":"application/vnd.microsoft.card.adaptive", "content":{
-                "$schema":"http://adaptivecards.io/schemas/adaptive-card.json", "type":"AdaptiveCard", "version":"1.2",
-                "body":[
-                    {"type":"TextBlock", "text":title, "weight":"Bolder", "wrap":true},
-                    {"type":"TextBlock", "text":body, "wrap":true}
-                ]
-            }}]
-        }),
-        "google_chat" => json!({"text": text.replace('<', "‹").replace('>', "›")}),
-        "discord" => json!({"content":text, "allowed_mentions":{"parse":[]}, "flags":4}),
+        "teams" => {
+            let markdown_title = escape_chat_markdown(&title, false);
+            let markdown_body = escape_chat_markdown(&body, false);
+            let markdown_text = format!("{markdown_title}\n{markdown_body}");
+            json!({
+                "type":"message", "text":markdown_text,
+                "attachments":[{"contentType":"application/vnd.microsoft.card.adaptive", "content":{
+                    "$schema":"http://adaptivecards.io/schemas/adaptive-card.json", "type":"AdaptiveCard", "version":"1.2",
+                    "body":[
+                        {"type":"TextBlock", "text":markdown_title, "weight":"Bolder", "wrap":true},
+                        {"type":"TextBlock", "text":markdown_body, "wrap":true}
+                    ]
+                }}]
+            })
+        }
+        "google_chat" => {
+            let markdown_title = escape_chat_markdown(&title, true);
+            let markdown_body = escape_chat_markdown(&body, true);
+            json!({
+                "text": format!("{markdown_title}\n{markdown_body}"),
+                "markupSyntax": "MARKUP_SYNTAX_MARKDOWN"
+            })
+        }
+        "discord" => {
+            let markdown_text = escape_chat_markdown(&text, false);
+            json!({
+                "content": clip_escaped(&markdown_text, DISCORD_CONTENT_LIMIT),
+                "allowed_mentions":{"parse":[]}, "flags":4
+            })
+        }
         _ => unreachable!("known chat channel"),
     }
 }
@@ -444,29 +522,19 @@ async fn send_smtp(
     transfer_id: Option<&str>,
 ) -> Result<(), &'static str> {
     let prepared = (|| -> Result<_, String> {
-        let mut builder = Message::builder()
-            .from(
-                smtp.from
-                    .parse()
-                    .map_err(|error| format!("smtp from: {error}"))?,
-            )
-            .subject(clipped_chars(title, 250).into_owned());
-        for recipient in recipients {
-            builder = builder.to(recipient
-                .parse()
-                .map_err(|error| format!("smtp to: {error}"))?);
-        }
-        // Application summary bound before MIME encoding, not an SMTP size limit.
-        let message = builder
-            .singlepart(SinglePart::plain(
-                clipped_bytes(body, 64 * 1024).into_owned(),
-            ))
-            .map_err(|error| format!("smtp message: {error}"))?;
-
-        Ok((message, smtp_tls(smtp)?))
+        let from: Mailbox = smtp
+            .from
+            .parse()
+            .map_err(|error| format!("smtp from: {error}"))?;
+        let subject = clipped_chars(title, 250).into_owned();
+        let body = clipped_bytes(body, 64 * 1024).into_owned();
+        let tls = smtp_tls(smtp)?;
+        Ok((from, subject, body, tls))
     })();
-    let (message, tls) = log_smtp_failure(event, transfer_id, prepared)
+    let (from, subject, body, tls) = log_smtp_failure(event, transfer_id, prepared)
         .map_err(|_| "SMTP settings could not be used. Ask the platform administrator to check the sender and TLS settings.")?;
+    let event = event.to_owned();
+    let transfer_id = transfer_id.map(str::to_owned);
     let mut transport = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&smtp.host)
         .port(smtp.port)
         .tls(tls)
@@ -477,21 +545,84 @@ async fn send_smtp(
             smtp.password.clone().unwrap_or_default(),
         ));
     }
-    log_smtp_failure(event, transfer_id, transport.build().send(message).await)
-        .map(|_| ())
-        .map_err(|error| {
-            if error.is_transient() {
-                "SMTP relay temporarily refused the request. Try again later."
-            } else if error.is_permanent() {
-                "SMTP relay rejected the request. Check the recipients and ask the platform administrator to check relay policy and credentials."
-            } else if error.is_client() {
-                "SMTP settings are incompatible with the relay. Ask the platform administrator to check TLS and authentication settings."
-            } else if error.is_response() {
-                "SMTP relay returned an invalid response. Ask the platform administrator to check relay configuration."
-            } else {
-                "SMTP connection failed. Ask the platform administrator to check the host, port and TLS settings."
+    let transport = transport.build();
+    let recipients = recipients.to_owned();
+    let results = stream::iter(recipients)
+        .map(|recipient| {
+            let from = from.clone();
+            let subject = subject.clone();
+            let body = body.clone();
+            let transport = transport.clone();
+            let event = event.clone();
+            let transfer_id = transfer_id.clone();
+            async move {
+                let to = match recipient.parse() {
+                    Ok(to) => to,
+                    Err(error) => {
+                        let _ = log_smtp_failure(
+                            &event,
+                            transfer_id.as_deref(),
+                            Err::<(), _>(format!("smtp to: {error}")),
+                        );
+                        return (false, None);
+                    }
+                };
+                let message = match Message::builder()
+                    .from(from)
+                    .to(to)
+                    .subject(subject)
+                    .singlepart(SinglePart::plain(body))
+                {
+                    Ok(message) => message,
+                    Err(error) => {
+                        let _ =
+                            log_smtp_failure(&event, transfer_id.as_deref(), Err::<(), _>(error));
+                        return (false, None);
+                    }
+                };
+                match log_smtp_failure(
+                    &event,
+                    transfer_id.as_deref(),
+                    transport.send(message).await,
+                ) {
+                    Ok(_) => (true, None),
+                    Err(error) => (false, Some(smtp_failure_reason(&error))),
+                }
             }
         })
+        .buffer_unordered(8);
+    futures_util::pin_mut!(results);
+    let mut accepted = false;
+    let mut failure = None;
+    while let Some((delivered, reason)) = results.next().await {
+        if delivered {
+            accepted = true;
+        }
+        if let Some(reason) = reason {
+            failure.get_or_insert(reason);
+        }
+    }
+    if accepted {
+        Ok(())
+    } else {
+        Err(failure.unwrap_or(
+            "SMTP settings could not be used. Ask the platform administrator to check the sender and TLS settings.",
+        ))
+    }
+}
+
+fn smtp_failure_reason(error: &lettre::transport::smtp::Error) -> &'static str {
+    if error.is_transient() {
+        "SMTP relay temporarily refused the request. Try again later."
+    } else if error.is_permanent() {
+        "SMTP relay rejected the request. Check the recipients and ask the platform administrator to check relay policy and credentials."
+    } else if error.is_client() {
+        "SMTP settings are incompatible with the relay. Ask the platform administrator to check TLS and authentication settings."
+    } else if error.is_response() {
+        "SMTP relay returned an invalid response. Ask the platform administrator to check relay configuration."
+    } else {
+        "SMTP connection failed. Ask the platform administrator to check the host, port and TLS settings."
+    }
 }
 
 fn smtp_tls(smtp: &ResolvedSmtp) -> Result<Tls, String> {
@@ -898,30 +1029,55 @@ pub(crate) mod tests {
 
     #[test]
     fn chat_messages_bound_unicode_and_disable_mentions() {
-        let title = "<!channel> & <@U123>";
-        let body = format!("<users/all> @everyone {}", "🎬".repeat(2000));
-        let slack = chat_payload("slack", title, &body);
+        let title = r#"report_[draft]* `v1` ~ (a) <x> #heading - item + one. ! &"#;
+        let body =
+            r#"<users/all> @everyone file_[final]* `v2` ~ <angle> #heading - item + one. ! &"#;
+        let text = format!("{title}\n{body}");
+        let escaped_title =
+            r#"report\_\[draft\]\* \`v1\` \~ \(a\) \<x\> \#heading \- item \+ one\. \! &"#;
+        let escaped_body = r#"\<users/all\> @everyone file\_\[final\]\* \`v2\` \~ \<angle\> \#heading \- item \+ one\. \! &"#;
+        let escaped = format!("{escaped_title}\n{escaped_body}");
+        let google_escaped_title =
+            r#"report\_\[draft\]\* \`v1\` \~ \(a\) \<x\> \#heading \- item \+ one\. \! \&"#;
+        let google_escaped_body = r#"\<users/all\> @everyone file\_\[final\]\* \`v2\` \~ \<angle\> \#heading \- item \+ one\. \! \&"#;
+        let google_escaped = format!("{google_escaped_title}\n{google_escaped_body}");
+        let slack_text = text
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        let slack = chat_payload("slack", title, body);
         assert_eq!(slack["blocks"][0]["text"]["type"], "plain_text");
         assert_eq!(slack["blocks"][1]["text"]["type"], "plain_text");
-        assert!(!slack["text"].as_str().unwrap().contains("<!channel>"));
+        assert_eq!(slack["text"], slack_text.as_str());
+        assert_eq!(slack["blocks"][0]["text"]["text"], title);
+        assert_eq!(slack["blocks"][1]["text"]["text"], body);
         assert_eq!(slack["mrkdwn"], false);
         assert_eq!(slack["unfurl_links"], false);
-        let teams = chat_payload("teams", title, &body);
+        let teams = chat_payload("teams", title, body);
         let card = &teams["attachments"][0];
         assert_eq!(teams["type"], "message");
+        assert_eq!(teams["text"], escaped.as_str());
         assert_eq!(
             card["contentType"],
             "application/vnd.microsoft.card.adaptive"
         );
         assert_eq!(card["content"]["type"], "AdaptiveCard");
         assert_eq!(card["content"]["body"][1]["wrap"], true);
-        let google = chat_payload("google_chat", title, &body);
-        assert!(!google["text"].as_str().unwrap().contains("<users/all>"));
-        let discord = chat_payload("discord", title, &body);
+        assert_eq!(card["content"]["body"][0]["text"], escaped_title);
+        assert_eq!(card["content"]["body"][1]["text"], escaped_body);
+        let google = chat_payload("google_chat", title, body);
+        assert_eq!(google["text"], google_escaped.as_str());
+        assert_eq!(google["markupSyntax"], "MARKUP_SYNTAX_MARKDOWN");
+        let entity_google = chat_payload("google_chat", "literal&amp;.mov", "&#65;.mov");
+        assert_eq!(
+            entity_google["text"],
+            r#"literal\&amp;\.mov
+\&\#65;\.mov"#
+        );
+        let discord = chat_payload("discord", title, body);
         assert_eq!(discord["allowed_mentions"]["parse"], json!([]));
         assert_eq!(discord["flags"], 4);
-        let text = discord["content"].as_str().unwrap();
-        assert!(text.chars().count() <= 1651 && text.ends_with('…'));
+        assert_eq!(discord["content"], escaped.as_str());
         assert_eq!(
             chat_payload("discord", "short", "body")["content"],
             "short\nbody"
@@ -958,6 +1114,15 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(clipped_body, format!("{}…", "🎬".repeat(1499)));
         assert_eq!(clipped_body.chars().count(), 1500);
+
+        let encoded_body = "*".repeat(1500);
+        let discord = chat_payload("discord", "title", &encoded_body);
+        let discord_text = discord["content"].as_str().unwrap();
+        assert!(discord_text.chars().count() <= DISCORD_CONTENT_LIMIT);
+        assert!(discord_text.chars().count() > DISCORD_CONTENT_LIMIT - 10);
+        assert!(discord_text.ends_with('…'));
+        assert!(!discord_text[..discord_text.len() - '…'.len_utf8()].ends_with('\\'));
+        assert!(discord_text.starts_with("title\n\\*\\*\\*"));
     }
 
     #[tokio::test]
@@ -965,6 +1130,7 @@ pub(crate) mod tests {
         use axum::{
             extract::Path,
             http::{StatusCode, Uri},
+            response::IntoResponse,
             routing::post,
             Json, Router,
         };
@@ -989,9 +1155,13 @@ pub(crate) mod tests {
                             .unwrap()
                             .forget();
                         if channel == "teams" {
-                            StatusCode::TOO_MANY_REQUESTS
+                            (
+                                StatusCode::TOO_MANY_REQUESTS,
+                                [(axum::http::header::RETRY_AFTER, "4")],
+                            )
+                                .into_response()
                         } else {
-                            StatusCode::OK
+                            StatusCode::OK.into_response()
                         }
                     }
                 },
@@ -1647,6 +1817,80 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn uploaded_smtp_continues_after_recipient_rejection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stub = tokio::spawn(async move { smtp_multi_stub(listener, 2).await });
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = testing::config(directory.path());
+        config.smtp_host = Some("127.0.0.1".to_owned());
+        config.smtp_port = addr.port();
+        config.smtp_starttls = false;
+        config.smtp_from = Some("votport@example.com".to_owned());
+        let application = Arc::new(app::build(config).unwrap());
+        let mut destination = test_destination_config(&application, "email", String::new());
+        destination.recipients = vec!["bad@example.com".into(), "good@example.com".into()];
+        application
+            .store
+            .save_notification_destination("", &mut destination)
+            .unwrap();
+
+        uploaded(
+            Arc::clone(&application),
+            String::new(),
+            "link-id".to_owned(),
+            "smtp-multiple-recipients".to_owned(),
+            100,
+            FinishReport {
+                received: 1,
+                upload_id: "up-smtp-multiple".to_owned(),
+                files: vec![FileRecord {
+                    path: "one.txt".into(),
+                    stored_as: "one.txt".into(),
+                    bytes: 1,
+                    suite: "blake3".into(),
+                    root: "fixture".into(),
+                    receipt: false,
+                    deleted: false,
+                }],
+            },
+            Some(test_policy()),
+        )
+        .await;
+
+        let mut stub = stub;
+        let transcripts = match tokio::time::timeout(Duration::from_secs(10), &mut stub).await {
+            Ok(result) => result.expect("smtp stub join").expect("smtp stub io"),
+            Err(_) => {
+                stub.abort();
+                let _ = stub.await;
+                panic!("smtp stub timed out");
+            }
+        };
+        assert_eq!(transcripts.len(), 2, "{transcripts:?}");
+        for transcript in &transcripts {
+            assert_eq!(transcript.matches("MAIL FROM:").count(), 1);
+            assert_eq!(transcript.matches("RCPT TO:").count(), 1);
+        }
+        let rejected = transcripts
+            .iter()
+            .find(|transcript| transcript.contains("RCPT TO:<bad@example.com>"))
+            .expect("rejected recipient transcript");
+        assert!(!rejected.contains("good@example.com"));
+        let accepted = transcripts
+            .iter()
+            .find(|transcript| transcript.contains("RCPT TO:<good@example.com>"))
+            .expect("accepted recipient transcript");
+        assert!(!accepted.contains("bad@example.com"));
+        assert_eq!(accepted.matches("DATA\r\n").count(), 1);
+        assert_eq!(
+            application.store.notification_outcomes("").unwrap()[&destination.id]["delivered"],
+            true
+        );
+    }
+
+    #[tokio::test]
     async fn notification_test_sends_unicode_smtp_sample() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1732,5 +1976,62 @@ pub(crate) mod tests {
             }
         }
         Ok(transcript)
+    }
+
+    async fn smtp_multi_stub(
+        listener: tokio::net::TcpListener,
+        expected: usize,
+    ) -> std::io::Result<Vec<String>> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let mut transcripts = Vec::with_capacity(expected);
+        for _ in 0..expected {
+            let (socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "smtp accept timed out")
+                })??;
+            let (reader, mut writer) = socket.into_split();
+            let mut reader = tokio::io::BufReader::new(reader);
+            writer.write_all(b"220 localhost ESMTP\r\n").await?;
+            let mut transcript = String::new();
+            let mut line = String::new();
+            let mut in_data = false;
+            loop {
+                line.clear();
+                let n = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::TimedOut, "smtp read timed out")
+                    })??;
+                if n == 0 {
+                    break;
+                }
+                transcript.push_str(&line);
+                if in_data {
+                    if line == ".\r\n" {
+                        in_data = false;
+                        writer.write_all(b"250 OK\r\n").await?;
+                    }
+                    continue;
+                }
+                if line.starts_with("RCPT TO:<bad@example.com>") {
+                    writer.write_all(b"550 bad recipient\r\n").await?;
+                } else {
+                    match line.get(..4).unwrap_or("").to_ascii_uppercase().as_str() {
+                        "DATA" => {
+                            in_data = true;
+                            writer.write_all(b"354 End data\r\n").await?;
+                        }
+                        "QUIT" => {
+                            writer.write_all(b"221 Bye\r\n").await?;
+                            break;
+                        }
+                        _ => writer.write_all(b"250 OK\r\n").await?,
+                    }
+                }
+            }
+            transcripts.push(transcript);
+        }
+        Ok(transcripts)
     }
 }

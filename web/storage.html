@@ -71,7 +71,7 @@
           <label>Connection name<input id="ws-label" required maxlength="200" placeholder="West coast studio" /></label>
           <label>Destination type<select id="ws-kind"><option value="s3">S3 storage</option><option value="folder">Shared folder</option></select></label>
         </div><details class="form-advanced"><summary>Connection ID for scripts and agents</summary><div class="field"><div class="field-heading"><label for="ws-id">Local connection ID</label><button type="button" class="hint-button" aria-label="Help about local connection IDs" data-hint="This local ID is filled from the name. Scripts and agents use it; people choose the connection by name.">?</button></div><input id="ws-id" required pattern="[a-z0-9_]+" maxlength="100" aria-describedby="ws-id-help" /><p id="ws-id-help" class="field-help">Filled from the connection name. Identifies this saved connection for agents and workflows on this port.</p></div></details></fieldset>
-        <fieldset id="ws-s3-settings"><legend>S3 storage <button type="button" class="hint-button" aria-label="Help about S3 credentials" data-hint="Use saved access keys or credentials already available to this server. The credentials need permission to write to the selected bucket and prefix.">?</button></legend><div class="grid">
+        <fieldset id="ws-s3-settings"><legend>S3 storage</legend><button type="button" class="hint-button" aria-label="Help about S3 credentials" data-hint="Use saved access keys or credentials already available to this server. The credentials need permission to write to the selected bucket and prefix.">?</button><div class="grid">
           <label>Provider<select id="ws-provider"><option value="aws">Amazon S3</option><option value="custom">S3-compatible service</option></select></label>
           <label>Bucket<input id="ws-bucket" required placeholder="studio-deliveries" /></label>
           <label>Region<input id="ws-region" required value="us-east-1" /></label>
@@ -84,11 +84,11 @@
             <label class="span-all">Session token<input id="ws-session-token" type="password" autocomplete="new-password" maxlength="4096" /><span class="field-help">Only for temporary credentials.</span></label>
           </div><p id="ws-auth-note" class="field-help">Credentials are stored privately on the server and are never sent back to the browser.</p>
         </fieldset>
-        <fieldset id="ws-folder-settings" hidden disabled><legend>Shared folder <button type="button" class="hint-button" aria-label="Help about server folders" data-hint="This is a folder visible to the VOTPort server, including a mounted network share. A folder on your browser’s computer is not accessible through this setting.">?</button></legend>
+        <fieldset id="ws-folder-settings" hidden disabled><legend>Shared folder</legend><button type="button" class="hint-button" aria-label="Help about server folders" data-hint="This is a folder visible to the VOTPort server, including a mounted network share. A folder on your browser’s computer is not accessible through this setting.">?</button>
           <label>Folder on the server<input id="ws-directory" required maxlength="4096" placeholder="/mnt/studio-shared" /><span class="field-help">Use a folder or network share already mounted and visible to this Votport server. Enter its full path.</span></label>
         </fieldset>
         <label id="ws-prefix-field">Folder within the destination<input id="ws-prefix" maxlength="1024" placeholder="client-deliveries" /><span class="field-help">Optional. Leave blank to use the connection root.</span></label>
-<details class="form-advanced"><summary>Access and advanced storage options <button type="button" class="hint-button" aria-label="Help about storage access" data-hint="Choose which tenants can use this destination. Encryption and path-style addressing are provider settings; keep the defaults unless your storage requires otherwise.">?</button></summary>        <fieldset><legend>Access and delivery</legend>
+<div class="form-advanced-with-hint"><details class="form-advanced"><summary>Access and advanced storage options</summary>        <fieldset><legend>Access and delivery</legend>
           <label id="ws-encryption-field">Encryption<select id="ws-encryption"><option value="default">Bucket default</option><option value="kms">AWS KMS managed key</option></select></label>
           <label id="ws-kms-field" hidden>KMS key ID or ARN<input id="ws-kms" placeholder="arn:aws:kms:…" /><span class="field-help">Applied to exported objects. The credential also needs permission to use this key.</span></label>
           <div class="field-space"><span class="field-label">Tenants allowed to use this connection</span><div id="ws-tenants" class="permission-grid"></div></div>
@@ -96,7 +96,7 @@
           <label class="check"><input id="ws-enabled" type="checkbox" checked /> Connection enabled</label>
           <p class="field-help">Disabling a connection prevents new transfers that depend on it. Files already delivered remain at their destination.</p>
         </fieldset>
-</details>
+</details><button type="button" class="hint-button" aria-label="Help about storage access" data-hint="Choose which tenants can use this destination. Encryption and path-style addressing are provider settings; keep the defaults unless your storage requires otherwise.">?</button></div>
         <div class="actions"><button type="submit">Save connection</button><button id="storage-test" type="button" class="ghost" disabled>Test saved connection</button><span id="storage-test-result" role="status"></span></div>
       </form>
       <div class="info-banner"><strong>Use storage in a workflow.</strong> Choose connections for outgoing deliveries and automatic mirroring in a receive project. S3 connections can also import source files. <a href="/workflows#projects" class="text-link">Open projects →</a></div>

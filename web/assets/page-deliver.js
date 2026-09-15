@@ -189,8 +189,8 @@ function renderGrants() {
           }
         });
         actions.append(copyLink);
-        if (deliverAdministrator) actions.append(
-          button('New address', 'tiny', async (control) => {
+        if (deliverAdministrator) {
+          const newAddress = button('New address', 'tiny', async (control) => {
             if (
               !(await confirmModal(
                 'Rotate download address',
@@ -208,11 +208,13 @@ function renderGrants() {
             showGrantResult(response.url, grant.has_password, focusResult);
             await refreshGrants();
             announce('outbound-grants-status', 'Download address rotated.');
-          }),
-        );
+          });
+          newAddress.setAttribute('aria-label', `New address: ${grant.label || grant.name}`);
+          actions.append(newAddress);
+        }
       }
-      if (deliverAdministrator) actions.append(
-        button('Extend 7 days', 'tiny', async () => {
+      if (deliverAdministrator) {
+        const extend = button('Extend 7 days', 'tiny', async () => {
           // Same base as the server: seven days past the later of now and the current expiry.
           const base = Math.max(grant.expires_at, Math.floor(Date.now() / 1000));
           const until = formatWhen(base + 7 * 86_400);
@@ -224,8 +226,9 @@ function renderGrants() {
           });
           await refreshGrants();
           announce('outbound-grants-status', `Download extended until ${formatWhen(expires_at)}.`);
-        }),
-        button('Revoke', 'tiny danger', async () => {
+        });
+        extend.setAttribute('aria-label', `Extend 7 days: ${grant.label || grant.name}`);
+        const revoke = button('Revoke', 'tiny danger', async () => {
           if (
             !(await confirmModal(
               'Revoke download',
@@ -237,8 +240,10 @@ function renderGrants() {
           await api(`/api/admin/outbound-grants/${grant.id}`, { method: 'DELETE' });
           await refreshGrants();
           announce('outbound-grants-status', 'Download revoked.');
-        }),
-      );
+        });
+        revoke.setAttribute('aria-label', `Revoke: ${grant.label || grant.name}`);
+        actions.append(extend, revoke);
+      }
       card.append(actions);
     }
     container.append(card);

@@ -126,6 +126,9 @@ try {
   await receiving.locator('#trade-return-guide').waitFor();
   assert.ok(await receiving.locator('#trade-return-guide').evaluate((node) => node === document.activeElement), 'Route handoff focuses its setup guide');
   assert.ok(await receiving.locator('#create-password').isHidden());
+  const routeNotificationWrapper = receiving.locator('#create-notification-options').locator('xpath=..');
+  assert.equal(await routeNotificationWrapper.locator('.hint-button').count(), 1);
+  assert.ok(await routeNotificationWrapper.isHidden(), 'Trade route setup hides its notification help wrapper');
   await receiving.fill('#create-label', id);
   await receiving.locator('#create-workflow select').selectOption(id);
   await receiving.getByRole('button', { name: 'Continue to route permissions', exact: true }).click();

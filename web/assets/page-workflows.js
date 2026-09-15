@@ -76,7 +76,9 @@ function projectFields() {
   jobNotifications?.destroy();
   jobNotifications = notificationEditor({ inherit: project?.notifications || null, events: workflowEvents }); $('workflow-notifications').replaceChildren(jobNotifications.element);
   $('workflow-metadata').replaceChildren();
-  $('workflow-recipients').replaceChildren($('workflow-recipients').querySelector('legend'));
+  const recipients = $('workflow-recipients');
+  const staticRecipients = [...recipients.children].filter((child) => child.matches('legend, .hint-button, .field-hint'));
+  recipients.replaceChildren(...staticRecipients);
   $('workflow-rules').textContent = project
     ? `${project.directory} · ${project.require_approval ? 'Approval required' : 'Released after preparation'}${project.scan_required ? ' · Malware scan' : ''}${project.media ? ' · Video checks' : ''}${project.sequence ? ' · Sequence check' : ''}`
     : 'Choose a project to see its delivery requirements.';
@@ -86,9 +88,9 @@ function projectFields() {
   }
   for (const recipient of project?.recipients || []) {
     const label = node('label', '', 'check'), input = document.createElement('input'); input.type = 'checkbox'; input.value = recipient.holder;
-    label.append(input, document.createTextNode(recipient.email)); $('workflow-recipients').append(label);
+    label.append(input, document.createTextNode(recipient.email)); recipients.append(label);
   }
-  if (!project?.recipients?.length) $('workflow-recipients').append(node('p', 'Anyone with the download link can receive this delivery.', 'field-help'));
+  if (!project?.recipients?.length) recipients.append(node('p', 'Anyone with the download link can receive this delivery.', 'field-help'));
 }
 async function refreshProjects() {
   const [projectResponse, storageResponse] = await Promise.all([api('/api/workflows/projects'), api('/api/workflows/storage')]);
@@ -168,8 +170,15 @@ function addRow(kind, values = {}) {
     else { input.type = field.type || 'text'; input.maxLength = field.max; if (field.pattern) input.pattern = field.pattern; if (field.list) input.setAttribute('list', field.list); }
     input.value = values[field.key] || (field.options ? field.options[0] : ''); label.append(input); row.append(label);
   }
+  const subjectKey = kind === 'members' ? 'subject' : kind === 'recipients' ? 'email' : 'key';
+  const subjectName = kind === 'metadata' ? 'required field' : kind === 'members' ? 'team member' : 'recipient';
   const remove = button('Remove', 'ghost', () => { markFormChanged($('workflow-save-project')); row.remove(); $(`wp-add-${kind === 'members' ? 'member' : kind === 'recipients' ? 'recipient' : 'metadata'}`).focus(); });
-  remove.setAttribute('aria-label', `Remove ${kind === 'metadata' ? 'required field' : kind === 'members' ? 'team member' : 'recipient'}`);
+  const updateRemoveName = () => {
+    const subject = row.querySelector(`[data-key="${subjectKey}"]`).value.trim();
+    remove.setAttribute('aria-label', `Remove ${subjectName}${subject ? `: ${subject}` : ''}`);
+  };
+  row.querySelector(`[data-key="${subjectKey}"]`).addEventListener('input', updateRemoveName);
+  updateRemoveName();
   row.append(remove); $(`wp-${kind}`).append(row); return row;
 }
 const rows = (kind) => [...$(`wp-${kind}`).children].map((row) => Object.fromEntries([...row.querySelectorAll('input,select')].map((input) => [input.dataset.key, input.value.trim()])));

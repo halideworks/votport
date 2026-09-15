@@ -173,13 +173,13 @@ try {
     await page.locator('#global-search-input').focus();
     await route.fulfill({ response });
   }, { times: 1 });
-  await grantCard.getByRole('button', { name: 'Extend 7 days', exact: true }).focus();
+  await grantCard.getByRole('button', { name: /^Extend 7 days: / }).focus();
   await page.keyboard.press('Enter'); await page.locator('#confirm-ok').press('Enter');
   await page.waitForFunction(() => document.querySelector('#outbound-grants-status').textContent.startsWith('Download extended until'));
   assert.ok(await page.locator('#global-search-input').evaluate((node) => node === document.activeElement), 'A delayed grant refresh preserves newly moved focus');
-  for (const [action, message] of [['New address', 'Download address rotated.'], ['Extend 7 days', 'Download extended until'], ['Revoke', 'Download revoked.']]) {
+  for (const [action, name, message] of [['New address', /^New address: /, 'Download address rotated.'], ['Extend 7 days', /^Extend 7 days: /, 'Download extended until'], ['Revoke', /^Revoke: /, 'Download revoked.']]) {
     if (action === 'Revoke') await page.route('**/api/admin/outbound-grants?*', (route) => route.fulfill({ status: 503 }), { times: 1 });
-    await grantCard.getByRole('button', { name: action, exact: true }).focus();
+    await grantCard.getByRole('button', { name }).focus();
     await page.keyboard.press('Enter'); await page.locator('#confirm-ok').press('Enter');
     await page.waitForFunction((text) => document.querySelector('#outbound-grants-status').textContent.startsWith(text), message);
     const resultFocus = action === 'New address' ? '#outbound-url' : '#outbound-grants-status';
