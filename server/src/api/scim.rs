@@ -1283,6 +1283,7 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(json["schemas"][0], ERROR_SCHEMA);
         assert_eq!(json["status"], "401");
+        assert_eq!(json["detail"], "invalid bearer");
         assert_eq!(content_type.as_deref(), Some(CONTENT_TYPE));
         // One instance per data directory: a rebuild needs the first one's
         // clean-shutdown release, as a real restart would have done.
@@ -1290,6 +1291,20 @@ mod tests {
         drop(unset);
 
         let application = build(directory.path());
+        let (status, json, content_type) = call_from(
+            &application,
+            [10, 2, 0, 1],
+            "GET",
+            "/scim/v2/Users",
+            Some("wrong"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(json["schemas"][0], ERROR_SCHEMA);
+        assert_eq!(json["status"], "401");
+        assert_eq!(json["detail"], "invalid bearer");
+        assert_eq!(content_type.as_deref(), Some(CONTENT_TYPE));
         let user = Some(("application/scim+json", r#"{"userName":"a"}"#));
         let patch = Some((
             "application/scim+json",

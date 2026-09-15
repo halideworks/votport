@@ -230,6 +230,53 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// Keep API client errors machine-readable even when a router or extractor
+/// supplied a plain-text response, while retaining response metadata.
+pub(crate) async fn normalize_response(response: Response) -> Response {
+    if response.status().is_client_error()
+        && !response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .is_some_and(is_json_content_type)
+    {
+        let status = response.status();
+        let (mut parts, _) = response.into_parts();
+        let (generated, body) = ApiError::new(
+            status,
+            "request does not match the API; check the path, JSON body and query parameters",
+        )
+        .into_response()
+        .into_parts();
+        for name in [
+            header::CONTENT_TYPE,
+            header::CONTENT_LENGTH,
+            header::CONTENT_RANGE,
+            header::CONTENT_ENCODING,
+            header::TRANSFER_ENCODING,
+        ] {
+            parts.headers.remove(name);
+        }
+        for (name, value) in generated.headers {
+            if let Some(name) = name {
+                parts.headers.insert(name, value);
+            }
+        }
+        Response::from_parts(parts, body)
+    } else {
+        response
+    }
+}
+
+fn is_json_content_type(value: &header::HeaderValue) -> bool {
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    let media_type = value.split(';').next().map(str::trim).unwrap_or_default();
+    let media_type = media_type.to_ascii_lowercase();
+    media_type == "application/json"
+        || (media_type.starts_with("application/") && media_type.ends_with("+json"))
+}
+
 type ApiResult<T> = Result<T, ApiError>;
 
 /// A failed store read becomes a 500 that says only that the database is
@@ -661,7 +708,7 @@ mod handler_tests {
         );
         assert_eq!(
             response.headers().get(header::CACHE_CONTROL).unwrap(),
-            "no-cache"
+            "no-store"
         );
 
         // A closed link hides its label; branding and the logo hide with it.

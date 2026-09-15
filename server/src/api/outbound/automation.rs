@@ -518,22 +518,6 @@ pub async fn revoke(
     Ok(Json(json!({"ok": true, "id": id, "state": "revoked"})))
 }
 
-pub async fn normalize_response(response: Response) -> Response {
-    if response.status().is_client_error()
-        && !response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .is_some_and(|value| value.as_bytes().starts_with(b"application/json"))
-    {
-        return ApiError::new(
-            response.status(),
-            "request does not match the API; check the path, JSON body and query parameters",
-        )
-        .into_response();
-    }
-    response
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

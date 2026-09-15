@@ -767,7 +767,14 @@ pub(super) async fn export(app: &Arc<App>, job: &Job) -> ApiResult<()> {
                         job.checks["trade_routes"][&id]["notifications"].clone(),
                     ),
                 ) {
-                    crate::notify::trade_event(app, &route, &policy, "route_failed").await;
+                    crate::notify::trade_event(
+                        app,
+                        &route,
+                        &policy,
+                        "route_failed",
+                        Some(error.message.as_str()),
+                    )
+                    .await;
                 }
             }
             failures.push(format!("{}: {}", label, error.message));

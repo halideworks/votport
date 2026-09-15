@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Path, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine as _;
@@ -24,7 +24,19 @@ use super::{client_ip, cookie_attributes, ApiError, ApiResult};
 
 /// Cookie carrying proof that this link's password was verified once.
 pub(crate) fn link_cookie_name(link_id: &str) -> String {
+    format!("votport_r2_{link_id}")
+}
+
+fn legacy_link_cookie_name(link_id: &str) -> String {
     format!("votport_r_{link_id}")
+}
+
+fn expired_legacy_link_cookie(app: &App, link_id: &str) -> String {
+    format!(
+        "{}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{}",
+        legacy_link_cookie_name(link_id),
+        cookie_attributes(app)
+    )
 }
 
 pub(crate) fn cookie_authorized(
@@ -69,7 +81,12 @@ pub async fn link_info(
     } else {
         None
     };
-    Ok((
+    let expire_legacy = headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| auth::cookie_value(cookies, &legacy_link_cookie_name(&link.id)))
+        .is_some();
+    let mut response = (
         [
             (header::CACHE_CONTROL, "no-store"),
             (header::VARY, "Cookie"),
@@ -93,7 +110,15 @@ pub async fn link_info(
         "web_build": app.web_build,
         })),
     )
-        .into_response())
+        .into_response();
+    if expire_legacy {
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&expired_legacy_link_cookie(&app, &link.id))
+                .expect("validated link cookie header"),
+        );
+    }
+    Ok(response)
 }
 
 /// Tenant logo for a request link. Ungated like the link label: the metadata
@@ -326,7 +351,7 @@ pub async fn verify_link_password(
         ));
     }
     let ip = client_ip(&headers, &peer, &app.config.trusted_proxies);
-    check_password(
+    let password_check = check_password(
         &app,
         PasswordResource {
             tenant: &link.tenant,
@@ -338,15 +363,34 @@ pub async fn verify_link_password(
         &ip,
         "wrong link password",
     )
-    .await?;
+    .await;
+    if let Err(error) = password_check {
+        let mut response = error.into_response();
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&expired_legacy_link_cookie(&app, &link.id))
+                .expect("validated link cookie header"),
+        );
+        return Ok(response);
+    }
     let phc = link.password_hash.as_deref().unwrap_or_default();
     let value = auth::issue_link_token(&app.secret, &link.id, phc);
     let cookie = format!(
-        "{}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000{}",
+        "{}={value}; Path=/api/r/{token}; HttpOnly; SameSite=Lax; Max-Age=2592000{}",
         link_cookie_name(&link.id),
         cookie_attributes(&app)
     );
-    Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
+    let mut response = Json(json!({ "ok": true })).into_response();
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&cookie).expect("validated link cookie header"),
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&expired_legacy_link_cookie(&app, &link.id))
+            .expect("validated link cookie header"),
+    );
+    Ok(response)
 }
 
 #[derive(Deserialize)]
@@ -2544,6 +2588,139 @@ mod push_preflight_tests {
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
         assert_eq!(response.headers()[header::VARY], "Cookie");
         assert_eq!(response_json(response).await["authorized"], true);
+    }
+
+    #[tokio::test]
+    async fn receive_cookie_is_scoped_and_legacy_root_cookie_cannot_authorize() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let mut link = open_link("cookie-scope");
+        link.password_hash = Some(auth::hash_password("correct password").unwrap());
+        application.store.insert_link(link).unwrap();
+        let phc = application
+            .store
+            .upload_link("cookie-scope")
+            .unwrap()
+            .unwrap()
+            .password_hash
+            .unwrap();
+        let old_token = auth::issue_link_token(&application.secret, "cookie-scope", &phc);
+        let old_cookie = format!("votport_r_cookie-scope={old_token}");
+
+        let legacy_info = app::router(application.clone())
+            .oneshot(
+                Request::get("/api/r/cookie-scope")
+                    .header(header::COOKIE, &old_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy_info.status(), StatusCode::OK);
+        assert!(legacy_info
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .any(|value| value
+                .to_str()
+                .unwrap()
+                .starts_with("votport_r_cookie-scope=; Path=/;")));
+        assert_eq!(response_json(legacy_info).await["authorized"], false);
+
+        let failed = app::router(application.clone())
+            .oneshot(
+                Request::post("/api/r/cookie-scope/verify")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &old_cookie)
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [192, 0, 2, 20],
+                        4444,
+                    ))))
+                    .body(Body::from(r#"{"password":"wrong password"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.status(), StatusCode::UNAUTHORIZED);
+        assert!(failed
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .any(|value| value
+                .to_str()
+                .unwrap()
+                .starts_with("votport_r_cookie-scope=; Path=/;")));
+
+        let verified = app::router(application.clone())
+            .oneshot(
+                Request::post("/api/r/cookie-scope/verify")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &old_cookie)
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [192, 0, 2, 21],
+                        4444,
+                    ))))
+                    .body(Body::from(r#"{"password":"correct password"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(verified.status(), StatusCode::OK);
+        let cookies: Vec<_> = verified
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_owned())
+            .collect();
+        let scoped_cookie = cookies
+            .iter()
+            .find(|value| value.starts_with("votport_r2_cookie-scope="))
+            .and_then(|value| value.split(';').next())
+            .unwrap()
+            .to_owned();
+        assert!(cookies
+            .iter()
+            .any(|value| value.starts_with("votport_r_cookie-scope=; Path=/;")));
+        assert!(cookies
+            .iter()
+            .any(|value| value.contains("Path=/api/r/cookie-scope;")));
+
+        let info = app::router(application.clone())
+            .oneshot(
+                Request::get("/api/r/cookie-scope")
+                    .header(header::COOKIE, &scoped_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_json(info).await["authorized"], true);
+
+        let session = app::router(application.clone())
+            .oneshot(
+                Request::post("/api/r/cookie-scope/session")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, scoped_cookie)
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [192, 0, 2, 21],
+                        4444,
+                    ))))
+                    .body(Body::from(
+                        json!({
+                            "package": {
+                                "suite": "blake3",
+                                "root": hex::encode([0_u8; 32]),
+                                "length": 1
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.status(), StatusCode::OK);
+        app::suspend_sessions(&application).await;
     }
 
     #[tokio::test]

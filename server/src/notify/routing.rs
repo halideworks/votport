@@ -510,6 +510,7 @@ mod tests {
             OutboundDownloadResult {
                 first_download: true,
                 completed_delivery: true,
+                event_at: 0,
             },
         )
         .await;
@@ -538,6 +539,7 @@ mod tests {
             OutboundDownloadResult {
                 first_download: true,
                 completed_delivery: true,
+                event_at: 0,
             },
         )
         .await;
@@ -553,6 +555,7 @@ mod tests {
             OutboundDownloadResult {
                 first_download: true,
                 completed_delivery: true,
+                event_at: 0,
             },
         )
         .await;
@@ -567,6 +570,7 @@ mod tests {
             OutboundDownloadResult {
                 first_download: true,
                 completed_delivery: true,
+                event_at: 0,
             },
         )
         .await;
@@ -578,6 +582,7 @@ mod tests {
             OutboundDownloadResult {
                 first_download: true,
                 completed_delivery: true,
+                event_at: 0,
             },
         )
         .await;

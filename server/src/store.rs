@@ -209,6 +209,7 @@ pub struct AutomationOperation {
 pub struct OutboundDownloadResult {
     pub first_download: bool,
     pub completed_delivery: bool,
+    pub event_at: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1653,6 +1654,28 @@ impl Store {
                 .query_row([id], row_to_link)
                 .optional()
         })
+    }
+
+    /// Read one upload's persisted completion time without hydrating its history.
+    pub fn upload_completed_at(
+        &self,
+        tenant: &str,
+        link_id: &str,
+        upload_id: &str,
+    ) -> Result<Option<u64>, String> {
+        self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT json_extract(document, '$.completed_at')
+                     FROM link_uploads
+                     WHERE tenant = ?1 AND link_id = ?2 AND upload_id = ?3
+                       AND EXISTS (SELECT 1 FROM links WHERE tenant = ?1 AND id = ?2)",
+                    rusqlite::params![tenant, link_id, upload_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .optional()
+        })
+        .map(|value| value.flatten().and_then(|value| u64::try_from(value).ok()))
     }
 
     /// Selected upload lookup for received sources and legacy download grants.
@@ -4192,6 +4215,7 @@ impl Store {
         let transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
+        let event_at = at;
         let result = (|| {
             let (downloads, max_downloads, first_download_at, normalized, file_count): (
                 i64,
@@ -4346,6 +4370,7 @@ impl Store {
                 return Ok(OutboundDownloadResult {
                     first_download,
                     completed_delivery,
+                    event_at,
                 });
             }
             let files_json: String = transaction
@@ -4390,6 +4415,7 @@ impl Store {
             Ok(OutboundDownloadResult {
                 first_download,
                 completed_delivery: first_download,
+                event_at,
             })
         })();
         match result {
@@ -7459,6 +7485,7 @@ pub(crate) mod tests {
             OutboundDownloadResult {
                 first_download: true,
                 completed_delivery: true,
+                event_at: 100,
             }
         );
         assert_eq!(
@@ -7466,6 +7493,7 @@ pub(crate) mod tests {
             OutboundDownloadResult {
                 first_download: false,
                 completed_delivery: false,
+                event_at: 110,
             }
         );
         let grant = store
@@ -7949,6 +7977,7 @@ pub(crate) mod tests {
             OutboundDownloadResult {
                 first_download: true,
                 completed_delivery: false,
+                event_at: 100,
             }
         );
         assert_eq!(
@@ -7956,6 +7985,7 @@ pub(crate) mod tests {
             OutboundDownloadResult {
                 first_download: false,
                 completed_delivery: true,
+                event_at: 200,
             }
         );
         assert_eq!(
@@ -7965,6 +7995,7 @@ pub(crate) mod tests {
             OutboundDownloadResult {
                 first_download: false,
                 completed_delivery: false,
+                event_at: 300,
             }
         );
         let grant = store
@@ -7988,6 +8019,7 @@ pub(crate) mod tests {
             OutboundDownloadResult {
                 first_download: false,
                 completed_delivery: false,
+                event_at: 400,
             }
         );
         assert_eq!(
@@ -7997,6 +8029,7 @@ pub(crate) mod tests {
             OutboundDownloadResult {
                 first_download: false,
                 completed_delivery: false,
+                event_at: 500,
             }
         );
         let grant = store

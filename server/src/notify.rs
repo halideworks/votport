@@ -52,7 +52,12 @@ pub async fn trade_uploaded(app: &App, tenant: &str, upload: &str) {
                 app.store.trade_route(tenant, &permission.grant),
                 app.store.trade_delivery_policy(&incoming.id),
             ) {
-                trade_event(app, &route, &policy, "route_received").await;
+                let detail = incoming
+                    .receipt
+                    .as_ref()
+                    .map(|receipt| format!("receipt:{}", receipt.digest()))
+                    .unwrap_or_else(|| format!("upload:{upload}"));
+                trade_event(app, &route, &policy, "route_received", Some(&detail)).await;
             }
         }
     }
@@ -62,7 +67,9 @@ pub async fn trade_uploaded(app: &App, tenant: &str, upload: &str) {
 pub async fn uploaded(
     app: Arc<App>,
     tenant: String,
+    link_id: String,
     label: String,
+    completed_at: u64,
     report: FinishReport,
     notifications: Option<crate::store::NotificationPolicy>,
 ) {
@@ -93,8 +100,10 @@ pub async fn uploaded(
 
     let payload = json!({
         "event": "upload_complete",
+        "link_id": link_id,
         "label": label,
         "upload_id": report.upload_id,
+        "completed_at": completed_at,
         "total_bytes": total,
         "file_count": count,
         "files_truncated": files_truncated,
@@ -174,6 +183,7 @@ pub async fn outbound_downloaded(
             "event": event,
             "grant_id": grant.id,
             "label": grant.label,
+            "event_at": result.event_at,
             "download_starts": download_starts,
             "file_count": file_count,
             "files_truncated": files_truncated,
@@ -308,8 +318,8 @@ fn clipped_chars(text: &str, limit: usize) -> Cow<'_, str> {
 }
 
 fn chat_payload(channel: &str, title: &str, body: &str) -> serde_json::Value {
-    let title = clipped_bytes(title, 150);
-    let body = clipped_bytes(body, 1500);
+    let title = clipped_chars(title, 150);
+    let body = clipped_chars(body, 1500);
     let text = format!("{title}\n{body}");
     match channel {
         "slack" => json!({
@@ -503,14 +513,37 @@ pub async fn trade_event(
     route: &crate::store::TradeRoute,
     policy: &crate::store::NotificationPolicy,
     event: &str,
+    detail: Option<&str>,
 ) {
     let title = format!(
         "{}: {}",
         title_brand(app, &route.tenant),
         event.replace('_', " ")
     );
-    let body = format!("{} · {} · {}", route.name, route.peer_name, route.state);
-    send_policy(app, Route {tenant: &route.tenant, policy: Some(policy)}, title, body, json!({"event":event,"route_id":route.id,"name":route.name,"peer":route.peer_key,"state":route.state}), event, None).await;
+    let body = match detail {
+        Some(detail) => format!(
+            "{} · {} · {}\n{detail}",
+            route.name, route.peer_name, route.state
+        ),
+        None => format!("{} · {} · {}", route.name, route.peer_name, route.state),
+    };
+    let mut payload = json!({"event":event,"route_id":route.id,"name":route.name,"peer":route.peer_key,"state":route.state});
+    if let Some(detail) = detail {
+        payload["detail"] = json!(detail);
+    }
+    send_policy(
+        app,
+        Route {
+            tenant: &route.tenant,
+            policy: Some(policy),
+        },
+        title,
+        body,
+        payload,
+        event,
+        None,
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -521,9 +554,9 @@ pub(crate) mod tests {
     use crate::app;
     use crate::session::FinishReport;
     use crate::store::{
-        now_unix, Branding, FileRecord, NotificationDestination, NotificationMode,
+        now_unix, Branding, FileRecord, Link, NotificationDestination, NotificationMode,
         NotificationPolicy, NotificationRule, OutboundDownloadResult, OutboundGrant,
-        OutboundGrantFile, Tenant, NOTIFICATION_EVENTS,
+        OutboundGrantFile, Tenant, TradeRoute, UploadRecord, NOTIFICATION_EVENTS,
     };
 
     pub(crate) fn test_grant(files: Vec<OutboundGrantFile>) -> OutboundGrant {
@@ -572,6 +605,31 @@ pub(crate) mod tests {
         NotificationPolicy {
             mode: NotificationMode::Default,
             rules: vec![],
+        }
+    }
+
+    fn test_trade_route(policy: NotificationPolicy) -> TradeRoute {
+        TradeRoute {
+            id: "route-id".into(),
+            revision: 1,
+            tenant: String::new(),
+            direction: "outgoing".into(),
+            name: "Fixture route".into(),
+            peer_name: "Fixture peer".into(),
+            peer_key: "peer-key".into(),
+            address: "http://127.0.0.1:1".into(),
+            endpoint: "endpoint".into(),
+            endpoint_name: "Endpoint".into(),
+            category: "fixture".into(),
+            forwarding: false,
+            metadata_keys: Vec::new(),
+            state: "active".into(),
+            notifications: policy,
+            last_contact: None,
+            error: None,
+            remote_grant: String::new(),
+            remote_state: "active".into(),
+            cancel_active: false,
         }
     }
 
@@ -774,7 +832,9 @@ pub(crate) mod tests {
                     uploaded(
                         application.clone(),
                         String::new(),
+                        "link-id".into(),
                         "Müller\n撮影".into(),
+                        100,
                         FinishReport {
                             received: 0,
                             upload_id: "up-ntfy".into(),
@@ -861,7 +921,7 @@ pub(crate) mod tests {
         assert_eq!(discord["allowed_mentions"]["parse"], json!([]));
         assert_eq!(discord["flags"], 4);
         let text = discord["content"].as_str().unwrap();
-        assert!(text.len() <= 1651 && text.ends_with('…'));
+        assert!(text.chars().count() <= 1651 && text.ends_with('…'));
         assert_eq!(
             chat_payload("discord", "short", "body")["content"],
             "short\nbody"
@@ -871,9 +931,33 @@ pub(crate) mod tests {
             long_title["blocks"][0]["text"]["text"]
                 .as_str()
                 .unwrap()
-                .len()
+                .chars()
+                .count()
                 <= 150
         );
+        let emoji_title = "🎬".repeat(100);
+        let japanese_title = "撮".repeat(50);
+        for title in [&emoji_title, &japanese_title] {
+            let payload = chat_payload("slack", title, "body");
+            assert_eq!(payload["blocks"][0]["text"]["text"], title.as_str());
+        }
+        let over_title = "🎬".repeat(151);
+        let clipped_title = chat_payload("slack", &over_title, "body")["blocks"][0]["text"]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(clipped_title, format!("{}…", "🎬".repeat(149)));
+        assert_eq!(clipped_title.chars().count(), 150);
+        let emoji_body = "🎬".repeat(1500);
+        let body_payload = chat_payload("slack", "title", &emoji_body);
+        assert_eq!(body_payload["blocks"][1]["text"]["text"], emoji_body);
+        let over_body = "🎬".repeat(1501);
+        let over_body_payload = chat_payload("slack", "title", &over_body);
+        let clipped_body = over_body_payload["blocks"][1]["text"]["text"]
+            .as_str()
+            .unwrap();
+        assert_eq!(clipped_body, format!("{}…", "🎬".repeat(1499)));
+        assert_eq!(clipped_body.chars().count(), 1500);
     }
 
     #[tokio::test]
@@ -1075,6 +1159,118 @@ pub(crate) mod tests {
         thread.join().unwrap();
     }
 
+    #[tokio::test]
+    async fn trade_event_details_reach_webhook_without_route_secrets() {
+        for (event, detail) in [
+            ("route_failed", Some("peer refused the request")),
+            ("route_received", Some("receipt:bounded-digest")),
+            ("route_approved", None),
+        ] {
+            let (application, _directory, rx, thread) = webhook_app();
+            let policy = application.store.notification_defaults("").unwrap();
+            let route = test_trade_route(policy.clone());
+            trade_event(&application, &route, &policy, event, detail).await;
+            let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let payload = request_json(&request);
+            assert_eq!(payload["event"], event);
+            match detail {
+                Some(detail) => {
+                    assert_eq!(payload["detail"], detail);
+                    assert!(request.contains(detail));
+                }
+                None => assert!(payload.get("detail").is_none()),
+            }
+            assert_no_secrets(&request);
+            thread.join().unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upload_completion_notification_uses_scalar_persisted_timestamp() {
+        let (application, _directory, rx, thread) = webhook_app();
+        let policy = application.store.notification_defaults("").unwrap();
+        application
+            .store
+            .insert_link(Link {
+                id: "link-id".into(),
+                tenant: String::new(),
+                label: "upload-label".into(),
+                dest: String::new(),
+                password_hash: None,
+                created_at: 1,
+                expires_at: None,
+                max_bytes: None,
+                active: true,
+                legal_hold: false,
+                notifications: Some(policy),
+                uploads: Vec::new(),
+                events: Vec::new(),
+            })
+            .unwrap();
+        assert!(application
+            .store
+            .append_upload(
+                "",
+                "link-id",
+                UploadRecord {
+                    id: "upload-id".into(),
+                    started_at: 10,
+                    completed_at: 42,
+                    replayed_chunks: 0,
+                    rejected_chunks: 0,
+                    transport: None,
+                    package_root: "package-root".into(),
+                    total_bytes: 1,
+                    files: vec![FileRecord {
+                        path: "file.txt".into(),
+                        stored_as: "file.txt".into(),
+                        bytes: 1,
+                        suite: "blake3".into(),
+                        root: "root".into(),
+                        receipt: false,
+                        deleted: false,
+                    }],
+                    partial: false,
+                    log: Vec::new(),
+                },
+            )
+            .unwrap());
+        application
+            .store
+            .with(|connection| {
+                connection.execute(
+                    "INSERT INTO link_uploads(link_id, tenant, upload_id, document, file_count)
+                     VALUES ('link-id', '', 'unrelated', 'poisoned history', 0)",
+                    [],
+                )
+            })
+            .unwrap();
+        let report = FinishReport {
+            received: 1,
+            upload_id: "upload-id".into(),
+            files: vec![FileRecord {
+                path: "file.txt".into(),
+                stored_as: "file.txt".into(),
+                bytes: 1,
+                suite: "blake3".into(),
+                root: "root".into(),
+                receipt: false,
+                deleted: false,
+            }],
+        };
+        crate::app::upload_completed(
+            &application,
+            "session-id",
+            Some("link-id".into()),
+            &report,
+            &tokio::runtime::Handle::current(),
+        );
+        let payload = request_json(&rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        assert_eq!(payload["link_id"], "link-id");
+        assert_eq!(payload["completed_at"], 42);
+        thread.join().unwrap();
+    }
+
     // Multi-threaded: the blocking recv below must not starve the notifier.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn notifier_skips_cancelled_and_unsubscribed_sessions() {
@@ -1131,6 +1327,7 @@ pub(crate) mod tests {
         let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let payload = request_json(&request);
         assert_eq!(payload["event"], "outbound_download_started");
+        assert_eq!(payload["event_at"], result.event_at);
         assert_eq!(payload["download_starts"], 1);
         assert_eq!(payload["file_count"], 2);
         assert_eq!(payload["total_bytes"], 30);
@@ -1156,7 +1353,9 @@ pub(crate) mod tests {
         uploaded(
             application,
             String::new(),
+            "link-id".to_owned(),
             "upload-label".to_owned(),
+            100,
             FinishReport {
                 received: 0,
                 upload_id: "upload-id".to_owned(),
@@ -1167,6 +1366,8 @@ pub(crate) mod tests {
         .await;
         let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let payload = request_json(&request);
+        assert_eq!(payload["link_id"], "link-id");
+        assert_eq!(payload["completed_at"], 100);
         assert_eq!(payload["file_count"], 101);
         assert_eq!(payload["total_bytes"], 5151);
         assert_eq!(payload["files"].as_array().unwrap().len(), 100);
@@ -1285,12 +1486,14 @@ pub(crate) mod tests {
             OutboundDownloadResult {
                 first_download: false,
                 completed_delivery: true,
+                event_at: 77,
             },
         )
         .await;
         let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let payload = request_json(&request);
         assert_eq!(payload["event"], "outbound_delivery_complete");
+        assert_eq!(payload["event_at"], 77);
         assert_eq!(payload["download_starts"], u64::MAX);
         assert_eq!(payload["file_count"], 1);
         assert_eq!(payload["total_bytes"], 10);
@@ -1311,6 +1514,7 @@ pub(crate) mod tests {
             OutboundDownloadResult {
                 first_download: true,
                 completed_delivery: false,
+                event_at: 0,
             },
         )
         .await;
@@ -1354,6 +1558,7 @@ pub(crate) mod tests {
             OutboundDownloadResult {
                 first_download: false,
                 completed_delivery: false,
+                event_at: 0,
             },
         )
         .await;
@@ -1381,7 +1586,9 @@ pub(crate) mod tests {
         uploaded(
             application,
             String::new(),
+            "link-id".to_owned(),
             "smtp-label".to_owned(),
+            100,
             FinishReport {
                 received: 0,
                 upload_id: "up-smtp".to_owned(),
