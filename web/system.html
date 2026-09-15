@@ -312,6 +312,16 @@
 
           <section class="settings-group" id="retention" data-group="retention">
             <h2>Retention <button type="button" class="hint-button" aria-label="Help about retention" data-hint="Retention controls how long records or received files are kept. Zero keeps them indefinitely. Check the field description before changing a setting that removes files.">?</button></h2>
+            <div class="card">
+              <strong>Automatic cleanup</strong>
+              <p class="muted" id="retention-clock-status" role="status"></p>
+              <div class="actions">
+                <button type="button" class="link" id="retention-clock-ack" hidden>
+                  Confirm server time
+                </button>
+                <span id="retention-clock-note" class="muted"></span>
+              </div>
+            </div>
             <form inert data-unsaved id="retention-form" class="card">
               <div class="grid">
                 <div class="field">

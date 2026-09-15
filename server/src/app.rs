@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, Method, Request, StatusCode};
@@ -43,9 +44,168 @@ pub(crate) struct PushTicket {
     pub(crate) control: session::PushControl,
 }
 
+/// A process-local monotonic ceiling for committed-data age retention. The
+/// wall anchor is persisted by Store, while elapsed uptime is deliberately
+/// kept process-local so a restart cannot manufacture downtime.
+pub(crate) struct RetentionClock {
+    state: Mutex<RetentionClockState>,
+    #[cfg(test)]
+    observe_hook: Mutex<Option<RetentionObserveHook>>,
+}
+
+struct RetentionClockState {
+    trusted_at: Option<u64>,
+    anchor_at: u64,
+    started_at: Instant,
+}
+
+#[cfg(test)]
+struct RetentionObserveHook {
+    reached: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RetentionObservation {
+    pub(crate) effective_at: u64,
+    pub(crate) allow_age: bool,
+}
+
+// GET settings and the monotonic observation run at separate second
+// boundaries. This tolerance is display-only; cleanup keeps the exact ceiling.
+const RETENTION_CLOCK_DISPLAY_TOLERANCE_SECS: u64 = 2;
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum RetentionClockAcknowledgementError {
+    FutureObservation,
+    Store(String),
+}
+
+impl RetentionClock {
+    fn open(store: &Store) -> Result<Self, String> {
+        let trusted_at = store.retention_clock_anchor()?;
+        Ok(Self {
+            state: Mutex::new(RetentionClockState {
+                anchor_at: trusted_at.unwrap_or(0),
+                trusted_at,
+                started_at: Instant::now(),
+            }),
+            #[cfg(test)]
+            observe_hook: Mutex::new(None),
+        })
+    }
+
+    fn observe(&self, store: &Store, raw_wall: u64) -> Result<RetentionObservation, String> {
+        let mut state = self.state.lock().expect("retention clock poisoned");
+        let elapsed = state.started_at.elapsed();
+        self.test_pause_observe();
+        Self::observe_locked(store, raw_wall, elapsed, &mut state)
+    }
+
+    #[cfg(test)]
+    fn observe_with_elapsed(
+        &self,
+        store: &Store,
+        raw_wall: u64,
+        elapsed: Duration,
+    ) -> Result<RetentionObservation, String> {
+        let mut state = self.state.lock().expect("retention clock poisoned");
+        self.test_pause_observe();
+        Self::observe_locked(store, raw_wall, elapsed, &mut state)
+    }
+
+    #[cfg(test)]
+    fn test_pause_observe(&self) {
+        let hook = self
+            .observe_hook
+            .lock()
+            .expect("retention observe hook poisoned")
+            .take();
+        if let Some(hook) = hook {
+            hook.reached.send(()).unwrap();
+            hook.release
+                .recv_timeout(Duration::from_secs(2))
+                .expect("retention observe hook was not released");
+        }
+    }
+
+    #[cfg(not(test))]
+    fn test_pause_observe(&self) {}
+
+    fn observe_locked(
+        store: &Store,
+        raw_wall: u64,
+        elapsed: Duration,
+        state: &mut RetentionClockState,
+    ) -> Result<RetentionObservation, String> {
+        let Some(trusted_at) = state.trusted_at else {
+            return Ok(RetentionObservation {
+                effective_at: raw_wall,
+                allow_age: false,
+            });
+        };
+        let ceiling = state.anchor_at.saturating_add(elapsed.as_secs());
+        let effective_at = raw_wall.min(ceiling);
+        let persisted = trusted_at.max(effective_at);
+        if persisted > trusted_at {
+            store.advance_retention_clock(persisted)?;
+            state.trusted_at = Some(persisted);
+        }
+        Ok(RetentionObservation {
+            effective_at,
+            allow_age: true,
+        })
+    }
+
+    fn acknowledge(&self, store: &Store, actor: &str, wall: u64) -> Result<(), String> {
+        let mut state = self.state.lock().expect("retention clock poisoned");
+        let trusted_at = store.acknowledge_retention_clock(actor, wall)?;
+        state.trusted_at = Some(trusted_at);
+        state.anchor_at = trusted_at;
+        state.started_at = Instant::now();
+        Ok(())
+    }
+
+    fn status(&self, raw_wall: u64) -> serde_json::Value {
+        let state = self.state.lock().expect("retention clock poisoned");
+        self.status_at(raw_wall, state.started_at.elapsed(), &state)
+    }
+
+    #[cfg(test)]
+    fn status_with_elapsed(&self, raw_wall: u64, elapsed: Duration) -> serde_json::Value {
+        let state = self.state.lock().expect("retention clock poisoned");
+        self.status_at(raw_wall, elapsed, &state)
+    }
+
+    fn status_at(
+        &self,
+        raw_wall: u64,
+        elapsed: Duration,
+        state: &RetentionClockState,
+    ) -> serde_json::Value {
+        let Some(trusted_at) = state.trusted_at else {
+            return serde_json::json!({
+                "held": true,
+                "trusted_at": serde_json::Value::Null,
+                "effective_at": serde_json::Value::Null,
+                "raw_wall_at": raw_wall,
+            });
+        };
+        let ceiling = state.anchor_at.saturating_add(elapsed.as_secs());
+        serde_json::json!({
+            "held": false,
+            "trusted_at": trusted_at,
+            "effective_at": raw_wall.min(ceiling),
+            "raw_wall_at": raw_wall,
+            "capped": raw_wall > ceiling.saturating_add(RETENTION_CLOCK_DISPLAY_TOLERANCE_SECS),
+        })
+    }
+}
+
 pub struct App {
     pub config: Config,
     pub store: Arc<Store>,
+    pub(crate) retention_clock: RetentionClock,
     pub sessions: Sessions,
     /// Content hash of the served sender assets, so a page loaded before a
     /// deploy can tell it is stale and reload instead of failing on a changed
@@ -783,6 +943,8 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
             .map_err(|e| e.to_string())?;
     }
     std::fs::create_dir_all(&config.outbound_dir).map_err(|e| e.to_string())?;
+    let retention_clock = RetentionClock::open(&store)?;
+    let boot_retention = retention_clock.observe(&store, now_unix())?;
     let lease_holder = crate::lease::new_holder();
     let mut receiving = match crate::receiving::Destinations::configured(
         &config.receive_dir,
@@ -796,7 +958,20 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
     };
     clean_outbound_stage(&config.data_dir);
     clean_outbound_proof_stages(&config.data_dir);
-    clean_outbound_proofs(&config.data_dir, &store, now_unix());
+    if boot_retention.allow_age {
+        clean_outbound_proofs(&config.data_dir, &store, boot_retention.effective_at);
+    } else {
+        tracing::warn!(
+            "automatic retention is held until a platform operator acknowledges the current clock"
+        );
+        store.audit(
+            "",
+            "",
+            "retention_clock_held",
+            "",
+            &serde_json::json!({ "raw_wall_at": now_unix() }),
+        );
+    }
     let secret = crate::auth::load_secret(&config.data_dir)?;
     let signer = Arc::clone(&store.event_signer);
     let sessions = Sessions::new();
@@ -821,6 +996,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
     let web_build = web_build(&config.web_root);
     Ok(Arc::new(App {
         store,
+        retention_clock,
         sessions,
         secret,
         web_build,
@@ -881,6 +1057,28 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
 }
 
 impl App {
+    pub(crate) fn retention_observation(&self) -> Result<RetentionObservation, String> {
+        self.retention_clock.observe(&self.store, now_unix())
+    }
+
+    pub(crate) fn retention_clock_status(&self) -> serde_json::Value {
+        self.retention_clock.status(now_unix())
+    }
+
+    pub(crate) fn acknowledge_retention_clock_at(
+        &self,
+        actor: &str,
+        observed_at: u64,
+        current_wall: u64,
+    ) -> Result<(), RetentionClockAcknowledgementError> {
+        if observed_at > current_wall {
+            return Err(RetentionClockAcknowledgementError::FutureObservation);
+        }
+        self.retention_clock
+            .acknowledge(&self.store, actor, observed_at)
+            .map_err(RetentionClockAcknowledgementError::Store)
+    }
+
     pub fn receiving_destinations(&self) -> Result<Arc<crate::receiving::Destinations>, String> {
         if self.lease_lost.load(Ordering::Acquire) {
             return Err("receiving storage ownership was lost".to_owned());
@@ -3318,6 +3516,10 @@ pub fn router(app: Arc<App>) -> Router {
             get(api::get_settings).put(api::put_settings),
         )
         .route(
+            "/api/admin/settings/retention-clock/acknowledge",
+            post(api::acknowledge_retention_clock),
+        )
+        .route(
             "/api/admin/tenants/{key}",
             axum::routing::patch(api::update_tenant).delete(api::delete_tenant),
         )
@@ -4793,14 +4995,24 @@ mod request_metrics_tests {
     }
 }
 
-async fn expire_link_uploads(app: &Arc<App>, candidate: crate::store::Link, cutoff: u64) {
+async fn expire_link_uploads(
+    app: &Arc<App>,
+    candidate: crate::store::Link,
+    cutoff: u64,
+    effective_now: u64,
+) {
     sweep_task(app, "upload retention", move |app| {
-        expire_link_uploads_sync(app, candidate, cutoff);
+        expire_link_uploads_sync(app, candidate, cutoff, effective_now);
     })
     .await;
 }
 
-fn expire_link_uploads_sync(app: &App, candidate: crate::store::Link, cutoff: u64) {
+fn expire_link_uploads_sync(
+    app: &App,
+    candidate: crate::store::Link,
+    cutoff: u64,
+    effective_now: u64,
+) {
     if app.receiving_destinations().is_err() {
         return;
     }
@@ -4840,11 +5052,10 @@ fn expire_link_uploads_sync(app: &App, candidate: crate::store::Link, cutoff: u6
         .filter(|file| !file.deleted)
         .map(|file| file.stored_as.as_str())
         .collect();
-    let now = now_unix();
     let active_outbound_files =
         match app
             .store
-            .active_outbound_file_keys(&link.tenant, &link.id, now)
+            .active_outbound_file_keys(&link.tenant, &link.id, effective_now)
         {
             Ok(keys) => keys,
             Err(error) => {
@@ -5085,6 +5296,26 @@ async fn sweep_short(app: &Arc<App>) {
 }
 
 async fn sweep_daily(app: &Arc<App>) {
+    let retention =
+        match sweep_task(app, "retention clock", |app| app.retention_observation()).await {
+            Some(Ok(retention)) => retention,
+            Some(Err(error)) => {
+                tracing::error!(%error, "retention clock read failed; skipping this sweep");
+                return;
+            }
+            None => return,
+        };
+    sweep_daily_at(app, retention).await;
+}
+
+async fn sweep_daily_at(app: &Arc<App>, retention: RetentionObservation) {
+    if !retention.allow_age {
+        tracing::warn!(
+            "automatic retention remains held until a platform operator acknowledges the current clock"
+        );
+        return;
+    }
+    let now = retention.effective_at;
     // Destructive cleanup requires current settings; a failed read skips this pass.
     let settings = match sweep_task(app, "retention settings", |app| {
         app.store.resolved_settings(&app.config)
@@ -5098,13 +5329,12 @@ async fn sweep_daily(app: &Arc<App>) {
         }
         None => return,
     };
-    sweep_task(app, "outbound proofs", |app| {
-        clean_outbound_proofs(&app.config.data_dir, &app.store, crate::store::now_unix());
+    sweep_task(app, "outbound proofs", move |app| {
+        clean_outbound_proofs(&app.config.data_dir, &app.store, now);
     })
     .await;
     if settings.audit_retention_days > 0 {
-        let cutoff = crate::store::now_unix()
-            .saturating_sub(settings.audit_retention_days.saturating_mul(86_400));
+        let cutoff = now.saturating_sub(settings.audit_retention_days.saturating_mul(86_400));
         sweep_task(app, "audit rows", move |app| {
             match app.store.audit_prune(cutoff) {
                 Ok(count) if count > 0 => tracing::info!(count, "pruned expired audit rows"),
@@ -5114,17 +5344,14 @@ async fn sweep_daily(app: &Arc<App>) {
         })
         .await;
     }
-    sweep_task(app, "database snapshots", |app| {
+    sweep_task(app, "database snapshots", move |app| {
         let backup_dir = app.config.data_dir.join("backups");
-        let cutoff_modified =
-            std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
-        prune_legacy_snapshots(&backup_dir, cutoff_modified);
+        prune_legacy_snapshots_at(&backup_dir, now);
     })
     .await;
 
     if settings.upload_retention_days > 0 {
-        let cutoff = crate::store::now_unix()
-            .saturating_sub(settings.upload_retention_days.saturating_mul(86_400));
+        let cutoff = now.saturating_sub(settings.upload_retention_days.saturating_mul(86_400));
         let mut after = None;
         loop {
             let page_after = after.clone();
@@ -5159,7 +5386,7 @@ async fn sweep_daily(app: &Arc<App>) {
                     }
                     None => return,
                 };
-                expire_link_uploads(app, link, cutoff).await;
+                expire_link_uploads(app, link, cutoff, now).await;
             }
             if page_len < RETENTION_LINK_PAGE_SIZE {
                 break;
@@ -5188,10 +5415,407 @@ fn prune_legacy_snapshots(backup_dir: &std::path::Path, cutoff: std::time::Syste
     }
 }
 
+fn prune_legacy_snapshots_at(backup_dir: &std::path::Path, now: u64) {
+    let cutoff =
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(now.saturating_sub(30 * 86_400));
+    prune_legacy_snapshots(backup_dir, cutoff);
+}
+
 #[cfg(test)]
 mod retention_tests {
     use super::*;
     use crate::store::{FileRecord, Link, OutboundGrant, SettingWrite, UploadRecord};
+
+    #[test]
+    fn retention_clock_seeds_new_database_and_holds_existing_until_ack() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        assert!(store.retention_clock_anchor().unwrap().is_some());
+        store
+            .with(|connection| {
+                connection.execute(
+                    "DELETE FROM meta WHERE key = ?1",
+                    [crate::store::RETENTION_CLOCK_KEY],
+                )
+            })
+            .unwrap();
+
+        let clock = RetentionClock::open(&store).unwrap();
+        let base = 1_800_000_000;
+        let future = base + 31 * 86_400;
+        assert_eq!(
+            clock
+                .observe_with_elapsed(&store, future, Duration::ZERO)
+                .unwrap(),
+            RetentionObservation {
+                effective_at: future,
+                allow_age: false,
+            }
+        );
+
+        clock
+            .acknowledge(&store, "platform-operator", base)
+            .unwrap();
+        assert_eq!(
+            clock.status_with_elapsed(base + 2, Duration::ZERO)["capped"],
+            false,
+            "one-second boundary drift does not show a spurious acknowledgement prompt"
+        );
+        assert_eq!(
+            clock.status_with_elapsed(base + 3, Duration::ZERO)["capped"],
+            true
+        );
+        let held_uptime = clock
+            .observe_with_elapsed(&store, future, Duration::ZERO)
+            .unwrap();
+        assert_eq!(held_uptime.effective_at, base);
+        assert!(held_uptime.allow_age);
+        assert_eq!(
+            clock
+                .observe_with_elapsed(&store, future, Duration::from_secs(86_400))
+                .unwrap()
+                .effective_at,
+            base + 86_400
+        );
+        assert_eq!(
+            clock
+                .observe_with_elapsed(&store, future, Duration::from_secs(86_400))
+                .unwrap()
+                .effective_at,
+            base + 86_400,
+            "repeated calls cannot manufacture additional retention age"
+        );
+        let persisted = store.retention_clock_anchor().unwrap().unwrap();
+        assert_eq!(persisted, base + 86_400);
+
+        let reopened = RetentionClock::open(&store).unwrap();
+        assert_eq!(
+            reopened
+                .observe_with_elapsed(&store, future, Duration::ZERO)
+                .unwrap()
+                .effective_at,
+            persisted,
+            "a restart starts from persisted effective time"
+        );
+        assert_eq!(
+            reopened
+                .observe_with_elapsed(&store, base - 1, Duration::ZERO)
+                .unwrap()
+                .effective_at,
+            base - 1,
+            "backward wall time lowers only the current cutoff"
+        );
+        assert_eq!(store.retention_clock_anchor().unwrap(), Some(persisted));
+        reopened
+            .acknowledge(&store, "platform-operator", base - 1)
+            .unwrap();
+        assert_eq!(
+            store.retention_clock_anchor().unwrap(),
+            Some(persisted),
+            "an acknowledgement cannot move trusted time backwards"
+        );
+        let audit = store.audit_export(None, 0, 0, 10).unwrap();
+        assert!(audit
+            .iter()
+            .any(|row| row.event == "retention_clock_acknowledged"));
+    }
+
+    #[test]
+    fn retention_observe_and_ack_interleaving_keeps_anchor_atomic() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(directory.path()).unwrap());
+        let clock = Arc::new(RetentionClock::open(&store).unwrap());
+        let base = store.retention_clock_anchor().unwrap().unwrap();
+        let raw = base + 200 * 86_400;
+        let acknowledged = base + 100 * 86_400;
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (observe_done_tx, observe_done_rx) = std::sync::mpsc::channel();
+        *clock
+            .observe_hook
+            .lock()
+            .expect("retention observe hook poisoned") = Some(RetentionObserveHook {
+            reached: reached_tx,
+            release: release_rx,
+        });
+
+        let observing_clock = Arc::clone(&clock);
+        let observing_store = Arc::clone(&store);
+        let observer = std::thread::spawn(move || {
+            let result = observing_clock.observe_with_elapsed(
+                &observing_store,
+                raw,
+                Duration::from_secs(31 * 86_400),
+            );
+            observe_done_tx.send(result).unwrap();
+        });
+        reached_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("observe must reach the forced interleaving");
+
+        let (ack_started_tx, ack_started_rx) = std::sync::mpsc::channel();
+        let (ack_done_tx, ack_done_rx) = std::sync::mpsc::channel();
+        let acknowledging_clock = Arc::clone(&clock);
+        let acknowledging_store = Arc::clone(&store);
+        let acknowledger = std::thread::spawn(move || {
+            ack_started_tx.send(()).unwrap();
+            let result = acknowledging_clock.acknowledge(
+                &acknowledging_store,
+                "platform-operator",
+                acknowledged,
+            );
+            ack_done_tx.send(result).unwrap();
+        });
+        ack_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("acknowledgement thread must start");
+        let ack_waited = ack_done_rx.recv_timeout(Duration::from_millis(50)).is_err();
+        release_tx.send(()).unwrap();
+        assert!(
+            ack_waited,
+            "acknowledgement must wait for the observation clock guard"
+        );
+
+        let observation = observe_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("observe must finish after the forced interleaving")
+            .unwrap();
+        observer.join().unwrap();
+        assert_eq!(observation.effective_at, base + 31 * 86_400);
+        assert!(ack_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .is_ok());
+        acknowledger.join().unwrap();
+        assert_eq!(store.retention_clock_anchor().unwrap(), Some(acknowledged));
+        assert_eq!(
+            clock
+                .observe_with_elapsed(&store, raw, Duration::ZERO)
+                .unwrap()
+                .effective_at,
+            acknowledged,
+            "old uptime cannot be applied to the new acknowledgement anchor"
+        );
+    }
+
+    #[tokio::test]
+    async fn injected_future_runs_real_age_cleanup_and_grant_protection() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = crate::api::testing::config(directory.path());
+        let store = Store::open(&config.data_dir).unwrap();
+        store
+            .with(|connection| {
+                connection.execute(
+                    "DELETE FROM meta WHERE key = ?1",
+                    [crate::store::RETENTION_CLOCK_KEY],
+                )
+            })
+            .unwrap();
+        drop(store);
+        let app = crate::app::build(config).unwrap();
+        let base = crate::store::now_unix();
+        let future = base + 31 * 86_400;
+        app.store
+            .put_settings(
+                "test",
+                &[
+                    (
+                        "audit_retention_days".to_owned(),
+                        SettingWrite::Set("7".to_owned()),
+                    ),
+                    (
+                        "upload_retention_days".to_owned(),
+                        SettingWrite::Set("1".to_owned()),
+                    ),
+                ],
+            )
+            .unwrap();
+        std::fs::create_dir_all(&app.config.receive_dir).unwrap();
+        let make_link = |id: &str, upload_id: &str, name: &str, completed_at: u64| {
+            let path = app.config.receive_dir.join(name);
+            let file = crate::receiving::tests::published_file(
+                &path,
+                name.as_bytes(),
+                vot_verifier::Suite::Blake3Bao64,
+                &app.signer,
+            );
+            Link {
+                id: id.to_owned(),
+                tenant: String::new(),
+                label: id.to_owned(),
+                dest: String::new(),
+                password_hash: None,
+                created_at: base,
+                expires_at: None,
+                max_bytes: None,
+                active: true,
+                legal_hold: false,
+                notifications: None,
+                uploads: vec![UploadRecord {
+                    partial: false,
+                    log: Vec::new(),
+                    id: upload_id.to_owned(),
+                    started_at: base,
+                    completed_at,
+                    replayed_chunks: 0,
+                    rejected_chunks: 0,
+                    transport: None,
+                    package_root: "root".to_owned(),
+                    total_bytes: file.bytes,
+                    files: vec![file],
+                }],
+                events: Vec::new(),
+            }
+        };
+        let old = make_link("old", "old-upload", "old.txt", base - 8 * 86_400);
+        let expired = make_link(
+            "expired-future",
+            "expired-upload",
+            "expired-future.txt",
+            future - 2 * 86_400,
+        );
+        let protected = make_link(
+            "protected-future",
+            "protected-upload",
+            "protected-future.txt",
+            future - 2 * 86_400,
+        );
+        let expired_object = expired.uploads[0].files[0].clone();
+        let protected_object = protected.uploads[0].files[0].clone();
+        app.store.insert_link(old).unwrap();
+        app.store.insert_link(expired).unwrap();
+        app.store.insert_link(protected).unwrap();
+        let make_grant =
+            |id: &str, link_id: &str, upload_id: &str, object: &FileRecord, expires_at: u64| {
+                app.store
+                    .insert_outbound_grant(OutboundGrant {
+                        id: id.to_owned(),
+                        token_hash: format!("{id}-hash"),
+                        password_hash: None,
+                        tenant: String::new(),
+                        link_id: link_id.to_owned(),
+                        upload_id: upload_id.to_owned(),
+                        package_root: "root".to_owned(),
+                        name: object.path.clone(),
+                        suite: object.suite.clone(),
+                        root: object.root.clone(),
+                        file_index: 0,
+                        bytes: object.bytes,
+                        label: id.to_owned(),
+                        created_at: base,
+                        expires_at,
+                        revoked_at: None,
+                        downloads: 0,
+                        max_downloads: None,
+                        notifications: None,
+                        first_download_at: None,
+                        last_download_at: None,
+                        files: Vec::new(),
+                    })
+                    .unwrap();
+            };
+        make_grant(
+            "expired-grant",
+            "expired-future",
+            "expired-upload",
+            &expired_object,
+            future - 3_600,
+        );
+        make_grant(
+            "future-grant",
+            "protected-future",
+            "protected-upload",
+            &protected_object,
+            future + 86_400,
+        );
+
+        app.store
+            .with(|connection| {
+                connection.execute(
+                    "INSERT INTO audit_log(at,tenant,actor,event,subject,detail)
+                     VALUES (?1,'','test','future_audit','subject','{}')",
+                    [i64::try_from(base - 8 * 86_400).unwrap()],
+                )
+            })
+            .unwrap();
+        let snapshot = app.config.data_dir.join("backups/votport-1-deadbeef.db");
+        std::fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+        std::fs::write(&snapshot, b"snapshot").unwrap();
+        std::fs::File::open(&snapshot)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(base - 31 * 86_400)),
+            )
+            .unwrap();
+        let proof_dir = app.config.data_dir.join("outbound.proofs");
+        std::fs::create_dir_all(&proof_dir).unwrap();
+        let expired_proof = proof_dir.join(format!(
+            "1-{}-{}.vot-catalog",
+            expired_object.root, expired_object.bytes
+        ));
+        let protected_proof = proof_dir.join(format!(
+            "1-{}-{}.vot-catalog",
+            protected_object.root, protected_object.bytes
+        ));
+        std::fs::write(&expired_proof, b"expired proof").unwrap();
+        std::fs::write(&protected_proof, b"protected proof").unwrap();
+
+        let held = app.retention_observation().unwrap();
+        assert!(!held.allow_age);
+        sweep_daily_at(&app, held).await;
+        assert!(app.config.receive_dir.join("old.txt").exists());
+        assert!(app.config.receive_dir.join("expired-future.txt").exists());
+        assert!(snapshot.exists());
+        assert!(expired_proof.exists());
+        assert!(protected_proof.exists());
+
+        app.acknowledge_retention_clock_at("platform-operator", base, base)
+            .unwrap();
+        let zero = app
+            .retention_clock
+            .observe_with_elapsed(&app.store, future, Duration::ZERO)
+            .unwrap();
+        assert_eq!(zero.effective_at, base);
+        sweep_daily_at(&app, zero).await;
+        assert!(!app.config.receive_dir.join("old.txt").exists());
+        assert!(app.config.receive_dir.join("expired-future.txt").exists());
+        assert!(app.config.receive_dir.join("protected-future.txt").exists());
+        assert!(!snapshot.exists());
+        assert!(expired_proof.exists());
+        assert!(protected_proof.exists());
+
+        let one_day = app
+            .retention_clock
+            .observe_with_elapsed(&app.store, future, Duration::from_secs(86_400))
+            .unwrap();
+        assert_eq!(one_day.effective_at, base + 86_400);
+        sweep_daily_at(&app, one_day).await;
+        assert!(app.config.receive_dir.join("expired-future.txt").exists());
+        assert!(app.config.receive_dir.join("protected-future.txt").exists());
+        assert!(expired_proof.exists());
+        assert!(protected_proof.exists());
+
+        let full_age = app
+            .retention_clock
+            .observe_with_elapsed(&app.store, future, Duration::from_secs(31 * 86_400))
+            .unwrap();
+        assert_eq!(full_age.effective_at, future);
+        sweep_daily_at(&app, full_age).await;
+        assert!(!app.config.receive_dir.join("expired-future.txt").exists());
+        assert!(app.config.receive_dir.join("protected-future.txt").exists());
+        assert!(!expired_proof.exists());
+        assert!(protected_proof.exists());
+        assert_eq!(
+            app.store
+                .audit_export(None, 0, 0, 100)
+                .unwrap()
+                .iter()
+                .filter(|row| row.event == "future_audit")
+                .count(),
+            0
+        );
+    }
 
     #[tokio::test]
     async fn poisoned_cleanup_duties_leave_other_work_and_later_passes_running() {
@@ -5558,7 +6182,7 @@ mod retention_tests {
                 std::fs::write(&expired_path, b"replacement").unwrap();
             }
             let candidate = app.store.link("", "expired").unwrap().unwrap();
-            expire_link_uploads(&app, candidate, cutoff).await;
+            expire_link_uploads(&app, candidate, cutoff, cutoff).await;
             assert!(!app.store.link("", "expired").unwrap().unwrap().uploads[0].files[0].deleted);
             assert_eq!(
                 std::fs::read(displaced.join("expired.txt")).unwrap(),
@@ -5573,7 +6197,7 @@ mod retention_tests {
         receiving.check_current().unwrap();
         let mut stale_held = held;
         stale_held.legal_hold = false;
-        expire_link_uploads(&app, stale_held, cutoff).await;
+        expire_link_uploads(&app, stale_held, cutoff, cutoff).await;
 
         let (active_tx, _active_rx) = tokio::sync::mpsc::channel(1);
         app.sessions
@@ -5585,11 +6209,11 @@ mod retention_tests {
             )
             .unwrap();
         let active_candidate = app.store.link("", "active").unwrap().unwrap();
-        expire_link_uploads(&app, active_candidate, cutoff).await;
+        expire_link_uploads(&app, active_candidate, cutoff, cutoff).await;
         assert!(active_path.exists());
 
         let shared_candidate = app.store.link("", "shared").unwrap().unwrap();
-        expire_link_uploads(&app, shared_candidate, cutoff).await;
+        expire_link_uploads(&app, shared_candidate, cutoff, cutoff).await;
         assert!(shared_path.exists());
         assert!(app
             .store
@@ -5601,7 +6225,7 @@ mod retention_tests {
             .all(|upload| !upload.files[0].deleted));
 
         let outbound_candidate = app.store.link("", "outbound").unwrap().unwrap();
-        expire_link_uploads(&app, outbound_candidate, cutoff).await;
+        expire_link_uploads(&app, outbound_candidate, cutoff, cutoff).await;
         assert!(outbound_path.exists());
         assert!(!app.store.link("", "outbound").unwrap().unwrap().uploads[0].files[0].deleted);
 
@@ -5614,7 +6238,7 @@ mod retention_tests {
             )
             .unwrap();
         let malformed_candidate = app.store.link("", "outbound").unwrap().unwrap();
-        expire_link_uploads(&app, malformed_candidate, cutoff).await;
+        expire_link_uploads(&app, malformed_candidate, cutoff, cutoff).await;
         assert!(outbound_path.exists());
         assert!(!app.store.link("", "outbound").unwrap().unwrap().uploads[0].files[0].deleted);
 
@@ -5625,7 +6249,7 @@ mod retention_tests {
             )
             .unwrap();
         let failed_candidate = app.store.link("", "failed").unwrap().unwrap();
-        expire_link_uploads(&app, failed_candidate, cutoff).await;
+        expire_link_uploads(&app, failed_candidate, cutoff, cutoff).await;
         connection
             .execute_batch("DROP TRIGGER fail_link_update")
             .unwrap();

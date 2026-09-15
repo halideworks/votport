@@ -477,6 +477,7 @@ pub struct SettingsOverlay {
 
 pub(crate) const SCHEMA_VERSION: u64 = 44;
 pub(crate) const DELIVERED_CANDIDATE_PAGE: usize = 128;
+pub(crate) const RETENTION_CLOCK_KEY: &str = "retention_clock_trusted_at";
 
 #[cfg(test)]
 const TENANT_RECEIVED_VM_UNOBSERVED: u64 = u64::MAX;
@@ -3034,6 +3035,88 @@ impl Store {
                 })
                 .map(|value| value.max(0) as u64)
         })
+    }
+
+    /// The persisted wall-time anchor for automatic age retention. An absent
+    /// value deliberately means that this is an existing installation whose
+    /// clock has not been acknowledged yet.
+    pub(crate) fn retention_clock_anchor(&self) -> Result<Option<u64>, String> {
+        self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    [RETENTION_CLOCK_KEY],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .and_then(|value| {
+                    value
+                        .map(|value| {
+                            value.parse::<u64>().map_err(|_| {
+                                rusqlite::Error::InvalidParameterName(
+                                    "invalid retention clock anchor".to_owned(),
+                                )
+                            })
+                        })
+                        .transpose()
+                })
+        })
+    }
+
+    pub(crate) fn advance_retention_clock(&self, at: u64) -> Result<(), String> {
+        self.with(|connection| {
+            connection
+                .execute(
+                    "UPDATE meta SET value = ?2
+                     WHERE key = ?1 AND CAST(value AS INTEGER) < ?2",
+                    rusqlite::params![RETENTION_CLOCK_KEY, i64::try_from(at).unwrap_or(i64::MAX)],
+                )
+                .map(|_| ())
+        })
+    }
+
+    /// A platform operator explicitly establishes the wall-time anchor for a
+    /// held or clock-capped installation and records that acknowledgement.
+    pub(crate) fn acknowledge_retention_clock(&self, actor: &str, at: u64) -> Result<u64, String> {
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let previous = transaction
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [RETENTION_CLOCK_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| "invalid retention clock anchor".to_owned())
+            })
+            .transpose()?
+            .unwrap_or(at);
+        let trusted_at = previous.max(at);
+        transaction
+            .execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![RETENTION_CLOCK_KEY, trusted_at.to_string()],
+            )
+            .map_err(|error| error.to_string())?;
+        insert_audit_row(
+            &transaction,
+            at,
+            "",
+            actor,
+            "retention_clock_acknowledged",
+            "",
+            &serde_json::json!({ "observed_at": at, "trusted_at": trusted_at }),
+        )
+        .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(trusted_at)
     }
 
     // -------------------------------------------------------------- settings
@@ -5716,6 +5799,12 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
         .execute(
             "INSERT INTO meta(key,value) VALUES ('schema_version',?1)",
             [SCHEMA_VERSION.to_string()],
+        )
+        .map_err(|e| e.to_string())?;
+    transaction
+        .execute(
+            "INSERT INTO meta(key,value) VALUES (?1,?2)",
+            rusqlite::params![RETENTION_CLOCK_KEY, now_unix().to_string()],
         )
         .map_err(|e| e.to_string())?;
     transaction.commit().map_err(|e| e.to_string())?;

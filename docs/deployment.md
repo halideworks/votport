@@ -716,6 +716,13 @@ from the automatic content sweep and records the change in the audit log.
 Explicit file, upload-record, and link deletion require releasing the hold
 first. Tenant deletion requires removing its links first.
 
+Automatic age cleanup uses a saved time anchor plus server uptime, so a
+forward clock correction cannot suddenly age stored data. Existing installations
+without an anchor pause age cleanup until a platform admin confirms the displayed
+server time under **System > Retention**. Cleanup stays conservative across
+restarts and downtime; confirm the current time there if it falls behind.
+Backup count limits and explicit deletions continue independently.
+
 Idle-session and staging cleanup waits one minute between passes. Daily
 retention waits 24 hours after startup and after each completed pass, so it
 never runs immediately at boot. The two schedules run independently. Restarting

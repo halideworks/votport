@@ -1432,6 +1432,11 @@ mod tests {
         );
         drop(converted);
         let store = Store::open(directory.path()).unwrap();
+        assert_eq!(
+            store.retention_clock_anchor().unwrap(),
+            None,
+            "converted existing data starts in the retention hold"
+        );
         assert_eq!(store.audit_count().unwrap(), 4);
         let connection = store.connection.lock().unwrap();
         assert_eq!(read_uploads(&connection, "link").unwrap(), vec![upload]);
