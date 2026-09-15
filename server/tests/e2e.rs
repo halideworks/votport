@@ -134,58 +134,69 @@ async fn admin_links(client: &reqwest::Client, base: &str) -> reqwest::Result<Va
 }
 
 async fn start_server() -> TestServer {
-    start_server_with_cap(64 * 1024 * 1024).await
+    start_server_with(ServerOptions::default()).await
 }
 
-async fn start_server_with_cap(max_upload_bytes: u64) -> TestServer {
-    start_server_inner(max_upload_bytes, false).await
-}
-
-async fn start_push_server() -> TestServer {
-    start_server_inner(64 * 1024 * 1024, true).await
-}
-
-async fn start_push_server_with_cap(max_upload_bytes: u64) -> TestServer {
-    start_server_inner(max_upload_bytes, true).await
-}
-
-async fn start_push_server_with_idle(session_idle_secs: u64) -> TestServer {
-    start_server_inner_with_idle(64 * 1024 * 1024, true, session_idle_secs).await
-}
-
-async fn start_server_inner(max_upload_bytes: u64, enable_push: bool) -> TestServer {
-    start_server_inner_with_idle(max_upload_bytes, enable_push, 600).await
-}
-
-async fn start_server_inner_with_idle(
-    max_upload_bytes: u64,
-    enable_push: bool,
-    session_idle_secs: u64,
-) -> TestServer {
-    start_server_custom(max_upload_bytes, enable_push, session_idle_secs, 32).await
-}
-
-async fn start_server_custom(
+struct ServerOptions {
     max_upload_bytes: u64,
     enable_push: bool,
     session_idle_secs: u64,
     max_total_sessions: usize,
-) -> TestServer {
+}
+
+impl Default for ServerOptions {
+    fn default() -> Self {
+        Self {
+            max_upload_bytes: 64 * 1024 * 1024,
+            enable_push: false,
+            session_idle_secs: 600,
+            max_total_sessions: 32,
+        }
+    }
+}
+
+async fn start_server_with_cap(max_upload_bytes: u64) -> TestServer {
+    start_server_with(ServerOptions {
+        max_upload_bytes,
+        ..ServerOptions::default()
+    })
+    .await
+}
+
+async fn start_push_server() -> TestServer {
+    start_server_with(ServerOptions {
+        enable_push: true,
+        ..ServerOptions::default()
+    })
+    .await
+}
+
+async fn start_push_server_with_cap(max_upload_bytes: u64) -> TestServer {
+    start_server_with(ServerOptions {
+        max_upload_bytes,
+        enable_push: true,
+        ..ServerOptions::default()
+    })
+    .await
+}
+
+async fn start_push_server_with_idle(session_idle_secs: u64) -> TestServer {
+    start_server_with(ServerOptions {
+        enable_push: true,
+        session_idle_secs,
+        ..ServerOptions::default()
+    })
+    .await
+}
+
+async fn start_server_with(options: ServerOptions) -> TestServer {
     let data = tempfile::tempdir().expect("data dir");
     use std::os::unix::fs::PermissionsExt as _;
     let received = tempfile::Builder::new()
         .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir()
         .expect("receive dir");
-    start_server_in(
-        data,
-        received,
-        max_upload_bytes,
-        enable_push,
-        session_idle_secs,
-        max_total_sessions,
-    )
-    .await
+    start_server_in(data, received, options).await
 }
 
 impl TestServer {
@@ -207,26 +218,23 @@ impl TestServer {
 
 /// Boots a fresh server over an earlier server's directories.
 async fn boot(data: tempfile::TempDir, received: tempfile::TempDir) -> TestServer {
-    start_server_in(data, received, 64 * 1024 * 1024, false, 600, 32).await
+    start_server_in(data, received, ServerOptions::default()).await
 }
 
 async fn start_server_in(
     data: tempfile::TempDir,
     received: tempfile::TempDir,
-    max_upload_bytes: u64,
-    enable_push: bool,
-    session_idle_secs: u64,
-    max_total_sessions: usize,
+    options: ServerOptions,
 ) -> TestServer {
     let config = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
-        push_bind: enable_push.then(|| "127.0.0.1:0".parse().unwrap()),
+        push_bind: options.enable_push.then(|| "127.0.0.1:0".parse().unwrap()),
         push_certificate: None,
         push_private_key: None,
         push_advertise: None,
         // The serve listener rides with push in tests: same certificate,
         // same issuer, a second port.
-        serve_bind: enable_push.then(|| "127.0.0.1:0".parse().unwrap()),
+        serve_bind: options.enable_push.then(|| "127.0.0.1:0".parse().unwrap()),
         serve_advertise: None,
         data_dir: data.path().join("state"),
         receive_dir: received.path().to_path_buf(),
@@ -245,10 +253,10 @@ async fn start_server_in(
         smtp_from: None,
 
         public_url: None,
-        max_upload_bytes,
-        workflow_snapshot_bytes: max_upload_bytes.saturating_mul(4),
+        max_upload_bytes: options.max_upload_bytes,
+        workflow_snapshot_bytes: options.max_upload_bytes.saturating_mul(4),
         allow_hidden: false,
-        session_idle_secs,
+        session_idle_secs: options.session_idle_secs,
         audit_retention_days: 400,
         upload_retention_days: 0,
         default_max_total_bytes: None,
@@ -257,14 +265,14 @@ async fn start_server_in(
         public_password_login: true,
         require_provisioning: false,
         metrics_token: None,
-        max_total_sessions,
+        max_total_sessions: options.max_total_sessions,
         max_link_sessions: 8,
         sso_session_secs: 7 * 24 * 3600,
         trusted_proxies: Vec::new(),
         oidc: None,
     };
     let application = app::build(config).expect("app builds");
-    if enable_push {
+    if options.enable_push {
         app::start_push_receiver(Arc::clone(&application));
         app::start_serve(Arc::clone(&application));
     }
@@ -279,7 +287,7 @@ async fn start_server_in(
         .await
         .unwrap();
     });
-    let (push_address, push_certificate_digest) = if enable_push {
+    let (push_address, push_certificate_digest) = if options.enable_push {
         let identity = reqwest::Client::new()
             .get(format!("http://{addr}/api/push-identity"))
             .send()
@@ -2934,7 +2942,11 @@ async fn multi_file_session_survives_a_restart_after_one_file_published() {
 #[tokio::test(flavor = "multi_thread")]
 async fn transfer_log_records_publishes_and_quiet_gaps() {
     // Idle timeout 50 s makes the quiet threshold 5 s.
-    let server = start_server_custom(64 * 1024 * 1024, false, 50, 32).await;
+    let server = start_server_with(ServerOptions {
+        session_idle_secs: 50,
+        ..ServerOptions::default()
+    })
+    .await;
     let client = reqwest::Client::builder()
         .cookie_store(true)
         .build()
@@ -3352,10 +3364,7 @@ async fn standby_pull_stages_the_live_copy_and_a_boot_promotes_it() {
     let promoted = start_server_in(
         standby_data,
         tempfile::tempdir().unwrap(),
-        64 * 1024 * 1024,
-        false,
-        600,
-        32,
+        ServerOptions::default(),
     )
     .await;
     let promoted_client = reqwest::Client::builder()
@@ -4978,9 +4987,12 @@ async fn concurrent_load() {
             (target.trim_end_matches('/').to_owned(), password, None)
         }
         Err(_) => {
-            let server =
-                start_server_custom((file_mib as u64 * 2 + 16) * MIB, false, 600, sessions + 8)
-                    .await;
+            let server = start_server_with(ServerOptions {
+                max_upload_bytes: (file_mib as u64 * 2 + 16) * MIB,
+                max_total_sessions: sessions + 8,
+                ..ServerOptions::default()
+            })
+            .await;
             let base = server.base.clone();
             (base, ADMIN_PASSWORD.to_owned(), Some(server))
         }
@@ -5792,7 +5804,7 @@ async fn search_finds_requests_files_and_downloads() {
 /// the VOT fetch environment, which is process-wide.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_library_grant_is_fetched_over_vot_quic_and_counted_once() {
-    let server = start_server_custom(64 * 1024 * 1024, true, 600, 32).await;
+    let server = start_push_server().await;
     let client = reqwest::Client::builder()
         .cookie_store(true)
         .build()
@@ -6362,7 +6374,17 @@ async fn start_nas_test_server(push: bool) -> TestServer {
             )
             .unwrap();
     }
-    start_server_in(data, received, 1 << 40, push, 3600, 32).await
+    start_server_in(
+        data,
+        received,
+        ServerOptions {
+            max_upload_bytes: 1 << 40,
+            enable_push: push,
+            session_idle_secs: 3600,
+            ..ServerOptions::default()
+        },
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
