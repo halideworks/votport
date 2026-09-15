@@ -2310,6 +2310,13 @@ impl Store {
         }
         transaction
             .execute(
+                "DELETE FROM upload_session_files WHERE session_id = ?1
+                 OR session_id IN (SELECT id FROM upload_sessions WHERE push_key = ?2)",
+                rusqlite::params![session.id, session.push_key],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
                 "INSERT OR REPLACE INTO upload_sessions
                  (id, link_id, tenant, dest_dir, dest_rel, package_suite,
                   package_root, package_length, max_total_bytes, started_at, created_at, push_key)
@@ -2330,12 +2337,6 @@ impl Store {
                     i64::try_from(now_unix()).unwrap_or(i64::MAX),
                     session.push_key,
                 ],
-            )
-            .map_err(|error| error.to_string())?;
-        transaction
-            .execute(
-                "DELETE FROM upload_session_files WHERE session_id = ?1",
-                [&session.id],
             )
             .map_err(|error| error.to_string())?;
         for file in &session.files {
@@ -10857,6 +10858,51 @@ mod settings_tests {
 
         store.delete_upload_session(&session.id).unwrap();
         assert!(store.load_upload_sessions().unwrap().is_empty());
+
+        session.push_key = Some("resume-key".to_owned());
+        store.insert_upload_session(&session).unwrap();
+        let mut unrelated = session.clone();
+        unrelated.id = "unrelated".to_owned();
+        unrelated.push_key = None;
+        store.insert_upload_session(&unrelated).unwrap();
+        let mut replacement = session.clone();
+        replacement.id = "replacement".to_owned();
+        replacement.files.truncate(1);
+        let owners = || {
+            store
+                .with(|connection| {
+                    let mut statement = connection.prepare(
+                        "SELECT session_id FROM upload_session_files ORDER BY session_id, entry",
+                    )?;
+                    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+        };
+        let before = owners();
+        store.with(|connection| connection.execute_batch(
+            "CREATE TRIGGER fail_replacement BEFORE INSERT ON upload_session_files
+             WHEN NEW.session_id = 'replacement' BEGIN SELECT RAISE(FAIL, 'replacement failure'); END;",
+        )).unwrap();
+        assert!(store.insert_upload_session(&replacement).is_err());
+        assert_eq!(owners(), before);
+        assert_eq!(
+            store.load_push_session("resume-key").unwrap(),
+            Some(session.clone())
+        );
+        store
+            .with(|connection| connection.execute_batch("DROP TRIGGER fail_replacement"))
+            .unwrap();
+
+        store.insert_upload_session(&replacement).unwrap();
+        assert_eq!(
+            store.load_push_session("resume-key").unwrap(),
+            Some(replacement.clone())
+        );
+        assert_eq!(owners(), vec!["replacement", "unrelated", "unrelated"]);
+        store.delete_upload_session(&replacement.id).unwrap();
+        assert_eq!(store.load_upload_sessions().unwrap(), vec![unrelated]);
+        assert_eq!(owners(), vec!["unrelated", "unrelated"]);
     }
 
     #[test]
