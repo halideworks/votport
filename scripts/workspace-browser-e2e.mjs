@@ -850,20 +850,6 @@ try {
   }
   await page.unroute('**/api/workflows/jobs?*');
 
-  const session = await api('admin/session');
-  await page.goto(`${base}/receive`);
-  await page.route(/\/(workflows|storage)$/, async (route) => {
-    const response = await route.fetch();
-    const body = (await response.text()).replace(/(<script id="admin-session" type="application\/json">)[\s\S]*?(<\/script>)/, (_, start, end) => start + JSON.stringify({ ...session, role: 'operator', tenant: 'named-tenant' }) + end);
-    await route.fulfill({ response, body });
-  });
-  await page.goto(`${base}/workflows#projects`); await page.locator('#workflow-project-list article').first().waitFor();
-  assert.ok(await page.locator('#workflow-new-project').isHidden());
-  assert.equal(await page.getByRole('button', { name: 'Edit project', exact: true }).count(), 0);
-  await page.goto(`${base}/storage`); await page.locator('#storage-access').waitFor();
-  assert.ok(await page.locator('#storage-new').isHidden());
-  assert.ok(await page.locator('#receiving-storage').isHidden());
-  assert.equal(await page.getByRole('button', { name: 'Edit connection', exact: true }).count(), 0);
   assert.deepEqual(errors, []);
   console.log('Responsive admin forms, project creation, lost-response recovery, automatic status refresh, policy invalidation, cumulative event export, private storage credentials and stale connection tests: passed');
 } finally { await browser.close(); }

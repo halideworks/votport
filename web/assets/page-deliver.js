@@ -30,6 +30,7 @@ const $ = (id) => document.getElementById(id);
 const createNotifications = notificationEditor({ events: downloadEvents });
 $('deliver-notifications').append(createNotifications.element);
 let notificationsReadOnly = true;
+let deliverAdministrator = false;
 
 function grantStatus(grant) {
   if (grant.revoked_at) return 'revoked';
@@ -188,7 +189,7 @@ function renderGrants() {
           }
         });
         actions.append(copyLink);
-        actions.append(
+        if (deliverAdministrator) actions.append(
           button('New address', 'tiny', async (control) => {
             if (
               !(await confirmModal(
@@ -210,7 +211,7 @@ function renderGrants() {
           }),
         );
       }
-      actions.append(
+      if (deliverAdministrator) actions.append(
         button('Extend 7 days', 'tiny', async () => {
           // Same base as the server: seven days past the later of now and the current expiry.
           const base = Math.max(grant.expires_at, Math.floor(Date.now() / 1000));
@@ -313,7 +314,7 @@ function libraryFilePairs(files) {
 }
 
 async function uploadLibraryFiles(pairs) {
-  if (!pairs.length || libraryUploading) return;
+  if (!deliverAdministrator || !pairs.length || libraryUploading) return;
   let uploads;
   try {
     uploads = pairs.map(({ path, file }) => ({ path: libraryPath(path), file }));
@@ -428,6 +429,7 @@ function updateLibraryFolderCheckbox(directory, checkbox) {
 }
 
 async function toggleLibraryFolder(directory, checkbox) {
+  if (!deliverAdministrator) return;
   const known = libraryFolderSelections.get(directory);
   if (!checkbox.checked) {
     if (!known) return;
@@ -509,6 +511,12 @@ function renderLibraryFile(file, container, showPath = false) {
   const size = document.createElement('span');
   size.className = 'muted';
   size.textContent = formatBytes(file.bytes);
+  if (!deliverAdministrator) {
+    checkbox.disabled = true;
+    label.append(checkbox, name, size);
+    container.append(label);
+    return;
+  }
   const remove = button('Delete', 'tiny danger', async () => {
     if (!(await confirmModal(
       'Delete outbound file',
@@ -541,6 +549,7 @@ function renderLibraryDirectory(directory, container) {
   const name = directory.slice(directory.lastIndexOf('/') + 1);
   const select = document.createElement('input');
   select.type = 'checkbox';
+  select.disabled = !deliverAdministrator;
   updateLibraryFolderCheckbox(directory, select);
   select.setAttribute('aria-label', `Select folder ${directory}`);
   select.title = 'Select all files in this folder';
@@ -741,6 +750,7 @@ for (const eventName of ['dragleave', 'drop']) {
 }
 document.addEventListener('drop', async (event) => {
   if (!carriesFiles(event)) return;
+  if (!deliverAdministrator) return;
   if (libraryUploading) {
     $('library-status').textContent = 'An upload is already in progress.';
     return;
@@ -791,7 +801,7 @@ function deliverFormValues() {
 }
 
 async function submitDeliverGrant() {
-  if (deliverGrantBusy) return;
+  if (!deliverAdministrator || deliverGrantBusy) return;
   const error = $('deliver-error');
   error.hidden = true;
   let request;
@@ -846,6 +856,7 @@ async function submitDeliverGrant() {
 
 $('deliver-form').addEventListener('submit', async (event) => {
   event.preventDefault();
+  if (!deliverAdministrator) return;
   await submitDeliverGrant();
 });
 
@@ -884,7 +895,25 @@ function renderStatus(status) {
 
 // The session check and every list go out together; each is one round trip.
 startStatusPoll({ render: renderStatus, active: (status) => status.outbound.active > 0 });
-const sessionReady = requireSession().then(async (session) => { notificationsReadOnly = session.role !== 'admin'; await createNotifications.ready; createNotifications.element.disabled = notificationsReadOnly; });
+$('deliver-upload-form').inert = true;
+$('deliver-form').inert = true;
+$('deliver-submit').disabled = true;
+for (const control of [$('library-add-files'), $('library-add-folder'), $('library-input'), $('library-folder-input')]) control.disabled = true;
+const sessionReady = requireSession().then(async (session) => {
+  deliverAdministrator = session.role === 'admin';
+  notificationsReadOnly = !deliverAdministrator;
+  $('deliver-upload-form').inert = !deliverAdministrator;
+  $('deliver-form').inert = !deliverAdministrator;
+  $('deliver-submit').disabled = !deliverAdministrator;
+  $('library-add-files').disabled = !deliverAdministrator;
+  $('library-add-folder').disabled = !deliverAdministrator;
+  $('library-input').disabled = !deliverAdministrator;
+  $('library-folder-input').disabled = !deliverAdministrator;
+  $('library-files').querySelectorAll('input[type="checkbox"]').forEach((input) => { input.disabled = !deliverAdministrator; });
+  await createNotifications.ready;
+  createNotifications.element.disabled = notificationsReadOnly;
+  if (deliverAdministrator) renderLibraryView();
+});
 await Promise.all([sessionReady, refreshGrants(), refreshLibrary()]);
 await revealGrant();
 
