@@ -2905,62 +2905,25 @@ fn settings_json(app: &App) -> ApiResult<serde_json::Value> {
         "oidc_configured": oidc.is_some(),
     });
     Ok(json!({
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        "overridden_keys": overlay.overridden_keys,
         "smtp_host": overlay.smtp_host,
-        "smtp_host_source": overlay.smtp_host_source,
         "smtp_port": overlay.smtp_port,
-        "smtp_port_source": overlay.smtp_port_source,
         "smtp_starttls": overlay.smtp_starttls,
-        "smtp_starttls_source": overlay.smtp_starttls_source,
         "smtp_username": overlay.smtp_username,
-        "smtp_username_source": overlay.smtp_username_source,
         "smtp_password_set": overlay.smtp_password_set,
-        "smtp_password_source": overlay.smtp_password_source,
         "smtp_from": overlay.smtp_from,
-        "smtp_from_source": overlay.smtp_from_source,
-
-
         "audit_retention_days": resolved.audit_retention_days,
-        "audit_retention_days_source": overlay.audit_retention_days_source,
         "upload_retention_days": resolved.upload_retention_days,
-        "upload_retention_days_source": overlay.upload_retention_days_source,
         "default_max_total_bytes": resolved.default_max_total_bytes,
-        "default_max_total_bytes_source": overlay.default_max_total_bytes_source,
         "default_max_links": resolved.default_max_links,
-        "default_max_links_source": overlay.default_max_links_source,
         "default_max_sessions": resolved.default_max_sessions,
-        "default_max_sessions_source": overlay.default_max_sessions_source,
         "public_password_login": resolved.public_password_login,
-        "public_password_login_source": overlay.public_password_login_source,
         "sso_session_secs": resolved.sso_session_secs,
-        "sso_session_secs_source": overlay.sso_session_secs_source,
         "scim_token_set": overlay.scim_token_set,
-        "scim_token_source": overlay.scim_token_source,
         "scim_token_previous_set": overlay.scim_token_previous_set,
         "replica_token_set": overlay.replica_token_set,
-        "replica_token_source": overlay.replica_token_source,
         "require_provisioning": resolved.require_provisioning,
-        "require_provisioning_source": overlay.require_provisioning_source,
         "draining": resolved.draining,
-        "draining_source": overlay.draining_source,
         "retention_clock": app.retention_clock_status(),
         "sso_configured": app.sso_config.is_some(),
         "deployment": deployment,
@@ -3790,6 +3753,8 @@ pub struct CreateLinkRequest {
     workflow: Option<crate::workflow::ReceiveWorkflow>,
 }
 
+const MAX_REQUEST_LINK_EXPIRY_DAYS: u32 = 3650;
+
 pub async fn create_link(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -3816,6 +3781,15 @@ pub async fn create_link(
                 ),
             ));
         }
+    }
+    if request
+        .expires_days
+        .is_some_and(|days| !(1..=MAX_REQUEST_LINK_EXPIRY_DAYS).contains(&days))
+    {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("expires_days must be between 1 and {MAX_REQUEST_LINK_EXPIRY_DAYS}"),
+        ));
     }
     let password_hash = match request.password.as_deref().filter(|p| !p.is_empty()) {
         Some(password) if password.len() <= MAX_PASSWORD_BYTES => {
@@ -3878,16 +3852,17 @@ pub async fn create_link(
             &super::notifications::WORKFLOW_EVENTS,
         )?;
     }
+    let created_at = now_unix();
     let link = Link {
         id: auth::random_token(),
         tenant,
         label,
         dest,
         password_hash,
-        created_at: now_unix(),
+        created_at,
         expires_at: request
             .expires_days
-            .map(|days| now_unix() + u64::from(days) * 86_400),
+            .map(|days| created_at.saturating_add(u64::from(days) * 86_400)),
         max_bytes: request.max_bytes,
         active: true,
         legal_hold: false,
@@ -8382,7 +8357,11 @@ mod settings_api_tests {
         )
         .await;
         assert_eq!(json["draining"], true);
-        assert_eq!(json["draining_source"], "db");
+        assert!(json["overridden_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|key| key == "draining"));
     }
 
     #[tokio::test]
@@ -8500,11 +8479,8 @@ mod settings_api_tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["audit_retention_days"], 400);
-        assert_eq!(json["audit_retention_days_source"], "env");
         assert_eq!(json["upload_retention_days"], 0);
-        assert_eq!(json["upload_retention_days_source"], "env");
         assert_eq!(json["smtp_host"], serde_json::Value::Null);
-        assert_eq!(json["smtp_host_source"], "env");
         assert_eq!(json["smtp_password_set"], false);
         assert_eq!(json["default_max_total_bytes"], serde_json::Value::Null);
         assert_eq!(json["public_password_login"], true);
@@ -8513,8 +8489,8 @@ mod settings_api_tests {
         assert_eq!(json["smtp_port"], 587);
         assert_eq!(json["smtp_starttls"], true);
         assert_eq!(json["smtp_password_set"], false);
-        assert_eq!(json["smtp_password_source"], "env");
         assert!(json.get("smtp_password").is_none());
+        assert_eq!(json["overridden_keys"], json!([]));
         let deployment = &json["deployment"];
         assert_eq!(deployment["bind"], "127.0.0.1:0");
         assert_eq!(deployment["public_url"], "https://drop.example.com");
@@ -8549,32 +8525,20 @@ mod settings_api_tests {
         // so neither belongs in this API payload.
         for field in [
             "smtp_host",
-            "smtp_host_source",
             "smtp_port",
-            "smtp_port_source",
             "smtp_starttls",
-            "smtp_starttls_source",
             "smtp_username",
-            "smtp_username_source",
             "smtp_password_set",
-            "smtp_password_source",
             "smtp_from",
-            "smtp_from_source",
             "audit_retention_days",
-            "audit_retention_days_source",
             "upload_retention_days",
-            "upload_retention_days_source",
             "default_max_total_bytes",
-            "default_max_total_bytes_source",
             "default_max_links",
-            "default_max_links_source",
             "default_max_sessions",
-            "default_max_sessions_source",
             "public_password_login",
-            "public_password_login_source",
             "sso_session_secs",
-            "sso_session_secs_source",
             "sso_configured",
+            "overridden_keys",
         ] {
             assert!(json.get(field).is_some(), "missing settings field {field}");
         }
@@ -8646,12 +8610,16 @@ mod settings_api_tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["smtp_host"], "smtp.example.com");
         assert_eq!(json["smtp_password_set"], true);
-        assert_eq!(json["smtp_password_source"], "db");
+        assert!(json["overridden_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|key| key == "smtp_password"));
         assert!(json.get("smtp_password").is_none());
     }
 
     #[tokio::test]
-    async fn put_then_get_shows_db_source() {
+    async fn put_then_get_lists_accepted_overrides() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
         let cookie = cookie_for(&application, "", "admin");
@@ -8671,10 +8639,35 @@ mod settings_api_tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["audit_retention_days"], 7);
-        assert_eq!(json["audit_retention_days_source"], "db");
         assert_eq!(json["smtp_host"], "https://db.example/hook");
-        assert_eq!(json["smtp_host_source"], "db");
-        assert_eq!(json["upload_retention_days_source"], "env");
+        let overridden_keys = json["overridden_keys"].as_array().unwrap();
+        assert!(overridden_keys
+            .iter()
+            .any(|key| key == "audit_retention_days"));
+        assert!(overridden_keys.iter().any(|key| key == "smtp_host"));
+        assert!(!overridden_keys
+            .iter()
+            .any(|key| key == "upload_retention_days"));
+
+        let (status, json) = send(
+            application,
+            Request::builder()
+                .method("PUT")
+                .uri("/api/admin/settings")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"smtp_host":null}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["smtp_host"], serde_json::Value::Null);
+        assert!(!json["overridden_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|key| key == "smtp_host"));
     }
 
     #[tokio::test]
@@ -8709,7 +8702,11 @@ mod settings_api_tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["smtp_password_set"], true);
-        assert_eq!(json["smtp_password_source"], "db");
+        assert!(json["overridden_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|key| key == "smtp_password"));
         assert!(json.get("smtp_password").is_none());
         assert_eq!(json["audit_retention_days"], 10);
     }
@@ -9791,6 +9788,93 @@ mod notification_and_limit_tests {
         let link = application.store.upload_link(&id).unwrap().unwrap();
         assert!((before..=after).contains(&link.created_at));
         assert!((before + 7 * 86_400..=after + 7 * 86_400).contains(&link.expires_at.unwrap()));
+    }
+
+    #[tokio::test]
+    async fn request_link_expiry_bounds_are_enforced_at_the_authenticated_api() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = admin_cookie(&application);
+        let cases = [
+            ("missing", json!({ "label": "missing" }), None, true),
+            (
+                "null",
+                json!({ "label": "null", "expires_days": null }),
+                None,
+                true,
+            ),
+            (
+                "one",
+                json!({ "label": "one", "expires_days": 1 }),
+                Some(1u32),
+                true,
+            ),
+            (
+                "maximum",
+                json!({ "label": "maximum", "expires_days": 3650 }),
+                Some(3650u32),
+                true,
+            ),
+            (
+                "zero",
+                json!({ "label": "zero", "expires_days": 0 }),
+                None,
+                false,
+            ),
+            (
+                "over-max",
+                json!({ "label": "over-max", "expires_days": 3651 }),
+                None,
+                false,
+            ),
+            (
+                "u32-max",
+                json!({ "label": "u32-max", "expires_days": u32::MAX }),
+                None,
+                false,
+            ),
+        ];
+        for (label, body, expected_days, accepted) in cases {
+            let before = application.store.links("").unwrap().len();
+            let response = app::router(application.clone())
+                .oneshot(
+                    Request::post("/api/admin/links")
+                        .header("cookie", &cookie)
+                        .header("x-votport", "1")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let response_body = response.into_body().collect().await.unwrap().to_bytes();
+            let after = application.store.links("").unwrap().len();
+            if accepted {
+                assert_eq!(status, StatusCode::OK, "{label}");
+                assert_eq!(after, before + 1, "{label}");
+                let id = serde_json::from_slice::<serde_json::Value>(&response_body).unwrap()
+                    ["link"]["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let link = application.store.upload_link(&id).unwrap().unwrap();
+                assert_eq!(
+                    link.expires_at,
+                    expected_days.map(|days| link.created_at + u64::from(days) * 86_400),
+                    "{label}"
+                );
+            } else {
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{label}");
+                assert_eq!(after, before, "{label}");
+                assert!(
+                    String::from_utf8_lossy(&response_body)
+                        .contains("expires_days must be between"),
+                    "{label}: {}",
+                    String::from_utf8_lossy(&response_body)
+                );
+            }
+        }
     }
 
     #[tokio::test]

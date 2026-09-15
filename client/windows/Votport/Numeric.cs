@@ -20,7 +20,11 @@ public static class Numeric
         };
     }
 
-    /// The box's value as a whole number, or null when it is empty.
-    public static uint? Whole(NumberBox box) =>
-        double.IsNaN(box.Value) ? null : (uint)Math.Clamp(Math.Round(box.Value, MidpointRounding.AwayFromZero), 0, uint.MaxValue);
+    /// The box's value as a positive whole number, or null when it is empty or nonpositive.
+    public static uint? Whole(NumberBox box)
+    {
+        if (double.IsNaN(box.Value)) return null;
+        var rounded = Math.Round(box.Value, MidpointRounding.AwayFromZero);
+        return rounded <= 0 ? null : (uint)Math.Clamp(rounded, 0, uint.MaxValue);
+    }
 }

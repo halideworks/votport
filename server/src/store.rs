@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
@@ -441,39 +441,48 @@ pub struct ResolvedSmtp {
     pub from: String,
 }
 
-/// Resolved settings plus whether each key came from the database or env.
-/// `source` is `"env"` when the row is absent or its TEXT was invalid.
+/// Resolved settings and the accepted database overrides used to derive their
+/// source labels.
 #[derive(Clone, Debug)]
 pub struct SettingsOverlay {
     pub resolved: ResolvedSettings,
 
-    pub smtp_host: Option<String>,
-    pub smtp_host_source: &'static str,
-    pub smtp_port: u16,
-    pub smtp_port_source: &'static str,
-    pub smtp_starttls: bool,
-    pub smtp_starttls_source: &'static str,
-    pub smtp_username: Option<String>,
-    pub smtp_username_source: &'static str,
-    pub smtp_password_set: bool,
-    pub smtp_password_source: &'static str,
-    pub smtp_from: Option<String>,
-    pub smtp_from_source: &'static str,
+    /// Keys whose stored value was accepted by the overlay parser. Invalid
+    /// rows are omitted so callers can derive the displayed source reliably.
+    pub overridden_keys: Vec<String>,
 
-    pub audit_retention_days_source: &'static str,
-    pub upload_retention_days_source: &'static str,
-    pub default_max_total_bytes_source: &'static str,
-    pub default_max_links_source: &'static str,
-    pub default_max_sessions_source: &'static str,
-    pub public_password_login_source: &'static str,
-    pub sso_session_secs_source: &'static str,
+    pub smtp_host: Option<String>,
+    pub smtp_port: u16,
+    pub smtp_starttls: bool,
+    pub smtp_username: Option<String>,
+    pub smtp_password_set: bool,
+    pub smtp_from: Option<String>,
     pub scim_token_set: bool,
-    pub scim_token_source: &'static str,
     pub scim_token_previous_set: bool,
     pub replica_token_set: bool,
-    pub replica_token_source: &'static str,
-    pub require_provisioning_source: &'static str,
-    pub draining_source: &'static str,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ValidatedSettings {
+    overridden_keys: Vec<String>,
+    smtp_host: Option<Option<String>>,
+    smtp_port: Option<u16>,
+    smtp_starttls: Option<bool>,
+    smtp_username: Option<Option<String>>,
+    smtp_password: Option<Option<String>>,
+    smtp_from: Option<Option<String>>,
+    audit_retention_days: Option<u64>,
+    upload_retention_days: Option<u64>,
+    default_max_total_bytes: Option<u64>,
+    default_max_links: Option<u64>,
+    default_max_sessions: Option<u64>,
+    public_password_login: Option<bool>,
+    sso_session_secs: Option<u64>,
+    scim_token: Option<Option<String>>,
+    scim_token_previous: Option<Option<String>>,
+    replica_token: Option<Option<String>>,
+    require_provisioning: Option<bool>,
+    draining: Option<bool>,
 }
 
 pub(crate) const SCHEMA_VERSION: u64 = 44;
@@ -1003,6 +1012,7 @@ pub struct Store {
     pub(crate) event_signer: std::sync::Arc<crate::receipt::ReceiptSigner>,
     path: PathBuf,
     settings_generation: std::sync::atomic::AtomicU64,
+    settings_cache: Mutex<Option<(u64, Arc<ValidatedSettings>)>>,
 }
 
 impl Store {
@@ -1124,6 +1134,7 @@ impl Store {
             )?),
             path: path.clone(),
             settings_generation: std::sync::atomic::AtomicU64::new(0),
+            settings_cache: Mutex::new(None),
         };
         Ok(store)
     }
@@ -3134,11 +3145,7 @@ impl Store {
     }
 
     pub fn settings_map(&self) -> Result<HashMap<String, String>, String> {
-        self.with(|connection| {
-            let mut statement = connection.prepare("SELECT key, value FROM settings")?;
-            let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-            rows.collect::<Result<HashMap<_, _>, _>>()
-        })
+        self.with(read_settings_map)
     }
 
     pub fn put_settings(
@@ -3195,7 +3202,28 @@ impl Store {
     }
 
     pub fn overlay(&self, config: &Config) -> Result<SettingsOverlay, String> {
-        Ok(overlay_rows(&self.settings_map()?, config))
+        Ok(overlay_rows(self.validated_settings()?.as_ref(), config))
+    }
+
+    fn validated_settings(&self) -> Result<Arc<ValidatedSettings>, String> {
+        let mut cache = self.settings_cache.lock().expect("settings cache poisoned");
+        // Fast path generation reads are protected by the cache lock so a
+        // delayed reader cannot overwrite a newer snapshot.
+        let generation = self.settings_generation();
+        if let Some((cached_generation, settings)) = cache.as_ref() {
+            if *cached_generation == generation {
+                return Ok(Arc::clone(settings));
+            }
+        }
+        // put_settings commits and increments generation while retaining the
+        // connection mutex. Read both under that mutex for one exact tag.
+        let connection = self.connection.lock().expect("store poisoned");
+        let generation = self.settings_generation();
+        let settings = Arc::new(validate_settings(
+            &read_settings_map(&connection).map_err(|error| error.to_string())?,
+        ));
+        *cache = Some((generation, Arc::clone(&settings)));
+        Ok(settings)
     }
 
     pub fn resolved_settings(&self, config: &Config) -> Result<ResolvedSettings, String> {
@@ -5847,17 +5875,154 @@ pub(crate) fn validate_schema(connection: &Connection, expected: u64) -> Result<
     Ok(())
 }
 
-fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOverlay {
-    let (smtp_host, smtp_host_source) = overlay_text(rows, "smtp_host", config.smtp_host.clone());
-    let (smtp_port, smtp_port_source) = overlay_port(rows, "smtp_port", config.smtp_port);
-    let (smtp_starttls, smtp_starttls_source) =
-        overlay_bool(rows, "smtp_starttls", config.smtp_starttls);
-    let (smtp_username, smtp_username_source) =
-        overlay_text(rows, "smtp_username", config.smtp_username.clone());
-    let (smtp_password, smtp_password_source) =
-        overlay_text(rows, "smtp_password", config.smtp_password.clone());
+fn read_settings_map(connection: &Connection) -> rusqlite::Result<HashMap<String, String>> {
+    let mut statement = connection.prepare("SELECT key, value FROM settings")?;
+    let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect::<Result<HashMap<_, _>, _>>()
+}
+
+fn validate_settings(rows: &HashMap<String, String>) -> ValidatedSettings {
+    let mut settings = ValidatedSettings::default();
+    settings.smtp_host = validated_text(rows, "smtp_host", &mut settings.overridden_keys);
+    settings.smtp_port = validated_port(rows, "smtp_port", &mut settings.overridden_keys);
+    settings.smtp_starttls = validated_bool(rows, "smtp_starttls", &mut settings.overridden_keys);
+    settings.smtp_username = validated_text(rows, "smtp_username", &mut settings.overridden_keys);
+    settings.smtp_password = validated_text(rows, "smtp_password", &mut settings.overridden_keys);
+    settings.smtp_from = validated_text(rows, "smtp_from", &mut settings.overridden_keys);
+    settings.audit_retention_days =
+        validated_u64(rows, "audit_retention_days", &mut settings.overridden_keys);
+    settings.upload_retention_days =
+        validated_u64(rows, "upload_retention_days", &mut settings.overridden_keys);
+    settings.default_max_total_bytes = validated_positive(
+        rows,
+        "default_max_total_bytes",
+        &mut settings.overridden_keys,
+    );
+    settings.default_max_links =
+        validated_positive(rows, "default_max_links", &mut settings.overridden_keys);
+    settings.default_max_sessions =
+        validated_positive(rows, "default_max_sessions", &mut settings.overridden_keys);
+    settings.public_password_login =
+        validated_bool(rows, "public_password_login", &mut settings.overridden_keys);
+    settings.sso_session_secs =
+        validated_positive(rows, "sso_session_secs", &mut settings.overridden_keys);
+    settings.scim_token = validated_text(rows, "scim_token", &mut settings.overridden_keys);
+    settings.scim_token_previous =
+        validated_text(rows, "scim_token_previous", &mut settings.overridden_keys);
+    settings.replica_token = validated_text(rows, "replica_token", &mut settings.overridden_keys);
+    settings.require_provisioning =
+        validated_bool(rows, "require_provisioning", &mut settings.overridden_keys);
+    settings.draining = validated_bool(rows, "draining", &mut settings.overridden_keys);
+    settings.overridden_keys.sort_unstable();
+    settings
+}
+
+fn invalid_setting(key: &str) {
+    tracing::error!(key, "invalid settings value; using env default");
+}
+
+fn validated_text(
+    rows: &HashMap<String, String>,
+    key: &str,
+    overridden_keys: &mut Vec<String>,
+) -> Option<Option<String>> {
+    rows.get(key).map(|value| {
+        overridden_keys.push(key.to_owned());
+        (!value.is_empty()).then(|| value.clone())
+    })
+}
+
+fn validated_u64(
+    rows: &HashMap<String, String>,
+    key: &str,
+    overridden_keys: &mut Vec<String>,
+) -> Option<u64> {
+    let value = rows.get(key)?;
+    match value.parse::<u64>() {
+        Ok(parsed) => {
+            overridden_keys.push(key.to_owned());
+            Some(parsed)
+        }
+        Err(_) => {
+            invalid_setting(key);
+            None
+        }
+    }
+}
+
+fn validated_positive(
+    rows: &HashMap<String, String>,
+    key: &str,
+    overridden_keys: &mut Vec<String>,
+) -> Option<u64> {
+    let value = rows.get(key)?;
+    match value.parse::<u64>() {
+        Ok(parsed) if parsed > 0 => {
+            overridden_keys.push(key.to_owned());
+            Some(parsed)
+        }
+        _ => {
+            invalid_setting(key);
+            None
+        }
+    }
+}
+
+fn validated_port(
+    rows: &HashMap<String, String>,
+    key: &str,
+    overridden_keys: &mut Vec<String>,
+) -> Option<u16> {
+    let value = rows.get(key)?;
+    match value.parse::<u16>() {
+        Ok(parsed) if parsed >= 1 => {
+            overridden_keys.push(key.to_owned());
+            Some(parsed)
+        }
+        _ => {
+            invalid_setting(key);
+            None
+        }
+    }
+}
+
+fn validated_bool(
+    rows: &HashMap<String, String>,
+    key: &str,
+    overridden_keys: &mut Vec<String>,
+) -> Option<bool> {
+    let value = rows.get(key)?;
+    match value.as_str() {
+        "1" => {
+            overridden_keys.push(key.to_owned());
+            Some(true)
+        }
+        "0" => {
+            overridden_keys.push(key.to_owned());
+            Some(false)
+        }
+        _ => {
+            invalid_setting(key);
+            None
+        }
+    }
+}
+
+fn overlay_text(value: &Option<Option<String>>, env: Option<String>) -> Option<String> {
+    match value {
+        Some(value) => value.clone(),
+        None => env,
+    }
+}
+
+fn overlay_rows(settings: &ValidatedSettings, config: &Config) -> SettingsOverlay {
+    let smtp_host = overlay_text(&settings.smtp_host, config.smtp_host.clone());
+    let smtp_port = settings.smtp_port.unwrap_or(config.smtp_port);
+    let smtp_starttls = settings.smtp_starttls.unwrap_or(config.smtp_starttls);
+    let smtp_username = overlay_text(&settings.smtp_username, config.smtp_username.clone());
+    let smtp_password = overlay_text(&settings.smtp_password, config.smtp_password.clone());
     let smtp_password_set = smtp_password.is_some();
-    let (smtp_from, smtp_from_source) = overlay_text(rows, "smtp_from", config.smtp_from.clone());
+    let smtp_from = overlay_text(&settings.smtp_from, config.smtp_from.clone());
     let smtp = assemble_smtp(
         smtp_host.clone(),
         smtp_port,
@@ -5866,43 +6031,30 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
         smtp_password.clone(),
         smtp_from.clone(),
     );
-    let (audit_retention_days, audit_retention_days_source) =
-        overlay_u64(rows, "audit_retention_days", config.audit_retention_days);
-    let (upload_retention_days, upload_retention_days_source) =
-        overlay_u64(rows, "upload_retention_days", config.upload_retention_days);
-    let (default_max_total_bytes, default_max_total_bytes_source) = overlay_positive(
-        rows,
-        "default_max_total_bytes",
-        config.default_max_total_bytes,
-    );
-    let (default_max_links, default_max_links_source) =
-        overlay_positive(rows, "default_max_links", config.default_max_links);
-    let (default_max_sessions, default_max_sessions_source) =
-        overlay_positive(rows, "default_max_sessions", config.default_max_sessions);
-    let (public_password_login, public_password_login_source) =
-        overlay_bool(rows, "public_password_login", config.public_password_login);
-    let (sso_session_secs, sso_session_secs_source) =
-        overlay_u64(rows, "sso_session_secs", config.sso_session_secs);
-    let (scim_token, scim_token_source) =
-        overlay_text(rows, "scim_token", config.scim_token.clone());
-    let (scim_token_previous, _) = overlay_text(rows, "scim_token_previous", None);
-    let (replica_token, replica_token_source) =
-        overlay_text(rows, "replica_token", config.replica_token.clone());
-    let (require_provisioning, require_provisioning_source) =
-        overlay_bool(rows, "require_provisioning", config.require_provisioning);
-    // The write path refuses zero; a hand-edited row falls back to env.
-    let (sso_session_secs, sso_session_secs_source) = if sso_session_secs == 0 {
-        tracing::error!(
-            key = "sso_session_secs",
-            "invalid settings value; using env default"
-        );
-        (config.sso_session_secs, "env")
-    } else {
-        (sso_session_secs, sso_session_secs_source)
-    };
-    // No env default: draining is an operator action, off unless the db says
-    // otherwise.
-    let (draining, draining_source) = overlay_bool(rows, "draining", false);
+    let audit_retention_days = settings
+        .audit_retention_days
+        .unwrap_or(config.audit_retention_days);
+    let upload_retention_days = settings
+        .upload_retention_days
+        .unwrap_or(config.upload_retention_days);
+    let default_max_total_bytes = settings
+        .default_max_total_bytes
+        .or(config.default_max_total_bytes);
+    let default_max_links = settings.default_max_links.or(config.default_max_links);
+    let default_max_sessions = settings
+        .default_max_sessions
+        .or(config.default_max_sessions);
+    let public_password_login = settings
+        .public_password_login
+        .unwrap_or(config.public_password_login);
+    let sso_session_secs = settings.sso_session_secs.unwrap_or(config.sso_session_secs);
+    let scim_token = overlay_text(&settings.scim_token, config.scim_token.clone());
+    let scim_token_previous = overlay_text(&settings.scim_token_previous, None);
+    let replica_token = overlay_text(&settings.replica_token, config.replica_token.clone());
+    let require_provisioning = settings
+        .require_provisioning
+        .unwrap_or(config.require_provisioning);
+    let draining = settings.draining.unwrap_or(false);
     SettingsOverlay {
         resolved: ResolvedSettings {
             smtp,
@@ -5919,89 +6071,16 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
             require_provisioning,
             draining,
         },
-
+        overridden_keys: settings.overridden_keys.clone(),
         smtp_host,
-        smtp_host_source,
         smtp_port,
-        smtp_port_source,
         smtp_starttls,
-        smtp_starttls_source,
         smtp_username,
-        smtp_username_source,
         smtp_password_set,
-        smtp_password_source,
         smtp_from,
-        smtp_from_source,
-
-        audit_retention_days_source,
-        upload_retention_days_source,
-        default_max_total_bytes_source,
-        default_max_links_source,
-        default_max_sessions_source,
-        public_password_login_source,
-        sso_session_secs_source,
         scim_token_set: scim_token.is_some(),
-        scim_token_source,
         scim_token_previous_set: scim_token_previous.is_some(),
         replica_token_set: replica_token.is_some(),
-        replica_token_source,
-        require_provisioning_source,
-        draining_source,
-    }
-}
-
-fn overlay_text(
-    rows: &HashMap<String, String>,
-    key: &str,
-    env: Option<String>,
-) -> (Option<String>, &'static str) {
-    match rows.get(key) {
-        None => (env, "env"),
-        Some(value) if value.is_empty() => (None, "db"),
-        Some(value) => (Some(value.clone()), "db"),
-    }
-}
-
-fn overlay_u64(rows: &HashMap<String, String>, key: &str, env: u64) -> (u64, &'static str) {
-    match rows.get(key) {
-        None => (env, "env"),
-        Some(value) => match value.parse::<u64>() {
-            Ok(parsed) => (parsed, "db"),
-            Err(_) => {
-                tracing::error!(key, value, "invalid settings value; using env default");
-                (env, "env")
-            }
-        },
-    }
-}
-
-fn overlay_positive(
-    rows: &HashMap<String, String>,
-    key: &str,
-    env: Option<u64>,
-) -> (Option<u64>, &'static str) {
-    match rows.get(key) {
-        None => (env, "env"),
-        Some(value) => match value.parse::<u64>() {
-            Ok(parsed) if parsed > 0 => (Some(parsed), "db"),
-            _ => {
-                tracing::error!(key, value, "invalid settings value; using env default");
-                (env, "env")
-            }
-        },
-    }
-}
-
-fn overlay_port(rows: &HashMap<String, String>, key: &str, env: u16) -> (u16, &'static str) {
-    match rows.get(key) {
-        None => (env, "env"),
-        Some(value) => match value.parse::<u16>() {
-            Ok(parsed) if parsed >= 1 => (parsed, "db"),
-            _ => {
-                tracing::error!(key, value, "invalid settings value; using env default");
-                (env, "env")
-            }
-        },
     }
 }
 
@@ -6030,18 +6109,6 @@ fn assemble_smtp(
         password,
         from,
     })
-}
-
-fn overlay_bool(rows: &HashMap<String, String>, key: &str, env: bool) -> (bool, &'static str) {
-    match rows.get(key) {
-        None => (env, "env"),
-        Some(value) if value == "1" => (true, "db"),
-        Some(value) if value == "0" => (false, "db"),
-        Some(value) => {
-            tracing::error!(key, value, "invalid settings value; using env default");
-            (env, "env")
-        }
-    }
 }
 
 /// Rebuilds an ObjectId from its stored suite, hex root, and length.
@@ -10336,6 +10403,10 @@ mod settings_tests {
             .unwrap()
     }
 
+    fn overridden(overlay: &SettingsOverlay, key: &str) -> bool {
+        overlay.overridden_keys.iter().any(|value| value == key)
+    }
+
     #[test]
     fn empty_settings_table_follows_env() {
         let directory = tempfile::tempdir().unwrap();
@@ -10345,9 +10416,9 @@ mod settings_tests {
             overlay.smtp_host.as_deref(),
             Some("https://env.example/hook")
         );
-        assert_eq!(overlay.smtp_host_source, "env");
+        assert!(!overridden(&overlay, "smtp_host"));
         assert_eq!(overlay.resolved.audit_retention_days, 400);
-        assert_eq!(overlay.audit_retention_days_source, "env");
+        assert!(!overridden(&overlay, "audit_retention_days"));
         assert_eq!(overlay.resolved.upload_retention_days, 0);
         assert!(overlay.resolved.default_max_total_bytes.is_none());
         assert!(overlay.resolved.public_password_login);
@@ -10371,9 +10442,9 @@ mod settings_tests {
             overlay.smtp_host.as_deref(),
             Some("https://db.example/hook")
         );
-        assert_eq!(overlay.smtp_host_source, "db");
+        assert!(overridden(&overlay, "smtp_host"));
         assert_eq!(overlay.resolved.audit_retention_days, 400);
-        assert_eq!(overlay.audit_retention_days_source, "env");
+        assert!(!overridden(&overlay, "audit_retention_days"));
     }
 
     #[test]
@@ -10388,7 +10459,7 @@ mod settings_tests {
             .unwrap();
         let overlay = store.overlay(&test_config()).unwrap();
         assert_eq!(overlay.smtp_host, None);
-        assert_eq!(overlay.smtp_host_source, "db");
+        assert!(overridden(&overlay, "smtp_host"));
     }
 
     #[test]
@@ -10412,7 +10483,7 @@ mod settings_tests {
             overlay.smtp_host.as_deref(),
             Some("https://env.example/hook")
         );
-        assert_eq!(overlay.smtp_host_source, "env");
+        assert!(!overridden(&overlay, "smtp_host"));
         assert!(store.setting("smtp_host").unwrap().is_none());
     }
 
@@ -10431,7 +10502,110 @@ mod settings_tests {
             .unwrap();
         let overlay = store.overlay(&test_config()).unwrap();
         assert_eq!(overlay.resolved.audit_retention_days, 400);
-        assert_eq!(overlay.audit_retention_days_source, "env");
+        assert!(!overridden(&overlay, "audit_retention_days"));
+    }
+
+    #[test]
+    fn cached_overrides_are_reapplied_to_each_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut first = test_config();
+        first.smtp_host = Some("https://first.example/hook".to_owned());
+        first.audit_retention_days = 11;
+        let mut second = test_config();
+        second.smtp_host = Some("https://second.example/hook".to_owned());
+        second.audit_retention_days = 22;
+
+        let first_overlay = store.overlay(&first).unwrap();
+        let second_overlay = store.overlay(&second).unwrap();
+        assert_eq!(
+            first_overlay.smtp_host.as_deref(),
+            Some("https://first.example/hook")
+        );
+        assert_eq!(
+            second_overlay.smtp_host.as_deref(),
+            Some("https://second.example/hook")
+        );
+        assert_eq!(first_overlay.resolved.audit_retention_days, 11);
+        assert_eq!(second_overlay.resolved.audit_retention_days, 22);
+        assert!(first_overlay.overridden_keys.is_empty());
+        assert!(second_overlay.overridden_keys.is_empty());
+    }
+
+    #[test]
+    fn invalid_setting_warns_once_without_logging_its_value() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let sentinel = "settings-secret-sentinel-7c4f";
+        store
+            .put_settings(
+                "local",
+                &[(
+                    "audit_retention_days".to_owned(),
+                    SettingWrite::Set(sentinel.to_owned()),
+                )],
+            )
+            .unwrap();
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let writer = log.reopen().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.try_clone().unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..3 {
+                let overlay = store.overlay(&test_config()).unwrap();
+                assert_eq!(overlay.resolved.audit_retention_days, 400);
+                assert!(!overridden(&overlay, "audit_retention_days"));
+            }
+        });
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        let records = text.lines().collect::<Vec<_>>();
+        assert_eq!(records.len(), 1, "{text}");
+        assert!(text.contains("audit_retention_days"));
+        assert!(!text.contains(sentinel));
+    }
+
+    #[test]
+    fn failed_write_keeps_the_cached_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .put_settings(
+                "local",
+                &[(
+                    "smtp_host".to_owned(),
+                    SettingWrite::Set("https://before.example/hook".to_owned()),
+                )],
+            )
+            .unwrap();
+        assert_eq!(
+            store.overlay(&test_config()).unwrap().smtp_host.as_deref(),
+            Some("https://before.example/hook")
+        );
+        store
+            .with(|connection| {
+                connection.execute_batch(
+                    "CREATE TRIGGER refuse_settings_update BEFORE UPDATE ON settings
+                     BEGIN SELECT RAISE(FAIL, 'fixture refusal'); END;",
+                )
+            })
+            .unwrap();
+        assert!(store
+            .put_settings(
+                "local",
+                &[(
+                    "smtp_host".to_owned(),
+                    SettingWrite::Set("https://after.example/hook".to_owned()),
+                )],
+            )
+            .is_err());
+        assert_eq!(
+            store.overlay(&test_config()).unwrap().smtp_host.as_deref(),
+            Some("https://before.example/hook")
+        );
     }
 
     #[test]
@@ -10968,7 +11142,7 @@ mod settings_tests {
             .unwrap();
         let overlay = store.overlay(&test_config()).unwrap();
         assert_eq!(overlay.smtp_port, 587);
-        assert_eq!(overlay.smtp_port_source, "env");
+        assert!(!overridden(&overlay, "smtp_port"));
     }
 }
 

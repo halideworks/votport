@@ -150,6 +150,8 @@ jobs:
         run: |
           dotnet run --project client/windows/ActivationTests/ActivationTests.csproj -c Release -p:TreatWarningsAsErrors=true
           if ($LASTEXITCODE -ne 0) { throw "activation checks failed" }
+          dotnet run --project client/windows/NumericTests/NumericTests.csproj -c Release -p:TreatWarningsAsErrors=true
+          if ($LASTEXITCODE -ne 0) { throw "numeric checks failed" }
 
       - name: Build the Windows shells
         working-directory: client/windows
