@@ -162,7 +162,7 @@ jobs:
           LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
         run: |
           $env:PATH = "C:\Program Files\NASM;" + $env:PATH
-          cargo install uniffi-bindgen-cs --git https://github.com/NordSecurity/uniffi-bindgen-cs --tag v0.11.0+v0.31.0 --locked
+          cargo install uniffi-bindgen-cs --git https://github.com/NordSecurity/uniffi-bindgen-cs --rev e10ce410eb3a10cc19c7928b93ea8d84e038c034 --locked
           if ($LASTEXITCODE -ne 0) { throw "C# bindgen install failed" }
           .\build-core.ps1 -BuildProfile dev
           dotnet build Votport\Votport.csproj -c Release -p:Platform=x64 -p:WindowsPackageType=None

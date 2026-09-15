@@ -1,7 +1,7 @@
 # Builds the Rust core for the Windows shell: the release DLL and the
 # UniFFI C# bindings, copied into the project. Run from anywhere; needs
 # cargo 1.97, cmake and nasm (BoringSSL), libclang, and uniffi-bindgen-cs
-# (cargo install uniffi-bindgen-cs --git https://github.com/NordSecurity/uniffi-bindgen-cs --tag v0.11.0+v0.31.0).
+# (cargo install uniffi-bindgen-cs --git https://github.com/NordSecurity/uniffi-bindgen-cs --rev e10ce410eb3a10cc19c7928b93ea8d84e038c034 --locked).
 param([ValidateSet("dev", "release")][string]$BuildProfile = "release")
 
 $ErrorActionPreference = "Stop"

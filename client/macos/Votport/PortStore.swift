@@ -17,6 +17,14 @@ final class PortStore: ObservableObject {
     @Published private(set) var deliveries: [Delivery] = []
     @Published private(set) var automationTokens: [AutomationToken] = []
     @Published private(set) var watches: [Watch] = []
+    /// The one library upload the app owns, including its final progress.
+    /// It survives Share view replacement while the process is running.
+    @Published private(set) var libraryUploadID: UUID?
+    @Published private(set) var libraryUploadTransfer: Transfer?
+    @Published private(set) var libraryUploadView: UploadView?
+    @Published private(set) var libraryUploadActive = false
+    @Published private(set) var libraryUploadOutcome: String?
+    private var libraryUploadWorkerID: UUID?
     /// A core call is in flight; the screens disable their primary action.
     @Published private(set) var busy = false
     /// Calls in flight; `busy` follows it, so two overlapping calls do not
@@ -65,6 +73,7 @@ final class PortStore: ObservableObject {
             guard let self else { return }
             switch result {
             case .success(let port):
+                self.resetLibraryUploadForSession()
                 self.port = port
                 self.problem = nil
                 self.refresh()
@@ -131,6 +140,7 @@ final class PortStore: ObservableObject {
             self.signingInBrowser = false
             switch result {
             case .success(let port):
+                self.resetLibraryUploadForSession()
                 self.port = port
                 self.problem = nil
                 self.refresh()
@@ -145,6 +155,7 @@ final class PortStore: ObservableObject {
             previous?.cancel()
             VotportCore.signOut()
         } then: { [weak self] _ in
+            self?.resetLibraryUploadForSession()
             self?.port = nil
             self?.requests = []
             self?.deliveries = []
@@ -251,22 +262,83 @@ final class PortStore: ObservableObject {
         }
     }
 
-    /// Uploads a drop (files, and folders with everything under them) into
-    /// the port under `into` and hands back every library file made.
-    /// Progress reaches `listener` on the core's thread; a failure midway
-    /// returns nothing here, and the listener's last view names what landed.
-    func upload(
-        _ paths: [String], into: String, transfer: Transfer, listener: UploadListener,
-        done: @escaping ([LibraryFile]?) -> Void
-    ) {
+    /// Starts the one library upload owned by this store. The handle and
+    /// progress stay available when Share is replaced by another screen.
+    @discardableResult
+    func startLibraryUpload(_ paths: [String], into: String) -> Bool {
+        guard !paths.isEmpty, !libraryUploadActive else { return false }
+        let id = UUID()
+        let transfer = Transfer()
+        libraryUploadID = id
+        libraryUploadWorkerID = id
+        libraryUploadTransfer = transfer
+        libraryUploadView = nil
+        libraryUploadOutcome = nil
+        libraryUploadActive = true
+        let listener = LibraryUploadListener(id: id)
         run(.deliver) {
             try VotportCore.upload(paths: paths, into: into, transfer: transfer, listener: listener)
         } then: { [weak self] result in
-            switch result {
-            case .success(let made): done(made)
-            case .failure(let error):
-                self?.take(error, .deliver)
-                done(nil)
+            self?.finishLibraryUpload(id: id, result: result)
+        }
+        return true
+    }
+
+    func cancelLibraryUpload() {
+        guard libraryUploadActive else { return }
+        libraryUploadTransfer?.cancel()
+    }
+
+    private func updateLibraryUpload(_ view: UploadView, id: UUID) {
+        guard libraryUploadID == id else { return }
+        // A late progress callback from a settled operation cannot replace
+        // its terminal line, but its final landed list is still useful.
+        guard libraryUploadActive || !view.landed.isEmpty else { return }
+        libraryUploadView = view
+    }
+
+    private func finishLibraryUpload(id: UUID, result: Result<[LibraryFile], PortError>) {
+        guard libraryUploadWorkerID == id else { return }
+        libraryUploadWorkerID = nil
+        libraryUploadActive = false
+        libraryUploadTransfer = nil
+        guard libraryUploadID == id else { return }
+        if case .failure(let error) = result {
+            let outcome: String
+            if case let .Failed(headline, _, _) = error {
+                outcome = headline
+            } else {
+                outcome = String(describing: error)
+            }
+            take(error, .deliver)
+            guard libraryUploadID == id else { return }
+            libraryUploadOutcome = outcome
+        }
+    }
+
+    /// Drops upload state when the signed-in account changes. A running core
+    /// worker remains the active guard until its completion callback settles.
+    private func resetLibraryUploadForSession() {
+        if libraryUploadActive { libraryUploadTransfer?.cancel() }
+        libraryUploadID = nil
+        libraryUploadView = nil
+        libraryUploadOutcome = nil
+        if !libraryUploadActive {
+            libraryUploadWorkerID = nil
+            libraryUploadTransfer = nil
+        }
+    }
+
+    private final class LibraryUploadListener: UploadListener, @unchecked Sendable {
+        private let id: UUID
+
+        init(id: UUID) { self.id = id }
+
+        func update(view: UploadView) {
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    PortStore.shared.updateLibraryUpload(view, id: self.id)
+                }
             }
         }
     }
@@ -313,6 +385,7 @@ final class PortStore: ObservableObject {
         problem = headline
         problemScope = scope
         if signedOut {
+            resetLibraryUploadForSession()
             port = nil
             requests = []
             deliveries = []

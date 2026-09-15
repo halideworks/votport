@@ -18,6 +18,16 @@ public sealed class PortStore
     public ObservableCollection<RequestItem> Requests { get; } = new();
     public ObservableCollection<DeliveryItem> Deliveries { get; } = new();
     public ObservableCollection<WatchItem> Watches { get; } = new();
+    /// The one library upload the app owns, including its final progress.
+    /// It survives Share page replacement while the process is running.
+    internal Guid? LibraryUploadId { get; private set; }
+    internal Transfer? LibraryUpload { get; private set; }
+    internal UploadView? LibraryUploadView { get; private set; }
+    internal bool LibraryUploadActive { get; private set; }
+    internal string? LibraryUploadOutcome { get; private set; }
+    internal string? LibraryUploadStatus => LibraryUploadOutcome ?? LibraryUploadView?.Status;
+    private Guid? libraryUploadWorkerId;
+    private long sessionGeneration;
     /// The last failure's headline, for the line under the form that made
     /// the call, named by ProblemScope.
     public string? Problem { get; private set; }
@@ -45,8 +55,11 @@ public sealed class PortStore
         Port = VotportClientCoreMethods.Port();
         ReloadWatches();
         if (Port is null) return;
+        var expectedSession = sessionGeneration;
         Run(Scope.Port, () => VotportClientCoreMethods.CheckPort(), port =>
         {
+            if (sessionGeneration != expectedSession) return;
+            if (port is null) ResetLibraryUploadForSession();
             Port = port;
             if (port is not null) Refresh();
         });
@@ -57,6 +70,7 @@ public sealed class PortStore
         var previous = ClearSso();
         Run(Scope.Port, () => { previous?.Cancel(); return VotportClientCoreMethods.SignIn(@base, password); }, port =>
         {
+            ResetLibraryUploadForSession();
             Port = port;
             Problem = null;
             Refresh();
@@ -115,6 +129,7 @@ public sealed class PortStore
             ssoLogin = null;
             ssoAttempt = null;
             ssoCompleting = false;
+            ResetLibraryUploadForSession();
             Port = port;
             Problem = null;
             Refresh();
@@ -131,6 +146,7 @@ public sealed class PortStore
         var previous = ClearSso();
         Run(Scope.Port, () => { previous?.Cancel(); VotportClientCoreMethods.SignOut(); return true; }, _ =>
         {
+            ResetLibraryUploadForSession();
             Port = null;
             AutomationTokens = Array.Empty<AutomationToken>();
             Requests.Clear();
@@ -170,12 +186,84 @@ public sealed class PortStore
     internal void Library(string directory, string? after, Func<bool> isCurrent, Action<Library?> done) =>
         Run(Scope.Deliver, () => VotportClientCoreMethods.Library(directory, after), done, () => done(null), isCurrent);
 
-    /// Uploads a drop (files, and folders with everything under them) into
-    /// the port under `into` and hands back every library file made.
-    /// Progress reaches `listener` on the core's thread; a failure midway
-    /// returns nothing here, and the listener's last view names what landed.
-    internal void Upload(string[] paths, string into, Transfer transfer, UploadListener listener, Action<LibraryFile[]> done, Action failed) =>
-        Run(Scope.Deliver, () => VotportClientCoreMethods.Upload(paths, into, transfer, listener), done, failed);
+    /// Starts the one library upload owned by this store. The handle and
+    /// progress stay available when Share is replaced by another page.
+    internal bool StartLibraryUpload(string[] paths, string into)
+    {
+        if (paths.Length == 0 || LibraryUploadActive) return false;
+        var id = Guid.NewGuid();
+        var transfer = new Transfer();
+        LibraryUploadId = id;
+        libraryUploadWorkerId = id;
+        LibraryUpload = transfer;
+        LibraryUploadView = null;
+        LibraryUploadOutcome = null;
+        LibraryUploadActive = true;
+        Changed?.Invoke();
+        Run(
+            Scope.Deliver,
+            () => VotportClientCoreMethods.Upload(paths, into, transfer, new LibraryUploadListener(id)),
+            _ => FinishLibraryUpload(id, null),
+            () => FinishLibraryUpload(id, Problem ?? "Upload failed."),
+            () => LibraryUploadId == id);
+        return true;
+    }
+
+    internal void CancelLibraryUpload()
+    {
+        if (LibraryUploadActive) LibraryUpload?.Cancel();
+    }
+
+    private void UpdateLibraryUpload(Guid id, UploadView view)
+    {
+        if (LibraryUploadId != id) return;
+        // A late progress callback from a settled operation cannot replace
+        // its terminal line, but its final landed list is still useful.
+        if (!LibraryUploadActive && view.Landed.Length == 0) return;
+        LibraryUploadView = view;
+        Changed?.Invoke();
+    }
+
+    private void FinishLibraryUpload(Guid id, string? outcome)
+    {
+        if (libraryUploadWorkerId != id) return;
+        libraryUploadWorkerId = null;
+        LibraryUploadActive = false;
+        LibraryUpload = null;
+        if (LibraryUploadId != id)
+        {
+            Changed?.Invoke();
+            return;
+        }
+        LibraryUploadOutcome = outcome;
+        Changed?.Invoke();
+    }
+
+    /// Drops upload state when the signed-in account changes. A running core
+    /// worker remains the active guard until its completion callback settles.
+    private void ResetLibraryUploadForSession()
+    {
+        sessionGeneration++;
+        if (LibraryUploadActive) LibraryUpload?.Cancel();
+        LibraryUploadId = null;
+        LibraryUploadView = null;
+        LibraryUploadOutcome = null;
+        if (!LibraryUploadActive)
+        {
+            libraryUploadWorkerId = null;
+            LibraryUpload = null;
+        }
+        Changed?.Invoke();
+    }
+
+    private sealed class LibraryUploadListener : UploadListener
+    {
+        private readonly Guid id;
+
+        public LibraryUploadListener(Guid id) => this.id = id;
+
+        public void Update(UploadView view) => PortStore.Shared.dispatcher.TryEnqueue(() => PortStore.Shared.UpdateLibraryUpload(id, view));
+    }
 
     internal void IssueDelivery(DeliverySpec spec, Action<IssuedDelivery?> done) =>
         Run(Scope.Deliver, () => VotportClientCoreMethods.IssueDelivery(spec), issued =>
@@ -231,6 +319,7 @@ public sealed class PortStore
     /// clears the port so the pages fold.
     private void Run<T>(Scope scope, Func<T> work, Action<T> done, Action? failed = null, Func<bool>? isCurrent = null)
     {
+        var expectedSession = sessionGeneration;
         inFlight++;
         Busy = true;
         Problem = null;
@@ -254,15 +343,18 @@ public sealed class PortStore
                 if (problem is null) done(result!);
                 else
                 {
-                    if (signedOut || isCurrent is null || isCurrent())
+                    var sameSession = sessionGeneration == expectedSession;
+                    var current = isCurrent?.Invoke() ?? true;
+                    if (sameSession && (current || signedOut))
                     {
                         // Stamped at the failure, so a slow call landing after a
                         // later one still reports under its own form.
                         Problem = problem;
                         ProblemScope = scope;
                     }
-                    if (signedOut)
+                    if (signedOut && sameSession)
                     {
+                        ResetLibraryUploadForSession();
                         Port = null;
                         AutomationTokens = Array.Empty<AutomationToken>();
                         Requests.Clear();
