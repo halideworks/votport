@@ -833,6 +833,278 @@ mod tests {
         )
     }
 
+    #[derive(Clone)]
+    struct RotationPeer {
+        app: Arc<crate::app::App>,
+        route_id: String,
+        remote_grant: String,
+        replacement: String,
+        signer: Arc<crate::receipt::ReceiptSigner>,
+        mutated: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    async fn rotation_peer_discovery(
+        axum::extract::State(peer): axum::extract::State<RotationPeer>,
+        axum::extract::Query(query): axum::extract::Query<DiscoveryQuery>,
+    ) -> axum::response::Response {
+        super::private(peer.signer.port_message(
+            "discovery",
+            "",
+            query.challenge,
+            super::now() + 300,
+            serde_json::json!({"protocols":[1]}),
+        ))
+    }
+
+    async fn rotation_peer_rotate(
+        axum::extract::State(peer): axum::extract::State<RotationPeer>,
+        axum::Json(request): axum::Json<SignedPortMessage>,
+    ) -> axum::response::Response {
+        peer.app
+            .store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE trade_routes SET credential=?2 WHERE id=?1",
+                    rusqlite::params![&peer.route_id, &peer.replacement,],
+                )
+            })
+            .unwrap();
+        peer.mutated
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        super::private(peer.signer.port_message(
+            "rotated",
+            &request.document.issuer,
+            request.document.nonce,
+            super::now() + 300,
+            serde_json::json!({"grant":peer.remote_grant}),
+        ))
+    }
+
+    fn invitation_fixture() -> (
+        tempfile::TempDir,
+        Arc<crate::app::App>,
+        String,
+        TradeEndpoint,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let endpoint = TradeEndpoint {
+            id: "trade-endpoint".into(),
+            name: "Trade endpoint".into(),
+            category: "external".into(),
+            forwarding: false,
+            metadata_keys: vec![],
+            notifications: crate::store::NotificationPolicy::default(),
+        };
+        app.store
+            .insert_link(crate::store::tests::test_link(&endpoint.id))
+            .unwrap();
+        app.store.create_trade_endpoint("", &endpoint).unwrap();
+        app.store
+            .put_settings(
+                "test",
+                &[(
+                    "port_address".into(),
+                    crate::store::SettingWrite::Set("http://127.0.0.1".into()),
+                )],
+            )
+            .unwrap();
+        let cookie = admin_cookie(&app);
+        (directory, app, cookie, endpoint)
+    }
+
+    fn invitation_count(app: &crate::app::App) -> i64 {
+        app.store
+            .with(|connection| {
+                connection.query_row("SELECT COUNT(*) FROM trade_invitations", [], |row| {
+                    row.get(0)
+                })
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn inspect_rejects_an_invalid_address_before_contacting_a_peer() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/trade-routes/inspect")
+                    .header("X-Votport", "1")
+                    .header(header::COOKIE, admin_cookie(&app))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"address":"file:///tmp"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(
+            body["error"],
+            "use a port origin such as https://port.example"
+        );
+        assert_eq!(app.store.audit_count().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn invitation_expiry_accepts_only_documented_bounds() {
+        let (_directory, app, cookie, endpoint) = invitation_fixture();
+        let router = crate::app::router(Arc::clone(&app));
+        let request = |expires_in| {
+            Request::post("/api/trade-routes/invitations")
+                .header("X-Votport", "1")
+                .header(header::COOKIE, &cookie)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "endpoint": endpoint.id,
+                        "expires_in": expires_in,
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+
+        for expires_in in [3600, 86400, 604800] {
+            let before = now();
+            let invitations_before = invitation_count(&app);
+            let audits_before = app.store.audit_count().unwrap();
+            let response = router.clone().oneshot(request(expires_in)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let response_body: serde_json::Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap_or_else(|_| panic!("invitation response was not JSON"));
+            let issued: SignedPortMessage =
+                serde_json::from_value(response_body["invitation"].clone())
+                    .expect("invitation response field");
+            assert!(issued.verify("invitation", "", now()));
+            assert!(issued.document.expires_at >= before + expires_in);
+            assert!(issued.document.expires_at <= now() + expires_in);
+            assert_eq!(invitation_count(&app), invitations_before + 1);
+            assert_eq!(app.store.audit_count().unwrap(), audits_before + 1);
+        }
+
+        for expires_in in [3599, 3601, 86399, 86401, 604799, 604801] {
+            let invitations_before = invitation_count(&app);
+            let audits_before = app.store.audit_count().unwrap();
+            let response = router.clone().oneshot(request(expires_in)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(invitation_count(&app), invitations_before);
+            assert_eq!(app.store.audit_count().unwrap(), audits_before);
+        }
+    }
+
+    #[tokio::test]
+    async fn local_rotation_refuses_a_credential_changed_during_remote_reply() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let cookie = admin_cookie(&app);
+        let sender_directory = tempfile::tempdir().unwrap();
+        let sender = Arc::new(
+            crate::receipt::ReceiptSigner::load_or_create(sender_directory.path()).unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let route_id = "local-rotation".to_owned();
+        let old = crate::auth::random_token();
+        let replacement = crate::auth::random_token();
+        let route = TradeRoute {
+            id: route_id.clone(),
+            revision: 1,
+            tenant: String::new(),
+            direction: "outgoing".into(),
+            name: "Remote".into(),
+            peer_name: "Remote".into(),
+            peer_key: sender.public_hex.clone(),
+            address: format!("http://{address}"),
+            endpoint: "endpoint".into(),
+            endpoint_name: "Endpoint".into(),
+            category: "external".into(),
+            forwarding: false,
+            metadata_keys: vec![],
+            state: "active".into(),
+            notifications: crate::store::NotificationPolicy::default(),
+            last_contact: None,
+            error: None,
+            remote_grant: "remote-grant".into(),
+            remote_state: "active".into(),
+            cancel_active: false,
+        };
+        let route_document = serde_json::to_string(&route).unwrap();
+        app.store
+            .with(|connection| {
+                connection.execute(
+                    "INSERT INTO trade_routes(id,tenant,direction,peer_key,endpoint,document,credential) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    rusqlite::params![
+                        &route.id,
+                        &route.tenant,
+                        &route.direction,
+                        &route.peer_key,
+                        route.endpoint,
+                        route_document,
+                        &old,
+                    ],
+                )
+            })
+            .unwrap();
+        let mutated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let peer = RotationPeer {
+            app: Arc::clone(&app),
+            route_id: route_id.clone(),
+            remote_grant: route.remote_grant.clone(),
+            replacement: replacement.clone(),
+            signer: sender,
+            mutated: Arc::clone(&mutated),
+        };
+        let peer_router = axum::Router::new()
+            .route("/api/port", axum::routing::get(rotation_peer_discovery))
+            .route(
+                "/api/port/rotate",
+                axum::routing::post(rotation_peer_rotate),
+            )
+            .with_state(peer);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, peer_router).await.unwrap();
+        });
+
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::post(format!("/api/trade-routes/{route_id}/rotate"))
+                    .header("X-Votport", "1")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        server.abort();
+        let _ = server.await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body["error"],
+            "credential changed; retry with current credentials"
+        );
+        assert!(mutated.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            app.store.trade_credential("", &route_id).unwrap(),
+            replacement
+        );
+        assert!(app
+            .store
+            .audit_export(Some(""), 0, 0, 100)
+            .unwrap()
+            .iter()
+            .all(|row| row.event != "trade_credential_rotated"));
+    }
+
     #[tokio::test]
     async fn trade_test_route_distinguishes_missing_foreign_and_store_failure() {
         let directory = tempfile::tempdir().unwrap();

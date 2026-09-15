@@ -128,15 +128,44 @@ def main():
             time.sleep(.05)
         raise AssertionError('job did not settle')
 
-    log = (args.root / 'server.log').open('wb')
-    server = subprocess.Popen([str(args.server)], env=env, stdout=log, stderr=log)
-    try:
-        for _ in range(200):
+    def start_server():
+        log = (args.root / 'server.log').open('ab')
+        server = subprocess.Popen([str(args.server)], env=env, stdout=log, stderr=log)
+        deadline = time.monotonic() + 60
+        for _ in range(600):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             try:
-                urllib.request.urlopen(base + '/healthz', timeout=1).close(); break
+                urllib.request.urlopen(base + '/healthz', timeout=min(1, remaining)).close()
+                return server, log
             except OSError:
-                assert server.poll() is None, (args.root / 'server.log').read_text()
-                time.sleep(.05)
+                if server.poll() is not None:
+                    log.close()
+                    raise RuntimeError((args.root / 'server.log').read_text())
+                time.sleep(min(.1, max(0, deadline - time.monotonic())))
+        stop_server(server, log)
+        raise RuntimeError('server did not become ready')
+
+    def stop_server(server, log):
+        if server is None:
+            return
+        if server.poll() is None:
+            server.terminate()
+        try:
+            server.wait(timeout=15)
+            if server.returncode != 0:
+                raise RuntimeError(f'server exited abnormally: {server.returncode}')
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait()
+            raise RuntimeError('server shutdown timed out; refusing to access its database')
+        finally:
+            log.close()
+
+    server, log = None, None
+    try:
+        server, log = start_server()
         api('admin/login', {'password': 'workflow-fixture-only'})
         config = api('workflows/storage', {'storage': {'id': 'fixture', 'revision': 0, 'label': 'Fixture',
             'endpoint': f'http://127.0.0.1:{proxy.server_port}', 'bucket': bucket, 'region': 'us-east-1',
@@ -174,23 +203,57 @@ def main():
             actual = s3('GET', entry['key'])
             assert hashlib.sha256(actual).digest() == hashlib.sha256(files[entry['name']]).digest()
         # Retry after a lost completion response must accept the identical commit object.
+        stop_server(server, log)
+        server, log = None, None
         import sqlite3
         with sqlite3.connect(args.root / 'data/votport.db') as database:
             database.execute("UPDATE delivery_jobs SET state='exporting',owner='',document=json_remove(json_set(document,'$.state','exporting'),'$.checks.destinations.fixture') WHERE id=?", (job_id,))
+        server, log = start_server()
+        api('admin/login', {'password': 'workflow-fixture-only'})
         assert wait_job(job_id, 'ready')['job']['manifest'] == manifest
         assert json.loads(s3('GET', prefix + '/complete.json')) == completion
         puts = [path for method, path, _ in trace if method == 'PUT']
         assert puts[-1].endswith('/complete.json')
         assert config['revision'] == 1
+        backup_config = {
+            'enabled': False, 'interval_secs': 3600, 'retention_days': 30,
+            'retention_count': 10, 'destination': 's3', 'local_path': None,
+            's3_endpoint': args.s3, 's3_region': 'us-east-1', 's3_bucket': bucket,
+            's3_prefix': 'backup-fixture', 'encrypt': False, 's3_path_style': True,
+            'access_key_id': access, 'secret_access_key': secret,
+        }
+        api('admin/backups', backup_config, 'PUT')
+        backup = api('admin/backups', method='POST')
+        backup_id = backup['id']
+        inventory = api('admin/backups')['inventory']
+        listed = [item for item in inventory if item['source'] == 's3' and item['id'] == backup_id]
+        assert listed and listed[0]['bytes'] > 0, inventory
+        assert s3('GET', 'backup-fixture/' + backup_id)
+        api('workflows/projects', {'id': 'after-backup', 'label': 'After backup',
+            'directory': 'after-backup'}, 'PUT')
+        restored = api('admin/backups/restore', {'source': 's3', 'id': backup_id}, 'POST')
+        assert restored == {'pending': True, 'restart_required': True}, restored
+        stop_server(server, log)
+        server, log = None, None
+        server, log = start_server()
+        api('admin/login', {'password': 'workflow-fixture-only'})
+        projects = api('workflows/projects')['projects']
+        assert any(project['id'] == 'storage' for project in projects), projects
+        assert not any(project['id'] == 'after-backup' for project in projects), projects
+        restored_job = api('workflows/jobs/' + job_id)['job']
+        assert restored_job['id'] == job_id and restored_job['manifest'] == manifest
+        assert restored_job['state'] == 'suspended'
+        assert restored_job['checks']['destinations']['fixture']['state'] == 'complete'
         print(json.dumps({'import_export': 'passed', 'conditional_mutation': 'rejected',
             'credentials': 'saved' if args.saved_credentials else 'ambient' if args.ambient_credentials else 'configured',
             'completion_failure': 'withheld URL', 'retry': 'same operation and manifest',
-            'literal_keys': 'preserved', 'files': len(files), 'bytes': sum(map(len, files.values()))}), flush=True)
+            'literal_keys': 'preserved', 'files': len(files), 'bytes': sum(map(len, files.values())),
+            'backup': 's3 inventory and restore passed'}), flush=True)
     finally:
-        server.terminate()
-        try: server.wait(timeout=15)
-        except subprocess.TimeoutExpired: server.kill(); server.wait()
-        log.close(); proxy.shutdown(); proxy.server_close()
+        try:
+            stop_server(server, log)
+        finally:
+            proxy.shutdown(); proxy.server_close()
 
 
 if __name__ == '__main__':
