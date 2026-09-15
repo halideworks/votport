@@ -22,6 +22,7 @@
     <link rel="modulepreload" href="/assets/undo.js" />
   </head>
   <body>
+  <a class="skip-link" href="#main-content">Skip to content</a>
     <div class="sheet">
       <header class="masthead">
         <div class="hero-brand">
@@ -45,6 +46,7 @@
         </form>
       </div>
 
+      <main id="main-content" tabindex="-1">
       <h1>Audit log</h1>
 
       <form id="audit-filters" class="card">
@@ -74,6 +76,7 @@
       <p class="field-help">Load more keeps up to 1,000 rows on this page. Refresh starts again with the selected filters and order.</p>
       <p id="audit-range" class="mono muted" role="status" tabindex="-1"></p>
       <div id="audit-log" class="mono"></div>
+      </main>
       <p class="sheet-foot"><span class="footer-custom"></span><span>Powered by Verified Object Transport (VOT) · <a href="https://votport.com" target="_blank" rel="noopener noreferrer">VOTPort</a></span></p>
     </div>
 

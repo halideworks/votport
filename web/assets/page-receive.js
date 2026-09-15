@@ -27,6 +27,7 @@ const $ = (id) => document.getElementById(id);
 const creatingRoute = new URLSearchParams(window.location.search).get('trade-route') === '1';
 $('trade-return-guide').hidden = !creatingRoute;
 if (creatingRoute) {
+  $('trade-return-guide').tabIndex = -1;
   $('create-password').disabled = true; $('create-password').closest('label').hidden = true;
   $('create-notification-options').hidden = true;
   $('create-form').querySelector('button[type="submit"]').textContent = 'Continue to route permissions';
@@ -962,3 +963,7 @@ $('links-query').value = linksFilter.search;
 startStatusPoll({ render: renderStatus, active: (status) => status.sessions_active > 0 });
 await Promise.all([sessionReady, refreshLinksSafe()]);
 revealHash();
+if (creatingRoute && window.location.hash === '#create-form') {
+  await projectsReady;
+  $('trade-return-guide').focus({ preventScroll: true });
+}

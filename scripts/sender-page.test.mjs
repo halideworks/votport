@@ -16,6 +16,12 @@ test('each staged file carries a state badge and a meter while sending', () => {
   assert.match(script, /item\.dataset\.state = state/);
   assert.match(script, /const state = done \? 'verified'/);
   assert.match(script, /meter\.className = 'row-meter'/);
+  assert.match(script, /meter\.setAttribute\('role', 'progressbar'\)/);
+  assert.match(script, /meter\.setAttribute\('aria-label', `\$\{path\} upload progress`\)/);
+  assert.match(script, /meter\.setAttribute\('aria-valuemin', '0'\)/);
+  assert.match(script, /meter\.setAttribute\('aria-valuemax', '100'\)/);
+  assert.match(script, /const percent = Math\.max\(0, Math\.min\(100, Math\.round\(fraction \* 100\)\)\);/);
+  assert.match(script, /meter\.setAttribute\('aria-valuenow', String\(percent\)\)/);
   assert.match(script, /item\.file\.size \? fileSent \/ item\.file\.size : 1/);
   assert.match(script, /files verified`\)/);
 });

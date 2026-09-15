@@ -415,6 +415,8 @@ jobs:
           BASE_URL=http://127.0.0.1:8080 ADMIN_PASSWORD="$ADMIN_PASSWORD" \
             WORKFLOW_TEST_ROOT="$e2e_root" node scripts/usability-browser-e2e.mjs
           BASE_URL=http://127.0.0.1:8080 ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+            node scripts/main-landmark-browser-e2e.mjs
+          BASE_URL=http://127.0.0.1:8080 ADMIN_PASSWORD="$ADMIN_PASSWORD" \
             WORKFLOW_TEST_ROOT="$e2e_root" NOTIFY_TEST_HOST=host.docker.internal NOTIFY_TEST_BIND=0.0.0.0 node scripts/notification-routing-browser-e2e.mjs
           BASE_URL=http://127.0.0.1:8080 ADMIN_PASSWORD="$ADMIN_PASSWORD" \
             WORKFLOW_TEST_ROOT="$e2e_root" node scripts/branding-browser-e2e.mjs

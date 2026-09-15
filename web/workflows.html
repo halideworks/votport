@@ -20,6 +20,7 @@
     <link rel="modulepreload" href="/assets/undo.js" />
   </head>
   <body>
+  <a class="skip-link" href="#main-content">Skip to content</a>
     <div class="sheet">
       <header class="masthead">
         <div class="hero-brand">
@@ -40,6 +41,7 @@
         </form>
       </div>
 
+      <main id="main-content" tabindex="-1">
       <div class="page-heading"><div><p class="eyebrow">Managed delivery</p><div class="field-heading"><h1>Workflows</h1><button type="button" class="hint-button" aria-label="Help about workflows" data-hint="A project holds reusable rules. Each delivery follows those rules for file checks, approvals and destinations. Start with a project, then create a delivery.">?</button></div><p class="page-lead">Prepare, approve and track deliveries using reusable project rules.</p></div><button id="workflow-new" type="button">New delivery</button></div>
       <nav class="page-tabs" aria-label="Workflow sections">
         <a href="#jobs" aria-current="page" data-hint="Track each delivery from preparation through release and recipient acceptance.">Deliveries</a><a href="#projects" data-hint="Set reusable checks, team access and destinations for a library folder.">Projects</a><a href="#webhooks" data-hint="Send signed delivery events to another application.">Webhooks</a><a href="#activity" data-hint="Review the signed history of delivery actions and recipient acknowledgments.">Activity</a>
@@ -129,6 +131,7 @@
         <div class="section-heading"><div><h2 class="section-title">Activity</h2><p class="muted">Signed delivery activity visible to you. Exports may omit records from other projects.</p></div><button id="workflow-events-export" type="button" class="ghost" disabled>Export activity</button></div>
         <div id="workflow-events"></div><button id="workflow-events-next" type="button" class="ghost">Load more activity</button>
       </section>
+      </main>
       <p class="sheet-foot"><span class="footer-custom"></span><span>Powered by Verified Object Transport (VOT) · <a href="https://votport.com" target="_blank" rel="noopener noreferrer">VOTPort</a></span></p>
     </div>
 

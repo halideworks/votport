@@ -55,6 +55,15 @@ test('anchor fallback copy explains multiple downloads', () => {
   assert.match(sendPage, />Start downloads<\/button>/);
 });
 
+test('single-file handoff reports browser ownership before navigation', () => {
+  const singleFileBranch = outboundScript.slice(
+    outboundScript.indexOf('  } else {', outboundScript.indexOf('if (metadataTotal > 1)')),
+    outboundScript.indexOf('\n  const fetchBlock', outboundScript.indexOf('if (metadataTotal > 1)')),
+  );
+  assert.match(singleFileBranch, /setSeparateDownloadStatus\('Download handed to the browser\./);
+  assert.ok(singleFileBranch.indexOf('setSeparateDownloadStatus') < singleFileBranch.indexOf('window.location.assign'));
+});
+
 test('anchor requests stop before the next click and report each handoff', async () => {
   const triggerSource = outboundScript.slice(
     outboundScript.indexOf('async function triggerSeparateDownloads('),

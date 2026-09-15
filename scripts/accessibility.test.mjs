@@ -40,6 +40,16 @@ test('upload progress exposes its current percentage', () => {
   assert.match(uploadScript, /\$\('meter'\)\.setAttribute\('aria-valuenow', String\(percent\)\)/);
 });
 
+test('recipient pages identify their request and receipt contexts', () => {
+  assert.match(request, /<title>VOTPort · Request files<\/title>/);
+  assert.match(request, /<h1 id="title">Request files<\/h1>/);
+  assert.match(verify, /<title>VOTPort · Verify a receipt<\/title>/);
+  assert.match(uploadScript, /document\.title = `VOTPort · \$\{info\.label\}`/);
+  assert.match(uploadScript, /showClosed\('Request not found'/);
+  assert.match(uploadScript, /showClosed\('Request closed'\)/);
+  assert.match(uploadScript, /document\.title = 'VOTPort · Request unavailable'/);
+});
+
 test('admin confirmation dialogs expose their shared title and detail', () => {
   for (const page of [receive, deliver, tenants, audit, system]) {
     const dialog = page.match(/<dialog id="confirm"[^>]*>/)?.[0];

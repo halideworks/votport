@@ -124,6 +124,7 @@ try {
   assert.equal(await receiving.locator('#trade-request').inputValue(), olderRequest.id, 'Returning to an older request uses its exact tenant-scoped ID');
   await receiving.getByRole('link', { name: 'Create a receive request and return here →', exact: true }).click();
   await receiving.locator('#trade-return-guide').waitFor();
+  assert.ok(await receiving.locator('#trade-return-guide').evaluate((node) => node === document.activeElement), 'Route handoff focuses its setup guide');
   assert.ok(await receiving.locator('#create-password').isHidden());
   await receiving.fill('#create-label', id);
   await receiving.locator('#create-workflow select').selectOption(id);
