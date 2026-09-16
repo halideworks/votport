@@ -4683,6 +4683,146 @@ async fn native_push_abort_retains_recoverable_objects() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn native_push_resume_across_restart_publishes_the_package_once() {
+    let server = start_push_server().await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let source = fixture.path().join("source");
+    std::fs::create_dir_all(source.join("nested")).unwrap();
+    std::fs::write(source.join("a.bin"), vec![95_u8; 1024 * 1024]).unwrap();
+    std::fs::write(source.join("nested/b.bin"), vec![96_u8; 16 * 1024 * 1024]).unwrap();
+    let bundle = fixture.path().join("bundle");
+    let summary = vot_cli::build_bundle(&source, &bundle).unwrap();
+    let files: Vec<(String, Vec<u8>)> = vec![
+        ("a.bin".to_owned(), vec![95_u8; 1024 * 1024]),
+        ("nested/b.bin".to_owned(), vec![96_u8; 16 * 1024 * 1024]),
+    ];
+    assert_eq!(summary.entries, files.len() as u64);
+    let token = create_open_link(&client, &server.base, "restarted push", "inbox", None).await;
+    let holder = ed25519_dalek::SigningKey::from_bytes(&[45; 32]);
+    let response = preflight_push(&client, &server.base, &token, &holder, summary).await;
+    let session = response["session"].as_str().unwrap().to_owned();
+    let (capability, holder_key) = write_push_credentials(fixture.path(), &response, &holder);
+    let persisted = server
+        .application
+        .store
+        .load_push_sessions()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.id == session)
+        .unwrap();
+    let resume_key = persisted.push_key.clone().unwrap();
+
+    // Push half the package, then drop the receive the established way.
+    let first = server.receive_dir.join("inbox").join(&files[0].0);
+    let first_bytes = files[0].1.clone();
+    let (pushed, aborted) = tokio::join!(
+        push_bundle_blocking(&server, &bundle, &capability, &holder_key),
+        async {
+            tokio::time::timeout(Duration::from_secs(10), async move {
+                loop {
+                    if std::fs::read(&first).is_ok_and(|bytes| bytes == first_bytes) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .expect("native push connects");
+            client
+                .post(format!("{}/api/session/{session}/abort", server.base))
+                .send()
+                .await
+                .unwrap()
+        }
+    );
+    assert_eq!(aborted.status(), 200);
+    assert!(pushed.is_err(), "aborted push stops the sender");
+    let staging = persisted
+        .dest_dir
+        .join(".vot-stage")
+        .join(format!(".vot-push-{resume_key}"));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(staging.join("writer.lock"))
+            .is_ok_and(|file| file.try_lock().is_ok())
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("aborted push cleanup completes");
+    assert_eq!(server.application.sessions.total(), 1);
+
+    // Reboot through the boot seam with push still enabled. The parked
+    // cancelled session is in-memory only, so the reboot drops it; whether
+    // its recovery record survived the abort race is both tolerated here.
+    let (data, received) = server.suspend().await;
+    let server = start_server_in(
+        data,
+        received,
+        ServerOptions {
+            enable_push: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    // The re-adopted session count depends on whether the abort landed
+    // between objects (record forgotten) or mid-object (record kept); both
+    // are established abort semantics and neither affects what follows.
+
+    // The same link, holder, and package derive the same resume key: the new
+    // preflight lands on the exact staging directory the old session used.
+    let resumed = preflight_push(&client, &server.base, &token, &holder, summary).await;
+    let records = server.application.store.load_push_sessions().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].push_key.as_deref(),
+        Some(resume_key.as_str()),
+        "the resume key derives identically after the restart"
+    );
+    let (capability, holder_key) = write_push_credentials(fixture.path(), &resumed, &holder);
+    let pushed = push_bundle_blocking(&server, &bundle, &capability, &holder_key)
+        .await
+        .unwrap_or_else(|error| {
+            let link = server.application.store.link_by_id(&token).unwrap();
+            panic!(
+                "resumed native push succeeds: {error}; sessions={}; events={:?}",
+                server.application.sessions.total(),
+                link.map(|link| link.events)
+            )
+        });
+    assert_eq!(pushed, summary);
+    for (path, bytes) in &files {
+        let destination = server.receive_dir.join("inbox").join(path);
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            *bytes,
+            "{path} is byte-identical after the resumed push"
+        );
+        assert!(PathBuf::from(format!("{}.vot-receipt", destination.display())).exists());
+    }
+    let link = server
+        .application
+        .store
+        .link_by_id(&token)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        link.uploads.len(),
+        1,
+        "the interrupted half-push leaves exactly one upload record"
+    );
+    assert_eq!(link.uploads[0].transport.as_deref(), Some("push"));
+    assert_eq!(link.uploads[0].package_root, hex::encode(summary.root));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn native_push_store_failure_preserves_published_files_for_retry() {
     let server = start_push_server().await;
     let client = reqwest::Client::builder()

@@ -975,6 +975,22 @@ fn refuse_closed_fetch(
 }
 
 /// The admission policy the serve listener runs for every session.
+/// Runs one blocking store round trip off the calling thread and waits for
+/// its result. Admission runs while the session's authentication deadline
+/// runs, so a contended store must not pin the calling thread to a
+/// synchronous fsync; the response still waits for the call, so the store
+/// writes keep their order relative to the admission decision.
+fn blocking<T: Send + 'static>(
+    runtime: &tokio::runtime::Handle,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    runtime.spawn_blocking(move || {
+        let _ = sender.send(work());
+    });
+    receiver.recv().expect("blocking store work finishes")
+}
+
 pub(crate) fn admit_fetch(
     app: &Arc<App>,
     presentation: vot_cli::ServePresentation<'_>,
@@ -999,7 +1015,9 @@ pub(crate) fn admit_fetch(
     };
     let token = capability.token_id;
     let root = capability.scope.root;
-    let ticket = match app.store.fetch_ticket(&hex::encode(token)) {
+    let store = Arc::clone(&app.store);
+    let token_id = hex::encode(token);
+    let ticket = match blocking(runtime, move || store.fetch_ticket(&token_id)) {
         Ok(Some(ticket)) => ticket,
         Ok(None) => return refuse(app, ServeRefusalReason::Unknown, peer),
         Err(error) => {
@@ -1010,7 +1028,9 @@ pub(crate) fn admit_fetch(
     if decode_root(&ticket.manifest_root) != Some(root) {
         return refuse(app, ServeRefusalReason::Capability, peer);
     }
-    let grant = match app.store.outbound_grant_by_id(&ticket.grant_id) {
+    let store = Arc::clone(&app.store);
+    let grant_id = ticket.grant_id.clone();
+    let grant = match blocking(runtime, move || store.outbound_grant_by_id(&grant_id)) {
         Ok(Some(grant)) => grant,
         Ok(None) => return refuse(app, ServeRefusalReason::Unknown, peer),
         Err(error) => {
@@ -1075,13 +1095,18 @@ pub(crate) fn admit_fetch(
         target: "audit", event = "serve_admitted", grant_id = %grant.id, %peer,
         "fetch session admitted"
     );
-    app.store.audit(
-        &grant.tenant,
-        "",
-        "serve_admitted",
-        &grant.id,
-        &json!({ "peer": peer.to_string() }),
-    );
+    let store = Arc::clone(&app.store);
+    let tenant = grant.tenant.clone();
+    let grant_id = grant.id.clone();
+    blocking(runtime, move || {
+        store.audit(
+            &tenant,
+            "",
+            "serve_admitted",
+            &grant_id,
+            &json!({ "peer": peer.to_string() }),
+        );
+    });
     let observer = {
         let app = Arc::clone(app);
         let runtime = runtime.clone();
@@ -1664,8 +1689,20 @@ mod tests {
         assert_eq!(registry.active_sessions(), 0);
     }
 
-    #[tokio::test]
-    async fn ticket_admission_store_error_is_unknown_not_closed() {
+    /// The admission tests' shared fixture: the app keeps the temporary
+    /// data directory alive.
+    struct FetchAdmissionFixture {
+        app: Arc<crate::app::App>,
+        challenge: vot_codec::frames::AuthContext,
+        open: vot_codec::frames::SessionOpen,
+        binding: vot_transport_api::ChannelBinding,
+        now: u64,
+        _directory: tempfile::TempDir,
+    }
+
+    /// A servable grant, its minted fetch ticket, and an answered capability
+    /// challenge: the admission tests' common fixture.
+    fn fetch_admission_fixture(token: &str, holder_seed: u8) -> FetchAdmissionFixture {
         let directory = tempfile::tempdir().unwrap();
         let mut config = crate::api::testing::config(directory.path());
         config.serve_bind = Some("127.0.0.1:0".parse().unwrap());
@@ -1682,8 +1719,7 @@ mod tests {
         builder.update(bytes).unwrap();
         let object = builder.finish().unwrap().object_id().clone();
         let now = now_unix();
-        let holder = ed25519_dalek::SigningKey::from_bytes(&[74; 32]);
-        let token = "admission-error";
+        let holder = ed25519_dalek::SigningKey::from_bytes(&[holder_seed; 32]);
         let mut grant = crate::store::tests::test_outbound_grant("admission", "", 0);
         grant.token_hash = crate::auth::hash_token(token);
         grant.package_root = hex::encode(object.root);
@@ -1740,6 +1776,24 @@ mod tests {
             .unwrap()
             .answer(&challenge, binding)
             .unwrap();
+        FetchAdmissionFixture {
+            app,
+            challenge,
+            open,
+            binding,
+            now,
+            _directory: directory,
+        }
+    }
+
+    #[tokio::test]
+    async fn ticket_admission_store_error_is_unknown_not_closed() {
+        let fixture = fetch_admission_fixture("admission-error", 74);
+        let app = fixture.app;
+        let now = fixture.now;
+        let challenge = &fixture.challenge;
+        let open = &fixture.open;
+        let binding = fixture.binding;
         app.store
             .with(|connection| {
                 connection.execute_batch(
@@ -1757,8 +1811,8 @@ mod tests {
             &app,
             vot_cli::ServePresentation {
                 peer,
-                challenge: &challenge,
-                open: &open,
+                challenge,
+                open,
                 channel_binding: binding,
                 now,
             },
@@ -1773,9 +1827,123 @@ mod tests {
             app.serve_metrics.refusals(ServeRefusalReason::Closed),
             closed_before
         );
-        assert_eq!(serve.registry.active_sessions(), 0);
+        assert_eq!(app.serve.as_ref().unwrap().registry.active_sessions(), 0);
         let _ = app
             .store
             .with(|connection| connection.execute_batch("DROP TRIGGER fail_fetch_admission"));
+    }
+
+    /// Under a held-open store the admission still completes within the
+    /// session's authentication deadline, and its store work runs off the
+    /// calling thread: the serve admission callback must not pin a thread to
+    /// a synchronous fsync while the deadline runs. The audit row itself
+    /// reports the thread it landed on, through a trigger probe.
+    #[tokio::test]
+    async fn fetch_admission_completes_under_store_contention_off_the_calling_thread() {
+        static AUDIT_THREAD: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+        let FetchAdmissionFixture {
+            app,
+            challenge,
+            open,
+            binding,
+            now,
+            _directory,
+        } = fetch_admission_fixture("admission-contended", 84);
+        app.store
+            .with(|connection| {
+                connection.create_scalar_function(
+                    "admission_audit_thread",
+                    0,
+                    rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+                    |_| {
+                        *AUDIT_THREAD.lock().unwrap() = Some(std::thread::current().id());
+                        Ok(0)
+                    },
+                )?;
+                connection.execute_batch(
+                    "CREATE TRIGGER admission_audit_thread_probe AFTER INSERT ON audit_log
+                     BEGIN SELECT admission_audit_thread(); END;",
+                )
+            })
+            .unwrap();
+
+        // Hold the store the way a slow fsync on another task would, and
+        // release it from the runtime a beat later.
+        let (locked, lock_ready) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let store = Arc::clone(&app.store);
+        let blocker = tokio::task::spawn_blocking(move || {
+            store.with(|_| {
+                locked.send(()).unwrap();
+                released
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("test must release the store contention");
+                Ok::<(), rusqlite::Error>(())
+            })
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            lock_ready.recv().expect("blocker thread stays alive");
+        })
+        .await
+        .expect("store contention fixture locks the store");
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = release.send(());
+        });
+
+        // Admit on its own thread the way the serve listener does, bounded
+        // so a regression fails instead of hanging past the deadline.
+        *AUDIT_THREAD.lock().unwrap() = None;
+        let runtime = tokio::runtime::Handle::current();
+        let serving = Arc::clone(&app);
+        let caller = Arc::new(Mutex::new(None));
+        let reported = Arc::clone(&caller);
+        let admitter = std::thread::spawn(move || {
+            *reported.lock().unwrap() = Some(std::thread::current().id());
+            admit_fetch(
+                &app,
+                vot_cli::ServePresentation {
+                    peer: "127.0.0.1:1".parse().unwrap(),
+                    challenge: &challenge,
+                    open: &open,
+                    channel_binding: binding,
+                    now,
+                },
+                &runtime,
+            )
+        });
+        let admission = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || admitter.join()),
+        )
+        .await
+        .expect("contended admission must finish within the deadline")
+        .unwrap()
+        .expect("admission thread does not panic");
+        assert!(
+            admission.is_some(),
+            "a valid fetch is admitted once the store clears"
+        );
+        assert_eq!(
+            serving.serve.as_ref().unwrap().registry.active_sessions(),
+            1
+        );
+        let caller = caller
+            .lock()
+            .unwrap()
+            .expect("admission thread reports itself");
+        let audit_thread = AUDIT_THREAD
+            .lock()
+            .unwrap()
+            .expect("the serve_admitted audit row fired the probe");
+        assert_ne!(
+            audit_thread, caller,
+            "admission store work must run off the calling thread"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), blocker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }
