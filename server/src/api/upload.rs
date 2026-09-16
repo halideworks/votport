@@ -1040,6 +1040,22 @@ async fn dispatch<T>(
                 "native push sessions cannot use the HTTP upload protocol",
             ),
         })?;
+    // An in-flight session must stop accepting progress once its link is
+    // closed or expired, exactly like the admission check that created it.
+    let link_id = app
+        .sessions
+        .link_id(session_id)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "unknown or expired session"))?;
+    match app.store.upload_link(&link_id) {
+        Ok(Some(link)) if link.usable_now() => {}
+        Ok(_) => {
+            return Err(ApiError::new(
+                StatusCode::GONE,
+                "this link is no longer accepting uploads",
+            ))
+        }
+        Err(error) => return Err(super::store_unavailable(error)),
+    }
     let (reply, receive) = oneshot::channel();
     let command_to_send = build(reply, command.lease);
     #[cfg(test)]

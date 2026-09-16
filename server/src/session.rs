@@ -1347,6 +1347,82 @@ pub(crate) fn cleanup_committed_session(
     store.delete_upload_session(&session.id)
 }
 
+/// Classifies a boot refusal as permanent: the link was deleted or has
+/// expired, so the session can never resume and its evidence is discarded.
+/// Every other refusal (closed link, structural damage, transient faults)
+/// stays recoverable and keeps today's behavior. The strings match the
+/// errors [`crate::app::resume_upload_session`] reports for the same causes.
+pub(crate) fn permanent_refusal_detail(
+    store: &Store,
+    session: &crate::store::PersistedUploadSession,
+) -> Option<String> {
+    match store.upload_link(&session.link_id) {
+        Ok(None) => Some("link no longer exists".to_owned()),
+        Ok(Some(link)) if link.expires_at.is_some_and(|at| now_unix() >= at) => {
+            Some("link is no longer accepting uploads".to_owned())
+        }
+        _ => None,
+    }
+}
+
+/// Removes a permanently refused session's staging evidence and its record.
+/// The caller commits the interrupted event first; afterwards no boot can
+/// re-attach this session, so no duplicate event or staging file remains.
+pub(crate) fn discard_refused_session(
+    store: &Arc<Store>,
+    destinations: &crate::receiving::Destinations,
+    session: &crate::store::PersistedUploadSession,
+) -> Result<(), String> {
+    if let Some(key) = &session.push_key {
+        if key.len() != 32 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("invalid push staging key".to_owned());
+        }
+        let directory = session
+            .dest_dir
+            .join(".vot-stage")
+            .join(format!(".vot-push-{key}"));
+        match lock_push_directory(&directory, destinations.contract()) {
+            Ok(lock) => destinations.remove_push_directory(&directory, &lock)?,
+            // The staging is already gone; only the record remains.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.to_string()),
+        }
+    } else {
+        for file in &session.files {
+            for path in [&file.staging_path, &file.journal_path] {
+                if path.as_os_str().is_empty() {
+                    continue;
+                }
+                discard_staged_path(destinations, path)?;
+            }
+        }
+    }
+    store.delete_upload_session(&session.id)
+}
+
+fn discard_staged_path(
+    destinations: &crate::receiving::Destinations,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    // Upload evidence only ever lives in a `.vot-stage` directory beside its
+    // destination; refuse anything else before resolving it for deletion.
+    if path.parent().and_then(std::path::Path::file_name)
+        != Some(std::ffi::OsStr::new(".vot-stage"))
+    {
+        return Err("resume metadata is outside the private receiving namespace".into());
+    }
+    let location = destinations.location(path)?;
+    let held = match location.open_read() {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    location
+        .remove_owned(&held)
+        .map_err(|error| error.to_string())?;
+    location.sync_parent().map_err(|error| error.to_string())
+}
+
 fn restore_files(
     setup: &WorkerSetup,
     persisted: &mut PersistedUploadSession,
@@ -2992,7 +3068,7 @@ impl Drop for PushReceive {
             if let Err(error) = self
                 .setup
                 .destinations
-                .clear_push_directory(&self.staging, lock)
+                .remove_push_directory(&self.staging, lock)
             {
                 tracing::warn!(path = %self.staging.display(), %error, "clear push staging");
             }
@@ -7574,8 +7650,7 @@ mod push_tests {
         drop(sink);
         drop(receive);
         drop(seams);
-        assert!(stage.join("writer.lock").is_file());
-        assert_eq!(fs::read_dir(&stage).unwrap().count(), 1);
+        assert!(!stage.exists());
         assert!(application.store.load_push_sessions().unwrap().is_empty());
         for (index, bytes) in data.iter().enumerate() {
             assert_eq!(

@@ -707,6 +707,35 @@ impl Destinations {
         Ok(directory.clone())
     }
 
+    /// Empties a finished push staging directory and removes it together with
+    /// its writer lock. The caller must hold `lock` and it must still be the
+    /// directory's lock inode: while that holds, no other writer can own the
+    /// name, and [`crate::session::lock_push_directory`] re-verifies the inode
+    /// after taking the lock, so removing the inode cannot strand a writer.
+    pub fn remove_push_directory(&self, path: &Path, lock: &File) -> Result<(), String> {
+        self.check_current()?;
+        let lock_location = self.location(&path.join("writer.lock"))?;
+        let directory = lock_location.directory();
+        directory.require_private().map_err(|e| e.to_string())?;
+        if !lock_location.same_file(lock).map_err(|e| e.to_string())? {
+            return Err("push control directory no longer holds its writer lock".into());
+        }
+        self.clear_directory(directory, Some(OsStr::new("writer.lock")))
+            .map_err(|e| e.to_string())?;
+        lock_location
+            .remove_owned(lock)
+            .map_err(|e| e.to_string())?;
+        let owner = self.location(path)?;
+        owner.require_removal_parent().map_err(|e| e.to_string())?;
+        rustix::fs::unlinkat(
+            owner.directory().file(),
+            owner.name(),
+            rustix::fs::AtFlags::REMOVEDIR,
+        )
+        .map_err(|e| e.to_string())?;
+        owner.sync_parent().map_err(|e| e.to_string())
+    }
+
     pub fn child(&self, components: &[String]) -> Result<Self, String> {
         self.check_live()?;
         let mut directory = self.root.clone();
@@ -1048,6 +1077,33 @@ pub(crate) mod tests {
         );
         assert!(crate::session::lock_push_directory(&path, NasContract::Unqualified).is_err());
         drop(lock);
+        assert!(crate::session::lock_push_directory(&path, NasContract::Unqualified).is_ok());
+    }
+
+    #[test]
+    fn removing_a_finished_push_directory_takes_its_lock_and_refuses_a_foreign_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let destinations = Destinations::open(root.path(), NasContract::Unqualified).unwrap();
+        let path = destinations.push_directory(&"02".repeat(16)).unwrap();
+        let lock = crate::session::lock_push_directory(&path, NasContract::Unqualified).unwrap();
+        let foreign = crate::session::lock_push_directory(
+            &destinations.push_directory(&"03".repeat(16)).unwrap(),
+            NasContract::Unqualified,
+        )
+        .unwrap();
+        assert!(destinations.remove_push_directory(&path, &foreign).is_err());
+        assert!(path.join("writer.lock").is_file());
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(path.join("engine"))
+            .unwrap();
+        std::fs::write(path.join("engine/checkpoint"), b"metadata").unwrap();
+        destinations.remove_push_directory(&path, &lock).unwrap();
+        assert!(!path.exists());
+        drop(lock);
+        // A later writer starts from a clean directory instead of the old lock.
+        let path = destinations.push_directory(&"02".repeat(16)).unwrap();
         assert!(crate::session::lock_push_directory(&path, NasContract::Unqualified).is_ok());
     }
 

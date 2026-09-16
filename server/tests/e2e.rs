@@ -2552,6 +2552,69 @@ async fn upload_session_is_recorded_at_begin_and_forgotten_at_finish() {
         .is_empty());
 }
 
+/// A link that closes or expires under a live session stops accepting
+/// progress immediately, exactly like the admission check that created it.
+#[tokio::test(flavor = "multi_thread")]
+async fn closed_and_expired_links_refuse_in_flight_session_progress() {
+    let server = start_server().await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let base = server.base.clone();
+    let files = [chunk_plus_one()];
+    let (closed_link, closed_session) = open_session(&client, &base, "closed", &files).await;
+    assert_eq!(begin(&client, &base, &closed_session).await.0, 200);
+    let (status, progress) = post_chunk(&client, &base, &closed_session, &files[0], 0).await;
+    assert_eq!(status, 200, "{progress}");
+    let response = client
+        .patch(format!("{base}/api/admin/links/{closed_link}"))
+        .header("x-votport", "1")
+        .json(&json!({ "active": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let (status, body) = post_chunk(&client, &base, &closed_session, &files[0], CHUNK).await;
+    assert_eq!(status, 410, "{body}");
+    let (status, body) = begin(&client, &base, &closed_session).await;
+    assert_eq!(status, 410, "{body}");
+
+    let (expired_link, expired_session) = open_session(&client, &base, "expired", &files).await;
+    assert_eq!(begin(&client, &base, &expired_session).await.0, 200);
+    let (status, progress) = post_chunk(&client, &base, &expired_session, &files[0], 0).await;
+    assert_eq!(status, 200, "{progress}");
+    server
+        .application
+        .store
+        .update_link("", &expired_link, |link| link.expires_at = Some(1))
+        .unwrap();
+    let (status, body) = post_chunk(&client, &base, &expired_session, &files[0], CHUNK).await;
+    assert_eq!(status, 410, "{body}");
+    let (status, body) = begin(&client, &base, &expired_session).await;
+    assert_eq!(status, 410, "{body}");
+    let response = client
+        .post(format!("{base}/api/session/{expired_session}/finish"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 410);
+    assert!(
+        !server.receive_dir.join("resume.bin").exists(),
+        "a closed or expired link publishes nothing further"
+    );
+    assert_eq!(
+        server
+            .application
+            .store
+            .load_upload_sessions()
+            .unwrap()
+            .len(),
+        2,
+        "the sessions stay suspended instead of vanishing mid-flight"
+    );
+}
+
 /// Creates a link and a session, and pushes the seal and pages so the next
 /// call is begin. Returns the link token and session id.
 async fn open_session(
@@ -3190,6 +3253,156 @@ async fn refused_resume_records_published_files_as_partial() {
             .len(),
         1
     );
+}
+
+/// A suspended session whose link expired or was deleted can never resume, so
+/// its record, staging and journals are dropped at boot and the interrupted
+/// event is committed once. A merely closed link keeps the session recoverable.
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_discards_sessions_of_expired_and_deleted_links_but_keeps_closed_ones() {
+    let server = start_server().await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let small: Vec<u8> = (0..2 * 1024 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let files = [prepare(vec!["first.bin"], small), chunk_plus_one()];
+    let (expired_link, expired_session) =
+        open_session(&client, &server.base, "expired", &files).await;
+    let (deleted_link, deleted_session) =
+        open_session(&client, &server.base, "deleted", &files).await;
+    let (closed_link, closed_session) = open_session(&client, &server.base, "closed", &files).await;
+    let base = server.base.clone();
+    for session in [&expired_session, &deleted_session, &closed_session] {
+        assert_eq!(begin(&client, &base, session).await.0, 200);
+        upload_chunks(&client, &base, session, 0, &files[0]).await;
+        let (status, progress) = post_chunk_entry(&client, &base, session, 1, &files[1], 0).await;
+        assert_eq!(status, 200, "{progress}");
+    }
+    let store = &server.application.store;
+    let staged = |store: &votport::store::Store| {
+        store
+            .load_upload_sessions()
+            .unwrap()
+            .into_iter()
+            .map(|session| {
+                (
+                    session.id,
+                    session
+                        .files
+                        .iter()
+                        .flat_map(|file| [file.staging_path.clone(), file.journal_path.clone()])
+                        .collect::<Vec<PathBuf>>(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let staged = staged(store);
+    assert_eq!(staged.len(), 3);
+    let staging_of = |id: &str| staged.iter().find(|entry| entry.0 == id).unwrap().1.clone();
+    let expired_staging = staging_of(&expired_session);
+    let deleted_staging = staging_of(&deleted_session);
+    let closed_staging = staging_of(&closed_session);
+    store
+        .update_link("", &expired_link, |link| link.expires_at = Some(1))
+        .unwrap();
+    store
+        .update_link("", &closed_link, |link| link.active = false)
+        .unwrap();
+    store.remove_link("", &deleted_link).unwrap();
+    let receive_dir = server.receive_dir.clone();
+    std::fs::create_dir_all(receive_dir.join(".vot-stage")).unwrap();
+    let orphan = receive_dir.join(".vot-stage/.vot-orphan.stage");
+    std::fs::write(&orphan, b"stale").unwrap();
+
+    let live_paths = |paths: &[PathBuf]| {
+        paths
+            .iter()
+            .filter(|path| path.exists())
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    let (data, received) = server.suspend().await;
+    let expired_live = live_paths(&expired_staging);
+    let closed_live = live_paths(&closed_staging);
+    assert!(
+        !expired_live.is_empty(),
+        "the expired session holds staged files"
+    );
+    assert!(
+        !closed_live.is_empty(),
+        "the closed session holds staged files"
+    );
+    let server = boot(data, received).await;
+    assert!(!orphan.exists(), "stale staging is swept at boot");
+    assert_eq!(
+        expired_staging
+            .iter()
+            .chain(&deleted_staging)
+            .filter(|path| path.exists())
+            .count(),
+        0,
+        "refused sessions leave no staging or journals"
+    );
+    assert!(
+        live_paths(&closed_staging) == closed_live,
+        "a closed link only refuses the session temporarily"
+    );
+    let retained = server.application.store.load_upload_sessions().unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].id, closed_session);
+    assert!(receive_dir.join("first.bin").is_file());
+    let uploads = server
+        .application
+        .store
+        .uploads_by_id(&expired_link)
+        .unwrap()
+        .unwrap();
+    assert_eq!(uploads.len(), 1, "{uploads:?}");
+    assert!(uploads[0].partial);
+    assert_eq!(uploads[0].files.len(), 1);
+    assert_eq!(uploads[0].files[0].stored_as, "first.bin");
+    let expired_events = |server: &TestServer| {
+        server
+            .application
+            .store
+            .link_by_id(&expired_link)
+            .unwrap()
+            .unwrap()
+            .events
+            .len()
+    };
+    assert_eq!(expired_events(&server), 1, "exactly one interrupted event");
+    let link_events = |server: &TestServer, link: &str| {
+        server
+            .application
+            .store
+            .link_by_id(link)
+            .unwrap()
+            .unwrap()
+            .events
+            .len()
+    };
+    assert!(
+        link_events(&server, &closed_link) >= 1,
+        "the closed link still records the refusal"
+    );
+
+    let server = server.restart().await;
+    assert_eq!(
+        expired_events(&server),
+        1,
+        "a discarded session records no further events"
+    );
+    assert_eq!(
+        server.application.store.load_upload_sessions().unwrap()[0].id,
+        closed_session,
+        "the closed link's session survives restarts"
+    );
+    assert_eq!(link_events(&server, &expired_link), 1);
 }
 
 /// Restore drill: a backup taken through the API restores through a restart
@@ -4156,6 +4369,20 @@ async fn native_push_matches_http_storage_and_is_single_use() {
         .unwrap();
     assert!(metrics.contains("votport_push_sessions_active 0\n"));
     assert!(metrics.contains(&format!("votport_push_bytes_total {transferred_bytes}\n")));
+    let leftover: Vec<PathBuf> = std::fs::read_dir(server.receive_dir.join(".vot-stage"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".vot-push-"))
+        })
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "a finished push session leaves no staging directory or writer lock: {leftover:?}"
+    );
     for (path, bytes) in files {
         let record = upload
             .files
