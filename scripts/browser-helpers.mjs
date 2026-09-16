@@ -7,6 +7,21 @@ export function apiClient(context, base) {
   };
 }
 
+// One-shot page.route interceptions intermittently stall the next navigation forever on an idle keep-alive connection (Chromium/Playwright CDP Fetch race); a fresh page in the same context always loads.
+export async function reloadWithInterceptRetry(page, arm, navigate, { attempts = 2 } = {}) {
+  for (let left = attempts; ; left -= 1) {
+    await arm(page);
+    try {
+      await navigate(page);
+      return page;
+    } catch (error) {
+      if (error.name !== 'TimeoutError' || left <= 1) throw error;
+      await page.close();
+      page = await page.context().newPage();
+    }
+  }
+}
+
 export async function openAncestors(locator) {
   for (const details of await locator.locator('xpath=ancestor::details').all()) {
     if (await details.getAttribute('open') === null) await details.locator(':scope > summary').click();

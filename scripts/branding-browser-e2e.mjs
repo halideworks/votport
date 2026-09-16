@@ -1,4 +1,4 @@
-import { apiClient, openAncestors } from './browser-helpers.mjs';
+import { apiClient, openAncestors, reloadWithInterceptRetry } from './browser-helpers.mjs';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { chromium } from 'playwright';
@@ -7,7 +7,7 @@ const base = process.env.BASE_URL, root = process.env.WORKFLOW_TEST_ROOT;
 if (!base || !root || !process.env.ADMIN_PASSWORD) throw new Error('Use an isolated instance with BASE_URL, WORKFLOW_TEST_ROOT and ADMIN_PASSWORD.');
 const browser = await chromium.launch();
 const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, reducedMotion: 'reduce' });
-const page = await context.newPage(), errors = [];
+let page = await context.newPage(), errors = [];
 page.on('dialog', (dialog) => dialog.accept());
 page.on('pageerror', (error) => errors.push(error.message));
 const api = apiClient(context, base);
@@ -67,9 +67,13 @@ try {
   await mobile.close();
   await api('admin/branding/default', { name: '', color: '', footer_text: '', footer_link_label: '', footer_link_url: '' }, 'PUT');
   await page.goto(base); assert.equal(await page.locator('.footer-custom').innerText(), '');
-  await page.route('**/api/admin/tenants', (route) => route.fulfill({ status: 503, json: { error: 'Tenant list fixture unavailable' } }), { times: 1 });
-  const principalsLoaded = page.waitForResponse((response) => response.url().includes('/api/admin/principals?'));
-  await page.goto(`${base}/tenants`);
+  let principalsLoaded;
+  page = await reloadWithInterceptRetry(page,
+    (candidate) => candidate.route('**/api/admin/tenants', (route) => route.fulfill({ status: 503, json: { error: 'Tenant list fixture unavailable' } }), { times: 1 }),
+    (candidate) => {
+      principalsLoaded = candidate.waitForResponse((response) => response.url().includes('/api/admin/principals?'));
+      return candidate.goto(`${base}/tenants`);
+    });
   await page.locator('#confirm-detail').getByText('Tenant list fixture unavailable', { exact: true }).waitFor();
   assert.equal((await principalsLoaded).status(), 200);
   await page.click('#confirm-cancel');

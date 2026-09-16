@@ -11,6 +11,7 @@
 //   BROWSER_ENGINE=firefox node scripts/browser-e2e.mjs
 
 import { chromium, firefox, webkit } from "playwright";
+import { reloadWithInterceptRetry } from "./browser-helpers.mjs";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -59,7 +60,7 @@ const context = await browser.newContext();
 // Starved CI runners can exceed the 30 second default for load events; the
 // suite's semantics only need the page loaded, not loaded fast.
 context.setDefaultNavigationTimeout(60000);
-const page = await context.newPage();
+let page = await context.newPage();
 page.on("dialog", (dialog) => dialog.accept());
 const errors = [];
 page.on("pageerror", (error) => errors.push(`pageerror: ${error.message}`));
@@ -142,8 +143,9 @@ await page.locator(".notification-editor > p.field-help").first().waitFor();
 if (await page.locator(".notification-editor > p.field-help").evaluateAll((nodes) => nodes.some((node) => node.getAttribute("role") === "status"))) {
   throw new Error("embedded notification guidance must stay quiet while editors rerender");
 }
-await page.route("**/api/notifications*", (route) => route.fulfill({ status: 503, json: { error: "Notification catalog unavailable." } }), { times: 1 });
-await page.reload();
+const armCatalogUnavailable = (candidate) => candidate.route("**/api/notifications*", (route) => route.fulfill({ status: 503, json: { error: "Notification catalog unavailable." } }), { times: 1 });
+// A retried fresh page sits at about:blank, so retry via goto instead of reload.
+page = await reloadWithInterceptRetry(page, armCatalogUnavailable, (candidate) => candidate.url() === "about:blank" ? candidate.goto(base) : candidate.reload());
 await page.locator("#create-notification-options").evaluate((node) => { node.open = true; });
 const notificationStatus = page.locator("#create-notifications .notification-editor > p.field-help");
 await notificationStatus.waitFor();
