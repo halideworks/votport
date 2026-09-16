@@ -486,6 +486,30 @@ test('streamToWritable resumes a dropped stream with a byte range', async () => 
   assert.equal(writable.truncated, 0);
 });
 
+test('streamToWritable retries on the redirected final URL that carries the lease', async () => {
+  const calls = [];
+  const responses = [
+    {
+      ok: true,
+      status: 200,
+      url: '/api/s/t/files/0?download_lease=abcdef0123456789.0123456789abcdef',
+      body: bodyOf([bytes(4, 1)], { failAfter: 1 }),
+    },
+    { ok: true, status: 206, headers: new Headers({ 'content-range': 'bytes 4-7/8' }), body: bodyOf([bytes(4, 2)]) },
+  ];
+  const fetchFn = async (url, options) => { calls.push([url, options.headers]); return responses.shift(); };
+  const writable = fakeWritable();
+  const total = await streamToWritable(
+    fetchFn, writable, { download_url: '/api/s/t/files/0', bytes: 8 }, noSleep,
+  );
+  assert.equal(total, 8);
+  assert.deepEqual(calls[0], ['/api/s/t/files/0', {}]);
+  assert.deepEqual(
+    calls[1],
+    ['/api/s/t/files/0?download_lease=abcdef0123456789.0123456789abcdef', { Range: 'bytes=4-' }],
+  );
+});
+
 test('streamToWritable restarts from zero when a resume is answered with 200', async () => {
   const responses = [
     { ok: true, status: 200, body: bodyOf([bytes(4, 1)], { failAfter: 1 }) },

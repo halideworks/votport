@@ -5527,6 +5527,515 @@ async fn status_reports_receiving_sessions_and_the_days_uploads() {
     assert_eq!(status["today"]["uploads"], json!(0));
 }
 
+/// The lease token from a download redirect, asserting the canonical
+/// same-origin location shape and the no-store, no-referrer, no-cookie
+/// policy that must ride the admission response.
+fn download_redirect_lease(response: reqwest::Response, expected_path: &str) -> String {
+    assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+    assert!(
+        response
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .is_none(),
+        "per-file leases no longer ride cookies"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::REFERRER_POLICY)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-referrer")
+    );
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let lease = location
+        .strip_prefix(&format!("{expected_path}?download_lease="))
+        .unwrap_or_else(|| panic!("unexpected redirect location {location}"))
+        .to_owned();
+    assert!(
+        !lease.is_empty()
+            && lease
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() || byte == b'.'),
+        "lease {lease} is not an issued token"
+    );
+    lease
+}
+
+/// The per-file download lease rides the final URL query instead of a
+/// cookie: the first tokenless request is admitted and answered with a
+/// same-origin 307, the redirected request streams without counting, a
+/// re-click of the final URL stays leased, and a re-click of the original
+/// tokenless URL is intentionally a new admission up to the cap.
+#[tokio::test]
+async fn a_download_lease_moves_to_the_final_url_and_counts_once() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let admin = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    admin
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let mut body = vec![0u8; 65536];
+    for (index, byte) in body.iter_mut().enumerate() {
+        *byte = (index * 13 % 251) as u8;
+    }
+    admin
+        .post(format!(
+            "{base}/api/admin/outbound-files?path=grade/reel.bin"
+        ))
+        .header("x-votport", "1")
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let grant: Value = admin
+        .post(format!("{base}/api/admin/outbound-grants"))
+        .header("x-votport", "1")
+        .json(&json!({ "paths": ["grade/reel.bin"], "expires_days": 1, "max_downloads": 2 }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = grant["url"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    let no_redirects = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let file_url = format!("{base}/api/s/{token}/files/0");
+    let file_path = format!("/api/s/{token}/files/0");
+
+    // The first tokenless request is admitted, not streamed.
+    let response = no_redirects.get(&file_url).send().await.unwrap();
+    let lease = download_redirect_lease(response, &file_path);
+
+    // The redirected request streams the body and carries no lease cookie.
+    let final_url = format!("{file_url}?download_lease={lease}");
+    let response = no_redirects.get(&final_url).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .is_none());
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::REFERRER_POLICY)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-referrer")
+    );
+    assert_eq!(response.bytes().await.unwrap(), &body[..]);
+
+    // A Range resume on the final URL neither redirects nor counts.
+    let response = no_redirects
+        .get(&final_url)
+        .header(reqwest::header::RANGE, "bytes=5-")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 206);
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok()),
+        Some(format!("bytes 5-{}/{}", body.len() - 1, body.len()).as_str())
+    );
+    assert_eq!(response.bytes().await.unwrap(), &body[5..]);
+
+    // HEAD neither admits nor redirects while the grant is not exhausted.
+    assert_eq!(
+        no_redirects.head(&file_url).send().await.unwrap().status(),
+        200
+    );
+
+    // A re-click of the original tokenless URL is a new logical admission.
+    let response = no_redirects.get(&file_url).send().await.unwrap();
+    let second = download_redirect_lease(response, &file_path);
+    assert_ne!(second, lease);
+
+    // The cap holds: the third tokenless attempt finds the file exhausted,
+    // and a forged lease counts as absent, so it is refused the same way.
+    assert_eq!(
+        no_redirects.get(&file_url).send().await.unwrap().status(),
+        404
+    );
+    let response = no_redirects
+        .get(format!(
+            "{file_url}?download_lease=forged.deadbeef.deadbeef"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+
+    // The lease survives exhaustion: the final URL still streams, and a
+    // leased HEAD answers while a tokenless one cannot.
+    let response = no_redirects.get(&final_url).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.bytes().await.unwrap(), &body[..]);
+    assert_eq!(
+        no_redirects.head(&final_url).send().await.unwrap().status(),
+        200
+    );
+    assert_eq!(
+        no_redirects.head(&file_url).send().await.unwrap().status(),
+        404
+    );
+}
+
+/// Parallel first requests each carry their own index-bound lease, so no
+/// shared cookie can lose admissions: one count per index, repeats of the
+/// final URLs never recount, and the per-file cap refuses what is over it.
+#[tokio::test]
+async fn parallel_file_downloads_count_once_each_and_the_cap_holds() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let admin = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    admin
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let bodies: Vec<Vec<u8>> = (0..3).map(|index| vec![index as u8 + 1; 4096]).collect();
+    for (index, bytes) in bodies.iter().enumerate() {
+        admin
+            .post(format!(
+                "{base}/api/admin/outbound-files?path=part/set{index}.bin"
+            ))
+            .header("x-votport", "1")
+            .body(bytes.clone())
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+    let grant: Value = admin
+        .post(format!("{base}/api/admin/outbound-grants"))
+        .header("x-votport", "1")
+        .json(&json!({
+            "paths": ["part/set0.bin", "part/set1.bin", "part/set2.bin"],
+            "expires_days": 1,
+            "max_downloads": 2
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = grant["url"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    // All three first requests run concurrently, tokenless.
+    let following = reqwest::Client::new();
+    let waves: Vec<_> = (0..3)
+        .map(|index| {
+            let client = following.clone();
+            let url = format!("{base}/api/s/{token}/files/{index}");
+            let expected = bodies[index].clone();
+            tokio::spawn(async move {
+                let response = client.get(&url).send().await.unwrap();
+                assert_eq!(response.status(), 200);
+                let final_url = response.url().to_string();
+                let bytes = response.bytes().await.unwrap();
+                (final_url, bytes, expected)
+            })
+        })
+        .collect();
+    let mut final_urls = Vec::new();
+    for wave in waves {
+        let (final_url, bytes, expected) = wave.await.unwrap();
+        assert_eq!(bytes, expected);
+        assert!(
+            final_url.contains("download_lease="),
+            "the browser lands on the final lease URL, got {final_url}"
+        );
+        final_urls.push(final_url);
+    }
+
+    // Every index counted exactly once: one more tokenless request per
+    // index is still admitted, and the one after that is over the cap.
+    let no_redirects = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    for index in 0..3 {
+        let response = no_redirects
+            .get(format!("{base}/api/s/{token}/files/{index}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 307);
+    }
+    for index in 0..3 {
+        let response = no_redirects
+            .get(format!("{base}/api/s/{token}/files/{index}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404);
+    }
+
+    // The wave's final URLs stay leased: repeats stream without recounting
+    // and cannot push anything over the cap.
+    for (index, final_url) in final_urls.iter().enumerate() {
+        let response = following.get(final_url).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.bytes().await.unwrap(), bodies[index]);
+    }
+}
+
+/// The lease MAC binds the grant token generation, so rotation, revocation
+/// and the password gate all control the final URL, and a lease keeps
+/// working across a server restart over the same data.
+#[tokio::test]
+async fn a_download_lease_binds_to_the_grant_generation_and_access() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let admin = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    admin
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    for (name, bytes) in [
+        ("pair/poster.pdf", vec![7u8; 2048]),
+        ("pair/notes.txt", b"notes".to_vec()),
+    ] {
+        admin
+            .post(format!("{base}/api/admin/outbound-files?path={name}"))
+            .header("x-votport", "1")
+            .body(bytes)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+    let grant: Value = admin
+        .post(format!("{base}/api/admin/outbound-grants"))
+        .header("x-votport", "1")
+        .json(&json!({
+            "paths": ["pair/poster.pdf", "pair/notes.txt"],
+            "expires_days": 1,
+            "max_downloads": 3
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let grant_id = grant["grant"]["id"].as_str().unwrap().to_owned();
+    let token = grant["url"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    let no_redirects = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let files_url =
+        |generation: &str, index: usize| format!("{base}/api/s/{generation}/files/{index}");
+    let files_path = |generation: &str, index: usize| format!("/api/s/{generation}/files/{index}");
+
+    // A lease minted for the first generation.
+    let response = no_redirects.get(files_url(&token, 0)).send().await.unwrap();
+    let lease = download_redirect_lease(response, &files_path(&token, 0));
+
+    // A lease for one index does not lease another: the wrong-index request
+    // is treated as absent and admitted on its own index.
+    let response = no_redirects
+        .get(files_url(&token, 1))
+        .query(&[("download_lease", lease.as_str())])
+        .send()
+        .await
+        .unwrap();
+    let own = download_redirect_lease(response, &files_path(&token, 1));
+    assert_ne!(own, lease);
+
+    // Rotating the grant token starts a new generation: the old lease no
+    // longer verifies there, so the request is a fresh admission.
+    let rotated: Value = admin
+        .patch(format!("{base}/api/admin/outbound-grants/{grant_id}"))
+        .header("x-votport", "1")
+        .json(&json!({ "rotate": true }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let next = rotated["url"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    assert_ne!(next, token);
+    let response = no_redirects
+        .get(files_url(&next, 0))
+        .query(&[("download_lease", lease.as_str())])
+        .send()
+        .await
+        .unwrap();
+    download_redirect_lease(response, &files_path(&next, 0));
+
+    // Revocation ends everything, leases included.
+    admin
+        .delete(format!("{base}/api/admin/outbound-grants/{grant_id}"))
+        .header("x-votport", "1")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        no_redirects
+            .get(files_url(&next, 0))
+            .query(&[("download_lease", lease.as_str())])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+
+    // The password gate runs before any admission or redirect.
+    let gated: Value = admin
+        .post(format!("{base}/api/admin/outbound-grants"))
+        .header("x-votport", "1")
+        .json(&json!({
+            "paths": ["pair/poster.pdf"],
+            "expires_days": 1,
+            "password": "upgrade-grade-tower"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let gated_token = gated["url"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        no_redirects
+            .get(files_url(&gated_token, 0))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    let verified = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let verified_cookie = verified
+        .post(format!("{base}/api/s/{gated_token}/verify"))
+        .json(&json!({ "password": "upgrade-grade-tower" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .unwrap()
+        .to_owned();
+    // The cookie jar refuses Secure cookies over http, so the verified
+    // grant cookie rides the request explicitly.
+    let response = verified
+        .get(files_url(&gated_token, 0))
+        .header(reqwest::header::COOKIE, verified_cookie)
+        .send()
+        .await
+        .unwrap();
+    let gated_lease = download_redirect_lease(response, &files_path(&gated_token, 0));
+
+    // The lease is stateless, so a restart over the same data keeps the
+    // final URL streaming without a recount, with no cookie at all.
+    let server = server.restart().await;
+    let base = server.base.clone();
+    let response = no_redirects
+        .get(format!(
+            "{base}/api/s/{gated_token}/files/0?download_lease={gated_lease}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.bytes().await.unwrap(), vec![7u8; 2048]);
+}
+
 /// The status view is the operator's tenant only, like the request list.
 #[tokio::test]
 async fn status_is_scoped_to_the_operators_tenant() {

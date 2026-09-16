@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use axum::body::{Body, Bytes};
-use axum::extract::{ConnectInfo, FromRequest, Path as AxumPath, Query, Request, State};
+use axum::extract::{ConnectInfo, FromRequest, Path as AxumPath, Query, RawQuery, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -3159,34 +3159,49 @@ pub async fn outbound_file(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
     AxumPath(token): AxumPath<String>,
+    query: RawQuery,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
 ) -> ApiResult<Response> {
-    outbound_file_inner(app, headers, token, 0, peer).await
+    let route_path = format!("/api/s/{token}/file");
+    outbound_file_inner(app, headers, token, 0, peer, route_path, query.0.as_deref()).await
 }
 
 pub async fn outbound_file_head(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
     AxumPath(token): AxumPath<String>,
+    query: RawQuery,
 ) -> ApiResult<Response> {
-    outbound_file_head_inner(app, headers, token, 0).await
+    outbound_file_head_inner(app, headers, token, 0, query.0.as_deref()).await
 }
 
 pub async fn outbound_file_indexed(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
     AxumPath((token, index)): AxumPath<(String, usize)>,
+    query: RawQuery,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
 ) -> ApiResult<Response> {
-    outbound_file_inner(app, headers, token, index, peer).await
+    let route_path = format!("/api/s/{token}/files/{index}");
+    outbound_file_inner(
+        app,
+        headers,
+        token,
+        index,
+        peer,
+        route_path,
+        query.0.as_deref(),
+    )
+    .await
 }
 
 pub async fn outbound_file_indexed_head(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
     AxumPath((token, index)): AxumPath<(String, usize)>,
+    query: RawQuery,
 ) -> ApiResult<Response> {
-    outbound_file_head_inner(app, headers, token, index).await
+    outbound_file_head_inner(app, headers, token, index, query.0.as_deref()).await
 }
 
 pub async fn outbound_batch(
@@ -3257,7 +3272,7 @@ pub async fn outbound_batch(
         .map_err(|_| ApiError::internal("batch source validation failed"))??;
         let indexes: Vec<usize> = (0..count).collect();
         record_download(&app, &grant, &indexes).await?;
-        audit_download_request(&app, &grant, &headers, peer, "batch", None).await?;
+        audit_download_request(&app, &grant, &headers, peer, "batch", None, false).await?;
         let mut response = Body::empty().into_response();
         response.headers_mut().insert(
             header::CONTENT_TYPE,
@@ -3312,7 +3327,7 @@ pub async fn outbound_batch(
         recorded: 0,
     };
     state.fill_lookahead();
-    audit_download_request(&app, &state.grant, &headers, peer, "batch", None).await?;
+    audit_download_request(&app, &state.grant, &headers, peer, "batch", None, false).await?;
     let stream = futures_util::stream::try_unfold(state, |mut state| async move {
         // Normal polls record only files whose bytes a previous poll handed
         // to the transport. The final frame is validated and admitted before
@@ -3632,11 +3647,18 @@ async fn outbound_file_inner(
     token: String,
     index: usize,
     peer: std::net::SocketAddr,
+    route_path: String,
+    query: Option<&str>,
 ) -> ApiResult<Response> {
-    let (grant, leased, file) = active_download_grant(&app, &token, index, &headers)?;
+    let (grant, leased, file) = active_download_grant(&app, &token, index, &headers, query)?;
     let grant = Arc::new(grant);
     let operation = begin_outbound_operation_owned(&app, &grant.tenant)?;
-    require_grant_access(&app, &grant, &headers)?;
+    // A verified lease was minted only after a full access check, so the
+    // redirected request streams on the MAC alone: it carries no grant
+    // cookie for a password gated grant.
+    if !leased {
+        require_grant_access(&app, &grant, &headers)?;
+    }
     let allowed = app
         .outbound_rate
         .allow_individual(&grant.token_hash, || {
@@ -3691,6 +3713,48 @@ async fn outbound_file_inner(
         })
         .await
         .map_err(|_| ApiError::internal("catalog generation failed"))??;
+        // The catalog is only rebuilt when its reuse key changes, so a
+        // stale cached catalog would otherwise admit a corrupt source. The
+        // unleased request therefore verifies the first chunk of the
+        // requested range against the catalog before anything is counted,
+        // exactly the eager check the streamed response used to make, so
+        // an absent or corrupt source still consumes no download. The
+        // probe drops its stream: the redirected request reopens and
+        // streams the body.
+        if !leased {
+            let probe = start_verified_stream(
+                source.path.clone(),
+                source.object.clone(),
+                catalog.clone(),
+                range,
+                integrity.clone(),
+                None,
+                None,
+            )
+            .await
+            .map_err(|_| ApiError::not_found())?;
+            drop(probe);
+            record_download(&app, &grant, &[index]).await?;
+            audit_download_request(&app, &grant, &headers, peer, "file", Some(index), leased)
+                .await?;
+            let lifetime = grant
+                .expires_at
+                .saturating_sub(now_unix())
+                .min(DOWNLOAD_LEASE_SECS);
+            if lifetime > 0 {
+                let lease = auth::issue_download_lease(
+                    &app.secret,
+                    &grant.id,
+                    &grant.token_hash,
+                    index,
+                    lifetime,
+                );
+                return Ok(download_lease_redirect(&route_path, &lease));
+            }
+            // At the expiry edge there is no lease left to hand out, so
+            // this request streams with no lease, exactly as the old
+            // cookie path did.
+        }
         let stream = start_verified_stream(
             source.path.clone(),
             source.object.clone(),
@@ -3703,19 +3767,13 @@ async fn outbound_file_inner(
         .await
         .map_err(|_| ApiError::not_found())?;
         drop(pin);
-        if !leased {
-            record_download(&app, &grant, &[index]).await?;
-        }
         let length = range.map_or(source.object.length, |(start, end)| end - start + 1);
         let mut response = Body::from_stream(stream).into_response();
         add_file_headers(&mut response, &source, length, range)?;
         if range.is_some() {
             *response.status_mut() = StatusCode::PARTIAL_CONTENT;
         }
-        if !leased {
-            issue_download_lease(&app, &grant, &token, index, &mut response);
-        }
-        audit_download_request(&app, &grant, &headers, peer, "file", Some(index)).await?;
+        audit_download_request(&app, &grant, &headers, peer, "file", Some(index), leased).await?;
         Ok(response)
     }
 }
@@ -3725,11 +3783,16 @@ async fn outbound_file_head_inner(
     headers: HeaderMap,
     token: String,
     index: usize,
+    query: Option<&str>,
 ) -> ApiResult<Response> {
-    let (grant, _leased, file) = active_download_grant(&app, &token, index, &headers)?;
+    let (grant, leased, file) = active_download_grant(&app, &token, index, &headers, query)?;
     let grant = Arc::new(grant);
     let operation = begin_outbound_operation_owned(&app, &grant.tenant)?;
-    require_grant_access(&app, &grant, &headers)?;
+    // Same as the streaming path: a verified lease stands in for the
+    // grant access recheck.
+    if !leased {
+        require_grant_access(&app, &grant, &headers)?;
+    }
     if !app.outbound_rate.allow(&grant.token_hash) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -3778,6 +3841,10 @@ fn add_file_headers(
     response.headers_mut().insert(
         header::CONTENT_DISPOSITION,
         attachment_filename(&source.name)?,
+    );
+    response.headers_mut().insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
     );
     Ok(())
 }
@@ -3874,6 +3941,26 @@ fn issue_download_lease(
     if let Ok(value) = HeaderValue::try_from(cookie) {
         response.headers_mut().append(header::SET_COOKIE, value);
     }
+}
+
+/// Builds the same-origin redirect that hands a counted file request its
+/// per-file lease in the URL query. The location mirrors the route the
+/// request came in on, so the final URL is the same file route and any
+/// old lease parameter is gone by construction. The lease value is
+/// digits, dots and lowercase hex, so it needs no percent-encoding.
+fn download_lease_redirect(route_path: &str, lease: &str) -> Response {
+    let mut response = StatusCode::TEMPORARY_REDIRECT.into_response();
+    if let Ok(value) = HeaderValue::from_str(&format!("{route_path}?download_lease={lease}")) {
+        response.headers_mut().insert(header::LOCATION, value);
+    }
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    response
 }
 
 pub async fn outbound_bundle(
@@ -3996,7 +4083,7 @@ pub async fn outbound_bundle(
         BUNDLE_DOWNLOAD_LEASE_INDEX,
         &mut response,
     );
-    audit_download_request(&app, &grant, &headers, peer, "bundle", None).await?;
+    audit_download_request(&app, &grant, &headers, peer, "bundle", None, false).await?;
     Ok(response)
 }
 
@@ -4032,6 +4119,7 @@ fn active_download_grant(
     token: &str,
     index: usize,
     headers: &HeaderMap,
+    query: Option<&str>,
 ) -> ApiResult<(OutboundGrant, bool, Option<OutboundGrantFile>)> {
     if !valid_token(token) {
         return Err(ApiError::not_found());
@@ -4044,7 +4132,7 @@ fn active_download_grant(
     if grant.revoked_at.is_some() || grant.expires_at <= now_unix() {
         return Err(ApiError::not_found());
     }
-    let leased = download_lease_authorized(app, &grant, index, headers);
+    let leased = download_lease_authorized(app, &grant, index, headers, query);
     if !leased && grant_is_exhausted(&grant, index, file.as_ref()) {
         return Err(ApiError::not_found());
     }
@@ -4066,6 +4154,10 @@ fn grant_is_exhausted(
         })
 }
 
+/// Audits a download response. `leased` marks a request whose per-file
+/// URL lease already proved grant access at admission, so the closure
+/// records the audit event without re-running the password and recipient
+/// checks that the redirected request can no longer answer.
 async fn audit_download_request(
     app: &Arc<App>,
     grant: &OutboundGrant,
@@ -4073,6 +4165,7 @@ async fn audit_download_request(
     peer: std::net::SocketAddr,
     mode: &'static str,
     index: Option<usize>,
+    leased: bool,
 ) -> ApiResult<()> {
     let client_ip = super::client_ip(headers, &peer, &app.config.trusted_proxies);
     let tenant = grant.tenant.clone();
@@ -4103,27 +4196,29 @@ async fn audit_download_request(
                     ApiError::new(StatusCode::FORBIDDEN, error).with_code("delivery_pending")
                 }
             })?;
-            if password_hash.is_some()
-                && !super::upload::cookie_authorized(
-                    &app,
+            if !leased {
+                if password_hash.is_some()
+                    && !super::upload::cookie_authorized(
+                        &app,
+                        &subject,
+                        password_hash.as_deref(),
+                        &grant_cookie_name(&subject),
+                        &headers,
+                    )
+                {
+                    return Err(ApiError::new(
+                        StatusCode::UNAUTHORIZED,
+                        "outbound grant password required",
+                    ));
+                }
+                workflows::require_recipient_for_job(
+                    &secret,
                     &subject,
-                    password_hash.as_deref(),
-                    &grant_cookie_name(&subject),
+                    &token_hash,
                     &headers,
-                )
-            {
-                return Err(ApiError::new(
-                    StatusCode::UNAUTHORIZED,
-                    "outbound grant password required",
-                ));
+                    job.as_ref(),
+                )?;
             }
-            workflows::require_recipient_for_job(
-                &secret,
-                &subject,
-                &token_hash,
-                &headers,
-                job.as_ref(),
-            )?;
             tracing::info!(
                 target: "audit",
                 event = "outbound_downloaded",
@@ -4201,28 +4296,45 @@ fn download_lease_authorized(
     grant: &OutboundGrant,
     index: usize,
     headers: &HeaderMap,
+    query: Option<&str>,
 ) -> bool {
-    let Some(cookies) = headers
+    if let Some(value) = download_lease_query(query) {
+        if auth::verify_download_lease(&app.secret, &grant.id, &grant.token_hash, index, value) {
+            return true;
+        }
+    }
+    // The bundle sentinel stays a cookie: it is issued once after every
+    // bundle index has been recorded, so its size does not grow with the
+    // file list the way one per-file cookie did.
+    headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
-    else {
-        return false;
-    };
-    [index, BUNDLE_DOWNLOAD_LEASE_INDEX]
-        .into_iter()
-        .any(|index| {
-            auth::cookie_value(cookies, &download_lease_cookie_name(&grant.id, index)).is_some_and(
-                |value| {
-                    auth::verify_download_lease(
-                        &app.secret,
-                        &grant.id,
-                        &grant.token_hash,
-                        index,
-                        value,
-                    )
-                },
+        .is_some_and(|cookies| {
+            auth::cookie_value(
+                cookies,
+                &download_lease_cookie_name(&grant.id, BUNDLE_DOWNLOAD_LEASE_INDEX),
             )
+            .is_some_and(|value| {
+                auth::verify_download_lease(
+                    &app.secret,
+                    &grant.id,
+                    &grant.token_hash,
+                    BUNDLE_DOWNLOAD_LEASE_INDEX,
+                    value,
+                )
+            })
         })
+}
+
+/// The raw value of the `download_lease` query parameter, when present.
+/// The value is compared as issued, so percent-encoded junk fails the
+/// MAC check and counts as absent.
+fn download_lease_query(query: Option<&str>) -> Option<&str> {
+    query?.split('&').find_map(|pair| {
+        pair.split_once('=')
+            .filter(|(name, _)| *name == "download_lease")
+            .map(|(_, value)| value)
+    })
 }
 
 fn grant_authorized(app: &App, grant: &OutboundGrant, headers: &HeaderMap) -> bool {
@@ -5134,6 +5246,79 @@ mod tests {
     use tower::ServiceExt as _;
     use vot_sdk_file::PublishObservation;
 
+    /// Wraps the router so tests observe the streamed response the file
+    /// download admission redirect produces: the one same-origin 307 is
+    /// replayed with the same method, headers and peer against its lease
+    /// location, exactly what a real download client does.
+    fn router(app: std::sync::Arc<App>) -> RedirectFollowing {
+        RedirectFollowing { app }
+    }
+
+    struct RedirectFollowing {
+        app: std::sync::Arc<App>,
+    }
+
+    impl tower::Service<Request<Body>> for RedirectFollowing {
+        type Response = Response;
+        type Error = std::convert::Infallible;
+        type Future = std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Response, std::convert::Infallible>> + Send,
+            >,
+        >;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::convert::Infallible>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: Request<Body>) -> Self::Future {
+            let app = self.app.clone();
+            Box::pin(async move {
+                let (parts, body) = request.into_parts();
+                let headers = parts.headers.clone();
+                let peer = parts
+                    .extensions
+                    .get::<ConnectInfo<std::net::SocketAddr>>()
+                    .map(|info| info.0);
+                let mut response = crate::app::router(app.clone())
+                    .oneshot(Request::from_parts(parts, body))
+                    .await
+                    .unwrap();
+                for _ in 0..3 {
+                    if response.status() != StatusCode::TEMPORARY_REDIRECT
+                        && response.status() != StatusCode::PERMANENT_REDIRECT
+                    {
+                        break;
+                    }
+                    let Some(location) = response
+                        .headers()
+                        .get(axum::http::header::LOCATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned)
+                    else {
+                        break;
+                    };
+                    let mut replayed = Request::builder()
+                        .method(axum::http::Method::GET)
+                        .uri(&location);
+                    *replayed.headers_mut().unwrap() = headers.clone();
+                    if let Some(address) = peer {
+                        replayed = replayed.extension(ConnectInfo(address));
+                    }
+                    let replayed = replayed.body(Body::empty()).unwrap();
+                    response = crate::app::router(app.clone())
+                        .oneshot(replayed)
+                        .await
+                        .unwrap();
+                }
+                Ok(response)
+            })
+        }
+    }
+
     fn admin_cookie(app: &App) -> String {
         let token = auth::issue_admin_token(
             &app.secret,
@@ -5229,7 +5414,7 @@ mod tests {
                     .body(Body::from(r#"{"paths":["held.bin"],"expires_days":1}"#))
                     .unwrap()
             };
-            let serving = tokio::spawn(crate::app::router(app.clone()).oneshot(request));
+            let serving = tokio::spawn(router(app.clone()).oneshot(request));
 
             tokio::time::timeout(Duration::from_secs(3), async {
                 loop {
@@ -5416,7 +5601,7 @@ mod tests {
             .unwrap();
 
         // Pre-password metadata reveals nothing, branding included.
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{gated}"))
                     .body(Body::empty())
@@ -5429,7 +5614,7 @@ mod tests {
         assert_eq!(json["authorized"], false);
         assert!(json.get("branding").is_none(), "{json}");
         // ... so the logo hides with it.
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{gated}/logo"))
                     .body(Body::empty())
@@ -5440,7 +5625,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         // The password cookie unlocks branding and the logo together.
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::post(format!("/api/s/{gated}/verify"))
                     .header("content-type", "application/json")
@@ -5461,7 +5646,7 @@ mod tests {
             .next()
             .unwrap()
             .to_owned();
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{gated}"))
                     .header("cookie", &cookie)
@@ -5473,7 +5658,7 @@ mod tests {
         let json = body(response).await;
         assert_eq!(json["authorized"], true);
         assert_eq!(json["branding"]["name"], "Acme Corp");
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{gated}/logo"))
                     .header("cookie", &cookie)
@@ -5490,7 +5675,7 @@ mod tests {
             format!("/api/s/{open}"),
             format!("/api/s/{open}?offset=0&limit=10"),
         ] {
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
@@ -5500,7 +5685,7 @@ mod tests {
             assert_eq!(json["branding"]["color"], "#12ab99", "{uri}");
             assert_eq!(json["branding"]["has_logo"], true, "{uri}");
         }
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{open}/logo"))
                     .body(Body::empty())
@@ -5644,7 +5829,7 @@ mod tests {
             ("cap/a.bin", b"file a".as_slice()),
             ("cap/b.bin", b"file b"),
         ] {
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(
                     Request::post(format!("/api/admin/outbound-files?path={path}"))
                         .header("cookie", &cookie)
@@ -5656,7 +5841,7 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
         }
-        let created = crate::app::router(app.clone())
+        let created = router(app.clone())
             .oneshot(
                 Request::post("/api/admin/outbound-grants")
                     .header("cookie", &cookie)
@@ -5680,7 +5865,7 @@ mod tests {
             .to_owned();
         let peer = |port| ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
 
-        let head_batch = crate::app::router(app.clone())
+        let head_batch = router(app.clone())
             .oneshot(
                 Request::head(format!("/api/s/{token}/batch"))
                     .extension(peer(10))
@@ -5699,7 +5884,7 @@ mod tests {
             .unwrap();
         assert!(grant.files.iter().all(|file| file.downloads == 0));
 
-        let head_bundle = crate::app::router(app.clone())
+        let head_bundle = router(app.clone())
             .oneshot(
                 Request::head(format!("/api/s/{token}/bundle"))
                     .extension(peer(11))
@@ -5721,7 +5906,7 @@ mod tests {
         // A batch response dropped before any body frame is polled records
         // nothing: the old up-front recording burned every file's single
         // download here.
-        let aborted = crate::app::router(app.clone())
+        let aborted = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/batch"))
                     .extension(peer(11))
@@ -5740,7 +5925,7 @@ mod tests {
         assert!(grant.files.iter().all(|file| file.downloads == 0));
 
         // Full consumption records each file exactly once.
-        let batch = crate::app::router(app.clone())
+        let batch = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/batch"))
                     .extension(peer(12))
@@ -5771,7 +5956,7 @@ mod tests {
         assert!(grant.files.iter().all(|file| file.downloads == 1));
 
         // The cap is now spent: another batch is refused before any bytes.
-        let refused = crate::app::router(app.clone())
+        let refused = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/batch"))
                     .extension(peer(13))
@@ -5783,7 +5968,7 @@ mod tests {
         assert_eq!(refused.status(), StatusCode::NOT_FOUND);
 
         for path in ["empty/a.bin", "empty/b.bin"] {
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(
                     Request::post(format!("/api/admin/outbound-files?path={path}"))
                         .header("cookie", &cookie)
@@ -5795,7 +5980,7 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
         }
-        let empty_created = crate::app::router(app.clone())
+        let empty_created = router(app.clone())
             .oneshot(
                 Request::post("/api/admin/outbound-grants")
                     .header("cookie", &cookie)
@@ -5816,7 +6001,7 @@ mod tests {
             .next()
             .unwrap()
             .to_owned();
-        let empty_batch = crate::app::router(app.clone())
+        let empty_batch = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{empty_token}/batch"))
                     .extension(peer(14))
@@ -5865,7 +6050,7 @@ mod tests {
         let missing_token = "a".repeat(32);
         let missing = make_grant("missing-zero", &missing_token, "missing-zero.bin");
         app.store.insert_outbound_grant(missing).unwrap();
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{missing_token}/batch"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
@@ -5890,7 +6075,7 @@ mod tests {
         let tampered_token = "b".repeat(32);
         let tampered = make_grant("tampered-zero", &tampered_token, "tampered-zero.bin");
         app.store.insert_outbound_grant(tampered).unwrap();
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{tampered_token}/batch"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 2))))
@@ -5918,7 +6103,7 @@ mod tests {
             ("batch/first.bin", b"first".as_slice()),
             ("batch/second.bin", b"second".as_slice()),
         ] {
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(
                     Request::post(format!("/api/admin/outbound-files?path={path}"))
                         .header("cookie", &cookie)
@@ -5930,7 +6115,7 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
         }
-        let created = crate::app::router(app.clone())
+        let created = router(app.clone())
             .oneshot(
                 Request::post("/api/admin/outbound-grants")
                     .header("cookie", &cookie)
@@ -5951,7 +6136,7 @@ mod tests {
         std::fs::write(&corrupt_path, b"tampered").unwrap();
         let failures_before = OUTBOUND_INTEGRITY_FAILURES.load(Ordering::Relaxed);
         let audits_before = app.store.audit_count().unwrap();
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/batch"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
@@ -5985,7 +6170,7 @@ mod tests {
     async fn corrupt_received_receipt_reports_file_context() {
         let (_directory, app, cookie, _expected) = fixture().await;
         let created = body(
-            crate::app::router(app.clone())
+            router(app.clone())
                 .oneshot(
                     Request::post("/api/admin/outbound-grants")
                         .header("cookie", &cookie)
@@ -6006,7 +6191,7 @@ mod tests {
         std::fs::write(receipt_path(&source_path), b"invalid receipt").unwrap();
         let failures_before = OUTBOUND_INTEGRITY_FAILURES.load(Ordering::Relaxed);
         let audits_before = app.store.audit_count().unwrap();
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/files/0"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
@@ -6038,7 +6223,7 @@ mod tests {
     async fn truncated_cached_catalog_source_reports_integrity_failure() {
         let (_directory, app, cookie, expected) = fixture().await;
         let created = body(
-            crate::app::router(app.clone())
+            router(app.clone())
                 .oneshot(
                     Request::post("/api/admin/outbound-grants")
                         .header("cookie", &cookie)
@@ -6067,7 +6252,7 @@ mod tests {
         std::fs::write(&source_path, &expected[..expected.len() - 1]).unwrap();
         let failures_before = OUTBOUND_INTEGRITY_FAILURES.load(Ordering::Relaxed);
         let audits_before = app.store.audit_count().unwrap();
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/files/0"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
@@ -6133,7 +6318,7 @@ mod tests {
             }))
             .collect();
         app.store.insert_outbound_grant(grant).unwrap();
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/batch"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 3))))
@@ -6208,7 +6393,7 @@ mod tests {
             ])
             .collect();
         app.store.insert_outbound_grant(grant).unwrap();
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/batch"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 4))))
@@ -6266,7 +6451,7 @@ mod tests {
             })
             .collect();
         app.store.insert_outbound_grant(grant).unwrap();
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/bundle"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 5))))
@@ -6291,7 +6476,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(grant.files.iter().all(|file| file.downloads == 1));
-        let refused = crate::app::router(app.clone())
+        let refused = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/files/0"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 6))))
@@ -6302,7 +6487,7 @@ mod tests {
             .unwrap();
         assert_eq!(refused.status(), StatusCode::NOT_FOUND);
         for index in 0..2 {
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(
                     Request::get(format!("/api/s/{token}/files/{index}"))
                         .header(header::COOKIE, cookie)
@@ -6342,7 +6527,7 @@ mod tests {
             ("win/c.bin", 1),
         ] {
             let bytes: Vec<u8> = (0..size).map(|index| (index % 251) as u8).collect();
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(
                     Request::post(format!("/api/admin/outbound-files?path={path}"))
                         .header("cookie", &cookie)
@@ -6354,7 +6539,7 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
         }
-        let created = crate::app::router(app.clone())
+        let created = router(app.clone())
             .oneshot(
                 Request::post("/api/admin/outbound-grants")
                     .header("cookie", &cookie)
@@ -6375,7 +6560,7 @@ mod tests {
             .next()
             .unwrap()
             .to_owned();
-        let batch = crate::app::router(app.clone())
+        let batch = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/batch"))
                     .extension(ConnectInfo(std::net::SocketAddr::from((
@@ -6486,7 +6671,7 @@ mod tests {
             ("audit/one.bin", first.as_slice()),
             ("audit/two.bin", b"second file".as_slice()),
         ] {
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(
                     Request::post(format!("/api/admin/outbound-files?path={path}"))
                         .header("cookie", &cookie)
@@ -6498,7 +6683,7 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
         }
-        let created = crate::app::router(app.clone())
+        let created = router(app.clone())
             .oneshot(
                 Request::post("/api/admin/outbound-grants")
                     .header("cookie", &cookie)
@@ -6523,7 +6708,7 @@ mod tests {
         };
 
         // Metadata, HEAD and receipts do not represent a payload request.
-        let metadata = crate::app::router(app.clone())
+        let metadata = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}"))
                     .body(Body::empty())
@@ -6532,7 +6717,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(metadata.status(), StatusCode::OK);
-        let head = crate::app::router(app.clone())
+        let head = router(app.clone())
             .oneshot(
                 Request::head(format!("/api/s/{token}/files/0"))
                     .body(Body::empty())
@@ -6541,7 +6726,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(head.status(), StatusCode::OK);
-        let receipt = crate::app::router(app.clone())
+        let receipt = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/receipts/0"))
                     .body(Body::empty())
@@ -6551,7 +6736,7 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.status(), StatusCode::NOT_FOUND);
         for (path, port) in [("batch", 6), ("bundle", 7)] {
-            let head = crate::app::router(app.clone())
+            let head = router(app.clone())
                 .oneshot(
                     Request::head(format!("/api/s/{token}/{path}"))
                         .extension(ConnectInfo(std::net::SocketAddr::from((
@@ -6568,7 +6753,10 @@ mod tests {
         }
         assert!(audit_rows().is_empty());
 
-        let file = crate::app::router(app.clone())
+        // The tokenless GET is admitted with a same-origin redirect that
+        // writes its own row; the redirected request streams and writes
+        // the payload row. No lease cookie is set anywhere.
+        let admission = crate::app::router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/files/0"))
                     .header("x-forwarded-for", "198.51.100.7")
@@ -6578,24 +6766,34 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(file.status(), StatusCode::OK);
-        let lease = file
-            .headers()
-            .get(header::SET_COOKIE)
-            .unwrap()
+        assert_eq!(admission.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert!(admission.headers().get(header::SET_COOKIE).is_none());
+        let location = admission.headers()[header::LOCATION]
             .to_str()
             .unwrap()
-            .split(';')
-            .next()
-            .unwrap()
             .to_owned();
+        let lease = location
+            .strip_prefix(&format!("/api/s/{token}/files/0?download_lease="))
+            .unwrap_or_else(|| panic!("unexpected redirect location {location}"))
+            .to_owned();
+        let final_url = format!("/api/s/{token}/files/0?download_lease={lease}");
+        let file = router(app.clone())
+            .oneshot(
+                Request::get(&final_url)
+                    .header("x-forwarded-for", "198.51.100.7")
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(file.status(), StatusCode::OK);
         assert_eq!(file.into_body().collect().await.unwrap().to_bytes(), first);
 
-        let range = crate::app::router(app.clone())
+        let range = router(app.clone())
             .oneshot(
-                Request::get(format!("/api/s/{token}/files/0"))
+                Request::get(&final_url)
                     .header(header::RANGE, "bytes=0-1")
-                    .header("cookie", &lease)
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 2))))
                     .body(Body::empty())
                     .unwrap(),
@@ -6608,7 +6806,7 @@ mod tests {
             &first[..2]
         );
 
-        let batch = crate::app::router(app.clone())
+        let batch = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/batch"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 3))))
@@ -6623,7 +6821,7 @@ mod tests {
             [first.clone(), b"second file".to_vec()].concat()
         );
 
-        let bundle = crate::app::router(app.clone())
+        let bundle = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/bundle"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 4))))
@@ -6637,7 +6835,7 @@ mod tests {
 
         // A source failure happens before the request-start boundary.
         std::fs::write(app.config.outbound_dir.join("audit/two.bin"), b"tampered").unwrap();
-        let failed = crate::app::router(app.clone())
+        let failed = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/files/1"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 5))))
@@ -6649,13 +6847,13 @@ mod tests {
         assert_eq!(failed.status(), StatusCode::NOT_FOUND);
 
         let rows = audit_rows();
-        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.len(), 5);
         let mut modes = rows
             .iter()
             .map(|row| row.detail["mode"].as_str().unwrap())
             .collect::<Vec<_>>();
         modes.sort_unstable();
-        assert_eq!(modes, ["batch", "bundle", "file", "file"]);
+        assert_eq!(modes, ["batch", "bundle", "file", "file", "file"]);
         assert!(rows.iter().all(|row| {
             row.actor.is_empty() && row.tenant.is_empty() && row.detail.get("token").is_none()
         }));
@@ -6663,7 +6861,7 @@ mod tests {
             .iter()
             .filter(|row| row.detail["mode"] == "file")
             .collect::<Vec<_>>();
-        assert_eq!(file_rows.len(), 2);
+        assert_eq!(file_rows.len(), 3);
         assert!(file_rows.iter().all(|row| row.detail["file_index"] == 0));
         assert!(file_rows
             .iter()
@@ -6955,7 +7153,7 @@ mod tests {
                 .unwrap();
         }
 
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::get("/api/admin/outbound-grants")
                     .header("cookie", admin_cookie(&app))
@@ -6993,7 +7191,7 @@ mod tests {
                 .unwrap()
         };
 
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(request("../outside"))
             .await
             .unwrap();
@@ -7036,7 +7234,7 @@ mod tests {
             last_download_at: None,
         }];
         app.store.insert_outbound_grant(grant).unwrap();
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(request("delete.bin"))
             .await
             .unwrap();
@@ -7046,10 +7244,7 @@ mod tests {
         app.store
             .revoke_outbound_grant("", "active", now_unix())
             .unwrap();
-        let response = crate::app::router(app)
-            .oneshot(request("delete.bin"))
-            .await
-            .unwrap();
+        let response = router(app).oneshot(request("delete.bin")).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert!(!path.exists());
     }
@@ -7427,7 +7622,7 @@ mod tests {
                 )
             })
             .unwrap();
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::post("/api/admin/outbound-grants")
                     .header("cookie", &cookie)
@@ -7450,7 +7645,7 @@ mod tests {
             ("receipts/0", ".vot-receipt"),
         ] {
             for method in [axum::http::Method::GET, axum::http::Method::HEAD] {
-                let response = crate::app::router(app.clone())
+                let response = router(app.clone())
                     .oneshot(
                         Request::builder()
                             .method(method)
@@ -7483,10 +7678,7 @@ mod tests {
                 r#"{"link_id":"link","upload_id":"upload","file_index":0,"label":"fixture","expires_days":7}"#,
             ))
             .unwrap();
-        let response = crate::app::router(app.clone())
-            .oneshot(create)
-            .await
-            .unwrap();
+        let response = router(app.clone()).oneshot(create).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
         let created = body(response).await;
@@ -7497,7 +7689,7 @@ mod tests {
         assert_eq!(url, format!("https://drop.example.com/s/{token}"));
         let id = created["grant"]["id"].as_str().unwrap().to_owned();
         for _ in 0..2 {
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(
                     Request::get(format!("/api/admin/outbound-grants/{id}/url"))
                         .header("cookie", &cookie)
@@ -7510,7 +7702,7 @@ mod tests {
             assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
             assert_eq!(body(response).await["url"], url);
         }
-        let refused = crate::app::router(app.clone())
+        let refused = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/admin/outbound-grants/{id}/url"))
                     .body(Body::empty())
@@ -7519,7 +7711,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
-        let listing = crate::app::router(app.clone())
+        let listing = router(app.clone())
             .oneshot(
                 Request::get("/api/admin/outbound-grants")
                     .header("cookie", &cookie)
@@ -7530,7 +7722,7 @@ mod tests {
             .unwrap();
         assert!(!body(listing).await.to_string().contains(token));
 
-        let metadata = crate::app::router(app.clone())
+        let metadata = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}"))
                     .body(Body::empty())
@@ -7551,7 +7743,7 @@ mod tests {
         assert_eq!(metadata["download_url"], format!("/api/s/{token}/file"));
         assert_eq!(metadata["bundle_url"], format!("/api/s/{token}/bundle"));
 
-        let paged = crate::app::router(app.clone())
+        let paged = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}?limit=1"))
                     .body(Body::empty())
@@ -7571,7 +7763,7 @@ mod tests {
             format!("/api/s/{token}/files/0")
         );
 
-        let receipt = crate::app::router(app.clone())
+        let receipt = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/receipt"))
                     .body(Body::empty())
@@ -7585,7 +7777,7 @@ mod tests {
             std::fs::read(app.config.receive_dir.join("received.bin.vot-receipt")).unwrap()
         );
 
-        let file = crate::app::router(app.clone())
+        let file = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/file"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
@@ -7611,7 +7803,7 @@ mod tests {
         assert!(catalog.is_file());
         let catalog_bytes = std::fs::read(&catalog).unwrap();
         assert!(!app.config.data_dir.join("outbound.stage").exists());
-        let second = crate::app::router(app.clone())
+        let second = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/file"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 3))))
@@ -7631,7 +7823,7 @@ mod tests {
             b"tampered fixture",
         )
         .unwrap();
-        let tampered = crate::app::router(app.clone())
+        let tampered = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/file"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 2))))
@@ -7643,7 +7835,7 @@ mod tests {
         assert_eq!(tampered.status(), StatusCode::NOT_FOUND);
         assert!(app.outbound_active.lock().unwrap().is_empty());
 
-        let conflict = crate::app::router(app.clone())
+        let conflict = router(app.clone())
             .oneshot(
                 Request::delete("/api/admin/links/link/uploads/upload/files/0")
                     .header("cookie", &cookie)
@@ -7661,14 +7853,10 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(
-            crate::app::router(app.clone())
-                .oneshot(revoke)
-                .await
-                .unwrap()
-                .status(),
+            router(app.clone()).oneshot(revoke).await.unwrap().status(),
             StatusCode::OK
         );
-        let refused = crate::app::router(app.clone())
+        let refused = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/admin/outbound-grants/{id}/url"))
                     .header("cookie", &cookie)
@@ -7685,7 +7873,7 @@ mod tests {
                     request.extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))));
             }
             assert_eq!(
-                crate::app::router(app.clone())
+                router(app.clone())
                     .oneshot(request.body(Body::empty()).unwrap())
                     .await
                     .unwrap()
@@ -7699,7 +7887,7 @@ mod tests {
     async fn resumable_downloads_count_once_and_head_does_not_stage() {
         let (_directory, app, cookie, expected_bytes) = fixture().await;
         let created = body(
-            crate::app::router(app.clone())
+            router(app.clone())
                 .oneshot(
                     Request::post("/api/admin/outbound-grants")
                         .header("cookie", &cookie)
@@ -7715,7 +7903,7 @@ mod tests {
         )
         .await;
         let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
-        let head = crate::app::router(app.clone())
+        let head = router(app.clone())
             .oneshot(
                 Request::head(format!("/api/s/{token}/file"))
                     .header(header::RANGE, "bytes=0-6")
@@ -7743,41 +7931,29 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(first.status(), StatusCode::PARTIAL_CONTENT);
-        assert_eq!(first.headers()[header::CONTENT_RANGE], "bytes 0-6/16");
-        assert_eq!(first.headers()[header::CONTENT_LENGTH], "7");
-        assert_eq!(first.headers()[header::ACCEPT_RANGES], "bytes");
-        let etag = first.headers()[header::ETAG].to_str().unwrap().to_owned();
-        let lease = first.headers()[header::SET_COOKIE]
-            .to_str()
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap()
-            .to_owned();
-        assert!(first.headers()[header::SET_COOKIE]
-            .to_str()
-            .unwrap()
-            .contains("HttpOnly"));
-        assert!(first.headers()[header::SET_COOKIE]
-            .to_str()
-            .unwrap()
-            .contains("SameSite=Lax"));
-        assert!(first.headers()[header::SET_COOKIE]
-            .to_str()
-            .unwrap()
-            .contains("Secure"));
-        assert_eq!(
-            first.into_body().collect().await.unwrap().to_bytes(),
-            &expected_bytes[..7]
+        assert_eq!(first.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert!(first.headers().get(header::SET_COOKIE).is_none());
+        assert_eq!(first.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(first.headers()[header::REFERRER_POLICY], "no-referrer");
+        let location = first.headers()[header::LOCATION].to_str().unwrap();
+        let lease = location
+            .strip_prefix(&format!("/api/s/{token}/file?download_lease="))
+            .unwrap_or_else(|| panic!("unexpected redirect location {location}"));
+        assert!(
+            !lease.is_empty()
+                && lease
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() || byte == b'.'),
+            "lease {lease} is not an issued token"
         );
 
-        let second = crate::app::router(app.clone())
+        // The redirected request streams the counted range and hands out no
+        // lease cookie.
+        let final_url = format!("/api/s/{token}/file?download_lease={lease}");
+        let second = router(app.clone())
             .oneshot(
-                Request::get(format!("/api/s/{token}/file"))
-                    .header(header::RANGE, "bytes=7-")
-                    .header(header::IF_RANGE, etag)
-                    .header(header::COOKIE, &lease)
+                Request::get(&final_url)
+                    .header(header::RANGE, "bytes=0-6")
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
                     .body(Body::empty())
                     .unwrap(),
@@ -7785,13 +7961,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.status(), StatusCode::PARTIAL_CONTENT);
-        assert_eq!(second.headers()[header::CONTENT_RANGE], "bytes 7-15/16");
+        assert_eq!(second.headers()[header::CONTENT_RANGE], "bytes 0-6/16");
+        assert_eq!(second.headers()[header::CONTENT_LENGTH], "7");
+        assert_eq!(second.headers()[header::ACCEPT_RANGES], "bytes");
+        assert!(second.headers().get(header::SET_COOKIE).is_none());
+        let etag = second.headers()[header::ETAG].to_str().unwrap().to_owned();
         assert_eq!(
             second.into_body().collect().await.unwrap().to_bytes(),
+            &expected_bytes[..7]
+        );
+
+        // A Range resume on the final URL neither redirects nor counts.
+        let resume = router(app.clone())
+            .oneshot(
+                Request::get(&final_url)
+                    .header(header::RANGE, "bytes=7-")
+                    .header(header::IF_RANGE, etag)
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resume.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(resume.headers()[header::CONTENT_RANGE], "bytes 7-15/16");
+        assert_eq!(
+            resume.into_body().collect().await.unwrap().to_bytes(),
             &expected_bytes[7..]
         );
 
-        let exhausted = crate::app::router(app.clone())
+        // The single download is spent, so a tokenless retry is refused.
+        let exhausted = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/file"))
                     .header(header::RANGE, "bytes=7-15")
@@ -7802,20 +8002,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(exhausted.status(), StatusCode::NOT_FOUND);
-        let invalid_lease = crate::app::router(app.clone())
-            .oneshot(
-                Request::get(format!("/api/s/{token}/file"))
-                    .header(header::COOKIE, "votport_d_invalid=forged")
-                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
+
+        // A forged lease and a lease minted for another index both count as
+        // absent and land on the same refusal.
+        let grant = app
+            .store
+            .outbound_grant_by_id(created["grant"]["id"].as_str().unwrap())
+            .unwrap()
             .unwrap();
-        assert_eq!(invalid_lease.status(), StatusCode::NOT_FOUND);
+        let wrong_index =
+            auth::issue_download_lease(&app.secret, &grant.id, &grant.token_hash, 1, 60);
+        for absent in ["forged.deadbeef.deadbeef".to_owned(), wrong_index] {
+            let refused = router(app.clone())
+                .oneshot(
+                    Request::get(format!("/api/s/{token}/file?download_lease={absent}"))
+                        .header(header::RANGE, "bytes=7-15")
+                        .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(refused.status(), StatusCode::NOT_FOUND, "{absent}");
+        }
 
         let id = created["grant"]["id"].as_str().unwrap();
-        let rotated = crate::app::router(app.clone())
+        let rotated = router(app.clone())
             .oneshot(
                 Request::patch(format!("/api/admin/outbound-grants/{id}"))
                     .header("cookie", &cookie)
@@ -7827,10 +8039,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rotated.status(), StatusCode::OK);
-        let old_lease_after_rotation = crate::app::router(app.clone())
+        let old_lease_after_rotation = router(app.clone())
             .oneshot(
-                Request::get(format!("/api/s/{token}/file"))
-                    .header(header::COOKIE, &lease)
+                Request::get(format!("/api/s/{token}/file?download_lease={lease}"))
+                    .header(header::RANGE, "bytes=7-15")
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
                     .body(Body::empty())
                     .unwrap(),
@@ -7840,7 +8052,7 @@ mod tests {
         assert_eq!(old_lease_after_rotation.status(), StatusCode::NOT_FOUND);
 
         let created = body(
-            crate::app::router(app.clone())
+            router(app.clone())
                 .oneshot(
                     Request::post("/api/admin/outbound-grants")
                         .header("cookie", &cookie)
@@ -7856,7 +8068,7 @@ mod tests {
         )
         .await;
         let revoke_token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
-        let first = crate::app::router(app.clone())
+        let admission = crate::app::router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{revoke_token}/file"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
@@ -7865,15 +8077,15 @@ mod tests {
             )
             .await
             .unwrap();
-        let revoke_lease = first.headers()[header::SET_COOKIE]
-            .to_str()
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap()
+        assert_eq!(admission.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert!(admission.headers().get(header::SET_COOKIE).is_none());
+        let location = admission.headers()[header::LOCATION].to_str().unwrap();
+        let revoke_lease = location
+            .strip_prefix(&format!("/api/s/{revoke_token}/file?download_lease="))
+            .unwrap_or_else(|| panic!("unexpected redirect location {location}"))
             .to_owned();
         let revoke_id = created["grant"]["id"].as_str().unwrap();
-        let revoke = crate::app::router(app.clone())
+        let revoke = router(app.clone())
             .oneshot(
                 Request::delete(format!("/api/admin/outbound-grants/{revoke_id}"))
                     .header("cookie", &cookie)
@@ -7884,13 +8096,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(revoke.status(), StatusCode::OK);
-        let old_lease_after_revoke = crate::app::router(app.clone())
+        let old_lease_after_revoke = router(app.clone())
             .oneshot(
-                Request::get(format!("/api/s/{revoke_token}/file"))
-                    .header(header::COOKIE, revoke_lease)
-                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
-                    .body(Body::empty())
-                    .unwrap(),
+                Request::get(format!(
+                    "/api/s/{revoke_token}/file?download_lease={revoke_lease}"
+                ))
+                .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
+                .body(Body::empty())
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -7901,7 +8114,7 @@ mod tests {
     async fn range_errors_and_if_range_mismatch_are_safe() {
         let (_directory, app, cookie, expected_bytes) = fixture().await;
         let created = body(
-            crate::app::router(app.clone())
+            router(app.clone())
                 .oneshot(
                     Request::post("/api/admin/outbound-grants")
                         .header("cookie", &cookie)
@@ -7918,7 +8131,7 @@ mod tests {
         .await;
         let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
         for value in ["bytes=0-1,2-3", "bytes=99-", "bytes=3-2"] {
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(
                     Request::get(format!("/api/s/{token}/file"))
                         .header(header::RANGE, value)
@@ -7941,13 +8154,10 @@ mod tests {
         multiple
             .headers_mut()
             .append(header::RANGE, HeaderValue::from_static("bytes=2-3"));
-        let multiple = crate::app::router(app.clone())
-            .oneshot(multiple)
-            .await
-            .unwrap();
+        let multiple = router(app.clone()).oneshot(multiple).await.unwrap();
         assert_eq!(multiple.status(), StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(multiple.headers()[header::CONTENT_RANGE], "bytes */16");
-        let full = crate::app::router(app.clone())
+        let full = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/file"))
                     .header(header::RANGE, "bytes=0-1")
@@ -7970,7 +8180,7 @@ mod tests {
     #[tokio::test]
     async fn grant_lifecycle_rotation_and_extension_are_scoped() {
         let (_directory, app, cookie, _expected_bytes) = fixture().await;
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::post("/api/admin/outbound-grants")
                     .header("cookie", &cookie)
@@ -7987,7 +8197,7 @@ mod tests {
         let old_url = created["url"].as_str().unwrap().to_owned();
         let old_token = old_url.rsplit('/').next().unwrap().to_owned();
         let id = created["grant"]["id"].as_str().unwrap();
-        let invalid = crate::app::router(app.clone())
+        let invalid = router(app.clone())
             .oneshot(
                 Request::patch(format!("/api/admin/outbound-grants/{id}"))
                     .header("cookie", &cookie)
@@ -8000,7 +8210,7 @@ mod tests {
             .unwrap();
         assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
-        let rotated = crate::app::router(app.clone())
+        let rotated = router(app.clone())
             .oneshot(
                 Request::patch(format!("/api/admin/outbound-grants/{id}"))
                     .header("cookie", &cookie)
@@ -8016,7 +8226,7 @@ mod tests {
         let new_url = rotated["url"].as_str().unwrap();
         assert_ne!(new_url, old_url);
         assert_eq!(
-            crate::app::router(app.clone())
+            router(app.clone())
                 .oneshot(
                     Request::get(format!("/api/s/{old_token}"))
                         .body(Body::empty())
@@ -8027,7 +8237,7 @@ mod tests {
                 .status(),
             StatusCode::NOT_FOUND
         );
-        let extended = crate::app::router(app.clone())
+        let extended = router(app.clone())
             .oneshot(
                 Request::patch(format!("/api/admin/outbound-grants/{id}"))
                     .header("cookie", &cookie)
@@ -8045,7 +8255,7 @@ mod tests {
     #[tokio::test]
     async fn exhausted_grant_is_not_available_for_a_second_download() {
         let (_directory, app, cookie, expected_bytes) = fixture().await;
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::post("/api/admin/outbound-grants")
                     .header("cookie", &cookie)
@@ -8061,7 +8271,7 @@ mod tests {
         let created = body(response).await;
         assert_eq!(created["grant"]["max_downloads"], 1);
         let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
-        let first = crate::app::router(app.clone())
+        let first = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/file"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
@@ -8075,7 +8285,7 @@ mod tests {
             first.into_body().collect().await.unwrap().to_bytes(),
             expected_bytes
         );
-        let second = crate::app::router(app)
+        let second = router(app)
             .oneshot(
                 Request::get(format!("/api/s/{token}/file"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 2))))
@@ -8090,7 +8300,7 @@ mod tests {
     #[tokio::test]
     async fn password_grant_gates_metadata_file_receipt_and_evidence() {
         let (_directory, app, cookie, expected_bytes) = fixture().await;
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::post("/api/admin/outbound-grants")
                     .header("cookie", &cookie)
@@ -8110,7 +8320,7 @@ mod tests {
         let grant_id = created["grant"]["id"].as_str().unwrap().to_owned();
         let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
 
-        let metadata = crate::app::router(app.clone())
+        let metadata = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}"))
                     .body(Body::empty())
@@ -8124,7 +8334,7 @@ mod tests {
             metadata,
             json!({ "has_password": true, "authorized": false })
         );
-        let paged = crate::app::router(app.clone())
+        let paged = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}?offset=0&limit=1"))
                     .body(Body::empty())
@@ -8145,7 +8355,7 @@ mod tests {
                     request.extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))));
             }
             assert_eq!(
-                crate::app::router(app.clone())
+                router(app.clone())
                     .oneshot(request.body(Body::empty()).unwrap())
                     .await
                     .unwrap()
@@ -8154,7 +8364,7 @@ mod tests {
             );
         }
 
-        let wrong = crate::app::router(app.clone())
+        let wrong = router(app.clone())
             .oneshot(
                 Request::post(format!("/api/s/{token}/verify"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 2))))
@@ -8166,7 +8376,7 @@ mod tests {
             .unwrap();
         assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
 
-        let verified = crate::app::router(app.clone())
+        let verified = router(app.clone())
             .oneshot(
                 Request::post(format!("/api/s/{token}/verify"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 2))))
@@ -8227,7 +8437,7 @@ mod tests {
         };
         let forged_cookie = format!("{}=forged", grant_cookie_name(&grant_id));
         for denied_cookie in ["", cookie.as_str(), forged_cookie.as_str()] {
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(challenge_request(denied_cookie))
                 .await
                 .unwrap();
@@ -8237,7 +8447,7 @@ mod tests {
                 "outbound grant password required"
             );
         }
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(challenge_request(&grant_cookie))
             .await
             .unwrap();
@@ -8254,7 +8464,7 @@ mod tests {
             app.store.delivery_manifest(&grant_id).unwrap()
         );
 
-        let metadata = crate::app::router(app.clone())
+        let metadata = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}"))
                     .header("cookie", &grant_cookie)
@@ -8265,7 +8475,7 @@ mod tests {
             .unwrap();
         assert_eq!(metadata.status(), StatusCode::OK);
         assert_eq!(body(metadata).await["label"], "received.bin");
-        let paged = crate::app::router(app.clone())
+        let paged = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}?offset=0&limit=1"))
                     .header("cookie", &grant_cookie)
@@ -8277,7 +8487,7 @@ mod tests {
         assert_eq!(paged.status(), StatusCode::OK);
         assert_eq!(body(paged).await["files_total"], 1);
 
-        let file = crate::app::router(app.clone())
+        let file = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/file"))
                     .header("cookie", &grant_cookie)
@@ -8293,7 +8503,7 @@ mod tests {
             expected_bytes
         );
 
-        let bundle = crate::app::router(app.clone())
+        let bundle = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/bundle"))
                     .header("cookie", &grant_cookie)
@@ -8324,7 +8534,7 @@ mod tests {
         assert!(!entries.contains_key("manifest.json"));
         assert!(app.outbound_active.lock().unwrap().is_empty());
 
-        let receipt = crate::app::router(app)
+        let receipt = router(app)
             .oneshot(
                 Request::get(format!("/api/s/{token}/receipt"))
                     .header("cookie", &grant_cookie)
@@ -8343,7 +8553,7 @@ mod tests {
             ("rate/one.bin", first.as_slice()),
             ("rate/two.bin", b"second file".as_slice()),
         ] {
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(
                     Request::post(format!("/api/admin/outbound-files?path={path}"))
                         .header("cookie", &cookie)
@@ -8355,7 +8565,7 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
         }
-        let created = crate::app::router(app.clone())
+        let created = router(app.clone())
             .oneshot(
                 Request::post("/api/admin/outbound-grants")
                     .header("cookie", &cookie)
@@ -8375,14 +8585,16 @@ mod tests {
             .unwrap()
             .to_owned();
 
-        // Leave one full unit. Two indexed requests must each cost half a
-        // unit; a full-unit endpoint wiring would refuse the second request.
+        // Leave two full units. Each indexed download is answered by two
+        // requests, the admission and the redirected stream, and each
+        // request must cost half a unit; a full-unit endpoint wiring would
+        // refuse the second download's replay.
         let key = hash_token(&token);
-        for _ in 0..1_999 {
+        for _ in 0..1_998 {
             assert!(app.outbound_rate.allow(&key));
         }
         for (index, expected) in [first, b"second file".to_vec()].into_iter().enumerate() {
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(
                     Request::get(format!("/api/s/{token}/files/{index}"))
                         .extension(ConnectInfo(std::net::SocketAddr::from((
@@ -8423,7 +8635,7 @@ mod tests {
                         std::fs::write(path, [index as u8]).unwrap();
                     }
                 }
-                let response = crate::app::router(app.clone())
+                let response = router(app.clone())
                     .oneshot(
                         Request::post("/api/admin/outbound-grants")
                             .header("cookie", &cookie)
@@ -8453,12 +8665,7 @@ mod tests {
                 .header("x-votport", "1")
                 .body(Body::from(bytes.to_vec()))
                 .unwrap();
-            async {
-                crate::app::router(app.clone())
-                    .oneshot(request)
-                    .await
-                    .unwrap()
-            }
+            async { router(app.clone()).oneshot(request).await.unwrap() }
         };
         assert_eq!(
             upload("project/one.bin", &first).await.status(),
@@ -8477,7 +8684,7 @@ mod tests {
                 && row.detail["bytes"] == first.len()
         }));
 
-        let listed = crate::app::router(app.clone())
+        let listed = router(app.clone())
             .oneshot(
                 Request::get("/api/admin/outbound-files?directory=project")
                     .header("cookie", &cookie)
@@ -8518,7 +8725,7 @@ mod tests {
             StatusCode::CONFLICT
         );
 
-        let duplicate = crate::app::router(app.clone())
+        let duplicate = router(app.clone())
             .oneshot(
                 Request::post("/api/admin/outbound-grants")
                     .header("cookie", &cookie)
@@ -8541,10 +8748,7 @@ mod tests {
                 r#"{"paths":["project/one.bin","project/two.bin"],"label":"project"}"#,
             ))
             .unwrap();
-        let response = crate::app::router(app.clone())
-            .oneshot(create)
-            .await
-            .unwrap();
+        let response = router(app.clone()).oneshot(create).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let created = body(response).await;
         assert_eq!(created["grant"]["file_count"], 2);
@@ -8557,7 +8761,7 @@ mod tests {
             .next()
             .unwrap()
             .to_owned();
-        let metadata = crate::app::router(app.clone())
+        let metadata = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}"))
                     .body(Body::empty())
@@ -8595,7 +8799,7 @@ mod tests {
                 false,
             ),
         ] {
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(
                     Request::get(format!("/api/s/{token}?offset={offset}&limit=1"))
                         .body(Body::empty())
@@ -8618,7 +8822,7 @@ mod tests {
             assert!(page["receipt_url"].is_null());
             assert!(page["files"][0]["receipt_url"].is_null());
         }
-        let end = crate::app::router(app.clone())
+        let end = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}?offset=2&limit=1"))
                     .body(Body::empty())
@@ -8633,7 +8837,7 @@ mod tests {
         assert_eq!(end["files"], json!([]));
         assert_eq!(end["has_more"], false);
         assert_eq!(metadata["batch_url"], format!("/api/s/{token}/batch"));
-        let batch = crate::app::router(app.clone())
+        let batch = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/batch"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 5))))
@@ -8657,7 +8861,7 @@ mod tests {
             [first.clone(), b"second file".to_vec()].concat()
         );
         assert!(app.outbound_active.lock().unwrap().is_empty());
-        let bundle = crate::app::router(app.clone())
+        let bundle = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/bundle"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 5))))
@@ -8676,7 +8880,7 @@ mod tests {
         assert!(!entries.contains_key("manifest.json"));
         assert!(app.outbound_active.lock().unwrap().is_empty());
         for (index, expected) in [first, b"second file".to_vec()].into_iter().enumerate() {
-            let file = crate::app::router(app.clone())
+            let file = router(app.clone())
                 .oneshot(
                     Request::get(format!("/api/s/{token}/files/{index}"))
                         .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 3))))
@@ -8690,7 +8894,7 @@ mod tests {
                 file.into_body().collect().await.unwrap().to_bytes(),
                 expected
             );
-            let receipt = crate::app::router(app.clone())
+            let receipt = router(app.clone())
                 .oneshot(
                     Request::get(format!("/api/s/{token}/receipts/{index}"))
                         .body(Body::empty())
@@ -8701,7 +8905,7 @@ mod tests {
             assert_eq!(receipt.status(), StatusCode::NOT_FOUND);
         }
         std::fs::write(app.config.outbound_dir.join("project/one.bin"), b"mutated").unwrap();
-        let batch = crate::app::router(app.clone())
+        let batch = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/batch"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 7))))
@@ -8717,7 +8921,7 @@ mod tests {
                 .next()
                 .is_none()
         );
-        let mutated = crate::app::router(app.clone())
+        let mutated = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/files/0"))
                     .header(header::RANGE, "bytes=0-1")
@@ -8728,7 +8932,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mutated.status(), StatusCode::NOT_FOUND);
-        let bundle = crate::app::router(app)
+        let bundle = router(app)
             .oneshot(
                 Request::get(format!("/api/s/{token}/bundle"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 6))))
@@ -8759,7 +8963,7 @@ mod tests {
     async fn library_uploads_refuse_nonportable_names_before_staging() {
         let (_directory, app, cookie, _) = fixture().await;
         let portable = "unicode/Café.mov";
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::post(outbound_file_path(portable))
                     .header("cookie", &cookie)
@@ -8785,7 +8989,7 @@ mod tests {
             "\u{202e}fdp.exe",
         ];
         for (index, path) in invalid.iter().enumerate() {
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(
                     Request::post(outbound_file_path(path))
                         .header("cookie", &cookie)
@@ -8812,7 +9016,7 @@ mod tests {
 
         for (index, path) in invalid.iter().enumerate() {
             let upload_id = format!("{:064x}", index + invalid.len());
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(chunk_request(
                     &cookie,
                     path,
@@ -8844,7 +9048,7 @@ mod tests {
         let (_directory, app, cookie, _) = fixture().await;
         let directory = "d".repeat(255);
         let file = format!("{directory}/clip.mov");
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::post(outbound_file_path(&file))
                     .header("cookie", &cookie)
@@ -8856,7 +9060,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let listed = crate::app::router(app.clone())
+        let listed = router(app.clone())
             .oneshot(
                 Request::get(outbound_query(&[("directory", &directory)]))
                     .header("cookie", &cookie)
@@ -8868,7 +9072,7 @@ mod tests {
         assert_eq!(listed.status(), StatusCode::OK);
         assert_eq!(body(listed).await["files"][0]["path"], file);
 
-        let paged = crate::app::router(app.clone())
+        let paged = router(app.clone())
             .oneshot(
                 Request::get(outbound_query(&[("directory", &directory), ("limit", "1")]))
                     .header("cookie", &cookie)
@@ -8882,7 +9086,7 @@ mod tests {
         assert_eq!(paged["files"][0]["path"], file);
         assert_eq!(paged["truncated"], false);
 
-        let selected = crate::app::router(app.clone())
+        let selected = router(app.clone())
             .oneshot(
                 Request::get(outbound_query(&[("selection", &directory)]))
                     .header("cookie", &cookie)
@@ -8894,7 +9098,7 @@ mod tests {
         assert_eq!(selected.status(), StatusCode::OK);
         assert_eq!(body(selected).await["files"][0]["path"], file);
 
-        let grant = crate::app::router(app)
+        let grant = router(app)
             .oneshot(
                 Request::post("/api/admin/outbound-grants")
                     .header("cookie", &cookie)
@@ -8920,7 +9124,7 @@ mod tests {
         let (directory, app, cookie, expected) = fixture().await;
         let source = app.config.outbound_dir.join("restore.bin");
         std::fs::write(&source, &expected).unwrap();
-        let created = crate::app::router(app.clone())
+        let created = router(app.clone())
             .oneshot(
                 Request::post("/api/admin/outbound-grants")
                     .header("cookie", &cookie)
@@ -8968,7 +9172,7 @@ mod tests {
                 .is_none()
         );
 
-        let receipt = crate::app::router(app.clone())
+        let receipt = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/receipts/0"))
                     .body(Body::empty())
@@ -8991,7 +9195,7 @@ mod tests {
         .unwrap();
         let restored = crate::api::testing::build(restored_directory.path());
 
-        let unavailable = crate::app::router(restored.clone())
+        let unavailable = router(restored.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/files/0"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
@@ -9004,7 +9208,7 @@ mod tests {
 
         std::fs::create_dir_all(&restored.config.outbound_dir).unwrap();
         std::fs::copy(&source, restored.config.outbound_dir.join("restore.bin")).unwrap();
-        let available = crate::app::router(restored)
+        let available = router(restored)
             .oneshot(
                 Request::get(format!("/api/s/{token}/files/0"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 2))))
@@ -9026,7 +9230,7 @@ mod tests {
         let mut app = crate::api::testing::build(directory.path());
         Arc::get_mut(&mut app).unwrap().config.max_upload_bytes = 3;
         let cookie = admin_cookie(&app);
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::post("/api/admin/outbound-files?path=too-large.bin")
                     .header("cookie", cookie)
@@ -9062,7 +9266,7 @@ mod tests {
             .header("x-votport", "1")
             .body(Body::from_stream(stream))
             .unwrap();
-        let upload = tokio::spawn(crate::app::router(app.clone()).oneshot(request));
+        let upload = tokio::spawn(router(app.clone()).oneshot(request));
 
         sender.send(Ok(Bytes::from_static(b"first"))).await.unwrap();
         let stage = tokio::time::timeout(Duration::from_secs(2), async {
@@ -9140,7 +9344,7 @@ mod tests {
         Arc::get_mut(&mut app).unwrap().config.max_upload_bytes = 5;
         std::fs::write(app.config.outbound_dir.join("one.bin"), b"one").unwrap();
         std::fs::write(app.config.outbound_dir.join("two.bin"), b"two").unwrap();
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::post("/api/admin/outbound-grants")
                     .header("cookie", admin_cookie(&app))
@@ -9196,7 +9400,7 @@ mod tests {
     async fn resumable_library_upload_keeps_partial_files_unpublished() {
         let (_directory, app, cookie, _bytes) = fixture().await;
         let upload_id = "a".repeat(64);
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(chunk_request(
                 &cookie,
                 "partial.bin",
@@ -9229,7 +9433,7 @@ mod tests {
     async fn resumable_library_upload_resynchronizes_and_audits_completion() {
         let (_directory, app, cookie, _bytes) = fixture().await;
         let upload_id = "b".repeat(64);
-        let first = crate::app::router(app.clone())
+        let first = router(app.clone())
             .oneshot(chunk_request(
                 &cookie,
                 "resume.bin",
@@ -9243,7 +9447,7 @@ mod tests {
             .unwrap();
         assert_eq!(first.status(), StatusCode::OK);
 
-        let mismatch = crate::app::router(app.clone())
+        let mismatch = router(app.clone())
             .oneshot(chunk_request(
                 &cookie,
                 "resume.bin",
@@ -9258,7 +9462,7 @@ mod tests {
         assert_eq!(mismatch.status(), StatusCode::OK);
         assert_eq!(body(mismatch).await["offset"], 3);
 
-        let complete = crate::app::router(app.clone())
+        let complete = router(app.clone())
             .oneshot(chunk_request(
                 &cookie,
                 "resume.bin",
@@ -9303,7 +9507,7 @@ mod tests {
         let (_directory, app, cookie, _bytes) = fixture().await;
         let upload_id = "1".repeat(64);
         for (start, end, bytes) in [(0, 2, b"abc".as_slice()), (3, 5, b"def".as_slice())] {
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(chunk_request(
                     &cookie,
                     "replay.bin",
@@ -9335,7 +9539,7 @@ mod tests {
 
         // The final response may be lost after publication. The same upload
         // id and hardlink witness make the retry an idempotent completion.
-        let replay = crate::app::router(app.clone())
+        let replay = router(app.clone())
             .oneshot(chunk_request(
                 &cookie,
                 "replay.bin",
@@ -9354,7 +9558,7 @@ mod tests {
 
         // A different upload id has no witness and cannot claim the name.
         let foreign = "2".repeat(64);
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(chunk_request(
                 &cookie,
                 "replay.bin",
@@ -9375,7 +9579,7 @@ mod tests {
 
         // Matching bytes are still rejected when the caller's declared total
         // differs from the published file.
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(chunk_request(
                 &cookie,
                 "replay.bin",
@@ -9393,7 +9597,7 @@ mod tests {
         // same size, so a stale final reply cannot bless a new file.
         std::fs::remove_file(&destination).unwrap();
         std::fs::write(&destination, b"ghijkl").unwrap();
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(chunk_request(
                 &cookie,
                 "replay.bin",
@@ -9501,7 +9705,7 @@ mod tests {
         let (_directory, app, cookie, _bytes) = fixture().await;
         let upload_id = "3".repeat(64);
         for (start, end, bytes) in [(0, 2, b"abc".as_slice()), (3, 5, b"def".as_slice())] {
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(chunk_request(
                     &cookie,
                     "symlink.bin",
@@ -9524,7 +9728,7 @@ mod tests {
         std::fs::remove_file(&destination).unwrap();
         std::fs::write(&external, b"abcdef").unwrap();
         std::os::unix::fs::symlink(&external, &destination).unwrap();
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(chunk_request(
                 &cookie,
                 "symlink.bin",
@@ -9542,7 +9746,7 @@ mod tests {
         std::fs::write(&destination, b"abcdef").unwrap();
         std::fs::remove_file(&stage).unwrap();
         std::os::unix::fs::symlink(&destination, &stage).unwrap();
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(chunk_request(
                 &cookie,
                 "symlink.bin",
@@ -9565,7 +9769,7 @@ mod tests {
     async fn resumable_library_upload_rolls_back_an_invalid_chunk() {
         let (_directory, app, cookie, _bytes) = fixture().await;
         let upload_id = "e".repeat(64);
-        let first = crate::app::router(app.clone())
+        let first = router(app.clone())
             .oneshot(chunk_request(
                 &cookie,
                 "rollback.bin",
@@ -9587,10 +9791,7 @@ mod tests {
             .header(header::CONTENT_LENGTH, 3)
             .body(Body::from("defg"))
             .unwrap();
-        let invalid = crate::app::router(app.clone())
-            .oneshot(invalid)
-            .await
-            .unwrap();
+        let invalid = router(app.clone()).oneshot(invalid).await.unwrap();
         assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
         assert!(!app.config.outbound_dir.join("rollback.bin").exists());
         let stage = app.config.outbound_dir.join(outbound_stage_name(
@@ -9605,7 +9806,7 @@ mod tests {
         let (_directory, app, cookie, _bytes) = fixture().await;
         let upload_id = "f".repeat(64);
         for (path, bytes) in [("sibling-a.bin", b"abc"), ("sibling-b.bin", b"xyz")] {
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(chunk_request(&cookie, path, &upload_id, 0, 2, 6, bytes))
                 .await
                 .unwrap();
@@ -9635,7 +9836,7 @@ mod tests {
                 .outbound_dir
                 .join(outbound_stage_name(&path, &upload_id));
             std::fs::write(&stage, stale).unwrap();
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(chunk_request(
                     &cookie, "late.bin", &upload_id, 0, 4, 10, b"whole",
                 ))
@@ -9647,7 +9848,7 @@ mod tests {
             assert_eq!(progress["offset"], 5);
             assert!(!path.exists());
             assert_eq!(std::fs::read(&stage).unwrap(), b"whole");
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(chunk_request(
                     &cookie, "late.bin", &upload_id, 5, 9, 10, b" file",
                 ))
@@ -9674,7 +9875,7 @@ mod tests {
                 .unwrap()
                 .join(outbound_stage_name(&path, &upload_id));
             std::fs::write(&stage, stale).unwrap();
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(chunk_request(
                     &cookie,
                     "prefix.bin",
@@ -9690,7 +9891,7 @@ mod tests {
             assert_eq!(body(response).await["offset"], expected_offset);
             if expected_status == StatusCode::CONFLICT {
                 assert_eq!(std::fs::read(&stage).unwrap(), b"who");
-                let response = crate::app::router(app.clone())
+                let response = router(app.clone())
                     .oneshot(chunk_request(
                         &cookie,
                         "prefix.bin",
@@ -9724,7 +9925,7 @@ mod tests {
             hex::encode(old_hash.finalize()),
         ));
         std::fs::write(&old_stage, b"wrong").unwrap();
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(chunk_request(
                 &cookie,
                 "older.bin",
@@ -9755,7 +9956,7 @@ mod tests {
         let body = Body::from_stream(futures_util::stream::iter(pieces).inspect(move |_| {
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }));
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::post("/api/admin/outbound-files?path=../escape.bin")
                     .header("cookie", &cookie)
@@ -9779,7 +9980,7 @@ mod tests {
         Arc::get_mut(&mut app).unwrap().config.max_upload_bytes = 5;
         let cookie = admin_cookie(&app);
         let upload_id = "c".repeat(64);
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(chunk_request(
                 &cookie,
                 "limited.bin",
@@ -9820,8 +10021,8 @@ mod tests {
         let first = chunk_request(&cookie, "concurrent.bin", &upload_id, 0, 2, 6, b"abc");
         let second = chunk_request(&cookie, "concurrent.bin", &upload_id, 0, 2, 6, b"xyz");
         let (first, second) = tokio::join!(
-            crate::app::router(app.clone()).oneshot(first),
-            crate::app::router(app.clone()).oneshot(second),
+            router(app.clone()).oneshot(first),
+            router(app.clone()).oneshot(second),
         );
         let statuses = [first.unwrap().status(), second.unwrap().status()];
         assert_eq!(statuses, [StatusCode::OK, StatusCode::OK]);
@@ -9965,7 +10166,7 @@ mod tests {
         .unwrap();
         std::fs::write(app.config.outbound_dir.join(".vot-crash.stage"), b"staged").unwrap();
 
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::get("/api/admin/outbound-files?directory=")
                     .header("cookie", admin_cookie(&app))
@@ -9997,7 +10198,7 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(root.join("adir"), root.join("link")).unwrap();
 
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::get("/api/admin/outbound-files?directory=")
                     .header("cookie", admin_cookie(&app))
@@ -10014,7 +10215,7 @@ mod tests {
         assert_eq!(listed["files"][1]["path"], "z.bin");
         assert_eq!(listed["truncated"], false);
 
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::get("/api/admin/outbound-files?directory=&limit=2")
                     .header("cookie", admin_cookie(&app))
@@ -10033,7 +10234,7 @@ mod tests {
         assert_eq!(first_page["truncated"], true);
         assert_eq!(first_page["next_cursor"], "adir");
 
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::get("/api/admin/outbound-files?directory=&limit=2&after=adir")
                     .header("cookie", admin_cookie(&app))
@@ -10059,7 +10260,7 @@ mod tests {
             "?directory=&limit=1001",
             "?directory=&limit=nope",
         ] {
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(
                     Request::get(format!("/api/admin/outbound-files{query}"))
                         .header("cookie", admin_cookie(&app))
@@ -10075,7 +10276,7 @@ mod tests {
             );
         }
 
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::get(format!(
                     "/api/admin/outbound-files?directory={}",
@@ -10089,7 +10290,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::get("/api/admin/outbound-files?directory=adir")
                     .header("cookie", admin_cookie(&app))
@@ -10104,7 +10305,7 @@ mod tests {
         assert_eq!(listed["directories"], json!([]));
         assert_eq!(listed["files"][0]["path"], "adir/nested.bin");
 
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::get("/api/admin/outbound-files?selection=adir")
                     .header("cookie", admin_cookie(&app))
@@ -10124,7 +10325,7 @@ mod tests {
         for index in 0..65 {
             std::fs::write(root.join(format!("large/file-{index:02}.bin")), b"x").unwrap();
         }
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::get("/api/admin/outbound-files?selection=large")
                     .header("cookie", admin_cookie(&app))
@@ -10138,7 +10339,7 @@ mod tests {
 
         #[cfg(unix)]
         {
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(
                     Request::get("/api/admin/outbound-files?selection=link")
                         .header("cookie", admin_cookie(&app))
@@ -10190,7 +10391,7 @@ mod tests {
             {"path":"public/visible.bin","bytes":1},
         ]);
         for query in ["?directory=public", "?selection=public"] {
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(
                     Request::get(format!("/api/admin/outbound-files{query}"))
                         .header("cookie", admin_cookie(&app))
@@ -10331,7 +10532,7 @@ mod tests {
             json!({ "directory": "project", "paths": ["project/file-00.bin"] }),
             json!({ "directory": "a/".repeat(MAX_LIBRARY_DIRECTORY_INPUT_BYTES / 2 + 1) }),
         ] {
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(
                     Request::post("/api/admin/outbound-grants")
                         .header("cookie", &cookie)
@@ -10346,7 +10547,7 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         }
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::post("/api/admin/outbound-grants")
                     .header("cookie", &cookie)
@@ -10366,7 +10567,7 @@ mod tests {
         assert_eq!(created["grant"]["files"], json!([]));
         let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
 
-        let metadata = crate::app::router(app.clone())
+        let metadata = router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}"))
                     .body(Body::empty())
@@ -10382,7 +10583,7 @@ mod tests {
             pair[0]["name"].as_str().unwrap() <= pair[1]["name"].as_str().unwrap()
         }));
 
-        let history = crate::app::router(app)
+        let history = router(app)
             .oneshot(
                 Request::get("/api/admin/outbound-grants")
                     .header("cookie", cookie)
@@ -10410,7 +10611,7 @@ mod tests {
             Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
         let refused = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            crate::app::router(app.clone()).oneshot(
+            router(app.clone()).oneshot(
                 Request::post("/api/admin/outbound-grants")
                     .header("cookie", &cookie)
                     .header("x-votport", "1")
@@ -10434,7 +10635,7 @@ mod tests {
                 format!("admitted/file-{index:02}.bin")
             })
             .collect::<Vec<_>>();
-        let accepted = crate::app::router(app)
+        let accepted = router(app)
             .oneshot(
                 Request::post("/api/admin/outbound-grants")
                     .header("cookie", cookie)
@@ -10465,7 +10666,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(r#"{"paths":["held.bin"],"expires_days":1}"#))
             .unwrap();
-        let mut response = Box::pin(crate::app::router(app.clone()).oneshot(request));
+        let mut response = Box::pin(router(app.clone()).oneshot(request));
         let waker = futures_util::task::noop_waker();
         let mut context = std::task::Context::from_waker(&waker);
         assert!(matches!(
@@ -10495,7 +10696,7 @@ mod tests {
             Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            crate::app::router(app.clone()).oneshot(
+            router(app.clone()).oneshot(
                 Request::post("/api/admin/outbound-grants")
                     .header("content-type", "application/json")
                     .body(pending)
@@ -10510,7 +10711,7 @@ mod tests {
         let paths = (0..100_001)
             .map(|index| format!("sequence/frame-{index:06}.exr"))
             .collect::<Vec<_>>();
-        let response = crate::app::router(app)
+        let response = router(app)
             .oneshot(
                 Request::post("/api/admin/outbound-grants")
                     .header("cookie", cookie)
@@ -10689,7 +10890,7 @@ mod tests {
             .unwrap();
         }
 
-        let response = crate::app::router(app.clone())
+        let response = router(app.clone())
             .oneshot(
                 Request::get("/api/admin/outbound-files?q=MaTcH")
                     .header("cookie", admin_cookie(&app))
@@ -10731,7 +10932,7 @@ mod tests {
             format!("/api/admin/outbound-files?q={}", "x".repeat(101)),
             format!("/api/admin/outbound-files?directory={}", "x".repeat(1025)),
         ] {
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(
                     Request::get(uri)
                         .header("cookie", admin_cookie(&app))
@@ -10763,7 +10964,7 @@ mod tests {
             std::fs::create_dir_all(app.config.outbound_dir.join(path)).unwrap();
             std::fs::write(app.config.outbound_dir.join(path).join("f.txt"), b"f").unwrap();
         }
-        let create = crate::app::router(app.clone())
+        let create = router(app.clone())
             .oneshot(
                 Request::post("/api/admin/automation-tokens")
                     .header("cookie", &cookie)
@@ -10784,7 +10985,7 @@ mod tests {
         // A traversal, absolute, or over-long directory is refused at issue time.
         let long = format!("\"{}\"", "a/".repeat(600));
         for bad in [r#""../x""#, r#""/abs""#, long.as_str()] {
-            let create = crate::app::router(app.clone())
+            let create = router(app.clone())
                 .oneshot(
                     Request::post("/api/admin/automation-tokens")
                         .header("cookie", &cookie)
@@ -10803,7 +11004,7 @@ mod tests {
             let app = app.clone();
             let raw = raw.clone();
             async move {
-                crate::app::router(app)
+                router(app)
                     .oneshot(
                         Request::post("/api/automation/share")
                             .header(header::AUTHORIZATION, format!("Bearer {raw}"))
@@ -10837,7 +11038,7 @@ mod tests {
         assert_eq!(refusals.len(), 2, "{refusals:?}");
         assert!(refusals.iter().all(|row| row.starts_with("automation:")));
         assert!(refusals.iter().any(|row| row.ends_with(" project-old")));
-        let listed = crate::app::router(app.clone())
+        let listed = router(app.clone())
             .oneshot(
                 Request::get("/api/admin/automation-tokens")
                     .header("cookie", &cookie)
@@ -10858,7 +11059,7 @@ mod tests {
         std::fs::create_dir_all(app.config.outbound_dir.join("project/sub")).unwrap();
         std::fs::write(app.config.outbound_dir.join("project/a.txt"), b"a").unwrap();
         std::fs::write(app.config.outbound_dir.join("project/sub/b.txt"), b"b").unwrap();
-        let create = crate::app::router(app.clone())
+        let create = router(app.clone())
             .oneshot(
                 Request::post("/api/admin/automation-tokens")
                     .header("cookie", &cookie)
@@ -10879,7 +11080,7 @@ mod tests {
         assert!(valid_token(&raw));
         assert!(created["automation_token"].get("token_hash").is_none());
 
-        let listed = crate::app::router(app.clone())
+        let listed = router(app.clone())
             .oneshot(
                 Request::get("/api/admin/automation-tokens")
                     .header("cookie", &cookie)
@@ -10913,11 +11114,7 @@ mod tests {
                     10,
                 ))));
             assert_eq!(
-                crate::app::router(app.clone())
-                    .oneshot(request)
-                    .await
-                    .unwrap()
-                    .status(),
+                router(app.clone()).oneshot(request).await.unwrap().status(),
                 StatusCode::UNAUTHORIZED
             );
         }
@@ -10938,7 +11135,7 @@ mod tests {
             ]
         );
 
-        let share = crate::app::router(app.clone())
+        let share = router(app.clone())
             .oneshot(
                 Request::post("/api/automation/share")
                     .header(header::AUTHORIZATION, format!("Bearer {raw}"))
@@ -10964,7 +11161,7 @@ mod tests {
         for index in 0..=1000 {
             std::fs::write(large.join(format!("file-{index:02}.bin")), b"x").unwrap();
         }
-        let large_share = crate::app::router(app.clone())
+        let large_share = router(app.clone())
             .oneshot(
                 Request::post("/api/automation/share")
                     .header(header::AUTHORIZATION, format!("Bearer {raw}"))
@@ -10987,7 +11184,7 @@ mod tests {
         assert_eq!(large_share["grant"]["label"], "automation-large");
 
         for directory in ["/project", "../project", "project/../project"] {
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(
                     Request::post("/api/automation/share")
                         .header(header::AUTHORIZATION, format!("Bearer {raw}"))
@@ -11013,7 +11210,7 @@ mod tests {
                 app.config.outbound_dir.join("project/link"),
             )
             .unwrap();
-            let response = crate::app::router(app.clone())
+            let response = router(app.clone())
                 .oneshot(
                     Request::post("/api/automation/share")
                         .header(header::AUTHORIZATION, format!("Bearer {raw}"))
@@ -11031,7 +11228,7 @@ mod tests {
         }
 
         let id = created["automation_token"]["id"].as_str().unwrap();
-        let revoke = crate::app::router(app.clone())
+        let revoke = router(app.clone())
             .oneshot(
                 Request::delete(format!("/api/admin/automation-tokens/{id}"))
                     .header("cookie", &cookie)
@@ -11042,7 +11239,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(revoke.status(), StatusCode::OK);
-        let denied = crate::app::router(app)
+        let denied = router(app)
             .oneshot(
                 Request::post("/api/automation/share")
                     .header(header::AUTHORIZATION, format!("Bearer {raw}"))

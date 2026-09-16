@@ -319,8 +319,10 @@ pub fn verify_link_token(secret: &[u8; 32], link_id: &str, phc: &str, token: &st
     )
 }
 
-/// Issues a short-lived cookie proving that one logical download of one file
-/// in the current grant-token generation has already been counted.
+/// Issues a short-lived token proving that one logical download of one file
+/// in the current grant-token generation has already been counted. The
+/// token rides the file URL query for individual files and one cookie for
+/// the bundle sentinel lease.
 pub fn issue_download_lease(
     secret: &[u8; 32],
     grant_id: &str,
@@ -632,6 +634,16 @@ mod tests {
         assert_eq!(identity.credential_version, 1);
         assert_eq!(identity.subject, "user@example.com");
         assert!(!payload.contains("cv"));
+    }
+
+    #[test]
+    fn a_download_lease_refuses_at_its_expiry_edge() {
+        let secret = [9u8; 32];
+        let live = issue_download_lease(&secret, "grant", "hash", 2, 60);
+        assert!(verify_download_lease(&secret, "grant", "hash", 2, &live));
+        // Zero lifetime expires at issuance: now >= expires refuses.
+        let dead = issue_download_lease(&secret, "grant", "hash", 2, 0);
+        assert!(!verify_download_lease(&secret, "grant", "hash", 2, &dead));
     }
 
     #[cfg(unix)]

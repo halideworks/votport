@@ -117,10 +117,11 @@ export async function streamToWritable(fetchFn, writable, file, options = {}) {
   let waited = 0;
   let written = 0;
   let reauthorized = 0;
+  let url = file.download_url;
   for (let attempt = 0; ; attempt += 1) {
     try {
       const headers = written ? { Range: `bytes=${written}-` } : {};
-      const response = await fetchFn(file.download_url, { credentials: 'same-origin', headers });
+      const response = await fetchFn(url, { credentials: 'same-origin', headers });
       if (!response.ok) await response.body?.cancel().catch(() => {});
       if (response.status >= 500 || response.status === 429) {
         throw Object.assign(new Error(`server returned ${response.status}`), { transient: true });
@@ -134,6 +135,10 @@ export async function streamToWritable(fetchFn, writable, file, options = {}) {
       }
       if (!response.ok) throw new Error(`server returned ${response.status}`);
       if (!response.body) throw new Error('browser cannot stream this response');
+      // The first tokenless request is answered by a 307 whose target adds
+      // the download lease to the URL query. fetch follows it, so every
+      // retry reuses the final URL instead of recounting from the original.
+      if (response.url) url = response.url;
       if (response.status === 206) {
         const range = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get('content-range'));
         if (!range || Number(range[1]) !== written || Number(range[2]) !== file.bytes - 1 ||

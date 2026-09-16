@@ -1613,6 +1613,34 @@ mod tests {
         cookie: Option<&str>,
         payload: Option<serde_json::Value>,
     ) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let mut response = call_once(app, method, path, cookie, payload).await;
+        for _ in 0..3 {
+            if response.0 != StatusCode::TEMPORARY_REDIRECT
+                && response.0 != StatusCode::PERMANENT_REDIRECT
+            {
+                break;
+            }
+            let Some(location) = response
+                .1
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+            else {
+                break;
+            };
+            response = call_once(app, Method::GET, location, cookie, None).await;
+        }
+        response
+    }
+
+    /// One request with no redirect following, for flows that must observe
+    /// the download admission redirect itself.
+    async fn call_once(
+        app: &Arc<App>,
+        method: Method,
+        path: &str,
+        cookie: Option<&str>,
+        payload: Option<serde_json::Value>,
+    ) -> (StatusCode, HeaderMap, Vec<u8>) {
         let mut request = Request::builder()
             .method(method)
             .uri(path)
@@ -4676,7 +4704,7 @@ mod tests {
             .unwrap()
             .to_owned();
         assert!(!payload_root(&app, "", &job.id).exists());
-        let response = call(
+        let response = call_once(
             &app,
             Method::GET,
             &format!("{path}/file"),
@@ -4684,6 +4712,14 @@ mod tests {
             None,
         )
         .await;
+        assert_eq!(response.0, StatusCode::TEMPORARY_REDIRECT);
+        let location = response.1[header::LOCATION].to_str().unwrap().to_owned();
+        let lease = location
+            .split("download_lease=")
+            .nth(1)
+            .expect("lease in redirect location")
+            .to_owned();
+        let response = call(&app, Method::GET, &location, Some(&cookie), None).await;
         assert_eq!(
             response.0,
             StatusCode::OK,
@@ -4691,16 +4727,7 @@ mod tests {
             String::from_utf8_lossy(&response.2)
         );
         assert_eq!(response.2, b"original");
-        let lease = response
-            .1
-            .get(header::SET_COOKIE)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap();
-        let with_lease = format!("{cookie}; {lease}");
+        let leased_path = format!("{path}/file?download_lease={lease}");
         let response = call(
             &app,
             Method::POST,
@@ -4799,15 +4826,9 @@ mod tests {
         );
         assert_eq!(displayed["url"], rotated_url);
         assert_eq!(
-            call(
-                &app,
-                Method::GET,
-                &format!("{path}/file"),
-                Some(&with_lease),
-                None
-            )
-            .await
-            .0,
+            call(&app, Method::GET, &leased_path, Some(&cookie), None)
+                .await
+                .0,
             StatusCode::NOT_FOUND
         );
         let project = app.store.delivery_project("", "project").unwrap().unwrap();
