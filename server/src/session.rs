@@ -828,8 +828,8 @@ fn spawn_worker_from(
                         });
                         send_noted!(item.reply, outcome);
                     }
-                    // Checkpoint covered progress on a byte or time threshold,
-                    // never per batch, so the fsync never paces accept.
+                    // Checkpoint covered progress past both the byte and the
+                    // time floor, never per batch, so the fsync never paces accept.
                     if persist.should_checkpoint(received - received_before) {
                         if let Phase::Receiving { files } = &mut phase {
                             checkpoint_session(&setup, files);
@@ -1054,10 +1054,19 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
     handle_begin(setup, phase)
 }
 
-/// Persist checkpoint pacing: write covered progress no more than this often
-/// by bytes or by time, so the fsync'd update never paces the accept path.
+/// Persist checkpoint pacing: a fast transfer's checkpoint needs both floors.
+/// The byte floor keeps tiny updates from paying for a transaction, the time
+/// floor keeps a fast transfer (40 GbE would cross the byte floor every
+/// ~64 ms) from paying for one more often than the pacing interval, so the
+/// fsync'd update never paces the accept path. A transfer that never crosses
+/// the byte floor still checkpoints behind `MAX_PERSIST_INTERVAL`, so a slow
+/// link bounds its crash-loss window at 5 seconds instead of the whole
+/// transfer.
 const PERSIST_BYTES: u64 = 256 * 1024 * 1024;
-const PERSIST_INTERVAL: Duration = Duration::from_secs(5);
+const PERSIST_INTERVAL: Duration = Duration::from_secs(2);
+/// Slow-path safety floor: dirty work that has waited this long since the
+/// last checkpoint is persisted even under the byte floor.
+const MAX_PERSIST_INTERVAL: Duration = Duration::from_secs(5);
 
 struct PersistTracker {
     bytes_since: u64,
@@ -1072,17 +1081,23 @@ impl PersistTracker {
         }
     }
 
-    /// Returns true when accumulated bytes or elapsed time crosses a
-    /// checkpoint threshold, resetting the counters.
+    /// Returns true once the paced floors (byte and time) or the slow-path
+    /// floor are met since the last checkpoint, resetting the counters.
     fn should_checkpoint(&mut self, added: u64) -> bool {
+        self.should_checkpoint_at(added, Instant::now())
+    }
+
+    /// `now` is injected so tests can pin the pacing decision without a clock.
+    fn should_checkpoint_at(&mut self, added: u64, now: Instant) -> bool {
         self.bytes_since += added;
-        if self.bytes_since >= PERSIST_BYTES || self.last_at.elapsed() >= PERSIST_INTERVAL {
+        let elapsed = now.duration_since(self.last_at);
+        let due = (self.bytes_since >= PERSIST_BYTES && elapsed >= PERSIST_INTERVAL)
+            || (elapsed >= MAX_PERSIST_INTERVAL && self.bytes_since > 0);
+        if due {
             self.bytes_since = 0;
-            self.last_at = Instant::now();
-            true
-        } else {
-            false
+            self.last_at = now;
         }
+        due
     }
 }
 
@@ -2629,6 +2644,11 @@ struct PushReceive {
     activity_origin: Instant,
     last_active: AtomicU64,
     checkpoint: Mutex<PersistTracker>,
+    /// Serializes whole checkpoints without holding `inner` across the store
+    /// commit, so receive-path calls only wait for the snapshot phases.
+    checkpointing: Mutex<()>,
+    /// Entries whose stored progress changed since the last checkpoint.
+    dirty: Mutex<HashSet<usize>>,
 }
 
 impl PushReceive {
@@ -2850,34 +2870,154 @@ impl PushReceive {
         self.finish_object(PushObjectKey::from(object))
     }
 
-    fn checkpoint(&self, inner: &mut PushReceiveInner) -> Result<(), String> {
-        {
+    /// Push checkpoint concurrency contract: checkpoints are serialized by
+    /// `checkpointing`, and `inner` guards only the snapshot and the swap-in
+    /// of results, never the SQLite commit or the NAS journal cleanup, so a
+    /// concurrent choose_sink or finish_object stalls only for the brief
+    /// phases. Atomicity with respect to the session's own lifecycle (finish
+    /// or abort) is preserved without the lock: a snapshot row is recorded
+    /// (entry marker set, publication journal forgotten) only when the
+    /// entry's progress is unchanged since its snapshot; an entry that moved
+    /// on meanwhile stays dirty for the next checkpoint. Markers therefore
+    /// never claim store rows that were not committed, and a publication
+    /// journal is only forgotten after the store records the file published.
+    fn run_checkpoint(&self) -> Result<(), String> {
+        let _serial = self.checkpointing.lock().expect("push checkpoint poisoned");
+        // Snapshot the dirty entries' rows while `inner` is held.
+        let planned = {
+            let inner = self.inner.lock().expect("push receive poisoned");
             let active = inner
                 .objects
                 .values()
                 .filter_map(|object| object.active.as_ref())
                 .map(|files| files.read().expect("push object poisoned"))
                 .collect::<Vec<_>>();
-            checkpoint_files(
-                &self.setup,
-                inner
+            let dirty = self
+                .dirty
+                .lock()
+                .expect("push dirty poisoned")
+                .drain()
+                .collect::<Vec<_>>();
+            let mut planned = Vec::new();
+            let mut lost = Vec::new();
+            for index in dirty {
+                let Some(file) = inner
                     .entries
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, entry)| entry.file.as_ref().map(|file| (index, file)))
-                    .chain(
-                        active
-                            .iter()
-                            .flat_map(|files| files.iter().map(|(index, file)| (*index, file))),
-                    ),
-            )?;
-        }
-        for entry in &mut inner.entries {
-            if let Some(file) = entry.file.as_mut() {
-                forget_publications(std::slice::from_mut(file));
+                    .get(index)
+                    .and_then(|entry| entry.file.as_ref())
+                    .or_else(|| {
+                        active.iter().find_map(|files| {
+                            files
+                                .iter()
+                                .find(|(entry, _)| *entry == index)
+                                .map(|(_, file)| file)
+                        })
+                    })
+                else {
+                    lost.push(index);
+                    continue;
+                };
+                let (_, prefix, published, receipt) = file_progress(0, file);
+                let current = (prefix, published, receipt);
+                if file
+                    .checkpointed
+                    .lock()
+                    .expect("checkpoint poisoned")
+                    .as_ref()
+                    == Some(&current)
+                {
+                    continue;
+                }
+                planned.push((index, current));
+            }
+            self.dirty.lock().expect("push dirty poisoned").extend(lost);
+            planned
+        };
+        if !planned.is_empty() {
+            if let Err(error) = self.setup.store.update_upload_file_progress(
+                &hex::encode(self.setup.session_id),
+                planned.iter().map(|(index, (prefix, published, receipt))| {
+                    (*index, *prefix, *published, *receipt)
+                }),
+            ) {
+                self.dirty
+                    .lock()
+                    .expect("push dirty poisoned")
+                    .extend(planned.iter().map(|(index, _)| *index));
+                return Err(error);
             }
         }
+        // Swap the committed rows into the entry markers, without `inner`
+        // having been held across the commit above.
+        let mut moved = Vec::new();
+        {
+            let mut inner = self.inner.lock().expect("push receive poisoned");
+            for (index, row) in planned {
+                if let Some(file) = inner
+                    .entries
+                    .get_mut(index)
+                    .and_then(|entry| entry.file.as_mut())
+                {
+                    record_checkpointed(file, index, row, &mut moved);
+                    continue;
+                }
+                let mut active = None;
+                for object in inner.objects.values() {
+                    if let Some(files) = object.active.as_ref() {
+                        if files
+                            .read()
+                            .expect("push object poisoned")
+                            .iter()
+                            .any(|(entry, _)| *entry == index)
+                        {
+                            active = Some(Arc::clone(files));
+                            break;
+                        }
+                    }
+                }
+                let Some(active) = active else {
+                    moved.push(index);
+                    continue;
+                };
+                let mut files = active.write().expect("push object poisoned");
+                let Some((entry, file)) = files.iter_mut().find(|(entry, _)| *entry == index)
+                else {
+                    moved.push(index);
+                    continue;
+                };
+                record_checkpointed(file, *entry, row, &mut moved);
+            }
+        }
+        self.dirty
+            .lock()
+            .expect("push dirty poisoned")
+            .extend(moved);
         Ok(())
+    }
+
+    /// Marks every admitted entry dirty so a flush checkpoint (completion or
+    /// abort) covers the whole session rather than only recent writes.
+    fn mark_all_dirty(&self, inner: &PushReceiveInner) {
+        let mut dirty = self.dirty.lock().expect("push dirty poisoned");
+        dirty.extend(
+            inner
+                .entries
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| entry.file.is_some().then_some(index)),
+        );
+        for object in inner.objects.values() {
+            let Some(files) = object.active.as_ref() else {
+                continue;
+            };
+            dirty.extend(
+                files
+                    .read()
+                    .expect("push object poisoned")
+                    .iter()
+                    .map(|(entry, _)| *entry),
+            );
+        }
     }
 
     fn finish_object(&self, key: PushObjectKey) -> Result<(), SessionError> {
@@ -2941,10 +3081,18 @@ impl PushReceive {
                 .lock()
                 .expect("push checkpoint poisoned")
                 .should_checkpoint(0);
-            if due || inner.remaining == 0 {
-                self.checkpoint(&mut inner)
-                    .map_err(SessionError::internal)?;
+            let final_checkpoint = inner.remaining == 0;
+            if final_checkpoint {
+                // Flush at completion covers every entry, not only dirty ones.
+                self.mark_all_dirty(&inner);
             }
+            // The checkpoint runs without `inner` (see run_checkpoint), so a
+            // concurrent choose_sink proceeds while the store commits.
+            drop(inner);
+            if due || final_checkpoint {
+                self.run_checkpoint().map_err(SessionError::internal)?;
+            }
+            let mut inner = self.inner.lock().expect("push receive poisoned");
             if inner.remaining != 0 || inner.committing {
                 return Ok(());
             }
@@ -2990,6 +3138,25 @@ fn file_progress(index: usize, file: &FileState) -> (usize, u64, bool, bool) {
     )
 }
 
+/// Records a committed checkpoint row on an unchanged entry and retires its
+/// publication journal; an entry that advanced past its snapshot stays dirty.
+fn record_checkpointed(
+    file: &mut FileState,
+    index: usize,
+    row: (u64, bool, bool),
+    moved: &mut Vec<usize>,
+) {
+    let (_, prefix, published, receipt) = file_progress(0, file);
+    if (prefix, published, receipt) != row {
+        moved.push(index);
+        return;
+    }
+    *file.checkpointed.lock().expect("checkpoint poisoned") = Some(row);
+    if file.published {
+        forget_publications(std::slice::from_mut(file));
+    }
+}
+
 impl Drop for PushReceive {
     fn drop(&mut self) {
         let sid = hex::encode(self.setup.session_id);
@@ -3032,9 +3199,14 @@ impl Drop for PushReceive {
             }
         }
         if !succeeded {
-            if let Err(error) = self.checkpoint(&mut inner) {
+            self.mark_all_dirty(&inner);
+            // The abort checkpoint runs without `inner` (see run_checkpoint);
+            // Drop is exclusive, so re-acquiring below cannot race a sink.
+            drop(inner);
+            if let Err(error) = self.run_checkpoint() {
                 tracing::warn!(%error, "retain native push recovery journals");
             }
+            inner = self.inner.lock().expect("push receive poisoned");
         }
         let retain = !succeeded
             || inner.entries.iter().any(|entry| {
@@ -3185,22 +3357,23 @@ impl vot_scheduler::RangeSink for PushFileSink {
             self.stopped.store(true, Ordering::Release);
             return Err(vot_scheduler::SinkError);
         }
+        {
+            let files = self.files.read().expect("push object poisoned");
+            self.receive
+                .dirty
+                .lock()
+                .map_err(|_| vot_scheduler::SinkError)?
+                .extend(files.iter().map(|(entry, _)| *entry));
+        }
         let due = self
             .receive
             .checkpoint
             .lock()
             .map_err(|_| vot_scheduler::SinkError)?
             .should_checkpoint(verified.data().len() as u64);
-        if due {
-            let mut inner = self
-                .receive
-                .inner
-                .lock()
-                .map_err(|_| vot_scheduler::SinkError)?;
-            if self.receive.checkpoint(&mut inner).is_err() {
-                self.stopped.store(true, Ordering::Release);
-                return Err(vot_scheduler::SinkError);
-            }
+        if due && self.receive.run_checkpoint().is_err() {
+            self.stopped.store(true, Ordering::Release);
+            return Err(vot_scheduler::SinkError);
         }
         self.receive
             .received
@@ -3339,6 +3512,8 @@ pub(crate) fn push_seams(
         activity_origin: Instant::now(),
         last_active: AtomicU64::new(0),
         checkpoint: Mutex::new(PersistTracker::new()),
+        checkpointing: Mutex::new(()),
+        dirty: Mutex::new(HashSet::new()),
     });
     let handle = PushSeamHandle(Arc::downgrade(&receive));
     (receive_seams(receive), handle)
@@ -7478,9 +7653,7 @@ mod push_tests {
                     WHEN NEW.prefix_bytes = OLD.prefix_bytes AND NEW.published = OLD.published AND NEW.receipt = OLD.receipt
                     BEGIN SELECT RAISE(FAIL, 'unchanged checkpoint row'); END;")
             }).unwrap();
-            receive
-                .checkpoint(&mut receive.inner.lock().unwrap())
-                .unwrap();
+            receive.run_checkpoint().unwrap();
             assert!(receive.complete_object(&requested).is_err());
             let sink: Arc<dyn vot_cli::ReceiveSink> =
                 Arc::from(receive.choose_sink(&requested).unwrap().unwrap());
@@ -7498,14 +7671,10 @@ mod push_tests {
                     .count()
                     <= MAX_OPEN_PUSH_ALIASES
             );
-            receive
-                .checkpoint(&mut receive.inner.lock().unwrap())
-                .unwrap();
+            receive.run_checkpoint().unwrap();
             write_push(Arc::clone(&sink), &requested, bytes);
             for _ in 0..2 {
-                receive
-                    .checkpoint(&mut receive.inner.lock().unwrap())
-                    .unwrap();
+                receive.run_checkpoint().unwrap();
             }
             assert!(receive.setup.store.load_push_sessions().unwrap()[0]
                 .files
@@ -7520,9 +7689,14 @@ mod push_tests {
                 assert_eq!(fs::read(&path).unwrap(), bytes);
                 assert!(identities.insert(fs::metadata(&path).unwrap().ino()));
             }
+            // This test publishes the sink's files directly instead of through
+            // finish_object, so mark them dirty as finish_object would.
             receive
-                .checkpoint(&mut receive.inner.lock().unwrap())
-                .unwrap();
+                .dirty
+                .lock()
+                .unwrap()
+                .extend(files.read().unwrap().iter().map(|(entry, _)| *entry));
+            receive.run_checkpoint().unwrap();
             assert!(receive.setup.store.load_push_sessions().unwrap()[0]
                 .files
                 .iter()
@@ -8216,6 +8390,249 @@ mod push_tests {
         assert_eq!(fs::read(setup.dest_dir.join("final")).unwrap(), bytes);
         assert!(journal.is_file());
     }
+    /// Two-object push with the checkpoint trigger forced on: while the sink's
+    /// checkpoint blocks inside its SQLite commit (the test holds the store
+    /// connection), choose_sink for the second object must still complete.
+    #[tokio::test]
+    async fn choose_sink_completes_while_a_checkpoint_persistence_is_in_flight() {
+        let directory = tempfile::tempdir().unwrap();
+        // One completing write for the writer thread, five untouched objects
+        // for the probe iterations, each choose_sink a fresh target.
+        let data = [
+            b"first payload".as_slice(),
+            b"payload-1".as_slice(),
+            b"payload-2".as_slice(),
+            b"payload-3".as_slice(),
+            b"payload-4".as_slice(),
+            b"payload-5".as_slice(),
+        ];
+        let objects = data.map(|bytes| object(Suite::Blake3Bao64, bytes));
+        let expected = ObjectId {
+            suite: 1,
+            root: [9; 32],
+            length: data.iter().map(|bytes| bytes.len() as u64).sum(),
+        };
+        let application = crate::api::testing::build(directory.path());
+        application
+            .store
+            .insert_link(crate::store::tests::test_link("link"))
+            .unwrap();
+        let setup = setup_with_app(directory.path(), expected.clone(), &application);
+        let key = hex::encode([4; 16]);
+        setup.destinations.push_directory(&key).unwrap();
+        persist_push(&setup, key.clone()).unwrap();
+        let records = objects
+            .iter()
+            .enumerate()
+            .map(|(index, object)| {
+                record(
+                    vot_manifest::PackagePath::portable([format!("file-{index}")]).unwrap(),
+                    object,
+                )
+            })
+            .collect::<Vec<_>>();
+        let requested = objects
+            .iter()
+            .map(|object| vot_cli::ReceiveObject {
+                object: vot_codec::frames::ObjectId {
+                    suite: object.suite,
+                    root: object.root,
+                    length: object.length,
+                },
+                entries: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let (seams, handle) = push_seams(
+            application.clone(),
+            setup,
+            PushControl::resumable(key, None),
+            tokio::runtime::Handle::current(),
+        );
+        let receive = handle.0.upgrade().unwrap();
+        receive
+            .prepare_manifest(
+                vot_cli::PackageSummary {
+                    root: expected.root,
+                    logical_length: expected.length,
+                    entries: data.len() as u64,
+                },
+                &records,
+            )
+            .unwrap();
+        let (written, written_rx) = std::sync::mpsc::channel();
+        // Holding the store connection blocks the checkpoint's SQLite commit
+        // for as long as this closure runs: a checkpoint-sized persistence.
+        application.store.with(|_| {
+            // Force the completing write into a checkpoint-sized flush.
+            {
+                let mut tracker = receive.checkpoint.lock().unwrap();
+                tracker.bytes_since = PERSIST_BYTES;
+                tracker.last_at = Instant::now() - PERSIST_INTERVAL;
+            }
+            let writer = {
+                let receive = Arc::clone(&receive);
+                let object = requested[0].object;
+                let full = requested[0].clone();
+                let written = written.clone();
+                std::thread::spawn(move || {
+                    let sink: Arc<dyn vot_cli::ReceiveSink> =
+                        Arc::from(receive.choose_sink(&full).unwrap().unwrap());
+                    write_push(
+                        sink,
+                        &vot_cli::ReceiveObject {
+                            object,
+                            entries: Vec::new(),
+                        },
+                        data[0],
+                    );
+                    let _ = written.send(());
+                })
+            };
+            // While that persistence is in flight, choose_sink for the other
+            // objects must not wait for the checkpoint's store commit. One
+            // fresh object per probe so no probe trips the already-sinked
+            // conflict; a probe that outlives its own timeout is the
+            // regression (the checkpoint holding the push state lock) and
+            // panics with a diagnosis instead of hanging the suite.
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            for object in requested.iter().skip(1) {
+                let (chosen, chosen_rx) = std::sync::mpsc::channel();
+                {
+                    let receive = Arc::clone(&receive);
+                    let object = object.clone();
+                    std::thread::spawn(move || {
+                        let _ = chosen.send(receive.choose_sink(&object).is_ok());
+                    });
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let budget = remaining.min(Duration::from_secs(2));
+                match chosen_rx.recv_timeout(budget) {
+                    Ok(true) => {}
+                    Ok(false) => panic!("choose_sink failed while a checkpoint was in flight"),
+                    Err(_) => panic!(
+                        "choose_sink did not complete within 2s while a checkpoint persistence was in flight; the checkpoint holds the push state lock across its store commit"
+                    ),
+                }
+            }
+            drop(writer);
+            Ok(())
+        })
+        .unwrap();
+        written_rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("the checkpoint write never finished after the store was released");
+        drop(receive);
+        drop(seams);
+    }
+
+    /// Entry 1 is advanced through a path that bypasses the sink, so it is
+    /// never marked dirty (production mutations always mark their entries):
+    /// the checkpoint must store entry 0 but leave entry 1's stale row alone
+    /// instead of walking every entry.
+    #[tokio::test]
+    async fn checkpoint_stores_only_dirty_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = b"first payload";
+        let untouched_bytes = vec![0x53; 131_072];
+        let mut builder = InMemoryObjectBuilder::new(
+            Suite::Blake3Bao64,
+            Some(untouched_bytes.len() as u64),
+            131_072,
+        )
+        .unwrap();
+        builder.update(&untouched_bytes).unwrap();
+        let prepared = builder.finish().unwrap();
+        let objects = [
+            object(Suite::Blake3Bao64, data),
+            prepared.object_id().clone(),
+        ];
+        let expected = ObjectId {
+            suite: 1,
+            root: [9; 32],
+            length: (data.len() + untouched_bytes.len()) as u64,
+        };
+        let application = crate::api::testing::build(directory.path());
+        application
+            .store
+            .insert_link(crate::store::tests::test_link("link"))
+            .unwrap();
+        let setup = setup_with_app(directory.path(), expected.clone(), &application);
+        let key = hex::encode([5; 16]);
+        setup.destinations.push_directory(&key).unwrap();
+        persist_push(&setup, key.clone()).unwrap();
+        let records = objects
+            .iter()
+            .enumerate()
+            .map(|(index, object)| {
+                record(
+                    vot_manifest::PackagePath::portable([format!("file-{index}")]).unwrap(),
+                    object,
+                )
+            })
+            .collect::<Vec<_>>();
+        let requested = objects
+            .iter()
+            .map(|object| vot_cli::ReceiveObject {
+                object: vot_codec::frames::ObjectId {
+                    suite: object.suite,
+                    root: object.root,
+                    length: object.length,
+                },
+                entries: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let (seams, handle) = push_seams(
+            application.clone(),
+            setup,
+            PushControl::resumable(key, None),
+            tokio::runtime::Handle::current(),
+        );
+        let receive = handle.0.upgrade().unwrap();
+        receive
+            .prepare_manifest(
+                vot_cli::PackageSummary {
+                    root: expected.root,
+                    logical_length: expected.length,
+                    entries: 2,
+                },
+                &records,
+            )
+            .unwrap();
+        let first: Arc<dyn vot_cli::ReceiveSink> =
+            Arc::from(receive.choose_sink(&requested[0]).unwrap().unwrap());
+        // Advance entry 1 outside the sink write path: no dirty mark.
+        {
+            let mut inner = receive.inner.lock().unwrap();
+            let file = inner.entries[1].file.as_mut().unwrap();
+            file.native.as_mut().unwrap().reopen().unwrap();
+            for offset in [0u64, 65_536] {
+                let proof = prepared.prove(offset, 65_536).unwrap();
+                let index = offset as usize;
+                accept_range(
+                    std::slice::from_ref(file),
+                    0,
+                    offset,
+                    proof.proof(),
+                    &untouched_bytes[index..index + 65_536],
+                )
+                .unwrap();
+            }
+        }
+        // Force the sink's next write_verified into its checkpoint.
+        {
+            let mut tracker = receive.checkpoint.lock().unwrap();
+            tracker.bytes_since = PERSIST_BYTES;
+            tracker.last_at = Instant::now() - PERSIST_INTERVAL;
+        }
+        write_push(Arc::clone(&first), &requested[0], data);
+        let saved = application.store.load_push_sessions().unwrap().remove(0);
+        // The dirty entry was stored; the unmarked one was not walked.
+        assert_eq!(saved.files[0].prefix_bytes, data.len() as u64);
+        assert_eq!(saved.files[1].prefix_bytes, 0);
+        drop(first);
+        drop(receive);
+        drop(seams);
+    }
 }
 
 #[cfg(test)]
@@ -8308,15 +8725,42 @@ mod parallel_accept_tests {
     }
 
     #[test]
-    fn persist_tracker_checkpoints_on_bytes_and_on_time() {
-        let mut tracker = PersistTracker::new();
-        // A small addition well under the byte threshold does not checkpoint.
-        assert!(!tracker.should_checkpoint(1024));
-        // Crossing the byte threshold does, and resets the counter.
-        assert!(tracker.should_checkpoint(PERSIST_BYTES));
-        assert!(!tracker.should_checkpoint(1024));
-        // The time threshold fires independently of bytes.
-        tracker.last_at = Instant::now() - PERSIST_INTERVAL;
-        assert!(tracker.should_checkpoint(0));
+    fn persist_tracker_paces_checkpoints_behind_both_floors() {
+        let start = Instant::now();
+        let mut tracker = PersistTracker {
+            bytes_since: 0,
+            last_at: start,
+        };
+        // Neither floor: no checkpoint.
+        assert!(!tracker.should_checkpoint_at(1024, start + Duration::from_secs(1)));
+        // The time floor alone: no checkpoint.
+        assert!(!tracker.should_checkpoint_at(0, start + PERSIST_INTERVAL));
+        // The byte floor alone: no checkpoint.
+        assert!(!tracker.should_checkpoint_at(PERSIST_BYTES, start + Duration::from_millis(1500)));
+        // Both floors met (bytes crossed earlier): checkpoint and reset both.
+        assert!(tracker.should_checkpoint_at(0, start + PERSIST_INTERVAL + Duration::from_secs(1)));
+        assert_eq!(tracker.bytes_since, 0);
+        // After a checkpoint both floors restart.
+        assert!(!tracker.should_checkpoint_at(
+            PERSIST_BYTES,
+            start + PERSIST_INTERVAL + Duration::from_secs(1)
+        ));
+        assert!(
+            tracker.should_checkpoint_at(0, start + 2 * PERSIST_INTERVAL + Duration::from_secs(1))
+        );
+        // The slow path: dirty work under the byte floor still checkpoints
+        // behind MAX_PERSIST_INTERVAL, bounding the crash-loss window for
+        // transfers slower than the byte floor.
+        let mut slow = PersistTracker {
+            bytes_since: 0,
+            last_at: start,
+        };
+        // 100 MiB at 4 s: under both the byte floor and the slow floor.
+        assert!(!slow.should_checkpoint_at(100 * 1024 * 1024, start + Duration::from_secs(4)));
+        // 100 MiB at 5 s: the slow-path floor alone fires the checkpoint.
+        assert!(slow.should_checkpoint_at(0, start + Duration::from_secs(5)));
+        assert_eq!(slow.bytes_since, 0);
+        // 0 bytes at any age: no dirty work means no checkpoint.
+        assert!(!slow.should_checkpoint_at(0, start + Duration::from_secs(60)));
     }
 }
