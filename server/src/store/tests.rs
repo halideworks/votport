@@ -5703,3 +5703,51 @@ mod principals_store_tests {
         assert_eq!(page[0].subject, "alice_literal");
     }
 }
+
+#[test]
+fn quota_layout_migration_records_the_tenants_it_moved() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+
+    // Nothing stored: re-running the layout install moves nothing and
+    // writes no row.
+    store.with(install_quota_schema).unwrap();
+    let rows = store.audit_export(None, 0, 0, 100).unwrap();
+    assert!(rows
+        .iter()
+        .all(|row| row.event != "tenant_storage_migrated"));
+
+    // A stored file makes the next install migrate its bytes into the
+    // layout and name the tenant and total it moved.
+    let mut link = test_link("link-1");
+    link.uploads.push(UploadRecord {
+        partial: false,
+        log: Vec::new(),
+        id: "up-1".to_owned(),
+        started_at: 1,
+        completed_at: 2,
+        replayed_chunks: 0,
+        rejected_chunks: 0,
+        transport: None,
+        package_root: "aa".to_owned(),
+        total_bytes: 5000,
+        files: vec![FileRecord {
+            path: "a.txt".to_owned(),
+            stored_as: "a.txt".to_owned(),
+            bytes: 5000,
+            suite: "blake3".to_owned(),
+            root: "bb".to_owned(),
+            receipt: false,
+            deleted: false,
+        }],
+    });
+    store.insert_link(link).unwrap();
+    store.with(install_quota_schema).unwrap();
+    let rows = store.audit_export(None, 0, 0, 100).unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row.event == "tenant_storage_migrated")
+        .expect("the layout migration names what it moved");
+    assert_eq!(row.detail["tenants"][0]["tenant"], "");
+    assert_eq!(row.detail["tenants"][0]["bytes"], 5000);
+}

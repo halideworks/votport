@@ -4983,15 +4983,17 @@ fn quota_fold(connection: &Connection, tenant: &str) -> rusqlite::Result<(u64, u
     ))
 }
 
-fn backfill_quota_usage(connection: &Connection) -> rusqlite::Result<()> {
+fn backfill_quota_usage(connection: &Connection) -> rusqlite::Result<Vec<(String, u64)>> {
+    // Writes one tenant's recomputed total and returns it, so the caller can
+    // name what the layout migration moved.
     fn flush(
         connection: &Connection,
         tenant: Option<String>,
         bytes: u64,
         saturated: bool,
-    ) -> rusqlite::Result<()> {
+    ) -> rusqlite::Result<Option<(String, u64)>> {
         let Some(tenant) = tenant else {
-            return Ok(());
+            return Ok(None);
         };
         let (bytes_hi, bytes_lo) = split_bytes(bytes);
         connection.execute(
@@ -5004,16 +5006,25 @@ fn backfill_quota_usage(connection: &Connection) -> rusqlite::Result<()> {
                 i64::from(saturated || bytes == u64::MAX)
             ],
         )?;
-        Ok(())
+        Ok(Some((tenant, bytes)))
     }
 
     let mut previous_tenant = None;
     let mut total = 0_u64;
     let mut saturated = false;
+    let mut moved: Vec<(String, u64)> = Vec::new();
     connection.execute("DELETE FROM tenant_quota_usage", [])?;
     walk_quota_files(connection, None, |identity, bytes| {
         if previous_tenant.as_deref() != Some(identity.tenant.as_str()) {
-            flush(connection, previous_tenant.take(), total, saturated)?;
+            if let Some(migrated) = flush(connection, previous_tenant.take(), total, saturated)? {
+                // One line per tenant whose totals the layout migration
+                // recomputed, bounded by this walk's tenant iteration.
+                tracing::info!(
+                    tenant = %migrated.0, bytes = migrated.1,
+                    "migrated tenant quota usage into the storage layout"
+                );
+                moved.push(migrated);
+            }
             previous_tenant = Some(identity.tenant.clone());
             total = 0;
             saturated = false;
@@ -5026,7 +5037,13 @@ fn backfill_quota_usage(connection: &Connection) -> rusqlite::Result<()> {
         }
         Ok(())
     })?;
-    flush(connection, previous_tenant, total, saturated)?;
+    if let Some(migrated) = flush(connection, previous_tenant, total, saturated)? {
+        tracing::info!(
+            tenant = %migrated.0, bytes = migrated.1,
+            "migrated tenant quota usage into the storage layout"
+        );
+        moved.push(migrated);
+    }
     connection.execute(
         "INSERT OR IGNORE INTO tenant_quota_usage(tenant,bytes_hi,bytes_lo,state)
          SELECT key,0,0,0 FROM tenants",
@@ -5036,7 +5053,7 @@ fn backfill_quota_usage(connection: &Connection) -> rusqlite::Result<()> {
         "INSERT OR IGNORE INTO tenant_quota_usage(tenant,bytes_hi,bytes_lo,state) VALUES ('',0,0,0)",
         [],
     )?;
-    Ok(())
+    Ok(moved)
 }
 
 fn rebuild_tenant_quota(connection: &Connection, tenant: &str) -> rusqlite::Result<u64> {
@@ -5058,7 +5075,24 @@ fn install_quota_schema(connection: &Connection) -> rusqlite::Result<()> {
          DROP TRIGGER IF EXISTS tenant_quota_usage_delete;
          DROP TRIGGER IF EXISTS tenant_quota_usage_update;",
     )?;
-    backfill_quota_usage(connection)?;
+    let moved = backfill_quota_usage(connection)?;
+    if !moved.is_empty() {
+        // Boot-time tenant storage layout migration: name what moved so the
+        // trail shows the totals the new layout now carries.
+        let tenants: Vec<_> = moved
+            .iter()
+            .map(|(tenant, bytes)| serde_json::json!({ "tenant": tenant, "bytes": bytes }))
+            .collect();
+        insert_audit_row(
+            connection,
+            now_unix(),
+            "",
+            "",
+            "tenant_storage_migrated",
+            "",
+            &serde_json::json!({ "tenants": tenants }),
+        )?;
+    }
     connection.execute_batch(&quota_trigger_sql())?;
     validate_quota_schema(connection).map_err(|error| {
         rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
