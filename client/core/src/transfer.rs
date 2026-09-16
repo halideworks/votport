@@ -342,6 +342,8 @@ pub fn send_http(base: &str, drop: Drop, observer: &mut dyn Observer) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn collect_for_link_skips_hidden_descendants_only_when_disallowed() {
@@ -427,5 +429,188 @@ mod tests {
             );
             assert!(matches!(result, Err(Error::ResumeSessionInvalid)));
         }
+    }
+
+    /// One request-link route with a `push` link and a push-identity endpoint
+    /// whose reply the caller picks, plus a counted HTTP session creation, so
+    /// a test can pin which transport the send decision ran. Serves until
+    /// dropped; every request is answered immediately.
+    struct MockLink {
+        base: String,
+        session_creates: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl std::ops::Drop for MockLink {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn spawn_link_mock(push_identity: (u16, &'static str)) -> MockLink {
+        use std::io::{Read as _, Write as _};
+
+        fn serve(
+            mut stream: std::net::TcpStream,
+            push_identity: (u16, &'static str),
+            session_creates: &AtomicUsize,
+        ) {
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8];
+            while !request.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(1) => request.push(byte[0]),
+                    _ => return,
+                }
+                if request.len() > 8192 {
+                    return;
+                }
+            }
+            let head = String::from_utf8_lossy(&request).into_owned();
+            let request_line = head.lines().next().unwrap_or_default();
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or_default().to_owned();
+            let path = parts
+                .next()
+                .unwrap_or_default()
+                .split('?')
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            let length = head
+                .to_ascii_lowercase()
+                .split("content-length:")
+                .nth(1)
+                .and_then(|rest| rest.split("\r\n").next())
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let mut body = vec![0; length];
+            let _ = stream.read_exact(&mut body);
+            let _ = body;
+            let (status, reason, payload): (u16, &str, String) =
+                match (method.as_str(), path.as_str()) {
+                    ("GET", "/api/r/tok") => (
+                        200,
+                        "OK",
+                        serde_json::json!({
+                            "label": "decision", "usable": true, "needs_password": false,
+                            "max_bytes": 1_048_576, "chunk_bytes": 65536, "allow_hidden": false,
+                            "max_entries": 10, "push": true
+                        })
+                        .to_string(),
+                    ),
+                    ("GET", "/api/push-identity") => {
+                        (push_identity.0, "Mock", push_identity.1.into())
+                    }
+                    ("POST", "/api/r/tok/session") => {
+                        session_creates.fetch_add(1, Ordering::Relaxed);
+                        (500, "Mock", "mock http receiver refused the session".into())
+                    }
+                    _ => (404, "Not Found", "unexpected request".into()),
+                };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let session_creates = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let counters = Arc::clone(&session_creates);
+        let stopping = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !stopping.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => serve(stream, push_identity, &counters),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        MockLink {
+            base,
+            session_creates,
+            stop,
+        }
+    }
+
+    /// Sends one small file through the real decision in [`send_with_session`].
+    fn send_one_file(base: &str) -> Result<Sent> {
+        let device_dir = tempfile::tempdir().unwrap();
+        let device = Device::load_or_create_in(device_dir.path()).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let file = source.path().join("note.txt");
+        std::fs::write(&file, b"decision payload").unwrap();
+        send_with_session(
+            base,
+            Drop {
+                token: "tok".to_owned(),
+                password: None,
+                files: vec![Selected {
+                    relative: "note.txt".to_owned(),
+                    source: file,
+                }],
+            },
+            &device,
+            &mut crate::progress::Silent,
+            None,
+            |_, _, _| Ok(false),
+        )
+    }
+
+    /// The prepare preflight succeeds (the mock link is usable with push on),
+    /// then the push path fails: the error surfaces and no HTTP session is
+    /// ever created, because a push error never falls back to HTTP.
+    #[test]
+    fn a_push_path_failure_surfaces_without_an_http_fallback() {
+        let mock = spawn_link_mock((500, "push receiver is broken"));
+        let error = send_one_file(&mock.base)
+            .err()
+            .expect("the broken push receiver must fail the send");
+        assert!(
+            matches!(&error, Error::Server { status: 500, what, .. } if what.as_str() == "push identity"),
+            "{error}"
+        );
+        assert_eq!(
+            mock.session_creates.load(Ordering::Relaxed),
+            0,
+            "a push failure must not retry over HTTP"
+        );
+    }
+
+    /// The link offers push but the receiver answers 404 for its push
+    /// identity: the decision treats the carrier as unreachable and the drop
+    /// falls back to the HTTP session path exactly once.
+    #[test]
+    fn an_unreachable_push_falls_back_to_http() {
+        let mock = spawn_link_mock((404, "push is off"));
+        let error = send_one_file(&mock.base)
+            .err()
+            .expect("the mock http receiver refuses, but the fallback must run");
+        assert!(
+            matches!(&error, Error::Server { status: 500, what, .. } if what.as_str() == "create session"),
+            "{error}"
+        );
+        assert_eq!(
+            mock.session_creates.load(Ordering::Relaxed),
+            1,
+            "the HTTP fallback ran exactly once"
+        );
     }
 }
