@@ -7,12 +7,14 @@ pub(super) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS delivery_policy_cache(grant_id TEXT PRIMARY KEY,protected INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS delivery_storage(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,document TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS delivery_projects(tenant TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL, document TEXT NOT NULL, PRIMARY KEY(tenant,id));
-CREATE TABLE IF NOT EXISTS delivery_jobs(id TEXT PRIMARY KEY, tenant TEXT NOT NULL, actor TEXT NOT NULL, operation_id TEXT NOT NULL, project_id TEXT NOT NULL, state TEXT NOT NULL, owner TEXT NOT NULL DEFAULT '', not_before INTEGER NOT NULL, deadline INTEGER, escalated INTEGER NOT NULL DEFAULT 0, token TEXT NOT NULL, document TEXT NOT NULL, UNIQUE(tenant,actor,operation_id));
+CREATE TABLE IF NOT EXISTS delivery_jobs(id TEXT PRIMARY KEY, tenant TEXT NOT NULL, actor TEXT NOT NULL, operation_id TEXT NOT NULL, project_id TEXT NOT NULL, state TEXT NOT NULL, owner TEXT NOT NULL DEFAULT '', not_before INTEGER NOT NULL, deadline INTEGER, escalated INTEGER NOT NULL DEFAULT 0, token TEXT NOT NULL, document TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT 0, snapshot_bytes INTEGER NOT NULL DEFAULT 0, UNIQUE(tenant,actor,operation_id));
 ";
 
 pub(super) const INDEXES: &str = "
 CREATE INDEX IF NOT EXISTS delivery_jobs_ready ON delivery_jobs(state,not_before);
 CREATE INDEX IF NOT EXISTS delivery_jobs_tenant ON delivery_jobs(tenant,id);
+CREATE INDEX IF NOT EXISTS delivery_jobs_tenant_created ON delivery_jobs(tenant,created_at,id);
+CREATE INDEX IF NOT EXISTS delivery_jobs_tenant_snapshot ON delivery_jobs(tenant,snapshot_bytes);
 CREATE INDEX IF NOT EXISTS delivery_jobs_deadline_pending ON delivery_jobs(deadline) WHERE deadline IS NOT NULL AND escalated=0;
 CREATE INDEX IF NOT EXISTS delivery_jobs_retirement_due ON delivery_jobs(COALESCE(json_extract(document,'$.checks.retirement_attempt_at'),0),id) WHERE state IN ('retiring','failed','cancelled','ready','awaiting_approval');
 ";
@@ -123,12 +125,15 @@ fn job_in(connection: &Connection, id: &str) -> rusqlite::Result<Option<Job>> {
 }
 
 fn save_job(connection: &Connection, job: &Job) -> rusqlite::Result<()> {
+    // The indexed snapshot_bytes column mirrors checks.snapshot_bytes so the
+    // delivery budget aggregate never has to extract JSON per row.
     connection.execute(
-        "UPDATE delivery_jobs SET state=?2,document=?3 WHERE id=?1",
+        "UPDATE delivery_jobs SET state=?2,document=?3,snapshot_bytes=?4 WHERE id=?1",
         params![
             job.id,
             job.state,
-            serde_json::to_string(job).expect("job serializes")
+            serde_json::to_string(job).expect("job serializes"),
+            job.checks["snapshot_bytes"].as_i64().unwrap_or(0),
         ],
     )?;
     Ok(())
@@ -426,7 +431,7 @@ pub(super) fn queue_received(
         reprocessed_from: None,
         reprocessed_as: None,
     };
-    connection.execute("INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,document,token) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![job.id,tenant,job.actor,job.request.operation_id,job.project.id,job.state,now as i64,serde_json::to_string(&job).map_err(|e| e.to_string())?,crate::auth::random_token()]).map_err(|e| e.to_string())?;
+    connection.execute("INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,created_at,document,token) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![job.id,tenant,job.actor,job.request.operation_id,job.project.id,job.state,now as i64,now as i64,serde_json::to_string(&job).map_err(|e| e.to_string())?,crate::auth::random_token()]).map_err(|e| e.to_string())?;
     evidence::delivery_event(connection,signer,tenant,&job.id,"reception_queued",&serde_json::json!({"project_id":job.project.id,"link_id":link_id,"upload_id":upload.id,"state":job.state,"error":job.error}),now).map_err(|e|e.to_string())
 }
 
@@ -470,7 +475,7 @@ impl Store {
         if job.state != "preparing" || job.attempts != attempt {
             return Err("job changed during snapshot".into());
         }
-        let reserved: i64 = tx.query_row("SELECT COALESCE(SUM(CAST(json_extract(document,'$.checks.snapshot_bytes') AS INTEGER)),0) FROM delivery_jobs WHERE id<>?1",[id],|row| row.get(0)).map_err(|e| e.to_string())?;
+        let reserved: i64 = tx.query_row("SELECT COALESCE(SUM(snapshot_bytes),0) FROM delivery_jobs WHERE tenant=?1 AND id<>?2",params![job.tenant,id],|row| row.get(0)).map_err(|e| e.to_string())?;
         if (reserved as u64)
             .checked_add(bytes)
             .is_none_or(|total| total > limit.min(i64::MAX as u64))
@@ -896,7 +901,7 @@ impl Store {
             reprocessed_as: None,
         };
         actor_active(&tx, &job)?;
-        tx.execute("INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,deadline,document,token) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![job.id,tenant,actor,job.request.operation_id,job.project.id,job.state,job.request.not_before.unwrap_or(now) as i64,job.request.deadline.map(|t| t as i64),serde_json::to_string(&job).expect("job serializes"),crate::auth::random_token()]).map_err(|e| e.to_string())?;
+        tx.execute("INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,created_at,deadline,document,token) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![job.id,tenant,actor,job.request.operation_id,job.project.id,job.state,job.request.not_before.unwrap_or(now) as i64,now as i64,job.request.deadline.map(|t| t as i64),serde_json::to_string(&job).expect("job serializes"),crate::auth::random_token()]).map_err(|e| e.to_string())?;
         evidence::delivery_event(
             &tx,
             &self.event_signer,
@@ -929,8 +934,25 @@ impl Store {
             .transpose()
             .map_err(|e| e.to_string())?;
         self.with(|connection| {
+            // Pages follow creation order; the cursor is the previous page's
+            // last job id, resolved to its creation stamp for a keyset seek
+            // over delivery_jobs_tenant_created. An unknown cursor restarts
+            // from the oldest job.
+            let after_created: i64 = if after.is_empty() {
+                -1
+            } else {
+                connection
+                    .query_row(
+                        "SELECT created_at FROM delivery_jobs WHERE id=?1",
+                        params![after],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or(-1)
+            };
             let mut query = connection.prepare(
-                "SELECT document FROM delivery_jobs WHERE tenant=?1 AND id>?2
+                "SELECT document FROM delivery_jobs WHERE tenant=?1
+                 AND (created_at,id) > (?2,?3)
                  AND (?4 IS NULL OR project_id IN (SELECT value FROM json_each(?4)))
                  AND (?5='' OR state=?5
                     OR (?5='attention' AND state IN ('awaiting_approval','failed','retrying','suspended'))
@@ -938,16 +960,17 @@ impl Store {
                  AND (?6='' OR instr(lower(json_extract(document,'$.request.label')),lower(?6))>0
                     OR instr(lower(json_extract(document,'$.project.label')),lower(?6))>0
                     OR instr(lower(id),lower(?6))>0)
-                 ORDER BY id LIMIT ?3",
+                 ORDER BY created_at,id LIMIT ?7",
             )?;
             let rows = query.query_map(
                 params![
                     tenant,
+                    after_created,
                     after,
-                    limit.min(101) as i64,
                     projects,
                     state,
-                    search
+                    search,
+                    limit.min(101) as i64
                 ],
                 |row| decode(row.get(0)?),
             )?;
@@ -1195,7 +1218,7 @@ impl Store {
             [&original.id],
         )
         .map_err(|e| e.to_string())?;
-        tx.execute("INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,document,token) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![replacement.id,replacement.tenant,replacement.actor,replacement.request.operation_id,replacement.project.id,replacement.state,now as i64,serde_json::to_string(&replacement).map_err(|e| e.to_string())?,crate::auth::random_token()]).map_err(|e| e.to_string())?;
+        tx.execute("INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,created_at,document,token) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![replacement.id,replacement.tenant,replacement.actor,replacement.request.operation_id,replacement.project.id,replacement.state,now as i64,now as i64,serde_json::to_string(&replacement).map_err(|e| e.to_string())?,crate::auth::random_token()]).map_err(|e| e.to_string())?;
         evidence::delivery_event(&tx,&self.event_signer,&identity.tenant,&original.id,"delivery_reprocessed",&serde_json::json!({"actor":identity.subject,"manifest":manifest,"project_id":replacement.project.id,"original_revision":original.project.revision,"revision":replacement.project.revision,"replacement_id":replacement.id}),now).map_err(|e| e.to_string())?;
         evidence::delivery_event(&tx,&self.event_signer,&identity.tenant,&replacement.id,"reception_queued",&serde_json::json!({"actor":identity.subject,"project_id":replacement.project.id,"reprocessed_from":original.id,"received":replacement.received}),now).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
@@ -3290,5 +3313,128 @@ mod tests {
         assert!(store
             .save_delivery_project("missing", "admin", crate::workflow::tests::project())
             .is_err());
+    }
+
+    #[test]
+    fn snapshot_budget_aggregates_the_tenant_column() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .insert_tenant(crate::store::tests::test_tenant("acme"))
+            .unwrap();
+        let project = store
+            .save_delivery_project("acme", "admin", project())
+            .unwrap();
+        let job = store
+            .enqueue_delivery_job("acme", "sender", 1, None, project.clone(), request())
+            .unwrap();
+        let running = store
+            .claim_delivery_job("boot", now_unix())
+            .unwrap()
+            .unwrap();
+        // Drift the stored JSON away from the column: only the indexed
+        // column may feed the budget aggregate.
+        store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE delivery_jobs SET snapshot_bytes=25,
+                        document=json_set(document,'$.checks.snapshot_bytes',100) WHERE id=?1",
+                    params![job.id],
+                )
+            })
+            .unwrap();
+        // A sibling tenant holds snapshot space this tenant must not see.
+        store
+            .with(|connection| {
+                connection.execute(
+                    "INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,document,token)
+                     VALUES ('other-job','other','sender','operation','project','ready',0,'{}','unused')",
+                    [],
+                )?;
+                connection.execute(
+                    "UPDATE delivery_jobs SET snapshot_bytes=1000 WHERE id='other-job'",
+                    [],
+                )
+            })
+            .unwrap();
+        store
+            .reserve_delivery_snapshot(&job.id, running.attempts, 10, 40)
+            .unwrap();
+        let reserved = store.delivery_job(&job.id).unwrap().unwrap();
+        assert_eq!(reserved.checks["snapshot_bytes"], 10);
+        let column: i64 = store
+            .with(|connection| {
+                connection.query_row(
+                    "SELECT snapshot_bytes FROM delivery_jobs WHERE id=?1",
+                    params![job.id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(column, 10);
+        // A second acme job counts the first job's column value against the
+        // same tenant budget.
+        let mut next = request();
+        next.operation_id = "next".into();
+        let second = store
+            .enqueue_delivery_job("acme", "sender", 1, None, project, next)
+            .unwrap();
+        let second_running = store
+            .claim_delivery_job("boot", now_unix())
+            .unwrap()
+            .unwrap();
+        assert_eq!(second_running.id, second.id);
+        let error = store
+            .reserve_delivery_snapshot(&second.id, second_running.attempts, 35, 40)
+            .unwrap_err();
+        assert!(error.contains("budget exhausted"), "{error}");
+        store
+            .reserve_delivery_snapshot(&second.id, second_running.attempts, 29, 40)
+            .unwrap();
+    }
+
+    #[test]
+    fn delivery_job_pages_follow_creation_order_with_state_filter() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let project = store.save_delivery_project("", "admin", project()).unwrap();
+        let mut ids = Vec::new();
+        for number in 0..6 {
+            let mut job_request = request();
+            job_request.operation_id = format!("operation-{number}");
+            let job = store
+                .enqueue_delivery_job("", "sender", 1, None, project.clone(), job_request)
+                .unwrap();
+            ids.push(job.id);
+        }
+        let states = ["queued", "failed", "queued", "ready", "failed", "queued"];
+        store
+            .with(|connection| {
+                for (index, id) in ids.iter().enumerate() {
+                    // Stamp creation order explicitly: same-second inserts
+                    // would otherwise tie and fall back to id order.
+                    connection.execute(
+                        "UPDATE delivery_jobs SET state=?2,created_at=?3 WHERE id=?1",
+                        params![id, states[index], ((index + 1) * 10) as i64],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let chronological = store.delivery_jobs("", "", 10, None, "", "").unwrap();
+        let chronological: Vec<String> = chronological.into_iter().map(|job| job.id).collect();
+        assert_eq!(chronological, ids);
+        let page = store.delivery_jobs("", "", 2, None, "queued", "").unwrap();
+        let page: Vec<String> = page.into_iter().map(|job| job.id).collect();
+        assert_eq!(page, [ids[0].clone(), ids[2].clone()]);
+        let rest = store
+            .delivery_jobs("", &ids[2], 2, None, "queued", "")
+            .unwrap();
+        let rest: Vec<String> = rest.into_iter().map(|job| job.id).collect();
+        assert_eq!(rest, [ids[5].clone()]);
+        let end = store
+            .delivery_jobs("", &ids[5], 2, None, "queued", "")
+            .unwrap();
+        assert!(end.is_empty());
     }
 }

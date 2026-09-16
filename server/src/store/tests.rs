@@ -1503,7 +1503,11 @@ fn schema41_upgrade_preserves_existing_grants_and_can_store_new_addresses() {
              DROP INDEX delivery_jobs_deadline_pending;
              DROP INDEX outbound_fetch_tickets_expires;
              DROP INDEX outbound_grants_open_expires;
+             DROP INDEX delivery_jobs_tenant_created;
+             DROP INDEX delivery_jobs_tenant_snapshot;
              ALTER TABLE outbound_grants DROP COLUMN share_token;
+             ALTER TABLE delivery_jobs DROP COLUMN created_at;
+             ALTER TABLE delivery_jobs DROP COLUMN snapshot_bytes;
              UPDATE meta SET value='41' WHERE key='schema_version';",
             )
         })
@@ -1568,6 +1572,112 @@ fn schema41_upgrade_preserves_existing_grants_and_can_store_new_addresses() {
             Ok(())
         })
         .unwrap();
+}
+
+#[test]
+fn schema45_upgrade_backfills_delivery_job_snapshot_and_created_columns() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    assert_eq!(
+        store
+            .with(|connection| {
+                connection.query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap(),
+        SCHEMA_VERSION.to_string()
+    );
+    // Seed rows the way schema 44 stored them, then strip the 45 columns
+    // and stamp the old version to present a pre-upgrade database.
+    store
+        .with(|connection| {
+            connection.execute_batch(
+                "INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,document,token)
+                 VALUES ('stamped','','sender','operation','project','ready',0,
+                         '{\"created_at\":33,\"checks\":{\"snapshot_bytes\":17}}','unused'),
+                        ('bare','','sender','bare','project','queued',0,'{}','unused');
+                 DROP INDEX delivery_jobs_tenant_created;
+                 DROP INDEX delivery_jobs_tenant_snapshot;
+                 ALTER TABLE delivery_jobs DROP COLUMN created_at;
+                 ALTER TABLE delivery_jobs DROP COLUMN snapshot_bytes;
+                 UPDATE meta SET value='44' WHERE key='schema_version';",
+            )
+        })
+        .unwrap();
+    drop(store);
+    // The upgrade runs inside one transaction, so a restart mid-migration
+    // presents exactly as this 44 database does and the next open reruns
+    // the whole step.
+    let store = Store::open(directory.path()).unwrap();
+    assert_eq!(
+        store
+            .with(|connection| {
+                connection.query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap(),
+        SCHEMA_VERSION.to_string()
+    );
+    let backfilled: Vec<(i64, i64)> = store
+        .with(|connection| {
+            let mut statement = connection
+                .prepare("SELECT created_at,snapshot_bytes FROM delivery_jobs ORDER BY id")?;
+            let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()
+        })
+        .unwrap();
+    assert_eq!(backfilled, [(0, 0), (33, 17)]);
+    let indexes: Vec<String> = store
+        .with(|connection| {
+            connection
+                .prepare(
+                    "SELECT name FROM sqlite_schema WHERE type='index' AND name IN (
+                            'delivery_jobs_tenant_created',
+                            'delivery_jobs_tenant_snapshot'
+                        ) ORDER BY name",
+                )?
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()
+        })
+        .unwrap();
+    assert_eq!(
+        indexes,
+        [
+            "delivery_jobs_tenant_created".to_owned(),
+            "delivery_jobs_tenant_snapshot".to_owned()
+        ]
+    );
+    drop(store);
+    // Restarting an already upgraded database changes nothing.
+    let store = Store::open(directory.path()).unwrap();
+    assert_eq!(
+        store
+            .with(|connection| {
+                connection.query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap(),
+        SCHEMA_VERSION.to_string()
+    );
+    let preserved: i64 = store
+        .with(|connection| {
+            connection.query_row(
+                "SELECT snapshot_bytes FROM delivery_jobs WHERE id='stamped'",
+                [],
+                |row| row.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(preserved, 17);
 }
 
 #[test]
@@ -5014,13 +5124,17 @@ mod settings_tests {
                 "DROP TRIGGER audit_log_count_insert;
                  DROP TRIGGER audit_log_count_delete;
                  DROP TABLE audit_log_count;
+                 DROP INDEX delivery_jobs_tenant_created;
+                 DROP INDEX delivery_jobs_tenant_snapshot;
+                 ALTER TABLE delivery_jobs DROP COLUMN created_at;
+                 ALTER TABLE delivery_jobs DROP COLUMN snapshot_bytes;
                  UPDATE meta SET value='43' WHERE key='schema_version';",
             )
             .unwrap();
         drop(connection);
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "44");
+        assert_eq!(schema_version(directory.path()), "45");
         assert_eq!(store.audit_count().unwrap(), 2);
         store.audit("", "", "third", "three", &serde_json::json!({}));
         assert_eq!(store.audit_count().unwrap(), 3);

@@ -486,7 +486,7 @@ struct ValidatedSettings {
     draining: Option<bool>,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 44;
+pub(crate) const SCHEMA_VERSION: u64 = 45;
 pub(crate) const DELIVERED_CANDIDATE_PAGE: usize = 128;
 pub(crate) const RETENTION_CLOCK_KEY: &str = "retention_clock_trusted_at";
 
@@ -5867,6 +5867,29 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
             transaction
                 .execute("UPDATE meta SET value='44' WHERE key='schema_version'", [])
+                .map_err(|e| e.to_string())?;
+            transaction.commit().map_err(|e| e.to_string())?;
+        }
+        if stored == 44 || stored == 41 || stored == 42 || stored == 43 {
+            validate_schema(connection, 44)?;
+            // One transaction keeps the bump atomic: a restart mid-migration
+            // rolls back to 44 and the next open reruns the whole step. The
+            // two backfill passes over delivery_jobs run once here, bounded
+            // by the table size, instead of per row on the job hot path.
+            let transaction = connection.transaction().map_err(|e| e.to_string())?;
+            transaction
+                .execute_batch(
+                    "ALTER TABLE delivery_jobs ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;
+                     UPDATE delivery_jobs SET created_at=COALESCE(CAST(json_extract(document,'$.created_at') AS INTEGER),0);
+                     ALTER TABLE delivery_jobs ADD COLUMN snapshot_bytes INTEGER NOT NULL DEFAULT 0;
+                     UPDATE delivery_jobs SET snapshot_bytes=COALESCE(CAST(json_extract(document,'$.checks.snapshot_bytes') AS INTEGER),0);",
+                )
+                .map_err(|e| e.to_string())?;
+            transaction
+                .execute_batch(workflows::INDEXES)
+                .map_err(|e| e.to_string())?;
+            transaction
+                .execute("UPDATE meta SET value='45' WHERE key='schema_version'", [])
                 .map_err(|e| e.to_string())?;
             transaction.commit().map_err(|e| e.to_string())?;
         }

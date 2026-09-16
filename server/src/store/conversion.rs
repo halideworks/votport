@@ -549,7 +549,7 @@ fn convert_jobs(
         connection,
         target,
         "delivery_jobs",
-        &["token"],
+        &["token", "created_at", "snapshot_bytes"],
         |connection| {
             let mut statement = connection.prepare("SELECT id,tenant,actor,operation_id,project_id,state,document FROM delivery_jobs ORDER BY rowid")?;
             let mut rows = statement.query([])?;
@@ -615,6 +615,11 @@ fn convert_jobs(
                     params![job.id, raw, serde_json::to_string(&document)?],
                 )?;
             }
+            connection.execute_batch(
+                "UPDATE conversion_delivery_jobs
+                 SET created_at=COALESCE(CAST(json_extract(document,'$.created_at') AS INTEGER),0),
+                     snapshot_bytes=COALESCE(CAST(json_extract(document,'$.checks.snapshot_bytes') AS INTEGER),0);",
+            )?;
             Ok(())
         },
     )?;
