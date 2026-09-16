@@ -316,7 +316,7 @@ pub async fn inspect(
     headers: HeaderMap,
     Json(body): Json<InspectRequest>,
 ) -> ApiResult<Response> {
-    write(&app, &headers)?;
+    let actor = write(&app, &headers)?;
     let (origin, key) = if let Some(invite) = &body.invitation {
         let (origin, _) = invitation(invite)?;
         (origin, Some(invite.document.issuer.as_str()))
@@ -328,7 +328,15 @@ pub async fn inspect(
     };
     // The address is admin-chosen and unverified; the reply says whether a
     // Votport port answered, not how the host failed.
-    let port = probe(&app, &origin, key).await.map_err(|error| {
+    let probed = probe(&app, &origin, key).await;
+    app.store.audit(
+        &actor.tenant,
+        &actor.subject,
+        "trade_port_probed",
+        &origin,
+        &json!({"outcome": if probed.is_ok() { "success" } else { "failure" }}),
+    );
+    let port = probed.map_err(|error| {
         if error.message.contains("identity mismatch") {
             error
         } else {
@@ -355,7 +363,15 @@ pub async fn accept(
         return Err(unprocessable("enter a route name"));
     }
     super::notifications::validate_policy(&app, &actor.tenant, &body.notifications, &TRADE_EVENTS)?;
-    let peer = probe(&app, &origin, Some(&body.invitation.document.issuer)).await?;
+    let probed = probe(&app, &origin, Some(&body.invitation.document.issuer)).await;
+    app.store.audit(
+        &actor.tenant,
+        &actor.subject,
+        "trade_invitation_probed",
+        &origin,
+        &json!({"outcome": if probed.is_ok() { "success" } else { "failure" }}),
+    );
+    let peer = probed?;
     if peer.document.issuer == app.signer.public_hex {
         return Err(invalid("cannot pair a port with itself"));
     }
@@ -1654,5 +1670,187 @@ mod tests {
         let text = serde_json::to_string(&mirrored[0]).unwrap();
         assert!(!text.contains(&old));
         assert!(!text.contains(&next));
+    }
+    #[tokio::test]
+    async fn probe_handlers_record_origin_only_outcome_rows() {
+        let (_directory, app, cookie, _endpoint) = invitation_fixture();
+
+        // Inspect a dead address: the probe is audited even though it fails.
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/trade-routes/inspect")
+                    .header("X-Votport", "1")
+                    .header(header::COOKIE, cookie.clone())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"address":"http://127.0.0.1:1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        // Accepting an invitation that points at a dead port audits the probe
+        // with the invitation address.
+        let invitation = app.signer.port_message(
+            "invitation",
+            "",
+            crate::auth::random_token(),
+            super::now() + 300,
+            json!({
+                "address": "http://127.0.0.1:1",
+                "name": "Dead Port",
+                "endpoint": {
+                    "id": "trade-endpoint",
+                    "name": "Trade endpoint",
+                    "category": "external",
+                    "forwarding": false,
+                    "metadata_keys": [],
+                    "notifications": {"mode": "off", "rules": []}
+                },
+            }),
+        );
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/trade-routes")
+                    .header("X-Votport", "1")
+                    .header(header::COOKIE, cookie.clone())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "invitation": invitation,
+                            "name": "Dead Route",
+                            "notifications": {"mode": "off", "rules": []}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(!response.status().is_success());
+
+        // Storage test against an unreadable shared folder: recorded as a
+        // failure with the folder path as the address.
+        let storage_body = |revision: u64, directory: &str| {
+            json!({
+                "storage": {
+                    "id": "probe_storage",
+                    "revision": revision,
+                    "label": "Probe",
+                    "kind": "folder",
+                    "directory": directory,
+                    "endpoint": "",
+                    "bucket": "",
+                    "region": "",
+                    "prefix": "",
+                    "path_style": false,
+                    "kms_key_id": null,
+                    "tenants": [""],
+                    "enabled": true
+                },
+                "credentials": null
+            })
+        };
+        let save = |revision: u64, directory: &str| {
+            crate::app::router(app.clone()).oneshot(
+                Request::put("/api/workflows/storage")
+                    .header("X-Votport", "1")
+                    .header(header::COOKIE, cookie.clone())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(storage_body(revision, directory).to_string()))
+                    .unwrap(),
+            )
+        };
+        let missing = std::env::temp_dir().join("votport-audit-probe-missing/shared");
+        let response = save(0, missing.to_str().unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/workflows/storage/probe_storage/test")
+                    .header("X-Votport", "1")
+                    .header(header::COOKIE, cookie.clone())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    // The save above bumped the storage to revision 1.
+                    .body(Body::from(json!({"revision": 1}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        // Notification test against a live webhook: success with the URL
+        // reduced to its origin.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let hook_port = listener.local_addr().unwrap().port();
+        let stub = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 2048];
+            let _ = std::io::Read::read(&mut stream, &mut buffer);
+            let _ = std::io::Write::write_all(
+                &mut stream,
+                b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            );
+        });
+        let mut destination: crate::store::NotificationDestination =
+            serde_json::from_value(json!({
+                "id": "probe_hook",
+                "label": "Probe hook",
+                "channel": "webhook",
+                "target": "Audit probe",
+                "enabled": true,
+                "url": format!("http://127.0.0.1:{hook_port}/hook?token=sekret")
+            }))
+            .unwrap();
+        app.store
+            .save_notification_destination("", &mut destination)
+            .unwrap();
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/notifications/probe_hook/test")
+                    .header("X-Votport", "1")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        stub.join().unwrap();
+
+        let rows = app.store.audit_export(Some(""), 0, 0, 100).unwrap();
+        let inspected = rows
+            .iter()
+            .find(|row| row.event == "trade_port_probed")
+            .expect("inspect probe is audited");
+        assert_eq!(inspected.subject, "http://127.0.0.1:1");
+        assert_eq!(inspected.detail["outcome"], json!("failure"));
+        let accepted = rows
+            .iter()
+            .find(|row| row.event == "trade_invitation_probed")
+            .expect("accept probe is audited");
+        assert_eq!(accepted.subject, "http://127.0.0.1:1");
+        assert_eq!(accepted.detail["outcome"], json!("failure"));
+        let storage_row = rows
+            .iter()
+            .find(|row| row.event == "storage_connection_tested")
+            .expect("storage test is audited");
+        assert_eq!(storage_row.subject, "probe_storage");
+        assert_eq!(storage_row.detail["kind"], json!("folder"));
+        assert_eq!(
+            storage_row.detail["address"],
+            json!(missing.to_str().unwrap())
+        );
+        assert_eq!(storage_row.detail["outcome"], json!("failure"));
+        let tested = rows
+            .iter()
+            .find(|row| row.event == "notification_tested")
+            .expect("notification test is audited");
+        assert_eq!(tested.subject, "probe_hook");
+        assert_eq!(tested.detail["outcome"], json!("success"));
+        assert_eq!(
+            tested.detail["url"],
+            json!(format!("http://127.0.0.1:{hook_port}"))
+        );
+        assert!(!tested.detail.to_string().contains("sekret"));
     }
 }

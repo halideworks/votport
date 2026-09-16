@@ -704,6 +704,7 @@ pub(crate) fn upload_completed(
     app: &Arc<App>,
     session_id: &str,
     link_id: Option<String>,
+    client_ip: &str,
     report: &FinishReport,
     runtime: &tokio::runtime::Handle,
 ) {
@@ -731,7 +732,8 @@ pub(crate) fn upload_completed(
         &session_id[..8.min(session_id.len())],
         &serde_json::json!({
             "files": report.files.len(),
-            "bytes": report.files.iter().map(|file| file.bytes).sum::<u64>()
+            "bytes": report.files.iter().map(|file| file.bytes).sum::<u64>(),
+            "client_ip": client_ip
         }),
     );
     {
@@ -1502,6 +1504,7 @@ fn resume_upload_session(
                     .collect::<Vec<_>>(),
             )?,
         ),
+        client_ip: String::new(),
         dest_rel: session.dest_rel.clone(),
         expected_package: session.package.clone(),
         max_total_bytes: session.max_total_bytes.unwrap_or(u64::MAX),
@@ -5503,6 +5506,7 @@ mod push_tests {
                 .child(&["destination".into()])
                 .unwrap(),
             ),
+            client_ip: String::new(),
             dest_rel: String::new(),
             expected_package: missing_setup.expected_package.clone(),
             max_total_bytes: 1,
@@ -6673,8 +6677,25 @@ async fn sweep_daily_at(app: &Arc<App>, retention: RetentionObservation) {
         let cutoff = now.saturating_sub(settings.audit_retention_days.saturating_mul(86_400));
         sweep_task(app, "audit rows", move |app| {
             match app.store.audit_prune(cutoff) {
-                Ok(count) if count > 0 => tracing::info!(count, "pruned expired audit rows"),
-                Ok(_) => {}
+                Ok(count) => {
+                    if count > 0 {
+                        tracing::info!(count, "pruned expired audit rows");
+                    }
+                    // Written after the delete with the current clock, so the
+                    // row survives its own cycle and then ages out under the
+                    // same retention: at most one row per day per instance.
+                    app.store.audit(
+                        "",
+                        "",
+                        "audit_pruned",
+                        "",
+                        &serde_json::json!({
+                            "pruned": count,
+                            "retention_days": settings.audit_retention_days,
+                            "cutoff": cutoff
+                        }),
+                    );
+                }
                 Err(error) => tracing::warn!("audit prune failed: {error}"),
             }
         })
@@ -7693,6 +7714,50 @@ mod retention_tests {
             released,
             "the blocking deletion must finish and release its pin after sweeper cancellation"
         );
+    }
+    #[tokio::test]
+    async fn audit_pruning_records_a_summary_row_that_outlives_its_own_cycle() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let base = now_unix();
+        app.store
+            .put_settings(
+                "platform-operator",
+                &[(
+                    "audit_retention_days".to_owned(),
+                    SettingWrite::Set("1".to_owned()),
+                )],
+            )
+            .unwrap();
+        // Seed one expired row so the cycle provably prunes something.
+        app.store
+            .with(|connection| {
+                connection.execute(
+                    "INSERT INTO audit_log (at, tenant, actor, event, subject, detail)
+                     VALUES (?1, '', '', 'expired_audit', '', '{}')",
+                    [(base.saturating_sub(2 * 86_400) as i64)],
+                )
+            })
+            .unwrap();
+        app.acknowledge_retention_clock_at("platform-operator", base, base)
+            .unwrap();
+        let observation = app
+            .retention_clock
+            .observe_with_elapsed(&app.store, base, Duration::ZERO)
+            .unwrap();
+        assert!(observation.allow_age);
+
+        sweep_daily_at(&app, observation).await;
+
+        let rows = app.store.audit_export(Some(""), 0, 0, 100).unwrap();
+        assert!(rows.iter().all(|row| row.event != "expired_audit"));
+        let row = rows
+            .iter()
+            .find(|row| row.event == "audit_pruned")
+            .expect("pruning records a summary row");
+        assert_eq!(row.detail["pruned"], serde_json::json!(1));
+        assert_eq!(row.detail["retention_days"], serde_json::json!(1));
+        assert!(row.detail["cutoff"].is_number());
     }
 }
 

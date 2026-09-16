@@ -1336,6 +1336,7 @@ pub async fn put_webhook(
             "webhook URL must use HTTPS, except loopback, without embedded credentials".into(),
         ));
     }
+    let previous = app.store.delivery_webhook(&identity.tenant).ok().flatten();
     let hook = app
         .store
         .save_delivery_webhook(
@@ -1346,6 +1347,20 @@ pub async fn put_webhook(
             request.revision,
         )
         .map_err(conflict)?;
+    // Value-free row: the webhook URL may carry query-string credentials, so
+    // only whether it changed and its origin are recorded.
+    app.store.audit(
+        &identity.tenant,
+        &identity.subject,
+        "webhook_changed",
+        "",
+        &json!({
+            "url_changed": previous.as_ref().is_none_or(|hook| hook.url != request.url),
+            "url_origin": crate::api::audit_url(&request.url),
+            "enabled": request.enabled,
+            "revision": hook.revision,
+        }),
+    );
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         Json(json!({"webhook": hook,"signing_secret": hook.secret})),
@@ -1601,6 +1616,7 @@ pub async fn update_notifications(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::testing;
     use crate::delivery_protocol::{AccessProof, Evidence, EvidenceKind, SignedChallenge};
     use axum::http::{Method, Request};
     use http_body_util::BodyExt;
@@ -5066,5 +5082,135 @@ mod tests {
             .0,
             StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    async fn webhook_and_storage_changes_leave_tenant_scoped_redacted_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = testing::build(directory.path());
+        app.store
+            .insert_tenant(crate::store::Tenant {
+                incarnation: String::new(),
+                key: "acme".into(),
+                label: "acme".into(),
+                admin_group: None,
+                max_total_bytes: None,
+                max_links: None,
+                max_sessions: None,
+                created_at: 1,
+            })
+            .unwrap();
+        let tenant_admin = crate::auth::AdminIdentity {
+            subject: "tenant-admin".into(),
+            tenant: "acme".into(),
+            role: "admin".into(),
+            grants: vec![crate::auth::TenantGrant {
+                incarnation: None,
+                tenant: "acme".into(),
+                role: "admin".into(),
+            }],
+            credential_version: 1,
+        };
+        let tenant_cookie = admin::test_admin_cookie(&app, &tenant_admin);
+        let platform_admin = crate::auth::AdminIdentity {
+            subject: "local".into(),
+            tenant: String::new(),
+            role: "admin".into(),
+            grants: vec![crate::auth::TenantGrant {
+                incarnation: None,
+                tenant: String::new(),
+                role: "admin".into(),
+            }],
+            credential_version: 1,
+        };
+        let platform_cookie = admin::test_admin_cookie(&app, &platform_admin);
+
+        // Tenant webhook change: audited in the webhook's tenant without the
+        // URL value or the signing secret.
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::put("/api/workflows/webhook")
+                    .header(header::COOKIE, tenant_cookie.clone())
+                    .header("x-votport", "1")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "url": "https://hooks.example.test/hook?token=sekret-webhook-secret",
+                            "enabled": true,
+                            "revision": 0
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Platform storage change: audited in every served tenant.
+        let save = |label: &str, revision: u64, cookie: String| {
+            crate::app::router(app.clone()).oneshot(
+                Request::put("/api/workflows/storage")
+                    .header(header::COOKIE, cookie)
+                    .header("x-votport", "1")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "storage": {
+                                "id": "audit_store",
+                                "revision": revision,
+                                "label": label,
+                                "kind": "folder",
+                                "directory": "/tmp/votport-audit-store-demo",
+                                "tenants": ["acme"],
+                                "enabled": true
+                            },
+                            "credentials": null
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+        };
+        let response = save("Audit store", 0, platform_cookie.clone())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = save("Renamed store", 1, platform_cookie).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let tenant_rows = app.store.audit_export(Some("acme"), 0, 0, 100).unwrap();
+        // The store mirror writes a coarse webhook_changed row; the API layer
+        // adds the redacted detail row with the acting subject.
+        let webhook = tenant_rows
+            .iter()
+            .find(|row| row.event == "webhook_changed" && row.detail.get("url_origin").is_some())
+            .expect("webhook change is audited");
+        assert_eq!(webhook.tenant, "acme");
+        assert_eq!(webhook.actor, "tenant-admin");
+        assert_eq!(
+            webhook.detail["url_origin"],
+            json!("https://hooks.example.test")
+        );
+        assert_eq!(webhook.detail["url_changed"], json!(true));
+        assert!(!webhook.detail.to_string().contains("sekret"));
+
+        let storage_row = tenant_rows
+            .iter()
+            .find(|row| row.event == "storage_changed" && row.detail["revision"] == json!(2))
+            .expect("storage change is audited in the served tenant");
+        assert_eq!(storage_row.tenant, "acme");
+        assert_eq!(storage_row.subject, "audit_store");
+        assert_eq!(storage_row.detail["changed"], json!(["label"]));
+        assert_eq!(storage_row.detail["tenants"], json!(["acme"]));
+        assert_eq!(storage_row.detail["credentials_saved"], json!(false));
+
+        // The API-layer rows live in the served tenant; any default-tenant
+        // rows are only the store's own coarse delivery-event mirrors.
+        let default_rows = app.store.audit_export(Some(""), 0, 0, 100).unwrap();
+        assert!(default_rows
+            .iter()
+            .all(|row| row.detail.get("credentials_saved").is_none()
+                && row.detail.get("url_origin").is_none()));
     }
 }

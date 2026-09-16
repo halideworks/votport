@@ -726,6 +726,7 @@ pub async fn create_session(
     }
     let announced_bytes = prepared.expected.length;
 
+    let ip = client_ip(&headers, &peer, &app.config.trusted_proxies);
     let session_id = auth::random_token();
     let session_bytes: [u8; 16] = hex::decode(&session_id)
         .ok()
@@ -735,6 +736,7 @@ pub async fn create_session(
         store: Arc::clone(&app.store),
         link_id: prepared.link.id.clone(),
         tenant: prepared.link.tenant.clone(),
+        client_ip: ip.clone(),
         dest_dir: prepared.dest_dir.clone(),
         destinations: Arc::clone(&prepared.destinations),
         dest_rel: prepared.link.dest.clone(),
@@ -777,7 +779,7 @@ pub async fn create_session(
     let store = Arc::clone(&app.store);
     let tenant = prepared.link.tenant.clone();
     let link_id = prepared.link.id.clone();
-    let detail = serde_json::json!({ "session_tag": &session_id[..8.min(session_id.len())], "bytes": announced_bytes });
+    let detail = serde_json::json!({ "session_tag": &session_id[..8.min(session_id.len())], "bytes": announced_bytes, "client_ip": ip });
     tokio::task::spawn_blocking(move || {
         store.audit(&tenant, "", "upload_session_created", &link_id, &detail)
     })
@@ -799,6 +801,7 @@ pub async fn create_push_session(
     let Some(push) = app.push.as_ref() else {
         return Err(ApiError::not_found());
     };
+    let ip = client_ip(&headers, &peer, &app.config.trusted_proxies);
     let prepared = prepare_session(
         &app,
         &token,
@@ -908,6 +911,7 @@ pub async fn create_push_session(
         store: Arc::clone(&app.store),
         link_id: prepared.link.id.clone(),
         tenant: prepared.link.tenant.clone(),
+        client_ip: ip.clone(),
         dest_dir: prepared.dest_dir.clone(),
         destinations,
         dest_rel: prepared.link.dest.clone(),
@@ -1010,7 +1014,8 @@ pub async fn create_push_session(
         &prepared.link.id,
         &json!({
             "session_tag": &session_id[..8.min(session_id.len())],
-            "bytes": prepared.expected.length
+            "bytes": prepared.expected.length,
+            "client_ip": ip
         }),
     );
     drop(admission_guard);
@@ -1190,6 +1195,7 @@ pub async fn upload_finish(
     let session_id = sid.clone();
     let session_tag = sid.get(..8).unwrap_or(&sid).to_owned();
     let task_session_tag = session_tag.clone();
+    let finisher_ip = ip.clone();
     let finish = tokio::spawn(async move {
         let link_id = application.sessions.link_id(&session_id);
         let report = dispatch(&application, &session_id, |reply, _lease| Cmd::Finish {
@@ -1206,6 +1212,7 @@ pub async fn upload_finish(
                 &app_for_completion,
                 &session_id,
                 link_id,
+                &finisher_ip,
                 &report_for_completion,
                 &runtime,
             )
@@ -1320,7 +1327,7 @@ mod session_rate_tests {
         }
     }
 
-    async fn create_received_session(application: &Arc<App>, link_id: &str) -> String {
+    pub(super) async fn create_received_session(application: &Arc<App>, link_id: &str) -> String {
         let bytes = b"finished";
         let mut object = InMemoryObjectBuilder::new(
             Suite::Blake3Bao64,
@@ -1411,7 +1418,7 @@ mod session_rate_tests {
         session
     }
 
-    async fn assert_completed(application: &Arc<App>, link_id: &str) {
+    pub(super) async fn assert_completed(application: &Arc<App>, link_id: &str) {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while application.sessions.active_for_link(link_id) != 0 {
                 tokio::task::yield_now().await;
@@ -3254,6 +3261,102 @@ mod push_preflight_tests {
                 .await
                 .status(),
             StatusCode::OK
+        );
+    }
+    #[tokio::test]
+    async fn upload_audit_rows_record_the_client_ip_of_each_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = push_app(directory.path());
+        application
+            .store
+            .insert_link(open_link("ip-audit"))
+            .unwrap();
+        let holder = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let response = post_push(application.clone(), "ip-audit", request_body(&holder, 8)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // The push transport leaves a live session awaiting the capability;
+        // park it on its own link so the receiving flow below owns this one.
+        application
+            .store
+            .insert_link(open_link("ip-audit-receive"))
+            .unwrap();
+        let push_session = serde_json::from_slice::<serde_json::Value>(
+            &response.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap()["session"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let session =
+            super::session_rate_tests::create_received_session(&application, "ip-audit-receive")
+                .await;
+        let rows = application.store.audit_export(Some(""), 0, 0, 100).unwrap();
+        let admitted = rows
+            .iter()
+            .find(|row| row.event == "push_admitted")
+            .expect("push admission is audited");
+        assert_eq!(admitted.detail["client_ip"], json!("127.0.0.1"));
+        let created = rows
+            .iter()
+            .find(|row| row.event == "upload_session_created")
+            .expect("session creation is audited");
+        assert_eq!(created.detail["client_ip"], json!("127.0.0.1"));
+
+        // Finishing from another address records that request's address.
+        let finish = app::router(application.clone())
+            .oneshot(
+                Request::post(format!("/api/session/{session}/finish"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [192, 0, 2, 6],
+                        4010,
+                    ))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(finish.status(), StatusCode::OK);
+        let rows = application.store.audit_export(Some(""), 0, 0, 100).unwrap();
+        let completed = rows
+            .iter()
+            .find(|row| row.event == "upload_completed")
+            .expect("completion is audited");
+        assert_eq!(completed.detail["client_ip"], json!("192.0.2.6"));
+        // Aborting the parked push session records the end with the
+        // session creator's address.
+        let abort = app::router(application.clone())
+            .oneshot(
+                Request::post(format!("/api/session/{push_session}/abort"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(abort.status(), StatusCode::OK);
+        let rows = application.store.audit_export(Some(""), 0, 0, 100).unwrap();
+        let ended = rows
+            .iter()
+            .find(|row| row.event == "upload_session_ended")
+            .expect("aborted sessions are audited");
+        assert_eq!(ended.detail["client_ip"], json!("127.0.0.1"));
+        assert_eq!(ended.detail["outcome"], json!("cancelled"));
+        // assert_completed's total()==0 check does not hold here: the aborted
+        // unconnected push session stays parked until the quiet-time reaper.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while application.sessions.active_for_link("ip-audit-receive") != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            application
+                .store
+                .uploads_by_id("ip-audit-receive")
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
         );
     }
 }

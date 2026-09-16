@@ -3169,6 +3169,35 @@ pub async fn put_settings(
     let mut writes = Vec::new();
     let mut keys = Vec::new();
     let mut reset = Vec::new();
+    // Old and new values for the audit trail. Secret-bearing settings record
+    // only that the value moved, never the value itself.
+    const SENSITIVE_SETTINGS: &[&str] = &[
+        "smtp_password",
+        "scim_token",
+        "scim_token_previous",
+        "replica_token",
+    ];
+    let current = app.store.settings_map().map_err(ApiError::internal)?;
+    let mut changes = serde_json::Map::new();
+    fn record_change(
+        key: &str,
+        old: Option<&String>,
+        new: Option<&str>,
+        changes: &mut serde_json::Map<String, serde_json::Value>,
+    ) {
+        changes.insert(
+            key.to_owned(),
+            if SENSITIVE_SETTINGS.contains(&key) {
+                json!({
+                    "changed": old.map(String::as_str) != new,
+                    "from_set": old.is_some(),
+                    "to_set": new.is_some(),
+                })
+            } else {
+                json!({ "from": old, "to": new })
+            },
+        );
+    }
     for key in SETTINGS_KEYS {
         let Some(value) = object.get(*key) else {
             continue;
@@ -3200,15 +3229,21 @@ pub async fn put_settings(
                 crate::store::SettingWrite::Set(text),
             ) if !text.is_empty() => {
                 if *key == "scim_token" {
-                    if let Some(current) = app
+                    if let Some(previous) = app
                         .store
                         .setting("scim_token")
                         .map_err(ApiError::internal)?
                     {
-                        if !current.is_empty() && !object.contains_key("scim_token_previous") {
+                        if !previous.is_empty() && !object.contains_key("scim_token_previous") {
+                            record_change(
+                                "scim_token_previous",
+                                current.get("scim_token_previous"),
+                                Some(previous.as_str()),
+                                &mut changes,
+                            );
                             writes.push((
                                 "scim_token_previous".to_owned(),
-                                crate::store::SettingWrite::Set(current),
+                                crate::store::SettingWrite::Set(previous),
                             ));
                             keys.push("scim_token_previous".to_owned());
                         }
@@ -3222,6 +3257,15 @@ pub async fn put_settings(
             crate::store::SettingWrite::Reset => reset.push((*key).to_owned()),
             crate::store::SettingWrite::Set(_) => keys.push((*key).to_owned()),
         }
+        record_change(
+            key,
+            current.get(*key),
+            match &write {
+                crate::store::SettingWrite::Set(value) => Some(value.as_str()),
+                crate::store::SettingWrite::Reset => None,
+            },
+            &mut changes,
+        );
         writes.push(((*key).to_owned(), write));
     }
     if !writes.is_empty() {
@@ -3240,7 +3284,7 @@ pub async fn put_settings(
             &identity.subject,
             "settings_updated",
             "",
-            &json!({ "keys": keys, "reset": reset }),
+            &json!({ "keys": keys, "reset": reset, "changes": changes }),
         );
     }
     settings_response(app, identity).await
@@ -9868,6 +9912,99 @@ mod settings_api_tests {
             .resolved_settings(&application.config)
             .unwrap();
         assert_eq!(resolved.audit_retention_days, 400);
+    }
+    #[tokio::test]
+    async fn settings_audit_rows_record_change_shape_without_secret_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = cookie_for(&application, "", "admin");
+        let put = |value: serde_json::Value| {
+            app::router(application.clone()).oneshot(
+                Request::put("/api/admin/settings")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(value.to_string()))
+                    .unwrap(),
+            )
+        };
+
+        let response = put(json!({
+            "smtp_host": "smtp1.example.test",
+            "smtp_password": "hunter2hunter2"
+        }))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let row = application
+            .store
+            .audit_export(Some(""), 0, 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.event == "settings_updated")
+            .expect("settings changes are audited");
+        assert_eq!(
+            row.detail["changes"]["smtp_host"],
+            json!({
+                "from": serde_json::Value::Null,
+                "to": "smtp1.example.test"
+            })
+        );
+        assert_eq!(
+            row.detail["changes"]["smtp_password"],
+            json!({"changed": true, "from_set": false, "to_set": true})
+        );
+        assert!(!row.detail.to_string().contains("hunter2"));
+
+        // Rotating the SCIM token moves the old value into scim_token_previous;
+        // that move is recorded as a value-free sensitive change too.
+        let response = put(json!({"scim_token": "first-scim-token-1234"}))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = put(json!({"scim_token": "second-scim-token-5678"}))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let row = application
+            .store
+            .audit_export(Some(""), 0, 0, 100)
+            .unwrap()
+            .into_iter()
+            .rfind(|row| row.event == "settings_updated")
+            .unwrap();
+        assert_eq!(
+            row.detail["changes"]["scim_token_previous"],
+            json!({"changed": true, "from_set": false, "to_set": true})
+        );
+        assert_eq!(
+            row.detail["changes"]["scim_token"],
+            json!({"changed": true, "from_set": true, "to_set": true})
+        );
+        let detail = row.detail.to_string();
+        assert!(!detail.contains("first-scim-token-1234"));
+        assert!(!detail.contains("second-scim-token-5678"));
+
+        // Resets record the value they removed.
+        let response = put(json!({"smtp_host": serde_json::Value::Null}))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let row = application
+            .store
+            .audit_export(Some(""), 0, 0, 100)
+            .unwrap()
+            .into_iter()
+            .rfind(|row| row.event == "settings_updated")
+            .unwrap();
+        assert_eq!(row.detail["reset"], json!(["smtp_host"]));
+        assert_eq!(
+            row.detail["changes"]["smtp_host"],
+            json!({
+                "from": "smtp1.example.test",
+                "to": serde_json::Value::Null
+            })
+        );
     }
 }
 

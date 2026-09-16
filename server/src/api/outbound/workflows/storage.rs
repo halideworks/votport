@@ -321,10 +321,95 @@ pub async fn put(
         return Err(conflict("Manage paired routes in Trade routes".into()));
     }
     body.storage.validate().map_err(conflict)?;
+    let previous = app
+        .store
+        .delivery_storages()
+        .map_err(crate::api::store_unavailable)?
+        .into_iter()
+        .find(|config| config.id == body.storage.id);
+    let credentials_saved = matches!(
+        body.credentials,
+        Some(Credentials::AccessKey { .. } | Credentials::Votport { .. })
+    );
     let storage = app
         .store
         .save_delivery_storage(&identity.subject, body.storage, body.credentials)
         .map_err(conflict)?;
+    // Value-free row: S3 endpoints may embed query credentials, so only the
+    // origin and which fields changed are recorded.
+    let changed: Vec<&str> = match &previous {
+        None => vec![
+            "label",
+            "kind",
+            "endpoint",
+            "bucket",
+            "region",
+            "prefix",
+            "path_style",
+            "kms_key_id",
+            "directory",
+            "tenants",
+            "enabled",
+        ],
+        Some(prev) => {
+            let mut changed = Vec::new();
+            if prev.label != storage.label {
+                changed.push("label");
+            }
+            if prev.kind != storage.kind {
+                changed.push("kind");
+            }
+            if prev.endpoint != storage.endpoint {
+                changed.push("endpoint");
+            }
+            if prev.bucket != storage.bucket {
+                changed.push("bucket");
+            }
+            if prev.region != storage.region {
+                changed.push("region");
+            }
+            if prev.prefix != storage.prefix {
+                changed.push("prefix");
+            }
+            if prev.path_style != storage.path_style {
+                changed.push("path_style");
+            }
+            if prev.kms_key_id != storage.kms_key_id {
+                changed.push("kms_key_id");
+            }
+            if prev.directory != storage.directory {
+                changed.push("directory");
+            }
+            if prev.tenants != storage.tenants {
+                changed.push("tenants");
+            }
+            if prev.enabled != storage.enabled {
+                changed.push("enabled");
+            }
+            changed
+        }
+    };
+    let detail = json!({
+        "changed": changed,
+        "endpoint": crate::api::audit_url(&storage.endpoint),
+        "tenants": storage.tenants.clone(),
+        "credentials_saved": credentials_saved,
+        "revision": storage.revision,
+    });
+    let audiences: Vec<String> = if storage.tenants.is_empty() {
+        vec![String::new()]
+    } else {
+        storage.tenants.clone()
+    };
+    for tenant in audiences {
+        app.store.audit(
+            &tenant,
+            &identity.subject,
+            "storage_changed",
+            &storage.id,
+            &detail,
+        );
+    }
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(storage)).into_response())
 }
 
@@ -360,8 +445,10 @@ pub async fn test_connection(
             "Storage changed. Save or reload it before testing.".into(),
         ));
     }
-    let message = match config.kind {
-        StorageKind::S3 => {
+    // Both probe outcomes are audited, so each arm yields its result instead
+    // of returning early.
+    let attempt: ApiResult<&'static str> = match config.kind {
+        StorageKind::S3 => async {
             let store = config.connect(&app.store).map_err(conflict)?;
             let prefix = if config.prefix.is_empty() {
                 None
@@ -375,8 +462,9 @@ pub async fn test_connection(
             if !matches!(result, Ok(Ok(_))) {
                 return Err(conflict("Could not list this storage location. Check the endpoint, bucket, credentials and list permission, then try again.".into()));
             }
-            "Connection verified. Bucket listing works; exports also require permission to write objects."
+            Ok("Connection verified. Bucket listing works; exports also require permission to write objects.")
         }
+        .await,
         StorageKind::Folder => {
             let config = config.clone();
             tokio::task::spawn_blocking(move || {
@@ -387,10 +475,10 @@ pub async fn test_connection(
                 Ok::<_, ApiError>(())
             })
             .await
-            .map_err(|_| ApiError::internal("shared folder check failed"))??;
-            "Connection verified. The server can read this shared folder; mirroring also requires write permission."
+            .map_err(|_| ApiError::internal("shared folder check failed"))?
+            .map(|_| "Connection verified. The server can read this shared folder; mirroring also requires write permission.")
         }
-        StorageKind::Votport => {
+        StorageKind::Votport => async {
             let Some(Credentials::Votport {
                 request_url,
                 password,
@@ -444,9 +532,28 @@ pub async fn test_connection(
                     ));
                 }
             }
-            "Connection verified. The destination port is accepting files into this receive request."
+            Ok("Connection verified. The destination port is accepting files into this receive request.")
         }
+        .await,
     };
+    // Origin-only address: S3 endpoints may embed credentials in the query.
+    let address = if matches!(config.kind, StorageKind::Folder) {
+        config.directory.clone()
+    } else {
+        crate::api::audit_url(&config.endpoint)
+    };
+    app.store.audit(
+        &identity.tenant,
+        &identity.subject,
+        "storage_connection_tested",
+        &config.id,
+        &json!({
+            "kind": config.kind,
+            "address": address,
+            "outcome": if attempt.is_ok() { "success" } else { "failure" }
+        }),
+    );
+    let message = attempt?;
     app.store
         .delivery_storage_credentials(&id, body.revision)
         .map_err(conflict)?;

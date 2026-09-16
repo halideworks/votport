@@ -290,6 +290,22 @@ pub async fn test(
         return Err(invalid("Enable this destination before testing"));
     }
     let result = crate::notify::test_destination(&app, &identity.tenant, &destination).await;
+    // Origin only: webhook and ntfy URLs commonly carry their token in the
+    // query string or path, which must not reach the audit log.
+    let mut detail = json!({
+        "channel": destination.channel,
+        "outcome": if result.is_ok() { "success" } else { "failure" },
+    });
+    if !destination.url.is_empty() {
+        detail["url"] = json!(crate::api::audit_url(&destination.url));
+    }
+    app.store.audit(
+        &identity.tenant,
+        &identity.subject,
+        "notification_tested",
+        &destination.id,
+        &detail,
+    );
     Ok((
         if result.is_ok() {
             StatusCode::OK
