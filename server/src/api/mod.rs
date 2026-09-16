@@ -85,6 +85,18 @@ fn client_ip(
         .unwrap_or_else(|| peer.ip().to_string())
 }
 
+/// Origin-only form of an admin-supplied URL for audit rows: anything that
+/// can carry a credential (path token, query string, userinfo, fragment)
+/// never reaches the audit log. Unparsable input is marked, not echoed.
+pub(crate) fn audit_url(url: &str) -> String {
+    if url.is_empty() {
+        return String::new();
+    }
+    reqwest::Url::parse(url)
+        .map(|parsed| parsed.origin().ascii_serialization())
+        .unwrap_or_else(|_| "<unparsable url>".to_owned())
+}
+
 fn parse_forwarded(value: &str) -> Option<String> {
     if let Ok(ip) = value.parse::<std::net::IpAddr>() {
         return Some(ip.to_string());

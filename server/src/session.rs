@@ -169,6 +169,9 @@ pub struct WorkerSetup {
     pub store: Arc<Store>,
     pub link_id: String,
     pub tenant: String,
+    /// Client address taken at session creation; empty on resume after a
+    /// restart, where no request supplied it.
+    pub client_ip: String,
     /// Absolute directory this session publishes into.
     pub dest_dir: PathBuf,
     pub destinations: Arc<crate::receiving::Destinations>,
@@ -2540,7 +2543,7 @@ pub fn commit_persisted_interruption(
         replayed_chunks: 0,
         rejected_chunks: 0,
     };
-    let _ = record_session_event(store, ended, &session.tenant, &session.link_id, event);
+    let _ = record_session_event(store, ended, &session.tenant, &session.link_id, "", event);
 }
 
 fn commit_upload(
@@ -3145,6 +3148,7 @@ impl PushReceive {
             &self.app,
             &sid,
             Some(self.setup.link_id.clone()),
+            &self.setup.client_ip,
             &report,
             &self.runtime,
         );
@@ -3856,6 +3860,7 @@ fn record_event(
         &setup.ended,
         &setup.tenant,
         &setup.link_id,
+        &setup.client_ip,
         event,
     );
 }
@@ -3865,6 +3870,7 @@ fn record_session_event(
     ended_sender: &mpsc::UnboundedSender<SessionEnded>,
     tenant: &str,
     link_id: &str,
+    client_ip: &str,
     event: crate::store::SessionEvent,
 ) -> Result<bool, String> {
     tracing::warn!(
@@ -3881,7 +3887,8 @@ fn record_session_event(
         &serde_json::json!({
             "outcome": event.outcome,
             "received_bytes": event.received_bytes,
-            "expected_bytes": event.expected_bytes
+            "expected_bytes": event.expected_bytes,
+            "client_ip": client_ip
         }),
     );
     crate::app::TRANSFERS.ended(&event.outcome);
@@ -5349,6 +5356,7 @@ mod push_tests {
             store: Arc::clone(&app.store),
             link_id: "link".to_owned(),
             tenant: String::new(),
+            client_ip: String::new(),
             dest_dir: directory.join("receive"),
             destinations: Arc::new(
                 crate::receiving::Destinations::configured(&directory.join("receive"), &app.store)
@@ -5385,6 +5393,7 @@ mod push_tests {
             &ended_sender,
             "",
             "deleted-link",
+            "",
             crate::store::SessionEvent {
                 at: 2,
                 started_at: 1,

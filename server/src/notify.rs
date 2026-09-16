@@ -1721,6 +1721,7 @@ pub(crate) mod tests {
             &application,
             "session-id",
             Some("link-id".into()),
+            "",
             &report,
             &tokio::runtime::Handle::current(),
         );
