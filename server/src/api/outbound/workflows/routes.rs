@@ -525,6 +525,9 @@ pub(super) async fn attempt_revocation(
 }
 
 pub async fn control_worker(app: Arc<App>) {
+    let mut claim_dedupe = super::super::ErrorDeduper::new("route revocation claim");
+    let mut record_dedupe = super::super::ErrorDeduper::new("route revocation status record");
+    let mut pinned_notice = super::super::SkipNotice::new();
     loop {
         if app.lease_lost.load(std::sync::atomic::Ordering::Relaxed) || app.is_stopping() {
             return;
@@ -533,12 +536,32 @@ pub async fn control_worker(app: Arc<App>) {
             match app.store.claim_route_revocation(now_unix()) {
                 Ok(Some(control)) => {
                     if let Err(error) = attempt_revocation(&app, &control).await {
-                        tracing::error!(%error,"record route revocation status");
+                        if record_dedupe.observe(&error, std::time::Instant::now()) {
+                            tracing::error!(%error,"record route revocation status");
+                        }
+                    } else {
+                        record_dedupe.recovered();
                     }
                     continue;
                 }
-                Err(error) => tracing::error!(%error,"claim route revocation"),
-                Ok(None) => {}
+                Err(error) => {
+                    if claim_dedupe.observe(&error, std::time::Instant::now()) {
+                        tracing::error!(%error,"claim route revocation");
+                    }
+                }
+                Ok(None) => {
+                    claim_dedupe.recovered();
+                }
+            }
+        } else {
+            match pinned_notice.due(std::time::Instant::now()) {
+                super::super::SkipLevel::First => tracing::info!(
+                    "route revocation worker iteration skipped; the platform tenant is pinned"
+                ),
+                super::super::SkipLevel::Repeat => tracing::debug!(
+                    "route revocation worker iteration skipped; the platform tenant is pinned"
+                ),
+                super::super::SkipLevel::Silent => {}
             }
         }
         tokio::select! { _ = app.wait_for_shutdown() => return, _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {} }

@@ -1268,7 +1268,9 @@ impl App {
 /// checkpoints and leaves its staging on disk for [`build`] to re-attach.
 /// Called once the server has stopped serving, so no handler can reach a
 /// session. A worker that does not answer in time is left to the process
-/// exit, which is the crash path the checkpoint already covers.
+/// exit, which is the crash path the checkpoint already covers. The summary
+/// counts only sessions whose suspend reply reports a persisted checkpoint;
+/// failures are named so an operator can see what a restart inherits.
 pub async fn suspend_sessions(app: &App) {
     let senders = app.sessions.take_http();
     let count = senders.len();
@@ -1280,13 +1282,50 @@ pub async fn suspend_sessions(app: &App) {
         tokio::spawn(async move {
             let (reply, done) = tokio::sync::oneshot::channel();
             if sender.send(session::Cmd::Suspend { reply }).await.is_ok() {
-                let _ = done.await;
+                done.await.ok()
+            } else {
+                None
             }
         })
     }));
     match tokio::time::timeout(std::time::Duration::from_secs(30), all).await {
-        Ok(_) => tracing::info!(count, "suspended upload sessions for restart"),
+        Ok(replies) => {
+            // A joined-but-panicked worker counts as unanswered, like a
+            // worker that never sent or replied.
+            summarize_suspend(
+                replies
+                    .into_iter()
+                    .map(|joined| joined.unwrap_or(None))
+                    .collect(),
+            );
+        }
         Err(_) => tracing::warn!(count, "suspending upload sessions timed out"),
+    }
+}
+
+/// Logs the suspend summary from the collected replies: `Ok` replies count
+/// toward the suspended total, everything else becomes a named failure.
+/// Split from [`suspend_sessions`] so tests can pin the summary without
+/// driving real workers.
+fn summarize_suspend(replies: Vec<Option<Result<(), String>>>) {
+    let mut suspended = 0;
+    let mut failures = Vec::new();
+    for reply in replies {
+        match reply {
+            Some(Ok(())) => suspended += 1,
+            Some(Err(error)) => failures.push(error),
+            None => failures.push("worker did not answer the suspend command".to_owned()),
+        }
+    }
+    if failures.is_empty() {
+        tracing::info!(count = suspended, "suspended upload sessions for restart");
+    } else {
+        tracing::warn!(
+            suspended,
+            failed = failures.len(),
+            "suspended upload sessions with failures: {}",
+            failures.join("; ")
+        );
     }
 }
 
@@ -1527,6 +1566,7 @@ fn resume_upload_session(
         started_at: session.started_at,
         quiet_after_secs: session::quiet_after_secs(config.session_idle_secs),
         ended: ended.clone(),
+        checkpoint_warn: session::CheckpointWarnPacer::new(),
     };
     if let Some(key) = &session.push_key {
         if key.len() != 32 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -3486,7 +3526,7 @@ mod health_tests {
         else {
             panic!("a blocked worker must not prevent another worker suspending");
         };
-        reply.send(()).unwrap();
+        reply.send(Ok(())).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(35), shutdown)
             .await
             .expect("a full worker queue must not bypass the 30-second shutdown deadline")
@@ -3505,7 +3545,128 @@ mod health_tests {
         else {
             panic!("the pending suspension must still reach a recovered worker");
         };
-        reply.send(()).unwrap();
+        reply.send(Ok(())).unwrap();
+    }
+
+    /// Drives `suspend_sessions` against manually answered workers and
+    /// returns the log records it emitted, so the summary can be pinned
+    /// without asserting on a real NAS checkpoint.
+    async fn suspend_summary_records(
+        app: std::sync::Arc<App>,
+        answers: Vec<Result<(), String>>,
+    ) -> Vec<serde_json::Value> {
+        use tracing::instrument::WithSubscriber;
+        let mut receivers = Vec::new();
+        for (index, _) in answers.iter().enumerate() {
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            app.sessions
+                .insert_resumed(
+                    format!("worker-{index}"),
+                    "link".into(),
+                    String::new(),
+                    0,
+                    sender,
+                )
+                .unwrap();
+            receivers.push(receiver);
+        }
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let writer = log.reopen().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.try_clone().unwrap())
+            .finish();
+        let suspend =
+            tokio::spawn(async move { suspend_sessions(&app).await }.with_subscriber(subscriber));
+        for (mut receiver, answer) in receivers.into_iter().zip(answers) {
+            let Some(session::Cmd::Suspend { reply }) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+                    .await
+                    .unwrap()
+            else {
+                panic!("suspend must reach every worker");
+            };
+            let _ = reply.send(answer);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(35), suspend)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::read_to_string(log.path())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn suspend_summary_counts_only_persisted_sessions() {
+        use tracing::instrument::WithSubscriber;
+        let failure = "checkpoint failed; staging kept".to_owned();
+        // Mixed through the real path: only the persisted session counts
+        // toward the suspended total and the failure is named.
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let records = suspend_summary_records(
+            app,
+            vec![Ok(()), Err(failure.clone()), Err(failure.clone())],
+        )
+        .await;
+        let summary = records
+            .iter()
+            .find(|record| {
+                record["fields"]["message"].as_str().is_some_and(|message| {
+                    message.contains("suspended upload sessions with failures")
+                })
+            })
+            .unwrap_or_else(|| panic!("no suspend summary in {records:?}"));
+        assert_eq!(summary["fields"]["suspended"], 1);
+        assert_eq!(summary["fields"]["failed"], 2);
+        assert!(
+            summary["fields"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(&failure),
+            "failures must be named: {summary}"
+        );
+        // All-fail: zero sessions count toward the suspended total.
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let writer = log.reopen().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.try_clone().unwrap())
+            .finish();
+        async {
+            summarize_suspend(vec![Some(Err(failure.clone())), Some(Err(failure.clone()))]);
+        }
+        .with_subscriber(subscriber)
+        .await;
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(log.path())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let summary = records
+            .iter()
+            .find(|record| {
+                record["fields"]["message"].as_str().is_some_and(|message| {
+                    message.contains("suspended upload sessions with failures")
+                })
+            })
+            .unwrap_or_else(|| panic!("no suspend summary in {records:?}"));
+        assert_eq!(summary["fields"]["suspended"], 0);
+        assert_eq!(summary["fields"]["failed"], 2);
+        assert!(
+            summary["fields"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(&failure),
+            "failures must be named: {summary}"
+        );
     }
 
     #[tokio::test]
@@ -5529,6 +5690,7 @@ mod push_tests {
             started_at: crate::store::now_unix(),
             quiet_after_secs: 5,
             ended: application.session_ended.clone(),
+            checkpoint_warn: session::CheckpointWarnPacer::new(),
         };
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let (seams, stale_handle) = session::push_seams(

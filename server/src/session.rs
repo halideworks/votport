@@ -122,8 +122,11 @@ pub enum Cmd {
         _lease: SessionLease,
     },
     /// Process shutdown: checkpoint, keep staging on disk for boot
-    /// re-attach, and exit.
-    Suspend { reply: oneshot::Sender<()> },
+    /// re-attach, and exit. The reply reports whether the checkpoint
+    /// persisted; an error means the resume point stopped advancing.
+    Suspend {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -189,6 +192,9 @@ pub struct WorkerSetup {
     pub quiet_after_secs: u64,
     /// Where an ended session reports for the failure notification.
     pub ended: mpsc::UnboundedSender<SessionEnded>,
+    /// Paces checkpoint-failure warnings so a persistently failing
+    /// checkpoint stays visible without flooding the log.
+    pub checkpoint_warn: CheckpointWarnPacer,
 }
 
 /// A session that ended without publishing, as handed to the notifier.
@@ -628,6 +634,10 @@ fn spawn_worker_from(
         let mut persist = PersistTracker::new();
         let mut rebegin = resumed;
         let mut suspended = false;
+        // Consecutive mid-transfer checkpoints that failed to persist. The
+        // rate-limited warning keeps the failure visible; this counter lets
+        // the accept path report when the resume point recovers.
+        let mut checkpoint_failures: u64 = 0;
         let mut replays: u64 = 0;
         let mut rejected: u64 = 0;
         let mut last_error: Option<String> = None;
@@ -842,7 +852,20 @@ fn spawn_worker_from(
                     // time floor, never per batch, so the fsync never paces accept.
                     if persist.should_checkpoint(received - received_before) {
                         if let Phase::Receiving { files } = &mut phase {
-                            checkpoint_session(&setup, files);
+                            if checkpoint_session(&setup, files) {
+                                // A failing checkpoint stops the resume point
+                                // from advancing, so its recovery is worth one
+                                // line naming how long the transfer flew dark.
+                                if checkpoint_failures > 0 {
+                                    tracing::info!(
+                                        failures = checkpoint_failures,
+                                        "mid-transfer checkpoint recovered; the resume point advances again"
+                                    );
+                                    checkpoint_failures = 0;
+                                }
+                            } else {
+                                checkpoint_failures += 1;
+                            }
                         }
                     }
                 }
@@ -875,10 +898,14 @@ fn spawn_worker_from(
                     // Checkpoint the exact prefix, then release the staging
                     // handles without removing the files: boot re-attaches
                     // them. Sessions before begin have nothing persisted.
-                    preserve_phase(&setup, &mut phase);
+                    let persisted = preserve_phase(&setup, &mut phase);
                     suspended = true;
                     phase = Phase::Done;
-                    let _ = reply.send(());
+                    let _ = reply.send(if persisted {
+                        Ok(())
+                    } else {
+                        Err("checkpoint failed; the resume point keeps its last persisted state and the staging stays on disk for recovery".to_owned())
+                    });
                 }
             }
             if matches!(phase, Phase::Done) {
@@ -1248,9 +1275,57 @@ fn checkpoint_files<'a>(
     Ok(())
 }
 
+/// Bounds checkpoint-failure warnings per session: the first failure logs
+/// immediately, repeats at most once per interval. A failing checkpoint
+/// would otherwise warn once per 256 MiB, about 20 lines per second per
+/// transfer at 40 GbE.
+const CHECKPOINT_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Per-session warning budget for [`checkpoint_session`]. Lives on
+/// [`WorkerSetup`] so every checkpoint of one session shares the budget.
+pub struct CheckpointWarnPacer {
+    last_at: Mutex<Option<Instant>>,
+}
+
+impl CheckpointWarnPacer {
+    pub fn new() -> Self {
+        Self {
+            last_at: Mutex::new(None),
+        }
+    }
+
+    /// True when a failure at `now` must be logged: the first failure of a
+    /// session always, afterwards at most once per
+    /// [`CHECKPOINT_WARN_INTERVAL`]. `now` is injected so tests can pin the
+    /// pacing decision without a clock.
+    fn should_log_at(&self, now: Instant) -> bool {
+        let mut last = self.last_at.lock().expect("checkpoint warn pacer poisoned");
+        let due = last.is_none_or(|at| now.duration_since(at) >= CHECKPOINT_WARN_INTERVAL);
+        if due {
+            *last = Some(now);
+        }
+        due
+    }
+
+    fn should_log(&self) -> bool {
+        self.should_log_at(Instant::now())
+    }
+}
+
+impl Default for CheckpointWarnPacer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn checkpoint_session(setup: &WorkerSetup, files: &mut [FileState]) -> bool {
     if let Err(error) = checkpoint_files(setup, files.iter().enumerate()) {
-        tracing::warn!(%error, "checkpoint upload session failed");
+        if setup.checkpoint_warn.should_log() {
+            tracing::warn!(
+                %error,
+                "checkpoint upload session failed; the resume point stops advancing until a checkpoint succeeds"
+            );
+        }
         return false;
     }
     forget_publications(files)
@@ -2418,14 +2493,19 @@ fn handle_finish(
 /// A session that ends without finishing still leaves its published files
 /// on disk. Record them as a partial upload so retention, dedupe, and the
 /// operator listing see them; without a record they would be orphans.
-fn preserve_phase(setup: &WorkerSetup, phase: &mut Phase) {
+/// Returns whether the final checkpoint persisted, so shutdown can report
+/// an honest suspend result.
+fn preserve_phase(setup: &WorkerSetup, phase: &mut Phase) -> bool {
     if let Phase::Receiving { files } = phase {
-        checkpoint_session(setup, files);
+        let persisted = checkpoint_session(setup, files);
         for file in files {
             if let Some(native) = file.native.take() {
                 native.abandon();
             }
         }
+        persisted
+    } else {
+        true
     }
 }
 
@@ -5385,6 +5465,7 @@ mod push_tests {
             started_at: 1,
             quiet_after_secs: 5,
             ended: mpsc::unbounded_channel().0,
+            checkpoint_warn: CheckpointWarnPacer::new(),
         }
     }
 
@@ -8956,5 +9037,21 @@ mod parallel_accept_tests {
         assert_eq!(slow.bytes_since, 0);
         // 0 bytes at any age: no dirty work means no checkpoint.
         assert!(!slow.should_checkpoint_at(0, start + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn checkpoint_warn_pacer_logs_first_failure_then_paces() {
+        let start = Instant::now();
+        let pacer = CheckpointWarnPacer::new();
+        // The first failure logs immediately.
+        assert!(pacer.should_log_at(start));
+        // Repeats inside the interval stay quiet, so a failing checkpoint
+        // on a fast transfer no longer warns once per 256 MiB.
+        assert!(!pacer.should_log_at(start + Duration::from_secs(1)));
+        assert!(!pacer.should_log_at(start + CHECKPOINT_WARN_INTERVAL - Duration::from_millis(1)));
+        // After the interval the next failure is visible again, so a
+        // persistently failing checkpoint cannot go silent.
+        assert!(pacer.should_log_at(start + CHECKPOINT_WARN_INTERVAL));
+        assert!(!pacer.should_log_at(start + CHECKPOINT_WARN_INTERVAL + Duration::from_secs(1)));
     }
 }
