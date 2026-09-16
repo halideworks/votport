@@ -56,6 +56,9 @@ const browser = await browserType.launch({
   env: { ...process.env, LANG: "C.UTF-8", LC_ALL: "C.UTF-8" },
 });
 const context = await browser.newContext();
+// Starved CI runners can exceed the 30 second default for load events; the
+// suite's semantics only need the page loaded, not loaded fast.
+context.setDefaultNavigationTimeout(60000);
 const page = await context.newPage();
 page.on("dialog", (dialog) => dialog.accept());
 const errors = [];
@@ -2176,8 +2179,14 @@ await stopPage.waitForSelector("#separate-download-confirm[open]");
 await stopPage.click("#separate-download-start");
 await stopAfterSecondRequest;
 await stopPage.waitForSelector("#separate-download-stop[hidden]", { state: "hidden" });
-await stopPage.waitForTimeout(100);
+// Download events can lag the request status text on loaded runners, so poll
+// for both events on an interval instead of assuming a fixed delay.
+const stoppedDownloadsDeadline = Date.now() + 5000;
+while (stoppedAnchorDownloads < 2 && Date.now() < stoppedDownloadsDeadline) {
+  await new Promise((resolve) => setTimeout(resolve, 50));
+}
 stopPage.off("download", countStoppedDownloads);
+await stopPage.waitForTimeout(150);
 const stoppedStatus = await stopPage.textContent("#separate-download-status");
 if (!stoppedStatus.includes("Requested 2 of 12 downloads. Remaining requests stopped.")) {
   throw new Error(`anchor stop status: ${stoppedStatus}`);
