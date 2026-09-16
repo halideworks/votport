@@ -49,10 +49,48 @@ exceptions = [
     { name = "uniffi_udl", version = "=0.31.2", allow = ["MPL-2.0"] },
 ]
 
-# Informational today (duplicates warn, none banned); add `deny` entries here
-# when a crate must be kept out.
+# Duplicates stay informational (warn). The deny list below fails cargo-deny
+# if a C-and-assembly crypto stack beyond the three known ones appears in
+# either tree, or if rustls ships a version that could change its provider
+# architecture. Removing one of the known stacks is dependency surgery outside
+# this file; note cargo-deny skips cannot exempt a deny entry (verified with
+# cargo-deny 0.20), so the known stacks are deliberately absent from the deny
+# list and documented here instead:
+# - ring: the provider reqwest 0.12's rustls-tls, lettre, and
+#   vot-transport-tcp select for rustls (cargo tree -i ring).
+# - aws-lc-sys: the aws-lc-rs provider object_store (via reqwest 0.13) and
+#   rcgen's aws_lc_rs feature select for rustls (cargo tree -i aws-lc-sys).
+# - boring-sys: the patched halideworks quiche fork links BoringSSL for QUIC
+#   via vot-transport-quiche (cargo tree -i boring-sys).
 [bans]
 multiple-versions = "warn"
+
+deny = [
+    { name = "openssl-sys", reason = "OpenSSL would be a fourth crypto stack; none of our clients link it" },
+    { name = "rustls", version = ">0.23", reason = "re-review any rustls that changes provider architecture (e.g. built-in crypto)" },
+    { name = "mbedtls-sys", reason = "Mbed TLS would be a fourth crypto stack" },
+    { name = "wolfssl", reason = "wolfSSL would be a fourth crypto stack" },
+    { name = "wolfssl-sys", reason = "wolfSSL would be a fourth crypto stack" },
+    { name = "sodium", reason = "libsodium would be a fourth crypto stack" },
+    { name = "libsodium-sys", reason = "libsodium would be a fourth crypto stack" },
+    { name = "sodiumoxide", reason = "libsodium would be a fourth crypto stack" },
+]
+
+# The duplicate majors below are the KNOWN situation on 2026-09-07 (verified
+# with cargo tree -i); they only silence the warn-level duplicate report.
+skip = [
+    # age's rust-embed-utils and i18n-embed use sha2 0.11; votport and the VOT
+    # proof crates use 0.10.
+    { name = "sha2", version = "0.11", reason = "age pulls sha2 0.11 through rust-embed-utils/i18n-embed" },
+    # vot-receipt (VOT fork) signs with hmac 0.13; votport's webhook
+    # signatures use 0.12.
+    { name = "hmac", version = "0.13", reason = "vot-receipt uses hmac 0.13" },
+    # object_store 0.14 uses rand 0.10; votport, age, and openidconnect use 0.8.
+    { name = "rand", version = "0.10", reason = "object_store uses rand 0.10" },
+    # rand 0.10 (object_store) and getrandom 0.4 (tempfile) use rand_core 0.10;
+    # the rest of the tree is on 0.6.
+    { name = "rand_core", version = "0.10", reason = "rand 0.10 and getrandom 0.4 use rand_core 0.10" },
+]
 
 [sources]
 unknown-registry = "deny"
