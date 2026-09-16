@@ -4429,6 +4429,16 @@ fn delete_received_file_sync(
     prepared
         .remove(&destinations)
         .map_err(|error| ApiError::new(StatusCode::CONFLICT, error))?;
+    // Audit finding 105: kill the process in the crash window between the
+    // filesystem unlink and the next store commit (the audit row). The
+    // tombstone that carries the quota update committed before the unlink, so
+    // the window proves the store never counts an unlinked file's bytes.
+    // Test-only: the gate compiles away in every non-test build.
+    #[cfg(test)]
+    if std::env::var_os("FAIL_AFTER_UNLINK").is_some() {
+        eprintln!("FAIL_AFTER_UNLINK: received file unlinked; aborting before the store commit");
+        std::process::abort();
+    }
     let stored_as = &record.stored_as;
     tracing::info!(target: "audit", event = "received_file_deleted", link = %id, stored_as = %stored_as, "received file deleted from disk");
     app.store.audit(
@@ -5547,6 +5557,157 @@ mod handler_tests {
             .and_then(|value| value.to_str().ok())
             .unwrap();
         assert!(cookie.contains("; Secure"), "cookie was {cookie}");
+    }
+
+    /// Audit finding 105: kill the process in the crash window between the
+    /// filesystem unlink and the next store commit (the audit row), then pin
+    /// what boot finds. The child arms FAIL_AFTER_UNLINK and aborts inside
+    /// delete_received_file_sync; the parent reopens the crashed data
+    /// directory and asserts the established reconciliation behavior: the
+    /// tombstone that carries the quota decrement commits before the unlink,
+    /// so the reopened store already agrees with the disk.
+    #[test]
+    fn abort_between_unlink_and_store_commit_leaves_the_quota_reconciled() {
+        const ROOT: &str = "FAIL_AFTER_UNLINK_ROOT";
+        if let Some(root) = std::env::var_os(ROOT) {
+            let app = testing::build(std::path::Path::new(&root));
+            std::fs::create_dir_all(&app.config.receive_dir).unwrap();
+            let record = crate::receiving::tests::published_file(
+                &app.config.receive_dir.join("report.bin"),
+                b"crash window payload",
+                vot_verifier::Suite::Blake3Bao64,
+                &app.signer,
+            );
+            app.store
+                .insert_link(crate::store::Link {
+                    id: "crash-link".to_owned(),
+                    tenant: String::new(),
+                    label: "crash".to_owned(),
+                    dest: String::new(),
+                    password_hash: None,
+                    created_at: 0,
+                    expires_at: None,
+                    max_bytes: None,
+                    active: true,
+                    legal_hold: false,
+                    notifications: None,
+                    uploads: vec![UploadRecord {
+                        partial: false,
+                        log: Vec::new(),
+                        id: "crash-upload".to_owned(),
+                        started_at: 1,
+                        completed_at: 2,
+                        replayed_chunks: 0,
+                        rejected_chunks: 0,
+                        transport: None,
+                        package_root: "crash-root".to_owned(),
+                        total_bytes: record.bytes,
+                        files: vec![record],
+                    }],
+                    events: Vec::new(),
+                })
+                .unwrap();
+            let identity = auth::AdminIdentity::local_admin();
+            let response =
+                delete_received_file_sync(&app, &identity, "crash-link", "crash-upload", 0);
+            unreachable!("the abort switch must kill the child before the commit: {response:?}");
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let log_path = directory.path().join("child.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "api::admin::handler_tests::abort_between_unlink_and_store_commit_leaves_the_quota_reconciled",
+                "--nocapture",
+            ])
+            .env("FAIL_AFTER_UNLINK", "1")
+            .env(ROOT, directory.path())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child did not abort in time: {}",
+                std::fs::read_to_string(&log_path).unwrap_or_default()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let crash = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            !status.success(),
+            "the child should have died from the abort switch: {status} / {crash}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            assert_eq!(
+                status.signal(),
+                Some(6),
+                "the child should have died from SIGABRT: {crash}"
+            );
+        }
+        assert!(
+            crash.contains("FAIL_AFTER_UNLINK: received file unlinked"),
+            "the child did not reach the crash window: {crash}"
+        );
+
+        // Boot over the crashed directory: the tombstone that decrements the
+        // quota commits before the unlink, so the reopened store already
+        // agrees with the disk and no reconciliation pass is needed.
+        let app = testing::build(directory.path());
+        assert!(!app.config.receive_dir.join("report.bin").exists());
+        assert!(!app
+            .config
+            .receive_dir
+            .join("report.bin.vot-receipt")
+            .exists());
+        let upload = app
+            .store
+            .link_upload("", "crash-link", "crash-upload")
+            .unwrap()
+            .unwrap();
+        assert!(
+            upload.files[0].deleted,
+            "the tombstone committed before the abort"
+        );
+        assert_eq!(
+            app.store.tenant_stored("").unwrap(),
+            (0, 0),
+            "the deleted file's bytes must not be counted after the crash"
+        );
+        let (bytes_hi, bytes_lo, state) = app
+            .store
+            .with(|connection| {
+                connection.query_row(
+                    "SELECT bytes_hi,bytes_lo,state FROM tenant_quota_usage WHERE tenant=''",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            (bytes_hi, bytes_lo, state),
+            (0, 0, 0),
+            "the quota cache kept the tombstone's answer"
+        );
+        let rows = app.store.audit_export(None, 0, 0, 100).unwrap();
+        assert!(
+            rows.iter().all(|row| row.event != "received_file_deleted"),
+            "the abort must land before the audit row commits"
+        );
     }
 }
 
