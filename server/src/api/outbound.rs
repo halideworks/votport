@@ -107,7 +107,31 @@ const LIBRARY_SELECTION_BUDGET: LibraryEnumerationBudget = LibraryEnumerationBud
 
 // ponytail: one tiny global critical section; use per-tenant locks only if contention is measured.
 static LIBRARY_MUTATION_LOCK: Mutex<()> = Mutex::new(());
+
+// Serialization contract for LIBRARY_MUTATION_LOCK: it must stay impossible
+// for delete_outbound_file to remove a library source that a concurrent grant
+// creation validated and inserted. Grant creation validates its sources by
+// statting every selected file, which on a stalled library mount can block
+// forever, so the walk runs WITHOUT the lock and the lock guards only the
+// grant insert. Closing the validation-to-insert window against deletes is
+// the generation below: delete_outbound_file is the only in-process mutator
+// that removes sources under the lock, and it bumps the count after removing.
+// A creation that saw generation G before validating re-reads it under the
+// lock (the mutex hand-off makes that re-read authoritative over every
+// completed bump) and, when it moved, revalidates before inserting. So a
+// delete and a validated insert are strictly ordered: either the delete
+// completes first and the insert revalidates and fails, or the insert lands
+// first and the delete observes the active grant and refuses.
+static LIBRARY_MUTATION_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 static LIBRARY_HASH_PERMITS: Semaphore = Semaphore::const_new(LIBRARY_HASH_CONCURRENCY);
+
+fn library_mutation_generation() -> u64 {
+    // Relaxed is enough: only the lock-held re-read decides, and the mutex
+    // gives that read happens-after every bump from earlier critical
+    // sections. A stale unlocked read can only cause a redundant recheck.
+    LIBRARY_MUTATION_GENERATION.load(Ordering::Relaxed)
+}
 
 #[cfg(test)]
 struct LibraryMutationStall {
@@ -1074,6 +1098,7 @@ pub async fn delete_outbound_file(
         }
         std::fs::remove_file(&path)
             .map_err(|_| ApiError::internal("delete outbound file failed"))?;
+        LIBRARY_MUTATION_GENERATION.fetch_add(1, Ordering::Relaxed);
         drop(_lock);
         worker.store.audit(
             &tenant,
@@ -2459,12 +2484,30 @@ async fn create_library_grant(
     let audit_detail = json!({ "files": grant_file_count, "operation_id": operation_id });
     tokio::task::spawn_blocking(move || {
         let _operation = operation;
+        // Validate without the lock: the walk stats every selected file and
+        // a stalled library mount would otherwise hold the lock forever.
+        #[cfg(test)]
+        wait_library_mutation_stall(&root);
+        let generation = library_mutation_generation();
+        if !library_sources_match(&root, &revalidation, &grant.files) {
+            return Err(ApiError::not_found());
+        }
+        // Test seam marking the start of the validation-to-insert window:
+        // arming with a marker key pins a validated creation right here, so
+        // a delete can be run through the window deterministically.
+        #[cfg(test)]
+        wait_library_mutation_stall(&root.join(".validated"));
         let _lock = LIBRARY_MUTATION_LOCK
             .lock()
             .expect("library mutation lock poisoned");
-        #[cfg(test)]
-        wait_library_mutation_stall(&root);
-        if !library_sources_match(&root, &revalidation, &grant.files) {
+        // The lock covers only the store transaction plus this recheck, so a
+        // stalled mount delays only the request doing the walking. A delete
+        // that completed while we validated moved the generation; redo the
+        // walk under the lock so it cannot win the validation-to-insert
+        // window.
+        if library_mutation_generation() != generation
+            && !library_sources_match(&root, &revalidation, &grant.files)
+        {
             return Err(ApiError::not_found());
         }
         worker
@@ -5344,7 +5387,45 @@ mod tests {
         format!("votport_admin={token}")
     }
 
+    /// One process-wide stall, so armed tests serialize on `SERIAL` and the
+    /// guard disarms on drop; concurrent tests must never see the stall.
+    static LIBRARY_MUTATION_STALL_SERIAL: Mutex<()> = Mutex::new(());
+
+    struct ArmedLibraryMutationStall {
+        _serial: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for ArmedLibraryMutationStall {
+        fn drop(&mut self) {
+            LIBRARY_MUTATION_STALL
+                .lock()
+                .expect("library mutation stall poisoned")
+                .take();
+        }
+    }
+
     fn arm_library_mutation_stall(
+        root: &Path,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        ArmedLibraryMutationStall,
+    ) {
+        let _serial = LIBRARY_MUTATION_STALL_SERIAL
+            .lock()
+            .expect("library mutation stall serializer poisoned");
+        let (entered_rx, release_tx) = rearm_library_mutation_stall(root);
+        (
+            entered_rx,
+            release_tx,
+            ArmedLibraryMutationStall { _serial },
+        )
+    }
+
+    /// Arms another stall while the caller already holds the serializer
+    /// guard, e.g. to pin the validation-to-insert window separately from
+    /// the walk-start stall.
+    fn rearm_library_mutation_stall(
         root: &Path,
     ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
@@ -5392,7 +5473,7 @@ mod tests {
             std::fs::write(root.join("held.bin"), b"library fixture").unwrap();
             let cookie = named_admin_cookie(&app, "acme");
 
-            let (entered, release) = arm_library_mutation_stall(&root);
+            let (entered, release, _stall) = arm_library_mutation_stall(&root);
             let (cancel_watchdog, watchdog_wait) = std::sync::mpsc::channel();
             let watchdog_release = release.clone();
             let watchdog = std::thread::spawn(move || {
@@ -5468,6 +5549,178 @@ mod tests {
             };
             assert_eq!(audit.iter().filter(|row| row.event == event).count(), 1);
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stalled_library_validation_does_not_block_outbound_deletion() {
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        app.store
+            .insert_tenant(crate::store::tests::test_tenant("acme"))
+            .unwrap();
+        let root = library_root(&app, "acme");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("held.bin"), b"library fixture").unwrap();
+        let cookie = named_admin_cookie(&app, "acme");
+
+        let (entered, release, _stall) = arm_library_mutation_stall(&root);
+        let create = tokio::spawn(
+            router(app.clone()).oneshot(
+                Request::post("/api/admin/outbound-grants")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"paths":["held.bin"],"expires_days":1}"#))
+                    .unwrap(),
+            ),
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if entered.try_recv().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("grant creation never reached its validation walk");
+        assert!(!create.is_finished());
+
+        // The stalled walk runs without the mutation lock, so the delete must
+        // finish while the walk is still stuck instead of queueing behind it.
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            router(app.clone()).oneshot(
+                Request::delete("/api/admin/outbound-files?path=held.bin")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("stalled library validation blocked outbound deletion")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!root.join("held.bin").exists());
+
+        release.send(()).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), create)
+            .await
+            .expect("grant creation never finished after its stall was released")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(app.store.outbound_grants("acme").unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn library_deletion_and_validated_insert_are_strictly_ordered() {
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        app.store
+            .insert_tenant(crate::store::tests::test_tenant("acme"))
+            .unwrap();
+        let root = library_root(&app, "acme");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("held.bin"), b"library fixture").unwrap();
+        let cookie = named_admin_cookie(&app, "acme");
+        let create_request = || {
+            Request::post("/api/admin/outbound-grants")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"paths":["held.bin"],"expires_days":1}"#))
+                .unwrap()
+        };
+        let delete_request = || {
+            Request::delete("/api/admin/outbound-files?path=held.bin")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // Delete first: pin a creation inside the validation-to-insert
+        // window (validated, not yet inserted), then run the delete through
+        // that window. The delete wins, so the insert must revalidate under
+        // the lock and refuse instead of landing a grant for a source that
+        // no longer exists.
+        let (validated, validated_release, _stall) =
+            arm_library_mutation_stall(&root.join(".validated"));
+        let create = tokio::spawn(router(app.clone()).oneshot(create_request()));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if validated.try_recv().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("grant creation never reached the validation-to-insert window");
+        let (entered, release) = rearm_library_mutation_stall(&root);
+        let delete = tokio::spawn(router(app.clone()).oneshot(delete_request()));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if entered.try_recv().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deletion never entered its critical section");
+        validated_release.send(()).unwrap();
+        release.send(()).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), delete)
+            .await
+            .expect("deletion never finished after its stall was released")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = tokio::time::timeout(Duration::from_secs(2), create)
+            .await
+            .expect("grant creation never finished after the delete released the lock")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(app.store.outbound_grants("acme").unwrap().is_empty());
+        assert!(!root.join("held.bin").exists());
+        let audit = app.store.audit_recent(Some("acme"), 0, 10).unwrap();
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|row| row.event == "outbound_grant_created")
+                .count(),
+            0
+        );
+
+        // Insert first: with the grant landed, the delete must observe the
+        // active grant and refuse instead of removing the validated source.
+        std::fs::write(root.join("held.bin"), b"library fixture").unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            router(app.clone()).oneshot(create_request()),
+        )
+        .await
+        .expect("grant creation stalled outside the mutation lock")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            router(app.clone()).oneshot(delete_request()),
+        )
+        .await
+        .expect("deletion stalled")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(app.store.outbound_grants("acme").unwrap().len(), 1);
+        assert!(root.join("held.bin").exists());
     }
 
     async fn body(response: Response) -> serde_json::Value {

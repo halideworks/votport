@@ -490,6 +490,14 @@ pub(crate) const SCHEMA_VERSION: u64 = 45;
 pub(crate) const DELIVERED_CANDIDATE_PAGE: usize = 128;
 pub(crate) const RETENTION_CLOCK_KEY: &str = "retention_clock_trusted_at";
 
+/// Cap on the on-disk WAL file, applied wherever a connection can reset the
+/// WAL (`journal_size_limit`). The steady state under the default 1000-page
+/// autocheckpoint is about 4 MiB, so 8 MiB gives routine resets headroom
+/// without re-growing the file, while a backup (whose VACUUM INTO reader
+/// pins the WAL read mark and lets commits pile up) cannot leave gigabytes
+/// behind. Matches the MiB scale of the other connection tuning.
+const WAL_SIZE_LIMIT_BYTES: i64 = 8 * 1024 * 1024;
+
 #[cfg(test)]
 const TENANT_RECEIVED_VM_UNOBSERVED: u64 = u64::MAX;
 
@@ -1104,6 +1112,11 @@ impl Store {
             .map_err(|e| e.to_string())?;
         connection
             .pragma_update(None, "journal_mode", "WAL")
+            .map_err(|error| error.to_string())?;
+        // Truncate the WAL file whenever a checkpoint resets it, so a pinned
+        // read mark (a running backup) cannot leave an oversized file behind.
+        connection
+            .pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT_BYTES)
             .map_err(|error| error.to_string())?;
         // A completed mutation must survive power loss.
         connection
@@ -3065,10 +3078,45 @@ impl Store {
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|error| error.to_string())?;
+        // The checkpoint below resets the WAL on this connection, so it needs
+        // the same size bound the serving connection carries for the reset to
+        // truncate the file.
+        connection
+            .pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT_BYTES)
+            .map_err(|error| error.to_string())?;
         connection
             .execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])
             .map_err(|error| error.to_string())?;
-        crate::paths::tighten_private_file(destination).map(|_| ())
+        crate::paths::tighten_private_file(destination).map(|_| ())?;
+        Self::checkpoint_wal_after_backup(&connection);
+        Ok(())
+    }
+
+    /// Checkpoint after a backup. The backup's long-running VACUUM INTO
+    /// reader pinned the WAL read mark, so commits during the backup piled up
+    /// uncheckpointed; running the checkpoint here, on the backup's own
+    /// connection so it never touches the shared store lock, means the first
+    /// writer after a backup does not pay for it inside its own transaction.
+    /// The mode is TRUNCATE, not PASSIVE: a passive checkpoint copies the
+    /// frames but never restarts the log, so the file would stay at the
+    /// backup-time high water and the journal size limit could not bind.
+    /// TRUNCATE restarts and truncates immediately; when a concurrent reader
+    /// makes it busy it degrades to the passive behavior and the next
+    /// automatic checkpoint retries, so this stays best effort.
+    fn checkpoint_wal_after_backup(connection: &Connection) {
+        let checkpoint = connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        });
+        match checkpoint {
+            Ok((busy, wal, checkpointed)) => {
+                tracing::debug!(busy, wal, checkpointed, "post-backup WAL checkpoint");
+            }
+            Err(error) => tracing::debug!(%error, "post-backup WAL checkpoint failed"),
+        }
     }
 
     /// Every link across every tenant. Internal use only for complete scans;
