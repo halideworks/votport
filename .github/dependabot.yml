@@ -33,3 +33,12 @@ updates:
           - "*"
     cooldown:
       default-days: 7
+  # The Dockerfile pins both base images by digest, so nothing moves them
+  # except this bot or a human edit; roll base-layer CVEs weekly. Only two
+  # images exist, so they stay ungrouped.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7

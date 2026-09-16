@@ -1,0 +1,8 @@
+# The one exact toolchain for every cargo command in this tree; rustup
+# applies it to anyone entering the repository. The Dockerfile keeps its own
+# digest-pinned rust:1.97 image and the Cargo.toml rust-version fields stay
+# the declared minimum, so neither is selected by this file.
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
