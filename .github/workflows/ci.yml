@@ -468,3 +468,87 @@ jobs:
           export VOTPORT_BIN="$RESTART_TEST_ROOT/votport" TMPDIR="$RESTART_TEST_ROOT"
           MODE=shared node scripts/restart-e2e.mjs
           MODE=replica node scripts/restart-e2e.mjs
+
+      # The NAS write path tests only accept a receive directory whose
+      # mountinfo filesystem is nfs, nfs4, cifs or smb3. The CIFS stack let a
+      # second process acquire the writer lock, so the fixture now serves
+      # NFSv4 only: nfs-ganesha in a privileged container (userland server,
+      # no host nfsd module needed) exporting the tmpfs share on the static
+      # NFSv4 port, and the kernel nfs4 client enforces the byte-range locks
+      # server-side exactly as the writer lock assertions demand. The lock
+      # revocation drills stay ignored: they need an external operator to
+      # drop the client's locks.
+      - name: Run NAS write path acceptance against a real NFSv4 share
+        working-directory: server
+        timeout-minutes: 15
+        run: |
+          set -Eeuo pipefail
+          nas_root="$(mktemp -d)"
+          nas_mount="$(mktemp -d)"
+          mkdir -p "$nas_root/source" "$nas_root/tmp"
+          dd if=/dev/urandom of="$nas_root/source/campaign-a.bin" bs=1M count=2 status=none
+          dd if=/dev/urandom of="$nas_root/source/campaign-b.bin" bs=1M count=2 status=none
+          printf 'votport nas fixture\n' > "$nas_root/source/campaign-c.txt"
+          cleanup() {
+            status=$?
+            if [ "$status" -ne 0 ]; then
+              docker logs votport-nas-ganesha || true
+            fi
+            sudo umount "$nas_mount" >/dev/null 2>&1 || true
+            docker rm -f votport-nas-ganesha >/dev/null 2>&1 || true
+            rm -rf "$nas_root" "$nas_mount"
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nfs-common
+
+          # Digest-pinned prebuilt ganesha image: no package installation at
+          # run time (PR 395 showed apt-at-runtime pushed the server past the
+          # 15 minute step budget). start_nfs.sh generates the export config
+          # from env: EXPORT_PATH defaults to /data/nfs (the tmpfs volume),
+          # PSEUDO_PATH=/votport serves the 127.0.0.1:/votport mount, and
+          # NFSv4 minor versions 0-2 are enabled by default.
+          docker run -d --name votport-nas-ganesha \
+            --privileged \
+            --tmpfs "/data/nfs:rw,size=268435456,uid=$(id -u),gid=$(id -g),mode=0770" \
+            -p 127.0.0.1:2049:2049 \
+            -e PSEUDO_PATH=/votport \
+            -e EXPORT_ID=77 \
+            -e PROTOCOLS=4 \
+            -e TRANSPORTS=TCP \
+            -e SEC_TYPE=sys \
+            -e SQUASH_MODE=No_Root_Squash \
+            -e GRACELESS=true \
+            janeczku/nfs-ganesha:latest@sha256:17fe1813fd20d9fdfa497a26c8a2e39dd49748cd39dbb0559df7627d9bcf4c53
+
+          # Readiness gate before any mount: ganesha logs this exact line once
+          # it is serving. Never retry the mount itself; mount.nfs4 blocks
+          # ~126s per attempt on a missing server.
+          nas_ready=0
+          for _ in $(seq 1 90); do
+            if docker logs votport-nas-ganesha 2>&1 | grep -q "NFS SERVER INITIALIZED"; then
+              nas_ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$nas_ready" -ne 1 ]; then
+            echo "the ganesha fixture never reported NFS SERVER INITIALIZED" >&2
+            docker logs votport-nas-ganesha || true
+            exit 1
+          fi
+
+          if ! timeout 30 sudo mount -t nfs4 -o vers=4.1 127.0.0.1:/votport "$nas_mount"; then
+            echo "the nfs4 fixture mount failed" >&2
+            docker logs votport-nas-ganesha || true
+            exit 1
+          fi
+          grep -q ' - nfs4 ' /proc/self/mountinfo
+
+          VOTPORT_NAS_TEST_MOUNT="$nas_mount" \
+          VOTPORT_NAS_TEST_SOURCE="$nas_root/source" \
+          VOTPORT_NAS_TEST_TRANSPORT=http \
+          TMPDIR="$nas_root/tmp" \
+            cargo +1.97.1 test --locked --test e2e mounted_nas_media_campaign -- --ignored --exact
