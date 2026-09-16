@@ -2424,7 +2424,18 @@ mod tests {
                 }
             }
         }
-        expected.sort();
+        // Stamp creation order explicitly: same-second inserts would
+        // otherwise tie and fall back to id order.
+        for (index, id) in expected.iter().enumerate() {
+            app.store
+                .with(|connection| {
+                    connection.execute(
+                        "UPDATE delivery_jobs SET created_at=?2 WHERE id=?1",
+                        rusqlite::params![id, (index + 1) as i64],
+                    )
+                })
+                .unwrap();
+        }
         let mut identity = auth::AdminIdentity::local_admin();
         identity.subject = "observer".into();
         identity.role = "operator".into();
