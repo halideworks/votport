@@ -813,7 +813,7 @@ await page.evaluate(() => { window.__copySuccessAt = performance.now(); });
 await page.waitForFunction(() => performance.now() - window.__copySuccessAt >= 750, null, { timeout: 3000, polling: 50 });
 await page.evaluate(() => { window.__clipboardFailure = true; });
 await copyControl.press("Enter");
-await page.waitForFunction(() => document.querySelector("#done-list .file-id")?.textContent === "Copy failed");
+await page.waitForFunction(() => document.querySelector("#done-list .file-id")?.textContent === "Copy failed", null, { timeout: 5000, polling: 50 });
 if (await copyControl.getAttribute("aria-label") !== `Copy failed: ${cards[0].name}`) {
   throw new Error("denied clipboard copy must expose an accessible failure status");
 }

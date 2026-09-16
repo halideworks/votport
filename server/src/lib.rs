@@ -13,6 +13,7 @@ pub mod config;
 #[path = "../../protocol/delivery.rs"]
 pub mod delivery_protocol;
 pub mod lease;
+pub mod logging;
 pub mod notify;
 pub mod paths;
 #[path = "../../protocol/paths.rs"]

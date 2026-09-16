@@ -5751,3 +5751,17 @@ fn quota_layout_migration_records_the_tenants_it_moved() {
     assert_eq!(row.detail["tenants"][0]["tenant"], "");
     assert_eq!(row.detail["tenants"][0]["bytes"], 5000);
 }
+
+#[test]
+fn store_outage_logs_use_the_reduced_subject_form() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    store
+        .with(|connection| connection.execute_batch("DROP TABLE principals"))
+        .unwrap();
+    let (log, _guard) = crate::logging::captured(crate::logging::stdout_filter(None, false));
+    assert!(!store.principal_allows("jane@example.com", 1));
+    let text = std::fs::read_to_string(log.path()).unwrap();
+    assert!(text.contains("ja..om (16)"), "{text}");
+    assert!(!text.contains("jane@example.com"), "{text}");
+}

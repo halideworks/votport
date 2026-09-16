@@ -229,7 +229,7 @@ fn finish_sso_login(
         match store.principal(subject) {
             Ok(Some(_)) => {}
             Ok(None) => {
-                tracing::warn!(target: "audit", event = "sso_failed", subject = %subject, "subject is not provisioned");
+                tracing::warn!(target: "audit", event = "sso_failed", subject = %crate::logging::reduce_subject(subject), "subject is not provisioned");
                 return Err("this account is not provisioned");
             }
             Err(error) => {
@@ -283,7 +283,7 @@ fn finish_sso_login(
     }
     identity.credential_version = row.credential_version;
     tracing::info!(
-        target: "audit", event = "sso_login", subject = %subject, %role,
+        target: "audit", event = "sso_login", subject = %crate::logging::reduce_subject(subject), %role,
         "SSO sign-in succeeded"
     );
     store.audit("", subject, "sso_login", subject, &json!({ "role": role }));
@@ -2254,5 +2254,34 @@ mod tests {
             .as_deref(),
             Some("u")
         );
+    }
+
+    #[test]
+    fn sso_logs_use_the_reduced_subject_form() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = crate::api::testing::build(directory.path());
+        let (log, _guard) = crate::logging::captured(crate::logging::audit_filter());
+        let identity = finish_sso_login(
+            &application.store,
+            "jane@example.com",
+            "viewer".into(),
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(identity.subject, "jane@example.com");
+        assert!(finish_sso_login(
+            &application.store,
+            "refused@example.com",
+            "viewer".into(),
+            &[],
+            true,
+        )
+        .is_err());
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        assert!(text.contains("ja..om (16)"), "{text}");
+        assert!(text.contains("re..om (19)"), "{text}");
+        assert!(!text.contains("jane@example.com"), "{text}");
+        assert!(!text.contains("refused@example.com"), "{text}");
     }
 }

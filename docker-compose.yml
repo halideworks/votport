@@ -7,6 +7,16 @@ services:
     # No value covers a 500 GiB upload; for upgrades, drain first (stop
     # admitting sessions, watch votport_sessions_active reach 0).
     stop_grace_period: 5m
+    # Bound the json-file log driver: without it the container log grows
+    # without limit. Log lines are human-readable by default; set
+    # VOTPORT_LOG_FORMAT=json for one JSON object per line, and AUDIT_LOG to
+    # a path inside ./data to route audit-target events to a dedicated
+    # append-only file instead of stdout.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     # Received files land in /mediastorage-pool as davidtorcivia:davidtorcivia,
     # matching the other *-in drop folders, instead of root.
     user: "1000:1000"

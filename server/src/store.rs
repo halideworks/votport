@@ -3031,7 +3031,7 @@ impl Store {
             Ok(None) => credential_version == 1,
             Ok(Some(row)) => credential_version == row.credential_version && !row.blocked,
             Err(error) => {
-                tracing::error!(%error, subject, "principal read failed; refusing the session");
+                tracing::error!(%error, subject = %crate::logging::reduce_subject(subject), "principal read failed; refusing the session");
                 false
             }
         }
