@@ -3652,6 +3652,7 @@ mod tests {
                         "revoked",
                         false,
                         &incoming.notifications,
+                        "test",
                     )
                     .unwrap();
             }

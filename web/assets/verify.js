@@ -1,14 +1,36 @@
-// votport public receipt check: POST the sidecar bytes to /api/verify and,
-// when a payload file is present, hash it locally with the same worker the
-// sender uses. The payload never leaves the tab. VOTPORT PROPRIETARY LICENSE.
+// votport public receipt check: verify the receipt sidecar's Ed25519
+// signature in this tab, with the same wasm the sender uses, against the
+// receipt key this server publishes, and hash any payload file locally with
+// the same worker the sender uses. The payload never leaves the tab and the
+// verdict here never comes from a server answer. VOTPORT PROPRIETARY LICENSE.
 
 import { appendObjectCard, formatBytes } from '/assets/object-card.js';
+import init, {
+  ErrorCode,
+  verifyReceiptEd25519,
+} from '/assets/vendor/vot_wasm.js';
 
 const $ = (id) => document.getElementById(id);
 
 let payloadFile = null;
 let sidecarFile = null;
 let checking = false;
+// The only key this tab will accept a receipt under. It is the same answer
+// that fills the printed key box below, so a check and the displayed key
+// cannot disagree.
+const receiptKey = (async () => {
+  try {
+    const response = await fetch('/api/receipt-key');
+    if (!response.ok) throw new Error(response.status);
+    const { receipt_key: key } = await response.json();
+    $('receipt-key').textContent = key || 'unavailable';
+    return hexBytes(key);
+  } catch {
+    $('receipt-key').textContent = 'unavailable';
+    return null;
+  }
+})();
+let wasmReady = null;
 
 function showError(message) {
   $('verify-error').textContent = message;
@@ -139,6 +161,11 @@ function toHex(bytes) {
   return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+function hexBytes(text) {
+  if (!/^[0-9a-f]{64}$/.test(text ?? '')) return null;
+  return new Uint8Array(text.match(/../g).map((pair) => parseInt(pair, 16)));
+}
+
 async function check() {
   clearError();
   setChecking(true);
@@ -150,37 +177,46 @@ async function check() {
 }
 
 async function runCheck() {
-  let response;
-  try {
-    response = await fetch('/api/verify', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/octet-stream' },
-      body: await sidecarFile.arrayBuffer(),
-    });
-  } catch {
-    showError('Could not reach the server. Reload the page to try again.');
+  const key = await receiptKey;
+  if (!key) {
+    showError('This server’s receipt key is unavailable. Reload the page and try again.');
     return;
   }
-  let result = null;
+  wasmReady ??= init();
   try {
-    result = await response.json();
+    await wasmReady;
   } catch {
-    // A 413 body is empty axum text; treat any non-JSON as not-a-receipt.
-  }
-  if (!response.ok || !result?.ok) {
-    showError(result?.error ?? 'This is not a vot-receipt.');
+    wasmReady = null;
+    showError('Local verification failed to load. Reload the page and try again.');
     return;
   }
+  let receipt;
+  try {
+    receipt = verifyReceiptEd25519(
+      new Uint8Array(await sidecarFile.arrayBuffer()),
+      key,
+    );
+  } catch (error) {
+    showError(
+      error?.code === ErrorCode.Malformed
+        ? 'This is not a vot-receipt.'
+        : 'This receipt was not signed by the receipt key this server publishes.',
+    );
+    return;
+  }
+  const subject = receipt.subjectId;
+  const signedRoot = toHex(subject.root);
+  const signedLength = Number(subject.length);
 
   if (!payloadFile) {
     showResult({
       ok: false,
-      title: 'Genuine receipt',
-      suite: result.suite,
-      root: result.root,
+      title: 'Signature verified',
+      suite: subject.suite,
+      root: signedRoot,
       file: sidecarFile.name,
-      bytes: Number(result.length),
-      next: 'This receipt was issued by this server. Pick the file too if you also want its bytes checked.',
+      bytes: signedLength,
+      next: 'This receipt carries this server’s signature. Pick the file too if you also want its bytes checked.',
     });
     return;
   }
@@ -194,16 +230,18 @@ async function runCheck() {
   }
   const root = toHex(done.root);
   const length = Number(done.length);
-  const match = root === result.root && length === Number(result.length);
+  // Verified only when the root signed in the receipt is the root hashed in
+  // this tab; nothing the server answers can produce a Verified card.
+  const match = signedRoot === root && signedLength === length;
   showResult({
     ok: match,
     title: match ? 'Verified' : 'Does not match',
-    suite: result.suite,
+    suite: done.suite,
     root,
     file: payloadFile.name,
     bytes: length,
     next: match
-      ? 'Every byte of this file matches what the server received.'
+      ? 'Every byte of this file matches the root signed in the receipt.'
       : 'This file is not the object in the receipt. Compare names — a receipt proves one exact file.',
   });
 }
@@ -248,16 +286,3 @@ $('verify-form').addEventListener('submit', (e) => {
   e.preventDefault();
   check();
 });
-
-// Last, and not awaited at module scope: a slow answer here must not delay
-// wiring the controls above.
-(async () => {
-  try {
-    const response = await fetch('/api/receipt-key');
-    if (!response.ok) throw new Error(response.status);
-    const { receipt_key: key } = await response.json();
-    $('receipt-key').textContent = key || 'unavailable';
-  } catch {
-    $('receipt-key').textContent = 'unavailable';
-  }
-})();

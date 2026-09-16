@@ -447,6 +447,7 @@ impl Store {
     ) -> Result<(), String> {
         self.with(|c|c.execute("UPDATE trade_routes SET document=json_set(document,'$.remote_grant',?3,'$.remote_state',?4,'$.state',CASE WHEN json_extract(document,'$.state') IN ('paused','revoked') THEN json_extract(document,'$.state') ELSE ?4 END),enrollment=NULL WHERE tenant=?1 AND id=?2 AND json_extract(document,'$.remote_grant')=''",params![tenant,id,grant,state])).map(|_|())
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn update_trade_route(
         &self,
         tenant: &str,
@@ -455,6 +456,7 @@ impl Store {
         state: &str,
         cancel_active: bool,
         policy: &NotificationPolicy,
+        actor: &str,
     ) -> Result<TradeRoute, String> {
         if !matches!(state, "active" | "paused" | "revoked" | "pending_approval") {
             return Err("choose active, paused or revoked".into());
@@ -490,7 +492,7 @@ impl Store {
             tenant,
             "",
             "route_permission_changed",
-            &serde_json::json!({"route":id,"state":state,"cancel_active":cancel_active}),
+            &serde_json::json!({"route":id,"state":state,"cancel_active":cancel_active,"actor":actor}),
             now_unix(),
         )
         .map_err(|e| e.to_string())?;
@@ -824,6 +826,7 @@ impl Store {
         id: &str,
         revision: u64,
         address: &str,
+        actor: &str,
     ) -> Result<(), String> {
         let mut c = self.connection.lock().expect("store poisoned");
         let tx = c.transaction().map_err(|e| e.to_string())?;
@@ -847,7 +850,7 @@ impl Store {
             tenant,
             "",
             "route_address_changed",
-            &serde_json::json!({"peer":route.peer_key,"address":address}),
+            &serde_json::json!({"peer":route.peer_key,"address":address,"actor":actor}),
             now_unix(),
         )
         .map_err(|e| e.to_string())?;
@@ -1201,11 +1204,20 @@ mod tests {
                 1,
                 "active",
                 false,
-                &pending.notifications
+                &pending.notifications,
+                "test"
             )
             .is_err());
         let active = store
-            .update_trade_route("", &pending.id, 1, "active", false, &pending.notifications)
+            .update_trade_route(
+                "",
+                &pending.id,
+                1,
+                "active",
+                false,
+                &pending.notifications,
+                "test",
+            )
             .unwrap();
         assert!(store.receive_route("", &endpoint.id, &signed, &[]).is_err());
         let admitted = store
@@ -1267,6 +1279,7 @@ mod tests {
                 "paused",
                 false,
                 &active.notifications,
+                "test",
             )
             .unwrap();
         assert!(store
@@ -1291,6 +1304,7 @@ mod tests {
                 "revoked",
                 true,
                 &paused.notifications,
+                "test",
             )
             .unwrap();
         assert!(store
@@ -1306,7 +1320,8 @@ mod tests {
                 paused.revision + 1,
                 "active",
                 false,
-                &paused.notifications
+                &paused.notifications,
+                "test"
             )
             .is_err());
         let next = crate::auth::random_token();
@@ -1590,7 +1605,15 @@ mod tests {
         );
         let (pending, _) = store.redeem_trade_invitation(&proof).unwrap();
         let active = store
-            .update_trade_route("", &pending.id, 1, "active", false, &pending.notifications)
+            .update_trade_route(
+                "",
+                &pending.id,
+                1,
+                "active",
+                false,
+                &pending.notifications,
+                "test",
+            )
             .unwrap();
         store
             .create_trade_invitation("", &endpoint.id, "", now_unix() + 300)
@@ -1657,6 +1680,7 @@ mod tests {
                 "revoked",
                 false,
                 &active.notifications,
+                "test",
             )
             .unwrap();
         assert!(store.remove_link("", &endpoint.id).unwrap());
