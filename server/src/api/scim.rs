@@ -240,7 +240,7 @@ fn parse_active(value: &Value) -> ScimResult<bool> {
 }
 
 /// Percent-encodes one path segment (RFC 3986 unreserved characters pass).
-fn encode_segment(value: &str) -> String {
+pub(crate) fn encode_segment(value: &str) -> String {
     const ENCODE_SET: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
         .remove(b'-')
         .remove(b'.')

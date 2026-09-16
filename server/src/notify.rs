@@ -28,6 +28,23 @@ const DESTINATION_FAILURE: &str =
 
 /// Product name for notification titles: the tenant's brand name when one is
 /// set, else the tenant label, else "VOTPort".
+/// The absolute deep link into an authenticated admin page for one
+/// event, or None without a configured public URL. Notification
+/// destinations only ever receive admin detail views: never a bearer
+/// receive or download route.
+fn admin_link(app: &App, path: &str) -> Option<String> {
+    Some(format!(
+        "{}{path}",
+        app.config.public_url.as_deref()?.trim_end_matches('/')
+    ))
+}
+
+/// The receive page path that selects one link and opens its card.
+fn receive_link(link_id: &str) -> String {
+    let id = crate::api::scim::encode_segment(link_id);
+    format!("/receive?search={id}#link-{id}")
+}
+
 fn title_brand(app: &App, tenant: &str) -> String {
     app.store
         .branding(tenant)
@@ -99,8 +116,10 @@ pub async fn uploaded(
         body.push_str(&format!("\nand {} more", count - files.len()));
     }
 
+    let url = admin_link(&app, &receive_link(&link_id));
     let payload = json!({
         "event": "upload_complete",
+        "tenant": &tenant,
         "link_id": link_id,
         "label": label,
         "upload_id": report.upload_id,
@@ -121,6 +140,7 @@ pub async fn uploaded(
         payload,
         "upload_complete",
         Some(&transfer_id),
+        url.as_deref(),
     )
     .await;
 }
@@ -170,6 +190,13 @@ pub async fn outbound_downloaded(
         )
     };
     let download_starts = grant.downloads.max(result.first_download as u64);
+    let url = admin_link(
+        &app,
+        &format!(
+            "/deliver#grant-{}",
+            crate::api::scim::encode_segment(&grant.id)
+        ),
+    );
     for (_, event, transition) in transitions.into_iter().filter(|(send, _, _)| *send) {
         let title = format!(
             "{}: outbound {transition} for \"{}\"",
@@ -182,6 +209,7 @@ pub async fn outbound_downloaded(
         );
         let payload = json!({
             "event": event,
+            "tenant": &grant.tenant,
             "grant_id": grant.id,
             "label": grant.label,
             "event_at": result.event_at,
@@ -202,6 +230,7 @@ pub async fn outbound_downloaded(
             payload,
             event,
             Some(&transfer_id),
+            url.as_deref(),
         )
         .await;
     }
@@ -221,8 +250,10 @@ pub async fn upload_ended(app: Arc<App>, ended: crate::session::SessionEnded) {
         "{}\n{} of {} bytes received",
         event.detail, event.received_bytes, event.expected_bytes
     );
+    let url = admin_link(&app, &receive_link(&ended.link_id));
     let payload = json!({
         "event": "upload_failed",
+        "tenant": &ended.tenant,
         "label": ended.label,
         "link_id": ended.link_id,
         "outcome": event.outcome,
@@ -243,6 +274,7 @@ pub async fn upload_ended(app: Arc<App>, ended: crate::session::SessionEnded) {
         payload,
         "upload_failed",
         Some(&ended.link_id),
+        url.as_deref(),
     )
     .await;
 }
@@ -286,7 +318,14 @@ pub async fn workflow_failed(app: Arc<App>, job: crate::workflow::Job) {
     } else {
         "workflow_failed"
     };
-    let payload = json!({"event":event, "job_id":job.id, "label":job.request.label, "state":job.state, "error":job.error, "retry_at":job.checks["retry_at"], "released":job.released()});
+    let url = admin_link(
+        &app,
+        &format!(
+            "/workflows#job-{}",
+            crate::api::scim::encode_segment(&job.id)
+        ),
+    );
+    let payload = json!({"event":event, "tenant":&job.tenant, "job_id":job.id, "label":job.request.label, "state":job.state, "error":job.error, "retry_at":job.checks["retry_at"], "released":job.released()});
     send_policy(
         &app,
         Route {
@@ -298,6 +337,7 @@ pub async fn workflow_failed(app: Arc<App>, job: crate::workflow::Job) {
         payload,
         event,
         Some(&job.id),
+        url.as_deref(),
     )
     .await;
 }
@@ -380,22 +420,37 @@ fn clip_escaped(text: &str, limit: usize) -> String {
 fn chat_payload(channel: &str, title: &str, body: &str) -> serde_json::Value {
     let title = clipped_chars(title, 150).into_owned();
     let body = clipped_chars(body, 1500).into_owned();
-    let text = format!("{title}\n{body}");
+    // When a deep link is present it is the first body line. It passes
+    // through as issued: markdown escaping would mangle it, and every
+    // chat client linkifies a bare URL without any markup.
+    let (link, rest) = match body.split_once('\n') {
+        Some((first, rest)) if first.starts_with("http://") || first.starts_with("https://") => {
+            (format!("{first}\n"), rest)
+        }
+        _ => (String::new(), body.as_str()),
+    };
     match channel {
-        "slack" => json!({
-            "text": text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;"),
-            "mrkdwn": false, "unfurl_links": false, "unfurl_media": false,
-            "blocks": [
-                {"type":"header", "text":{"type":"plain_text", "text":title}},
-                {"type":"section", "text":{"type":"plain_text", "text":body}}
-            ]
-        }),
+        "slack" => {
+            let text = format!(
+                "{}\n{}{}",
+                escape_slack_entities(&title),
+                link,
+                escape_slack_entities(rest)
+            );
+            json!({
+                "text": text,
+                "mrkdwn": false, "unfurl_links": false, "unfurl_media": false,
+                "blocks": [
+                    {"type":"header", "text":{"type":"plain_text", "text":title}},
+                    {"type":"section", "text":{"type":"plain_text", "text":format!("{link}{rest}")}}
+                ]
+            })
+        }
         "teams" => {
             let markdown_title = escape_chat_markdown(&title, false);
-            let markdown_body = escape_chat_markdown(&body, false);
-            let markdown_text = format!("{markdown_title}\n{markdown_body}");
+            let markdown_body = format!("{link}{}", escape_chat_markdown(rest, false));
             json!({
-                "type":"message", "text":markdown_text,
+                "type":"message", "text":format!("{markdown_title}\n{markdown_body}"),
                 "attachments":[{"contentType":"application/vnd.microsoft.card.adaptive", "content":{
                     "$schema":"http://adaptivecards.io/schemas/adaptive-card.json", "type":"AdaptiveCard", "version":"1.2",
                     "body":[
@@ -406,15 +461,18 @@ fn chat_payload(channel: &str, title: &str, body: &str) -> serde_json::Value {
             })
         }
         "google_chat" => {
-            let markdown_title = escape_chat_markdown(&title, true);
-            let markdown_body = escape_chat_markdown(&body, true);
             json!({
-                "text": format!("{markdown_title}\n{markdown_body}"),
+                "text": format!("{}\n{}{}", escape_chat_markdown(&title, true), link, escape_chat_markdown(rest, true)),
                 "markupSyntax": "MARKUP_SYNTAX_MARKDOWN"
             })
         }
         "discord" => {
-            let markdown_text = escape_chat_markdown(&text, false);
+            let markdown_text = format!(
+                "{}\n{}{}",
+                escape_chat_markdown(&title, false),
+                link,
+                escape_chat_markdown(rest, false)
+            );
             json!({
                 "content": clip_escaped(&markdown_text, DISCORD_CONTENT_LIMIT),
                 "allowed_mentions":{"parse":[]}, "flags":4
@@ -422,6 +480,12 @@ fn chat_payload(channel: &str, title: &str, body: &str) -> serde_json::Value {
         }
         _ => unreachable!("known chat channel"),
     }
+}
+
+fn escape_slack_entities(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn notification_connection_failure(error: &reqwest::Error) -> &'static str {
@@ -658,10 +722,17 @@ pub async fn trade_event(
         ),
         None => format!("{} · {} · {}", route.name, route.peer_name, route.state),
     };
-    let mut payload = json!({"event":event,"route_id":route.id,"name":route.name,"peer":route.peer_key,"state":route.state});
+    let mut payload = json!({"event":event,"tenant":&route.tenant,"route_id":route.id,"name":route.name,"peer":route.peer_key,"state":route.state});
     if let Some(detail) = detail {
         payload["detail"] = json!(detail);
     }
+    let url = admin_link(
+        app,
+        &format!(
+            "/trade-routes#route-{}",
+            crate::api::scim::encode_segment(&route.id)
+        ),
+    );
     send_policy(
         app,
         Route {
@@ -673,6 +744,7 @@ pub async fn trade_event(
         payload,
         event,
         None,
+        url.as_deref(),
     )
     .await;
 }
@@ -795,9 +867,10 @@ pub(crate) mod tests {
         destination
     }
 
-    fn webhook_app() -> (
-        Arc<App>,
-        tempfile::TempDir,
+    /// A single-request loopback stub that hands the captured request to
+    /// the caller.
+    fn capture_stub() -> (
+        std::net::SocketAddr,
         std::sync::mpsc::Receiver<String>,
         std::thread::JoinHandle<()>,
     ) {
@@ -814,8 +887,30 @@ pub(crate) mod tests {
                 b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             );
         });
+        (addr, rx, thread)
+    }
+
+    fn webhook_app() -> (
+        Arc<App>,
+        tempfile::TempDir,
+        std::sync::mpsc::Receiver<String>,
+        std::thread::JoinHandle<()>,
+    ) {
+        webhook_app_with(None)
+    }
+
+    fn webhook_app_with(
+        public_url: Option<&str>,
+    ) -> (
+        Arc<App>,
+        tempfile::TempDir,
+        std::sync::mpsc::Receiver<String>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (addr, rx, thread) = capture_stub();
         let directory = tempfile::tempdir().unwrap();
-        let application = app::build(testing::config(directory.path())).unwrap();
+        let mut application = app::build(testing::config(directory.path())).unwrap();
+        Arc::get_mut(&mut application).unwrap().config.public_url = public_url.map(str::to_owned);
         test_destination_config(&application, "webhook", format!("http://{addr}/outbound"));
         (application, directory, rx, thread)
     }
@@ -909,7 +1004,8 @@ pub(crate) mod tests {
             }),
         );
         let directory = tempfile::tempdir().unwrap();
-        let application = testing::build(directory.path());
+        let mut application = testing::build(directory.path());
+        Arc::get_mut(&mut application).unwrap().config.public_url = None;
         let destination =
             test_destination_config(&application, "ntfy", format!("http://{address}/topic"));
         application
@@ -1201,6 +1297,7 @@ pub(crate) mod tests {
                 json!({"event":"upload_complete"}),
                 "upload_complete",
                 None,
+                None,
             )
             .await;
         });
@@ -1330,19 +1427,211 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn uploaded_notification_links_the_receive_page() {
+        let (application, _directory, rx, thread) =
+            webhook_app_with(Some("https://notify.example/"));
+        uploaded(
+            application,
+            String::new(),
+            "link-id".to_owned(),
+            "upload-label".to_owned(),
+            100,
+            FinishReport {
+                received: 0,
+                upload_id: "upload-id".to_owned(),
+                files: vec![],
+            },
+            Some(test_policy()),
+        )
+        .await;
+        let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let payload = request_json(&request);
+        assert_eq!(
+            payload["url"],
+            "https://notify.example/receive?search=link-id#link-link-id"
+        );
+        assert_eq!(payload["tenant"], "");
+        assert_no_secrets(&request);
+        thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_ended_notification_links_the_receive_page() {
+        let (application, _directory, rx, thread) =
+            webhook_app_with(Some("https://notify.example"));
+        upload_ended(application, ended("interrupted", true)).await;
+        let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let payload = request_json(&request);
+        assert_eq!(
+            payload["url"],
+            "https://notify.example/receive?search=link-1#link-link-1"
+        );
+        assert_no_secrets(&request);
+        thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn outbound_downloaded_notification_links_the_deliver_page() {
+        let (application, _directory, rx, thread) =
+            webhook_app_with(Some("https://notify.example/"));
+        let grant = test_grant(vec![test_file("one.txt", 10), test_file("two.txt", 20)]);
+        application.store.insert_outbound_grant(grant).unwrap();
+        let result = application
+            .store
+            .record_outbound_download("grant-id", &[0], now_unix())
+            .unwrap();
+        let grant = application
+            .store
+            .outbound_grant_by_id("grant-id")
+            .unwrap()
+            .unwrap();
+        outbound_downloaded(application, grant, result).await;
+        let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let payload = request_json(&request);
+        assert_eq!(
+            payload["url"],
+            "https://notify.example/deliver#grant-grant-id"
+        );
+        assert_no_secrets(&request);
+        thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn workflow_failed_notification_links_the_workflows_page() {
+        let (application, _directory, rx, thread) =
+            webhook_app_with(Some("https://notify.example/"));
+        let mut request = crate::workflow::tests::request();
+        request.notifications = Some(test_policy());
+        let job = crate::workflow::Job {
+            id: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6".to_owned(),
+            tenant: String::new(),
+            token_generation: 0,
+            actor: "sender".to_owned(),
+            credential_version: 0,
+            automation_token_id: None,
+            request,
+            project: crate::workflow::tests::project(),
+            state: "failed".to_owned(),
+            manifest: None,
+            approved_by: None,
+            attempts: 1,
+            created_at: 1,
+            updated_at: 2,
+            error: Some("A destination did not complete".to_owned()),
+            checks: serde_json::json!({}),
+            received: None,
+            reprocessed_from: None,
+            reprocessed_as: None,
+        };
+        workflow_failed(application, job).await;
+        let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let payload = request_json(&request);
+        assert_eq!(
+            payload["url"],
+            "https://notify.example/workflows#job-a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
+        );
+        assert_no_secrets(&request);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn chat_payload_keeps_deep_links_clickable() {
+        let url = "https://notify.example/receive?search=abc123#link-abc123";
+        let title = "Port: files received";
+        let body = format!("{url}\nfile (1).mov");
+        let slack = chat_payload("slack", title, &body);
+        let slack_text = slack["text"].as_str().unwrap();
+        assert!(
+            slack_text.contains(&format!("\n{url}\n")),
+            "slack mangled the link: {slack_text}"
+        );
+        assert!(
+            slack_text.contains("file (1).mov"),
+            "slack entity escaping altered a plain filename: {slack_text}"
+        );
+        assert!(
+            slack["blocks"][1]["text"]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with(url),
+            "slack section mangled the link"
+        );
+        for channel in ["teams", "google_chat"] {
+            let payload = chat_payload(channel, title, &body);
+            let text = payload["text"].as_str().unwrap();
+            assert!(
+                text.contains(&format!("\n{url}\n")),
+                "{channel} mangled the link: {text}"
+            );
+            assert!(
+                text.contains("file \\(1\\)\\.mov"),
+                "{channel} lost literal filename escaping: {text}"
+            );
+        }
+        let discord = chat_payload("discord", title, &body);
+        let content = discord["content"].as_str().unwrap();
+        assert!(content.contains(&format!("\n{url}\n")), "{content}");
+        assert!(content.contains("file \\(1\\)\\.mov"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn deep_link_leads_the_summary_and_stays_clickable_in_chat() {
+        let (application, _directory, webhook_rx, webhook_thread) =
+            webhook_app_with(Some("https://notify.example/"));
+        let (address, rx, thread) = capture_stub();
+        test_destination_config(&application, "discord", format!("http://{address}/hook"));
+        uploaded(
+            application,
+            String::new(),
+            "link-id".to_owned(),
+            "upload-label".to_owned(),
+            100,
+            FinishReport {
+                received: 0,
+                upload_id: "upload-id".to_owned(),
+                files: vec![],
+            },
+            Some(test_policy()),
+        )
+        .await;
+        let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let payload = request_json(&request);
+        let content = payload["content"].as_str().unwrap();
+        assert!(
+            content.contains("\nhttps://notify.example/receive?search=link-id#link-link-id\nID: "),
+            "the deep link must lead the summary: {content}"
+        );
+        assert_no_secrets(&request);
+        thread.join().unwrap();
+        // The webhook destination of the same app receives its own copy.
+        let webhook_request = webhook_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            request_json(&webhook_request)["url"],
+            "https://notify.example/receive?search=link-id#link-link-id"
+        );
+        webhook_thread.join().unwrap();
+    }
+
+    #[tokio::test]
     async fn trade_event_details_reach_webhook_without_route_secrets() {
         for (event, detail) in [
             ("route_failed", Some("peer refused the request")),
             ("route_received", Some("receipt:bounded-digest")),
             ("route_approved", None),
         ] {
-            let (application, _directory, rx, thread) = webhook_app();
+            let (application, _directory, rx, thread) =
+                webhook_app_with(Some("https://notify.example/"));
             let policy = application.store.notification_defaults("").unwrap();
             let route = test_trade_route(policy.clone());
             trade_event(&application, &route, &policy, event, detail).await;
             let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let payload = request_json(&request);
             assert_eq!(payload["event"], event);
+            assert_eq!(
+                payload["url"],
+                "https://notify.example/trade-routes#route-route-id"
+            );
+            assert_eq!(payload["tenant"], "");
             match detail {
                 Some(detail) => {
                     assert_eq!(payload["detail"], detail);
@@ -1497,6 +1786,7 @@ pub(crate) mod tests {
         let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let payload = request_json(&request);
         assert_eq!(payload["event"], "outbound_download_started");
+        assert!(payload.get("url").is_none());
         assert_eq!(payload["event_at"], result.event_at);
         assert_eq!(payload["download_starts"], 1);
         assert_eq!(payload["file_count"], 2);
@@ -1537,6 +1827,7 @@ pub(crate) mod tests {
         let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let payload = request_json(&request);
         assert_eq!(payload["link_id"], "link-id");
+        assert!(payload.get("url").is_none());
         assert_eq!(payload["completed_at"], 100);
         assert_eq!(payload["file_count"], 101);
         assert_eq!(payload["total_bytes"], 5151);
@@ -1750,6 +2041,7 @@ pub(crate) mod tests {
         config.smtp_port = addr.port();
         config.smtp_starttls = false;
         config.smtp_from = Some("votport@example.com".to_owned());
+        config.public_url = None;
         let application = app::build(config).unwrap();
         test_destination_config(&application, "email", String::new());
 
