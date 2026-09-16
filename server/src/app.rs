@@ -1365,16 +1365,18 @@ fn resume_upload_sessions(
     ended: &tokio::sync::mpsc::UnboundedSender<session::SessionEnded>,
     active: &crate::receiving::Active,
 ) -> Result<HashSet<std::path::PathBuf>, String> {
-    active.during_recovery(|destinations| {
-        Ok(restore_upload_sessions(
-            config,
-            store,
-            signer,
-            sessions,
-            ended,
-            destinations,
-        ))
-    })
+    active
+        .during_recovery(|destinations| {
+            Ok(restore_upload_sessions(
+                config,
+                store,
+                signer,
+                sessions,
+                ended,
+                destinations,
+            ))
+        })
+        .inspect(|kept| crate::paths::clean_staging(&config.receive_dir, kept))
 }
 
 fn restore_upload_sessions(
@@ -1417,11 +1419,43 @@ fn restore_upload_sessions(
                 kept.extend(paths);
             }
             Err(error) => {
-                tracing::warn!(session_tag = %session_tag, %error, "suspended upload requires recovery");
-                session::commit_persisted_interruption(store, ended, &session, &error);
-                for file in &session.files {
-                    kept.insert(file.staging_path.clone());
-                    kept.insert(file.journal_path.clone());
+                match session::permanent_refusal_detail(store, &session) {
+                    Some(detail) => {
+                        // The link can never accept this session again, so the
+                        // evidence is dropped: one final interrupted event, then
+                        // the record, staging and journals are removed.
+                        session::commit_persisted_interruption(store, ended, &session, &detail);
+                        match session::discard_refused_session(store, destinations, &session) {
+                            Ok(()) => {
+                                tracing::info!(target: "audit", event = "upload_session_discarded", link = %session.link_id, session_tag = %session_tag, %error, "discarded a suspended upload whose link can never accept it again")
+                            }
+                            Err(cleanup) => {
+                                tracing::warn!(session_tag = %session_tag, %error, %cleanup, "discarding a refused suspended upload failed");
+                                for file in &session.files {
+                                    kept.insert(file.staging_path.clone());
+                                    kept.insert(file.journal_path.clone());
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        tracing::warn!(session_tag = %session_tag, %error, "suspended upload requires recovery");
+                        session::commit_persisted_interruption(store, ended, &session, &error);
+                        for file in &session.files {
+                            kept.insert(file.staging_path.clone());
+                            kept.insert(file.journal_path.clone());
+                        }
+                        if let Some(key) = &session.push_key {
+                            // The sweep must not remove a staging directory this
+                            // session still needs; its files live inside it.
+                            kept.insert(
+                                session
+                                    .dest_dir
+                                    .join(".vot-stage")
+                                    .join(format!(".vot-push-{key}")),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1506,7 +1540,18 @@ fn resume_upload_session(
                 || Ok((0, Vec::new())),
             )
             .map_err(|error| format!("register push session: {error:?}"))?;
-        return Ok(vec![directory]);
+        // The parked session's native staging and journals live beside the
+        // destination, outside the push directory; keep them from any sweep.
+        let mut kept_paths = vec![directory];
+        for file in &session.files {
+            if !file.staging_path.as_os_str().is_empty() {
+                kept_paths.push(file.staging_path.clone());
+            }
+            if !file.journal_path.as_os_str().is_empty() {
+                kept_paths.push(file.journal_path.clone());
+            }
+        }
+        return Ok(kept_paths);
     }
     let (sender, receiver) = tokio::sync::mpsc::channel(8);
     let (kept, already) = session::resume_worker(setup, receiver, session)?;
@@ -5294,8 +5339,7 @@ mod push_tests {
         assert!(object_path.exists());
         drop(lock);
         sweep_push_staging(&app);
-        assert!(stage.join("writer.lock").is_file());
-        assert_eq!(std::fs::read_dir(&stage).unwrap().count(), 1);
+        assert!(!stage.exists());
         assert!(app.store.load_push_sessions().unwrap().is_empty());
         app.store.insert_upload_session(&persisted).unwrap();
         sweep_push_staging(&app);
@@ -6515,7 +6559,7 @@ fn sweep_push_staging(app: &App) {
             continue;
         }
         if let Err(error) = destinations
-            .clear_push_directory(&directory, &_lock)
+            .remove_push_directory(&directory, &_lock)
             .map_err(std::io::Error::other)
             .and_then(|_| {
                 app.store
