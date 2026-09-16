@@ -5,7 +5,9 @@
 //! owner-only, so the apps and `votport watch` share one list. A watcher
 //! thread scans each folder every [`POLL`]: a top-level file or folder whose
 //! fingerprint (entry count, total bytes, newest change) has not moved for
-//! [`SETTLE`] is handed to the listener once, as one drop; the caller ships
+//! [`SETTLE`] and whose newest change is itself at least that old is handed
+//! to the listener once, as one drop, so a stalled writer cannot have a
+//! half-written drop shipped under it; the caller ships
 //! it with [`ship`], which moves it into the folder's `shipped` subfolder
 //! when the send ends well, so the folder itself is the ledger. A drop that
 //! fails stays where it is with its failed card and Retry; it is handed over
@@ -257,10 +259,11 @@ pub fn watch_with(
                     _ => return,
                 }
                 let now = Instant::now();
+                let wall = SystemTime::now();
                 let list = load();
                 seen.retain(|(id, _), _| list.iter().any(|w| &w.id == id));
                 for watch in &list {
-                    scan(watch, settle, now, &mut seen, listener.as_ref());
+                    scan(watch, settle, now, wall, &mut seen, listener.as_ref());
                 }
                 std::thread::sleep(poll);
             }
@@ -269,11 +272,27 @@ pub fn watch_with(
     watcher
 }
 
+/// Whether a drop whose fingerprint has held still for `held` settles: the
+/// fingerprint must be unchanged for the window and its newest change must
+/// be at least the window old, so a writer that stalls mid-drop longer
+/// than the window cannot have a half-written drop shipped under it. A
+/// newest change in the future (clock skew, NFS) counts as aged, and a
+/// drop whose newest change cannot be read is not held by the age rule.
+fn settled(held: Duration, newest: Option<SystemTime>, now: SystemTime, window: Duration) -> bool {
+    held >= window
+        && newest.is_none_or(|newest| match now.duration_since(newest) {
+            // A newest change in the future counts as aged.
+            Err(_) => true,
+            Ok(age) => age >= window,
+        })
+}
+
 /// One pass over one watched folder.
 fn scan(
     watch: &Stored,
     settle: Duration,
     now: Instant,
+    wall: SystemTime,
     seen: &mut HashMap<(String, PathBuf), Seen>,
     listener: &dyn WatchListener,
 ) {
@@ -311,7 +330,7 @@ fn scan(
             state.handed = false;
             continue;
         }
-        if !state.handed && now.duration_since(state.since) >= settle {
+        if !state.handed && settled(now.duration_since(state.since), fingerprint.2, wall, settle) {
             let path = path.to_string_lossy().into_owned();
             let Some(admission) = try_admit(&watch.id, &path) else {
                 continue;
@@ -596,6 +615,12 @@ mod tests {
         (state, scope)
     }
 
+    /// A wall clock behind the real one, so every drop a test writes is
+    /// already aged past `window` and only the hold timing is exercised.
+    fn aged_wall(window: Duration) -> SystemTime {
+        SystemTime::now() - window * 3
+    }
+
     struct Collect(Mutex<Vec<(String, String)>>);
 
     impl WatchListener for Collect {
@@ -633,8 +658,16 @@ mod tests {
             std::fs::write(dir.path().join(name), name).unwrap();
         }
         let t0 = Instant::now();
-        scan(&watch, settle, t0, &mut seen, listener.as_ref());
-        scan(&watch, settle, t0 + settle, &mut seen, listener.as_ref());
+        let wall = aged_wall(settle);
+        scan(&watch, settle, t0, wall, &mut seen, listener.as_ref());
+        scan(
+            &watch,
+            settle,
+            t0 + settle,
+            wall,
+            &mut seen,
+            listener.as_ref(),
+        );
         assert_eq!(listener.calls.lock().unwrap().len(), WATCH_CAPACITY);
         assert_eq!(listener.admissions.lock().unwrap().len(), WATCH_CAPACITY);
 
@@ -644,6 +677,7 @@ mod tests {
             &watch,
             settle,
             t0 + Duration::from_secs(1),
+            wall,
             &mut seen,
             listener.as_ref(),
         );
@@ -654,6 +688,7 @@ mod tests {
             &watch,
             settle,
             t0 + Duration::from_secs(2),
+            wall,
             &mut seen,
             listener.as_ref(),
         );
@@ -663,6 +698,7 @@ mod tests {
             &watch,
             settle,
             t0 + Duration::from_secs(3),
+            wall,
             &mut seen,
             listener.as_ref(),
         );
@@ -674,6 +710,7 @@ mod tests {
             &watch,
             settle,
             t0 + Duration::from_secs(4),
+            wall,
             &mut seen,
             listener.as_ref(),
         );
@@ -804,7 +841,8 @@ mod tests {
         std::fs::write(dir.path().join(".hidden"), b"x").unwrap();
         std::fs::create_dir(dir.path().join(SHIPPED)).unwrap();
         let t0 = Instant::now();
-        scan(&watch, settle, t0, &mut seen, seen_list.as_ref());
+        let wall = aged_wall(settle);
+        scan(&watch, settle, t0, wall, &mut seen, seen_list.as_ref());
         assert!(seen_list.0.lock().unwrap().is_empty(), "not yet settled");
         // Grows before the window: the clock restarts.
         std::fs::write(dir.path().join("a.bin"), b"1234567").unwrap();
@@ -812,6 +850,7 @@ mod tests {
             &watch,
             settle,
             t0 + Duration::from_millis(40),
+            wall,
             &mut seen,
             seen_list.as_ref(),
         );
@@ -819,6 +858,7 @@ mod tests {
             &watch,
             settle,
             t0 + Duration::from_millis(80),
+            wall,
             &mut seen,
             seen_list.as_ref(),
         );
@@ -827,6 +867,7 @@ mod tests {
             &watch,
             settle,
             t0 + Duration::from_millis(95),
+            wall,
             &mut seen,
             seen_list.as_ref(),
         );
@@ -838,6 +879,7 @@ mod tests {
             &watch,
             settle,
             t0 + Duration::from_secs(5),
+            wall,
             &mut seen,
             seen_list.as_ref(),
         );
@@ -849,6 +891,7 @@ mod tests {
             &watch,
             settle,
             t0 + Duration::from_secs(6),
+            wall,
             &mut seen,
             seen_list.as_ref(),
         );
@@ -858,6 +901,7 @@ mod tests {
             &watch,
             settle,
             t0 + Duration::from_secs(7),
+            wall,
             &mut seen,
             seen_list.as_ref(),
         );
@@ -865,6 +909,7 @@ mod tests {
             &watch,
             settle,
             t0 + Duration::from_secs(8),
+            wall,
             &mut seen,
             seen_list.as_ref(),
         );
@@ -882,6 +927,99 @@ mod tests {
             "dotfiles are never handed"
         );
         assert!(!dir.path().join(SHIPPED).join(".hidden").exists());
+    }
+
+    /// A drop settles only when its fingerprint has held still for the
+    /// window and its newest change is itself at least the window old.
+    #[test]
+    fn settling_needs_both_a_held_fingerprint_and_an_aged_newest_change() {
+        let window = Duration::from_secs(10);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let aged = now - window;
+        let fresh = now - Duration::from_secs(1);
+        let future = now + Duration::from_secs(60);
+        // A fingerprint that holds still is not enough: while its newest
+        // change is fresh, a stalled writer keeps the drop unsettled.
+        assert!(!settled(window, Some(fresh), now, window));
+        assert!(!settled(window * 100, Some(fresh), now, window));
+        assert!(!settled(Duration::ZERO, Some(aged), now, window));
+        // Held for the window and aged for the window settles.
+        assert!(settled(window, Some(aged), now, window));
+        // A newest change in the future counts as aged, but it never
+        // skips the hold.
+        assert!(settled(window, Some(future), now, window));
+        assert!(!settled(Duration::ZERO, Some(future), now, window));
+        // A drop whose newest change cannot be read is not held by the
+        // age rule.
+        assert!(settled(window, None, now, window));
+    }
+
+    /// A stalled writer: the fingerprint holds still well past the window,
+    /// but the drop stays unsettled while its newest change is fresh, hands
+    /// over once that change ages past the window, and a future change
+    /// counts as aged.
+    #[test]
+    fn a_fresh_newest_change_blocks_settling_until_it_ages() {
+        let _test_lock = TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let watch = watch_in(dir.path());
+        let (_state, _state_scope) = test_state();
+        store(std::slice::from_ref(&watch)).unwrap();
+        let handed = Arc::new(Collect(Mutex::new(Vec::new())));
+        let mut seen = HashMap::new();
+        let settle = Duration::from_millis(50);
+        std::fs::write(dir.path().join("a.bin"), b"12345").unwrap();
+        let newest = fingerprint(&dir.path().join("a.bin")).unwrap().2.unwrap();
+        let t0 = Instant::now();
+        scan(
+            &watch,
+            settle,
+            t0,
+            newest + settle / 2,
+            &mut seen,
+            handed.as_ref(),
+        );
+        scan(
+            &watch,
+            settle,
+            t0 + settle * 10,
+            newest + settle / 2,
+            &mut seen,
+            handed.as_ref(),
+        );
+        assert!(
+            handed.0.lock().unwrap().is_empty(),
+            "a fresh newest change holds the drop"
+        );
+        scan(
+            &watch,
+            settle,
+            t0 + settle * 10,
+            newest + settle,
+            &mut seen,
+            handed.as_ref(),
+        );
+        assert_eq!(handed.0.lock().unwrap().len(), 1);
+        // A newest change in the future (clock skew) counts as aged.
+        std::fs::write(dir.path().join("b.bin"), b"1").unwrap();
+        let next = fingerprint(&dir.path().join("b.bin")).unwrap().2.unwrap();
+        scan(
+            &watch,
+            settle,
+            t0 + settle * 11,
+            next - settle * 2,
+            &mut seen,
+            handed.as_ref(),
+        );
+        scan(
+            &watch,
+            settle,
+            t0 + settle * 12,
+            next - settle * 2,
+            &mut seen,
+            handed.as_ref(),
+        );
+        assert_eq!(handed.0.lock().unwrap().len(), 2);
     }
 
     fn watch_in(dir: &Path) -> Stored {
@@ -905,22 +1043,26 @@ mod tests {
         let settle = Duration::from_millis(10);
         std::fs::create_dir(dir.path().join("seq")).unwrap();
         let empty_at = Instant::now();
-        scan(&watch, settle, empty_at, &mut seen, handed.as_ref());
+        let wall = aged_wall(settle);
+        scan(&watch, settle, empty_at, wall, &mut seen, handed.as_ref());
         scan(
             &watch,
             settle,
             empty_at + settle,
+            wall,
             &mut seen,
             handed.as_ref(),
         );
         assert!(handed.0.lock().unwrap().is_empty());
         std::fs::write(dir.path().join("seq/.DS_Store"), b"metadata").unwrap();
         let t0 = Instant::now();
-        scan(&watch, settle, t0, &mut seen, handed.as_ref());
+        let wall = aged_wall(settle);
+        scan(&watch, settle, t0, wall, &mut seen, handed.as_ref());
         scan(
             &watch,
             settle,
             t0 + Duration::from_secs(1),
+            wall,
             &mut seen,
             handed.as_ref(),
         );
@@ -930,6 +1072,7 @@ mod tests {
             &watch,
             settle,
             t0 + Duration::from_secs(2),
+            wall,
             &mut seen,
             handed.as_ref(),
         );
@@ -937,6 +1080,7 @@ mod tests {
             &watch,
             settle,
             t0 + Duration::from_secs(3),
+            wall,
             &mut seen,
             handed.as_ref(),
         );
@@ -961,11 +1105,13 @@ mod tests {
         std::fs::create_dir_all(drop.join("inner")).unwrap();
         std::fs::write(drop.join("inner/a"), b"12").unwrap();
         let t0 = Instant::now();
-        scan(&watch, settle, t0, &mut seen, handed.as_ref());
+        let wall = aged_wall(settle);
+        scan(&watch, settle, t0, wall, &mut seen, handed.as_ref());
         scan(
             &watch,
             settle,
             t0 + Duration::from_secs(1),
+            wall,
             &mut seen,
             handed.as_ref(),
         );
@@ -978,6 +1124,7 @@ mod tests {
             &watch,
             settle,
             t0 + Duration::from_secs(2),
+            wall,
             &mut seen,
             handed.as_ref(),
         );
@@ -985,6 +1132,7 @@ mod tests {
             &watch,
             settle,
             t0 + Duration::from_secs(3),
+            wall,
             &mut seen,
             handed.as_ref(),
         );
