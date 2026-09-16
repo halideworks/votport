@@ -3912,6 +3912,84 @@ mod ops_tests {
         assert!(snapshot.exists());
     }
 
+    #[test]
+    fn backup_bounds_wal_after_a_pinned_reader_grows_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let database = directory.path().join("votport.db");
+        let wal = directory.path().join("votport.db-wal");
+
+        // A backup's VACUUM INTO reader pins the WAL read mark for its whole
+        // run; commits in that window cannot be checkpointed away and pile
+        // up in the WAL. Reproduce the shape with a plain read transaction.
+        let reader = Connection::open(&database).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM meta;")
+            .unwrap();
+        let payload = "x".repeat(512 * 1024);
+        for index in 0..40 {
+            store
+                .put_settings(
+                    "test",
+                    &[(
+                        format!("growth-{index}"),
+                        SettingWrite::Set(format!("{payload}-{index}")),
+                    )],
+                )
+                .unwrap();
+        }
+        let high_water = std::fs::metadata(&wal).unwrap().len();
+        assert!(
+            high_water > WAL_SIZE_LIMIT_BYTES as u64,
+            "pinned-reader backlog should exceed the WAL bound, got {high_water}"
+        );
+
+        // The backup's explicit checkpoint drains and truncates the pileup,
+        // so no writer after the backup pays for it inside its own
+        // transaction and the file is back under the bound (a probe finds no
+        // frames left to copy; the unbounded shape would show the whole
+        // backlog here).
+        drop(reader);
+        let snapshot = directory.path().join("snapshot.db");
+        store.backup_into(&snapshot).unwrap();
+        let pending = store
+            .with(|connection| {
+                connection.query_row::<(i64, i64, i64), _, _>(
+                    "PRAGMA wal_checkpoint(PASSIVE)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            pending,
+            (0, 0, 0),
+            "backup left WAL frames for the next writer to drain"
+        );
+
+        // The next write resets the drained WAL and the journal size limit
+        // truncates the file back under the bound; later writes stay there.
+        store
+            .put_settings(
+                "test",
+                &[("after".to_owned(), SettingWrite::Set(payload.clone()))],
+            )
+            .unwrap();
+        let after_write = std::fs::metadata(&wal).unwrap().len();
+        assert!(
+            after_write <= WAL_SIZE_LIMIT_BYTES as u64,
+            "WAL stayed at the backup-time high water after the next write: {after_write}"
+        );
+        store
+            .put_settings(
+                "test",
+                &[("after-2".to_owned(), SettingWrite::Set(payload))],
+            )
+            .unwrap();
+        let after_more_writes = std::fs::metadata(&wal).unwrap().len();
+        assert!(after_more_writes <= WAL_SIZE_LIMIT_BYTES as u64);
+    }
+
     #[cfg(unix)]
     #[test]
     fn open_protects_existing_and_new_database_state() {
