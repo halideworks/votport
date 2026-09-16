@@ -243,7 +243,7 @@ export function revealHash({ scroll = true, focus = scroll } = {}) {
   const id = window.location.hash.slice(1);
   // Only list cards are revealed; a settings section fragment on System is
   // plain navigation.
-  if (id && !/^(link|grant|job)-/.test(id)) return false;
+  if (id && !/^(link|grant|job|route)-/.test(id)) return false;
   if (!id) return false;
   const target = document.getElementById(id);
   if (!target) return false;

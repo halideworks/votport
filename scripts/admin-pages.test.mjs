@@ -231,7 +231,7 @@ test('the audit log can be read oldest first, the theme switch is a quiet link, 
   const auditScript = await readFile(new URL('../web/assets/page-audit.js', import.meta.url), 'utf8');
   assert.match(auditScript, /after_rowid/);
   assert.match(receive, /id="theme-toggle" class="link theme-toggle"/);
-  assert.match(commonScript, /\^\(link\|grant\|job\)-/);
+  assert.match(commonScript, /\^\(link\|grant\|job\|route\)-/);
   assert.match(system, /Reset to default/);
 });
 

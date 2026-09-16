@@ -1,5 +1,5 @@
 import { isFormDirty, markFormSaved } from '/assets/form-drafts.js';
-import { api, requireSession, button, copyToClipboard, confirmModal, formatWhen } from '/assets/admin-common.js';
+import { api, requireSession, button, copyToClipboard, confirmModal, formatWhen, revealHash } from '/assets/admin-common.js';
 import { notificationEditor, tradeEvents } from '/assets/notifications.js';
 
 const $ = (id) => document.getElementById(id);
@@ -291,5 +291,9 @@ $('trade-endpoint-form').addEventListener('submit', (event) => { event.preventDe
   });
 });
 await guard(refresh);
+// A notification or search result names a route card: open it now that
+// the list has rendered, and follow later hash changes as routes load.
+revealHash();
+window.addEventListener('hashchange', revealHash);
 if (admin && (returnRequest || window.location.hash === '#receive')) showSetup('receive');
 else if (admin && window.location.hash === '#send') showSetup('send');

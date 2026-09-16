@@ -20,14 +20,16 @@ pub fn destination(
     app.store.notification_destination(tenant, id)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn send_policy(
     app: &App,
     route: Route<'_>,
     title: String,
     mut body: String,
-    payload: serde_json::Value,
+    mut payload: serde_json::Value,
     event: &str,
     transfer_id: Option<&str>,
+    url: Option<&str>,
 ) {
     let resolved = (|| -> Result<Vec<NotificationDestination>, String> {
         let Some(policy) = route.policy else {
@@ -65,6 +67,12 @@ pub(super) async fn send_policy(
     };
     if let Some(id) = transfer_id {
         body.insert_str(0, &format!("ID: {id}\n"));
+    }
+    if let Some(url) = url {
+        // The deep link leads the summary so clipping keeps it, and the
+        // structured payload carries it for automations.
+        body.insert_str(0, &format!("{url}\n"));
+        payload["url"] = serde_json::Value::String(url.to_owned());
     }
     stream::iter(destinations.iter())
         .for_each_concurrent(8, |destination| async {
@@ -478,6 +486,7 @@ mod tests {
             "body".into(),
             payload.clone(),
             "event",
+            None,
             None,
         )
         .await;
