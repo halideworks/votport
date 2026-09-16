@@ -35,6 +35,11 @@ pub const MAX_SEAL_BYTES: usize = 1024 * 1024;
 pub const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_PAGES: u64 = 4096;
 pub const MAX_ENTRIES: usize = 2_000_000;
+/// Per-session bound on stored entries: every entry's state stays resident
+/// for the session's whole life, so the count is capped regardless of the
+/// link byte budget. The browser UI fixture handles 100k files, leaving
+/// 2.6x headroom.
+pub const MAX_SESSION_ENTRIES: usize = 262_144;
 // Reserve room for one file, its journal, and metadata when bytes are zero.
 const ENTRY_ADMISSION_BYTES: u64 = 4096;
 const ENTRY_ADMISSION_FLOOR: u64 = 256;
@@ -565,7 +570,9 @@ impl Drop for StagedFile {
 
 struct FileState {
     display_path: String,
-    stored_components: Vec<String>,
+    /// Admitted path components joined by NUL; component names can never
+    /// contain NUL, so one String replaces a Vec of per-component heaps.
+    stored_components: String,
     object: ObjectId,
     native: Option<StagedFile>,
     published: bool,
@@ -932,6 +939,18 @@ fn entry_count_within_limit(count: usize, max_total_bytes: u64) -> bool {
     count <= max_entries_for_bytes(max_total_bytes)
 }
 
+/// Refuses entry batches past [`MAX_SESSION_ENTRIES`]. Applied wherever a
+/// session's entry list is first created: HTTP and push admission via
+/// [`prepare_files`], boot and push replay via [`restore_files`].
+fn check_session_entry_cap(count: usize) -> Result<(), SessionError> {
+    if count > MAX_SESSION_ENTRIES {
+        return Err(SessionError::bad(format!(
+            "session exceeds the {MAX_SESSION_ENTRIES} entry cap"
+        )));
+    }
+    Ok(())
+}
+
 fn handle_page(phase: &mut Phase, bytes: &[u8]) -> Result<u64, SessionError> {
     let Phase::Pages {
         ingest,
@@ -1148,7 +1167,11 @@ fn persisted_session<'a>(
             PersistedUploadFile {
                 entry,
                 display_path: file.display_path.clone(),
-                stored_components: file.stored_components.clone(),
+                stored_components: file
+                    .stored_components
+                    .split('\0')
+                    .map(str::to_owned)
+                    .collect(),
                 object: file.object.clone(),
                 staging_path,
                 journal_path,
@@ -1443,6 +1466,7 @@ fn restore_files(
     persisted: &mut PersistedUploadSession,
     active: impl Fn() -> bool,
 ) -> Result<(Vec<FileState>, Vec<PathBuf>), String> {
+    check_session_entry_cap(persisted.files.len()).map_err(|error| error.message)?;
     if persisted.committed_upload_id.is_some() {
         return Err("completed upload cannot resume receiving".into());
     }
@@ -1549,7 +1573,7 @@ fn restore_files(
         };
         files.push(FileState {
             display_path: file.display_path.clone(),
-            stored_components: file.stored_components.clone(),
+            stored_components: file.stored_components.join("\0"),
             object: file.object.clone(),
             native,
             published: file.published,
@@ -1742,6 +1766,7 @@ fn prepare_files<'a>(
     entries: &[(Vec<String>, ObjectId)],
     active: impl Fn() -> bool + Sync,
 ) -> Result<(Vec<FileState>, std::sync::MutexGuard<'a, ()>), SessionError> {
+    check_session_entry_cap(entries.len())?;
     for (components, _) in entries {
         crate::protocol_paths::check_payload_name_length(
             components.last().map_or("", String::as_str),
@@ -1797,7 +1822,7 @@ fn prepare_files<'a>(
         if let Some(existing) = &existing[index] {
             return Ok(FileState {
                 display_path: components.join("/"),
-                stored_components: existing.stored_components.clone(),
+                stored_components: existing.stored_components.join("\0"),
                 object: object.clone(),
                 native: None,
                 published: true,
@@ -1939,7 +1964,7 @@ fn open_destination_for(
             Ok(native) => {
                 return Ok(FileState {
                     display_path,
-                    stored_components: stored,
+                    stored_components: stored.join("\0"),
                     object: object.clone(),
                     native: Some(StagedFile::new(
                         native,
@@ -2460,7 +2485,7 @@ pub fn commit_persisted_interruption(
         .filter(|file| file.published)
         .map(|file| FileRecord {
             path: file.display_path.clone(),
-            stored_as: stored_rel(&session.dest_rel, &file.stored_components),
+            stored_as: stored_rel(&session.dest_rel, &file.stored_components.join("\0")),
             bytes: file.object.length,
             suite: suite_name(file.object.suite),
             root: hex::encode(file.object.root),
@@ -3898,8 +3923,10 @@ pub(crate) fn record_unconnected_push(setup: WorkerSetup, aborted: bool) {
     record_event(&setup, 0, now_unix(), outcome, detail.to_owned(), 0, 0);
 }
 
-fn stored_rel(dest_rel: &str, components: &[String]) -> String {
-    let tail = components.join("/");
+/// `components` is a stored path as [`FileState`] keeps it: admitted
+/// components joined by NUL, which cannot appear inside a component name.
+fn stored_rel(dest_rel: &str, components: &str) -> String {
+    let tail = components.replace('\0', "/");
     if dest_rel.is_empty() {
         tail
     } else {
@@ -5339,6 +5366,12 @@ mod push_tests {
         }
     }
 
+    /// FileState stores the admitted path as one NUL-joined string; tests
+    /// that need the component list back split on that separator.
+    fn split_components(joined: &str) -> Vec<String> {
+        joined.split('\0').map(str::to_owned).collect()
+    }
+
     #[test]
     fn session_event_writer_reports_store_errors() {
         let directory = tempfile::tempdir().unwrap();
@@ -5714,11 +5747,16 @@ mod push_tests {
                     start_b.send(()).unwrap();
                     (a.join().unwrap(), b.join().unwrap())
                 });
-                let first_path =
-                    paths::join_under(&first.dest_dir, &first_files[0].stored_components).unwrap();
-                let second_path =
-                    paths::join_under(&second.dest_dir, &second_files[0].stored_components)
-                        .unwrap();
+                let first_path = paths::join_under(
+                    &first.dest_dir,
+                    &split_components(&first_files[0].stored_components),
+                )
+                .unwrap();
+                let second_path = paths::join_under(
+                    &second.dest_dir,
+                    &split_components(&second_files[0].stored_components),
+                )
+                .unwrap();
                 assert_ne!(
                     first_path, second_path,
                     "admitted uploads must own distinct final names before publication"
@@ -6045,7 +6083,10 @@ mod push_tests {
         .unwrap();
         persist_session(&competing, &files).unwrap();
         drop(allocation);
-        assert_ne!(files[0].stored_components, saved.files[0].stored_components);
+        assert_ne!(
+            files[0].stored_components,
+            saved.files[0].stored_components.join("\0")
+        );
         let mut retry = setup_with_app(directory.path(), expected.clone(), &application);
         retry.session_id = [8; 16];
         persist_push(&retry, key.clone()).unwrap();
@@ -6089,8 +6130,14 @@ mod push_tests {
         assert_eq!(fs::read(competing.dest_dir.join("frame")).unwrap(), bytes);
         assert!(competing.dest_dir.join("frame.vot-receipt").is_file());
         assert_eq!(
-            fs::read(paths::join_under(&competing.dest_dir, &files[0].stored_components).unwrap())
+            fs::read(
+                paths::join_under(
+                    &competing.dest_dir,
+                    &split_components(&files[0].stored_components),
+                )
                 .unwrap(),
+            )
+            .unwrap(),
             b"competing"
         );
     }
@@ -6126,10 +6173,10 @@ mod push_tests {
                 let (other, allocation) = result.unwrap();
                 drop(allocation);
                 assert_ne!(
-                    stored_path_key("", &other[0].stored_components).unwrap(),
+                    stored_path_key("", &split_components(&other[0].stored_components)).unwrap(),
                     stored_path_key("", &first_path).unwrap()
                 );
-                assert_ne!(other[0].stored_components, second_path);
+                assert_ne!(other[0].stored_components, second_path.join("\0"));
             }
         }
     }
@@ -6205,7 +6252,7 @@ mod push_tests {
             let (other, allocation) =
                 prepare_files(&second, &[(vec!["frame".into()], expected)], || true).unwrap();
             drop(allocation);
-            assert_eq!(other[0].stored_components, ["frame"]);
+            assert_eq!(other[0].stored_components, "frame");
         }
     }
 
@@ -6239,7 +6286,7 @@ mod push_tests {
         )
         .unwrap();
         drop(allocation);
-        assert_eq!(files[0].stored_components, ["existing.bin"]);
+        assert_eq!(files[0].stored_components, "existing.bin");
         assert!(files[0].published);
         assert!(files[0].native.is_none());
         assert!(!first.dest_dir.join("folder").exists());
@@ -6273,9 +6320,10 @@ mod push_tests {
                 drop(allocation);
                 let mut names = HashSet::new();
                 for file in &mut files {
-                    let path =
-                        vot_manifest::PackagePath::portable(file.stored_components.iter().cloned())
-                            .unwrap();
+                    let path = vot_manifest::PackagePath::portable(split_components(
+                        &file.stored_components,
+                    ))
+                    .unwrap();
                     let key = vot_manifest::canonical_path_key(
                         &path,
                         vot_manifest::PathProfile::Portable,
@@ -6284,12 +6332,16 @@ mod push_tests {
                     assert!(
                         names.insert(key),
                         "stored name claimed twice: {}",
-                        file.stored_components.join("/")
+                        file.stored_components.replace('\0', "/")
                     );
                     publish_file(&setup, file, || true).unwrap();
                     assert_eq!(
                         fs::metadata(
-                            paths::join_under(&setup.dest_dir, &file.stored_components).unwrap()
+                            paths::join_under(
+                                &setup.dest_dir,
+                                &split_components(&file.stored_components)
+                            )
+                            .unwrap()
                         )
                         .unwrap()
                         .len(),
@@ -6327,7 +6379,7 @@ mod push_tests {
             drop(allocation);
             assert_eq!(files.len(), count);
             for (index, file) in files.iter().enumerate() {
-                assert_eq!(file.stored_components, entries[index].0);
+                assert_eq!(file.stored_components, entries[index].0.join("\0"));
                 assert!(!file.published);
             }
             assert_eq!(checks.load(Ordering::Relaxed), count * 2);
@@ -6811,6 +6863,110 @@ mod push_tests {
         assert_eq!(fs::read(&sidecar).unwrap(), evidence);
         assert_eq!(fs::read(setup.dest_dir.join("frame")).unwrap(), bytes);
         assert!(setup.store.load_upload_sessions().unwrap()[0].files[0].receipt);
+    }
+
+    #[test]
+    fn persisted_components_survive_a_save_restore_round_trip_byte_identically() {
+        let directory = tempfile::tempdir().unwrap();
+        let object = object(Suite::Blake3Bao64, b"frame");
+        let setup = setup(directory.path(), object.clone());
+        let mut files = vec![
+            open_destination_for(&setup, vec!["plain.bin".into()], object.clone()).unwrap(),
+            open_destination_for(
+                &setup,
+                vec!["nested".into(), "dir".into(), "report.pdf".into()],
+                object,
+            )
+            .unwrap(),
+        ];
+        persist_session(&setup, &files).unwrap();
+        // Park the staging the way a crash would leave it, after the
+        // admission record carries the live staging paths.
+        for file in &mut files {
+            file.native.take().unwrap().abandon();
+        }
+        let mut saved = setup.store.load_upload_sessions().unwrap().remove(0);
+        // The persisted cell must remain the pre-existing JSON array of
+        // components: the in-memory representation changed, the schema did not.
+        let wire = |files: &[crate::store::PersistedUploadFile]| {
+            files
+                .iter()
+                .map(|file| serde_json::to_string(&file.stored_components).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let first_wire = wire(&saved.files);
+        assert_eq!(
+            saved.files[1].stored_components,
+            ["nested", "dir", "report.pdf"]
+        );
+        let (restored, _) = restore_files(&setup, &mut saved, || true).unwrap();
+        assert_eq!(restored[1].stored_components, "nested\0dir\0report.pdf");
+        persist_session(&setup, &restored).unwrap();
+        let resaved = setup.store.load_upload_sessions().unwrap().remove(0);
+        assert_eq!(resaved, saved);
+        assert_eq!(wire(&resaved.files), first_wire);
+    }
+
+    #[test]
+    fn admission_refuses_entries_over_the_session_cap_with_the_cap_named() {
+        let directory = tempfile::tempdir().unwrap();
+        let expected = object(Suite::Blake3Bao64, b"");
+        let setup = setup(directory.path(), expected.clone());
+        // The empty trailing component is rejected by per-name validation, so
+        // if the cap check is ever removed or reordered behind it, this test
+        // still fails (fast, with the wrong message) instead of staging
+        // MAX_SESSION_ENTRIES real files.
+        let entries =
+            vec![(vec!["f.bin".to_owned(), String::new()], expected); MAX_SESSION_ENTRIES + 1];
+        let error = prepare_files(&setup, &entries, || true).err().unwrap();
+        assert_eq!(error.status, 422);
+        assert!(error.message.contains("262144"), "{}", error.message);
+    }
+
+    #[test]
+    fn session_cap_admits_cap_minus_one_entries() {
+        assert!(check_session_entry_cap(MAX_SESSION_ENTRIES - 1).is_ok());
+        assert!(check_session_entry_cap(MAX_SESSION_ENTRIES).is_ok());
+    }
+
+    #[test]
+    fn restore_refuses_replaying_persisted_sessions_over_the_entry_cap() {
+        let directory = tempfile::tempdir().unwrap();
+        let stub = object(Suite::Blake3Bao64, b"");
+        let object = object(Suite::Blake3Bao64, b"");
+        let setup = setup(directory.path(), object.clone());
+        let file = crate::store::PersistedUploadFile {
+            entry: 0,
+            display_path: String::new(),
+            stored_components: vec![String::new()],
+            object,
+            staging_path: std::path::PathBuf::new(),
+            journal_path: std::path::PathBuf::new(),
+            incarnation: [0; 16],
+            profile: CommitProfile::Balanced,
+            nas_contract: vot_sdk_file::NasContract::Unqualified,
+            prefix_bytes: 0,
+            published: false,
+            receipt: false,
+        };
+        let mut saved = crate::store::PersistedUploadSession {
+            committed_upload_id: None,
+            push_key: None,
+            id: "over-cap".to_owned(),
+            link_id: "link".to_owned(),
+            tenant: String::new(),
+            dest_dir: setup.dest_dir.clone(),
+            dest_rel: String::new(),
+            package: stub,
+            max_total_bytes: None,
+            started_at: 1,
+            files: vec![file; MAX_SESSION_ENTRIES + 1],
+        };
+        let error = match restore_files(&setup, &mut saved, || true) {
+            Err(error) => error,
+            Ok(_) => panic!("over-cap persisted session replay must be refused"),
+        };
+        assert!(error.contains("262144"), "{error}");
     }
 
     #[test]
@@ -7358,7 +7514,7 @@ mod push_tests {
                 .unwrap();
             let legacy = FileState {
                 display_path: names.join("/"),
-                stored_components: names.clone(),
+                stored_components: names.join("\0"),
                 object: object.clone(),
                 native: Some(StagedFile::new(
                     native,
@@ -7968,7 +8124,7 @@ mod push_tests {
                     || true,
                 )
                 .unwrap();
-                assert_eq!(files[0].stored_components, ["renamed.bin"]);
+                assert_eq!(files[0].stored_components, "renamed.bin");
                 assert!(!files[0].published);
                 assert_eq!(fs::read(&reserved).unwrap(), b"original");
             }
@@ -7982,7 +8138,7 @@ mod push_tests {
                 .is_none());
             let file = FileState {
                 display_path: record.path.clone(),
-                stored_components: vec![record.path],
+                stored_components: record.path,
                 object: expected,
                 native: None,
                 published: true,
@@ -8027,7 +8183,7 @@ mod push_tests {
         staged.park();
         let file = FileState {
             display_path: "fast".to_owned(),
-            stored_components: vec!["fast".to_owned()],
+            stored_components: "fast".to_owned(),
             object: object.clone(),
             native: Some(staged),
             published: false,
@@ -8688,7 +8844,7 @@ mod parallel_accept_tests {
         native.reopen().unwrap();
         let files = vec![FileState {
             display_path: "obj".to_owned(),
-            stored_components: vec!["obj".to_owned()],
+            stored_components: "obj".to_owned(),
             object,
             native: Some(native),
             published: false,
