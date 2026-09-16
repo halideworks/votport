@@ -397,11 +397,42 @@ fn retry_in(directory: &Path) -> OutboxStatus {
     result
 }
 
+fn outbox_status(directory: &Path) -> OutboxStatus {
+    OutboxStatus {
+        pending: std::fs::read_dir(directory)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| {
+                        entry
+                            .path()
+                            .extension()
+                            .is_some_and(|extension| extension == "json")
+                    })
+                    .count() as u64
+            })
+            .unwrap_or(0),
+        recorded: 0,
+        failed: std::fs::read_dir(directory.join("failed"))
+            .map(|entries| entries.flatten().count() as u64)
+            .unwrap_or(0),
+    }
+}
+
 #[uniffi::export]
 pub fn retry_evidence() -> OutboxStatus {
     static RETRY: Mutex<()> = Mutex::new(());
-    let _guard = RETRY.lock().unwrap_or_else(|e| e.into_inner());
-    retry_in(&outbox())
+    // One pass holds this lock across its network round trips, seconds per
+    // report. A second caller never queues behind it: it reports the outbox
+    // as it stands instead, so a slow retry path cannot stall the FFI.
+    match RETRY.try_lock() {
+        Ok(_pass) => retry_in(&outbox()),
+        Err(std::sync::TryLockError::Poisoned(pass)) => {
+            let _pass = pass.into_inner();
+            retry_in(&outbox())
+        }
+        Err(std::sync::TryLockError::WouldBlock) => outbox_status(&outbox()),
+    }
 }
 
 pub fn start_retry_worker() {
@@ -690,5 +721,64 @@ mod tests {
         assert!(saved
             .evidence
             .verify(&hex::encode(server.verifying_key().to_bytes())));
+    }
+
+    /// A retry pass holds the pass lock across its network round trips, so a
+    /// second call must report the outbox as it stands instead of queueing
+    /// behind a slow server.
+    #[test]
+    fn a_retry_pass_in_flight_does_not_stall_the_next_call() {
+        use std::io::BufRead;
+        let home = tempfile::tempdir().unwrap();
+        let _state = crate::identity::test_state_dir(home.path());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        enqueue(
+            &base,
+            report(&base, "stall", u64::MAX, EvidenceKind::Verified),
+            &outbox(),
+        )
+        .unwrap();
+        let (accepted, in_flight) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            let _ = accepted.send(());
+            // Read the request and answer nothing: the pass stays stuck on
+            // its round trip while it holds the lock.
+            let mut reader = std::io::BufReader::new(&stream);
+            let mut line = String::new();
+            loop {
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+                line.clear();
+            }
+            std::thread::sleep(Duration::from_secs(8));
+        });
+        let passes = std::thread::spawn(retry_evidence);
+        in_flight
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the stalled pass never reached the server");
+        let start = std::time::Instant::now();
+        let status = retry_evidence();
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "a pass in flight stalled this caller"
+        );
+        assert_eq!(
+            (status.pending, status.recorded, status.failed),
+            (1, 0, 0),
+            "the snapshot reports the outbox without sending"
+        );
+        let stalled = passes.join().unwrap();
+        assert_eq!(
+            (stalled.pending, stalled.recorded, stalled.failed),
+            (1, 0, 0),
+            "the stalled pass retains the report for its retry"
+        );
+        server.join().unwrap();
     }
 }

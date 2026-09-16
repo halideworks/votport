@@ -15,6 +15,13 @@ pub struct Client {
     base: String,
     recipient_cookie: std::sync::Mutex<Option<String>>,
     route: Option<String>,
+    /// The whole-request bound for a metadata-sized request on this client.
+    /// A client built with a total of its own keeps that for these; the
+    /// transfer client, whose total stays unbounded for streaming bodies,
+    /// bounds them separately.
+    metadata_timeout: std::time::Duration,
+    /// The whole-request bound for one chunk upload (at most 8 MiB).
+    chunk_timeout: std::time::Duration,
 }
 
 /// What `GET /api/r/{token}` tells a sender about a link.
@@ -276,7 +283,6 @@ impl Client {
             self.run("recipient challenge", true, || {
                 self.http
                     .post(self.url(&format!("/api/s/{token}/recipient-challenge")))
-                    .timeout(std::time::Duration::from_secs(10))
                     .header("X-Votport", "1")
                     .json(&serde_json::json!({"holder": device.holder_key_hex()}))
             })?;
@@ -292,9 +298,9 @@ impl Client {
         let response = self
             .http
             .post(self.url(&format!("/api/s/{token}/recipient-verify")))
-            .timeout(std::time::Duration::from_secs(10))
             .header("X-Votport", "1")
             .json(&proof)
+            .timeout(self.metadata_timeout)
             .send()
             .map_err(|e| Error::Other(e.without_url().to_string()))?;
         if !response.status().is_success() {
@@ -334,9 +340,9 @@ impl Client {
                     .post(self.url(&format!("/api/s/{token}/evidence-challenge"))),
                 cookie,
             )
-            .timeout(std::time::Duration::from_secs(5))
             .header("X-Votport", "1")
             .json(&serde_json::json!({"holder": holder}))
+            .timeout(self.metadata_timeout)
             .send()
             .map_err(|e| Error::Other(e.without_url().to_string()))?;
         response
@@ -352,6 +358,7 @@ impl Client {
             .post(self.url("/api/evidence"))
             .header("X-Votport", "1")
             .json(evidence)
+            .timeout(self.metadata_timeout)
             .send()
             .map_err(|e| Error::Other(e.without_url().to_string()))?;
         if !response.status().is_success() {
@@ -413,12 +420,32 @@ impl Client {
         base: impl Into<String>,
         timeout: Option<std::time::Duration>,
     ) -> Result<Self> {
+        Self::with_bounds(
+            base,
+            timeout,
+            timeout.unwrap_or(METADATA_TIMEOUT),
+            timeout.unwrap_or(CHUNK_TIMEOUT),
+        )
+    }
+
+    /// Builds a client with a total request bound plus separate bounds for
+    /// metadata-sized requests and one chunk, so the transfer client's phase
+    /// bounds are fixed independently of its total.
+    pub(crate) fn with_bounds(
+        base: impl Into<String>,
+        timeout: Option<std::time::Duration>,
+        metadata_timeout: std::time::Duration,
+        chunk_timeout: std::time::Duration,
+    ) -> Result<Self> {
         let base = crate::port::origin(&base.into())?;
         let http = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("votport-client/", env!("CARGO_PKG_VERSION")))
             // Transfers can legitimately run long. Authentication and the
-            // short interactive preview use total-request timeouts.
+            // short interactive preview use total-request timeouts; the
+            // transfer client leaves the total unbounded and bounds each
+            // phase instead: metadata and chunks by whole-request deadlines,
+            // a streaming download by the connect bound alone.
             .timeout(timeout)
             .connect_timeout(std::time::Duration::from_secs(20))
             .build()
@@ -431,6 +458,8 @@ impl Client {
             recipient_cookie: std::sync::Mutex::new(None),
             route: None,
             base,
+            metadata_timeout,
+            chunk_timeout,
         })
     }
 
@@ -448,7 +477,34 @@ impl Client {
         idempotent: bool,
         build: impl Fn() -> reqwest::blocking::RequestBuilder,
     ) -> Result<T> {
-        retry(idempotent, || self.run_once(what, &build))
+        self.run_bounded(what, idempotent, self.metadata_timeout, build)
+    }
+
+    /// [`Self::run`] with another whole-request bound than the metadata one.
+    fn run_bounded<T: for<'de> Deserialize<'de>>(
+        &self,
+        what: &str,
+        idempotent: bool,
+        bound: std::time::Duration,
+        build: impl Fn() -> reqwest::blocking::RequestBuilder,
+    ) -> Result<T> {
+        retry(idempotent, || self.attempt(what, bound, &build))
+    }
+
+    fn attempt<T: for<'de> Deserialize<'de>>(
+        &self,
+        what: &str,
+        bound: std::time::Duration,
+        build: impl Fn() -> reqwest::blocking::RequestBuilder,
+    ) -> Result<T> {
+        let response = build()
+            .timeout(bound)
+            .send()
+            .map_err(|source| Error::Http {
+                url: what.to_owned(),
+                source,
+            })?;
+        json(response, what)
     }
 
     fn run_once<T: for<'de> Deserialize<'de>>(
@@ -456,11 +512,7 @@ impl Client {
         what: &str,
         build: impl Fn() -> reqwest::blocking::RequestBuilder,
     ) -> Result<T> {
-        let response = build().send().map_err(|source| Error::Http {
-            url: what.to_owned(),
-            source,
-        })?;
-        json(response, what)
+        self.attempt(what, self.metadata_timeout, build)
     }
 
     /// `GET /api/r/{token}`: what a sender may do with this link.
@@ -547,7 +599,7 @@ impl Client {
         data: &[u8],
     ) -> Result<ChunkProgress> {
         let url = self.url(&format!("/api/session/{session}/chunk"));
-        self.run("chunk", true, || {
+        self.run_bounded("chunk", true, self.chunk_timeout, || {
             let mut body = Vec::with_capacity(proof.len() + data.len());
             body.extend_from_slice(proof);
             body.extend_from_slice(data);
@@ -568,10 +620,15 @@ impl Client {
     pub fn finish(&self, session: &str) -> Result<FinishReport> {
         let url = self.url(&format!("/api/session/{session}/finish"));
         retry(false, || {
-            let response = self.http.post(&url).send().map_err(|source| Error::Http {
-                url: url.clone(),
-                source,
-            })?;
+            let response = self
+                .http
+                .post(&url)
+                .timeout(self.metadata_timeout)
+                .send()
+                .map_err(|source| Error::Http {
+                    url: url.clone(),
+                    source,
+                })?;
             let status = response.status();
             if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
                 let body = error_body_with_retry_after(response);
@@ -592,7 +649,7 @@ impl Client {
     /// answers ok, so this is safe on any failure path.
     pub fn abort(&self, session: &str) {
         let url = self.url(&format!("/api/session/{session}/abort"));
-        let _ = self.http.post(&url).send();
+        let _ = self.http.post(&url).timeout(self.metadata_timeout).send();
     }
 
     /// `GET /api/push-identity`: the receiver's push address and certificate
@@ -685,6 +742,7 @@ impl Client {
                 .http
                 .post(&url)
                 .json(&VerifyOutboundRequest { password })
+                .timeout(self.metadata_timeout)
                 .send()
                 .map_err(|source| Error::Http {
                     url: url.clone(),
@@ -880,6 +938,7 @@ impl Client {
             .http
             .post(&url)
             .json(&serde_json::json!({ "password": password }))
+            .timeout(self.metadata_timeout)
             .send()
             .map_err(|source| Error::Http {
                 url: "sign in".to_owned(),
@@ -1120,6 +1179,16 @@ const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// The complete request bound for an interactive link preview.
 pub(crate) const PREVIEW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The whole-request bound for a metadata-sized request (small JSON, one
+/// manifest page) on a client with no total of its own: a request that
+/// outlives this is lost, not slow, and the retry budget or the resume path
+/// recovers it. A client built with a total of its own keeps that instead.
+const METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The whole-request bound for one chunk, at most 8 MiB: past this the link
+/// is slower than waiting out a resume can justify.
+const CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The longest a single backoff waits, so the budget is spent in many attempts
 /// rather than a few long sleeps.
@@ -1697,6 +1766,8 @@ mod tests {
                 base,
                 recipient_cookie: std::sync::Mutex::new(None),
                 route: None,
+                metadata_timeout: Duration::from_secs(2),
+                chunk_timeout: Duration::from_secs(2),
             };
             let dir = tempfile::tempdir().unwrap();
             let destination = dir.path().join("file");
@@ -1806,5 +1877,153 @@ mod tests {
             "{wrong:?}"
         );
         assert!(split_link_as("https://drop.example/r/ABC", LinkKind::Request).is_ok());
+    }
+
+    /// A client with no total of its own must still bound a metadata-sized
+    /// request: a server that accepts and then never answers is lost, not
+    /// slow, and the send fails into the retry budget instead of wedging the
+    /// transfer past its own cancellation.
+    #[test]
+    fn a_transfer_client_bounds_a_stalled_metadata_request() {
+        use std::io::{BufRead, BufReader};
+        use std::time::{Duration, Instant};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut held = None;
+            for index in 0..8 {
+                let mut stream = (0..400)
+                    .find_map(|_| match listener.accept() {
+                        Ok((stream, _)) => Some(stream),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                            None
+                        }
+                        Err(error) => panic!("accept failed: {error}"),
+                    })
+                    .expect("the client request reached the fixture");
+                stream.set_nonblocking(false).unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                loop {
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    line.clear();
+                }
+                if index == 0 {
+                    // Hold the first attempt far past the metadata bound on
+                    // its own thread, so the retry is accepted and answered
+                    // while the stalled one is still held.
+                    held = Some(std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(5));
+                        drop(stream);
+                    }));
+                    continue;
+                }
+                let body = serde_json::json!({
+                    "label": null, "needs_password": false, "usable": true,
+                    "authorized": false, "max_bytes": 1, "chunk_bytes": 65536,
+                    "allow_hidden": false, "max_entries": 1, "push": false,
+                });
+                use std::io::Write as _;
+                write!(stream, "HTTP/1.1 200 Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.to_string().len()).unwrap();
+                break;
+            }
+            if let Some(held) = held {
+                held.join().unwrap();
+            }
+        });
+        let client =
+            super::Client::with_bounds(base, None, Duration::from_secs(1), Duration::from_secs(2))
+                .unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let start = Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let _ = sender.send(client.link_info("token"));
+            });
+            let result = receiver
+                .recv_timeout(Duration::from_secs(15))
+                .expect("a stalled request must be bounded, not wedged forever");
+            let info = result.expect("the retried request must succeed");
+            assert_eq!(info.chunk_bytes, 65536);
+            // The first attempt is held 5s, so success within 4s proves the
+            // metadata bound cut it and the retry carried the answer.
+            assert!(
+                start.elapsed() < Duration::from_secs(4),
+                "the metadata bound did not cut the stalled first attempt"
+            );
+        });
+        server.join().unwrap();
+    }
+
+    /// A streaming download must not carry a whole-request deadline: a body
+    /// that trickles longer than the metadata bound still lands whole.
+    #[test]
+    fn a_slow_streaming_body_outlives_the_metadata_bound() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut stream = (0..400)
+                .find_map(|_| match listener.accept() {
+                    Ok((stream, _)) => Some(stream),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        None
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                })
+                .expect("the download request reached the fixture");
+            stream.set_nonblocking(false).unwrap();
+            let mut reader = BufReader::new(&stream);
+            let mut line = String::new();
+            loop {
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                line.clear();
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 Test\r\nContent-Length: 8\r\nConnection: close\r\n\r\n123",
+                )
+                .unwrap();
+            // Two gaps of 700ms: together past a 1s whole-request deadline,
+            // which a streaming body must not carry.
+            for tail in ["45", "678"] {
+                std::thread::sleep(Duration::from_millis(700));
+                stream.write_all(tail.as_bytes()).unwrap();
+            }
+        });
+        let client =
+            super::Client::with_bounds(base, None, Duration::from_secs(1), Duration::from_secs(2))
+                .unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let result = client.download("/file", None, &mut None, 0, 8);
+                let body = result.and_then(|(response, start)| {
+                    assert_eq!(start, 0);
+                    let mut bytes = Vec::new();
+                    let mut reader = response;
+                    reader
+                        .read_to_end(&mut bytes)
+                        .map(|_| bytes)
+                        .map_err(|error| Error::Other(error.to_string()))
+                });
+                let _ = sender.send(body);
+            });
+            let bytes = receiver
+                .recv_timeout(Duration::from_secs(15))
+                .expect("a flowing download must not be cut");
+            assert_eq!(bytes.unwrap(), b"12345678");
+        });
+        server.join().unwrap();
     }
 }

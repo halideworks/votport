@@ -15,6 +15,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+/// How long a journalled entry is kept for its retry. Past this a transfer
+/// was never offered again (or its offer was refused) and the entry is
+/// abandoned: the journal is swept at the next listing rather than growing
+/// forever on sends that failed retryably and were never resumed.
+const RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
+
 use crate::error::{Error, Result};
 use crate::identity::state_dir;
 
@@ -186,7 +192,10 @@ fn forget_in(dir: &std::path::Path, id: &str) {
 }
 
 /// The journalled transfers, oldest first. An entry that cannot be read is
-/// skipped, never refused.
+/// skipped, never refused. Entries past [`RETENTION_SECS`] are abandoned:
+/// dropped here and at every later listing, the same expiry an evidence
+/// report meets, so entries kept for a retry that never came cannot
+/// accumulate forever.
 #[must_use]
 pub fn pending() -> Vec<Entry> {
     pending_in(&dir())
@@ -203,7 +212,17 @@ fn pending_in(dir: &std::path::Path) -> Vec<Entry> {
         .filter_map(|path| serde_json::from_slice(&fs::read(path).ok()?).ok())
         .collect();
     entries.sort_by(|a, b| a.started_unix.cmp(&b.started_unix).then(a.id.cmp(&b.id)));
-    entries
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    let (current, abandoned): (Vec<_>, Vec<_>) = entries
+        .into_iter()
+        .partition(|entry| now.saturating_sub(entry.started_unix) <= RETENTION_SECS);
+    for entry in &abandoned {
+        forget_in(dir, &entry.id);
+    }
+    current
 }
 
 /// One journalled transfer by id.
@@ -229,6 +248,10 @@ mod tests {
     fn a_recorded_entry_is_pending_until_forgotten_and_a_broken_file_is_skipped() {
         let home = tempfile::tempdir().unwrap();
         let dir = home.path().join("journal");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let first = Entry {
             id: "1-a".into(),
             kind: Kind::Receive,
@@ -237,7 +260,7 @@ mod tests {
             dest: Some("/tmp/landed".into()),
             needs_password: true,
             http: None,
-            started_unix: 1,
+            started_unix: now - 10,
         };
         let second = Entry {
             id: "2-b".into(),
@@ -247,7 +270,7 @@ mod tests {
             dest: None,
             needs_password: false,
             http: None,
-            started_unix: 2,
+            started_unix: now,
         };
         fs::create_dir_all(&dir).unwrap();
         let retained = serde_json::to_vec(&first).unwrap();
@@ -323,5 +346,43 @@ mod tests {
     fn fresh_ids_differ_within_a_second() {
         assert_ne!(fresh_id(7), fresh_id(7));
         assert!(fresh_id(7).starts_with("7-"));
+    }
+
+    /// An entry kept for a retry that never came is dropped at the next
+    /// listing once it is past retention, so abandoned sends do not
+    /// accumulate forever.
+    #[test]
+    fn entries_past_retention_are_dropped_by_the_next_listing() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("journal");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let fresh = Entry {
+            id: "fresh".into(),
+            kind: Kind::Send,
+            link: "https://drop.example/r/REQ".into(),
+            paths: vec!["/shots".into()],
+            dest: None,
+            needs_password: false,
+            http: None,
+            started_unix: now,
+        };
+        let abandoned = Entry {
+            id: "abandoned".into(),
+            started_unix: now - RETENTION_SECS - 1,
+            ..fresh.clone()
+        };
+        write_in(&dir, &fresh).unwrap();
+        write_in(&dir, &abandoned).unwrap();
+        assert_eq!(pending_in(&dir), vec![fresh.clone()]);
+        assert!(get_in(&dir, "fresh").is_ok());
+        assert!(
+            get_in(&dir, &abandoned.id).is_err(),
+            "the abandoned entry is gone"
+        );
+        // The listing itself is stable once the sweep has run.
+        assert_eq!(pending_in(&dir), vec![fresh]);
     }
 }

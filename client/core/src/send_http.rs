@@ -142,6 +142,9 @@ fn drive(
         let expected_pages = client.seal(session, prepared.seal_bytes.clone())?;
         let mut remaining = expected_pages;
         for page in &prepared.page_bytes {
+            if observer.cancelled() {
+                return Err(Error::Cancelled);
+            }
             remaining = client.page(session, page.clone())?;
         }
         if remaining != 0 {
@@ -177,6 +180,9 @@ fn drive(
                 continue;
             }
             Outcome::Sent => {}
+        }
+        if observer.cancelled() {
+            return Err(Error::Cancelled);
         }
         match client.finish(session) {
             Ok(report) => {
@@ -769,5 +775,127 @@ mod tests {
             },
         );
         assert!(matches!(result, Err(Error::Cancelled)));
+    }
+
+    /// A cancel observed after the last chunk must stop the send before its
+    /// finish request: the finish would publish a drop the caller asked to
+    /// stop, and the abort path, not the finish path, owns the session then.
+    #[test]
+    fn a_cancelled_send_stops_before_its_finish_request() {
+        use serde_json::json;
+        use std::io::{BufRead, BufReader, Write as _};
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("frame");
+        std::fs::write(&source, vec![7; 7]).unwrap();
+        let prepared = crate::package::build(
+            vec![crate::entries::Entry {
+                path: vot_manifest::PackagePath::portable(["frame".to_owned()]).unwrap(),
+                source,
+            }],
+            &directory.path().join("manifest"),
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut finish_seen = false;
+            for round in 0..4 {
+                let accepted = (0..400).find_map(|_| match listener.accept() {
+                    Ok((stream, _)) => Some(stream),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        None
+                    }
+                    Err(error) => panic!("{error}"),
+                });
+                let Some(mut stream) = accepted else {
+                    if round == 3 {
+                        return finish_seen;
+                    }
+                    panic!("HTTP upload fixture did not receive a request");
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let path = first.split_whitespace().nth(1).unwrap().to_owned();
+                let mut body_length = 0;
+                for _ in 0..64 {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        body_length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                reader.read_exact(&mut vec![0; body_length]).unwrap();
+                let (status, body) = if path == "/api/r/token/session" {
+                    (
+                        200,
+                        json!({"session":"0123456789abcdef0123456789abcdef", "chunk_bytes":65536, "resume":true}),
+                    )
+                } else if path.ends_with("/begin") {
+                    (
+                        200,
+                        json!({"entries":[{"index":0, "path":"frame", "stored_as":"frame", "bytes":7,
+                        "complete":false, "covered_bytes":0}]}),
+                    )
+                } else if path.contains("/chunk?") {
+                    (
+                        200,
+                        json!({"accepted":true, "replay":false, "covered_bytes":7,
+                        "total_bytes":7, "complete":true, "received":7, "rebegin":false}),
+                    )
+                } else {
+                    finish_seen = path.ends_with("/finish");
+                    (
+                        200,
+                        json!({"ok": true, "upload_id": "finished", "files": []}),
+                    )
+                };
+                let body = body.to_string();
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            finish_seen
+        });
+        struct CancelOnChunk {
+            cancelled: bool,
+        }
+        impl Observer for CancelOnChunk {
+            fn event(&mut self, event: Event) {
+                if matches!(event, Event::Chunk { .. }) {
+                    self.cancelled = true;
+                }
+            }
+            fn cancelled(&self) -> bool {
+                self.cancelled
+            }
+        }
+        let client = Client::with_timeout(&url, Some(Duration::from_secs(2))).unwrap();
+        let result = send(
+            &client,
+            "token",
+            None,
+            &prepared,
+            &mut CancelOnChunk { cancelled: false },
+        );
+        let finish_seen = server.join().unwrap();
+        assert!(
+            matches!(result, Err(Error::Cancelled)),
+            "a cancelled send must not report success: {result:?}"
+        );
+        assert!(
+            !finish_seen,
+            "a cancelled send must not reach its finish request"
+        );
     }
 }
