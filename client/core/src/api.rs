@@ -724,23 +724,63 @@ impl Client {
         offset: u64,
         total: u64,
     ) -> Result<(reqwest::blocking::Response, u64)> {
-        let url = self.url(path);
-        // The GET is idempotent, so a transient failure before the body starts
-        // is retried; a break mid-stream is the caller's to handle by resuming.
+        // The lease token rides the file URL query instead of a cookie, and
+        // the admission redirect is followed explicitly because this client
+        // disables automatic redirects. A lease bound to another path or a
+        // stale token fails the MAC check and counts as absent, which the
+        // server answers with a fresh redirect.
         retry(true, || {
-            let cookies = cookie
-                .into_iter()
-                .chain(lease.as_deref())
-                .collect::<Vec<_>>()
-                .join("; ");
-            let mut request = self.outbound_cookie(self.http.get(&url), Some(&cookies));
-            if offset > 0 {
-                request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
-            }
-            let response = request.send().map_err(|source| Error::Http {
-                url: url.clone(),
-                source,
-            })?;
+            let mut url = match lease.as_deref() {
+                Some(token) if !token.is_empty() => {
+                    format!("{}?download_lease={token}", self.url(path))
+                }
+                _ => self.url(path),
+            };
+            let mut hops = 0u8;
+            let response = loop {
+                let cookies = cookie.into_iter().collect::<Vec<_>>().join("; ");
+                let mut request = self.outbound_cookie(self.http.get(&url), Some(&cookies));
+                if offset > 0 {
+                    request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
+                }
+                let response = request.send().map_err(|source| Error::Http {
+                    url: url.clone(),
+                    source,
+                })?;
+                let status = response.status();
+                let is_redirect = status == reqwest::StatusCode::TEMPORARY_REDIRECT
+                    || status == reqwest::StatusCode::PERMANENT_REDIRECT;
+                if !is_redirect {
+                    break response;
+                }
+                if hops >= 2 {
+                    return Err(Error::Server {
+                        status: status.as_u16(),
+                        what: "download".to_owned(),
+                        body: error_body_with_retry_after(response),
+                    });
+                }
+                let Some(location) = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+                else {
+                    return Err(Error::Server {
+                        status: status.as_u16(),
+                        what: "download".to_owned(),
+                        body: format!("HTTP {status}").to_owned(),
+                    });
+                };
+                hops += 1;
+                let base: reqwest::Url = url
+                    .parse()
+                    .map_err(|_| Error::Other("invalid download url".into()))?;
+                url = base
+                    .join(&location)
+                    .map_err(|_| Error::Other("invalid redirect location".into()))?
+                    .to_string();
+            };
             let status = response.status();
             if !status.is_success() {
                 let body = error_body_with_retry_after(response);
@@ -759,16 +799,8 @@ impl Client {
                 offset,
                 total,
             )?;
-            if let Some(value) = response
-                .headers()
-                .get_all(reqwest::header::SET_COOKIE)
-                .iter()
-                .filter_map(|value| value.to_str().ok())
-                .filter_map(|value| value.split(';').next())
-                .map(str::trim)
-                .find(|pair| is_download_lease(pair))
-            {
-                *lease = Some(value.to_owned());
+            if let Some(token) = download_lease_query(response.url().query()) {
+                *lease = Some(token.to_owned());
             }
             Ok((response, start))
         })
@@ -1044,16 +1076,14 @@ fn set_cookie(response: &reqwest::blocking::Response, name: &str) -> Option<Stri
         .map(str::to_owned)
 }
 
-pub(crate) fn is_download_lease(pair: &str) -> bool {
-    pair.split_once('=').is_some_and(|(name, value)| {
-        name.starts_with("votport_d_")
-            && !value.is_empty()
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.=".contains(&byte))
+/// The raw value of a `download_lease` query parameter, when the query
+/// carries one. The value is compared as issued, so percent-encoded junk
+/// fails the MAC check.
+pub(crate) fn download_lease_query(query: Option<&str>) -> Option<&str> {
+    query?.split('&').find_map(|pair| {
+        pair.split_once('=')
+            .filter(|(name, _)| *name == "download_lease")
+            .map(|(_, value)| value)
     })
 }
 

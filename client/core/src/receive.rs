@@ -177,8 +177,8 @@ fn receive_over_http_inner(
     };
 
     // The grant cookie a verify returns, echoed onto the reads and downloads
-    // that follow. It is not kept in a jar, so a many-file delivery does not
-    // accumulate the per-file lease cookies the downloads set.
+    // that follow. It is not kept in a jar, so a many-file delivery never
+    // carries more than this one cookie.
     if metadata.has_password && !metadata.authorized {
         let password = delivery
             .password
@@ -260,16 +260,28 @@ fn receive_over_http_inner(
             let scope = format!("{}{}", base.trim_end_matches('/'), file.download_url);
             let mut lease = serde_json::from_slice::<(String, String, String)>(&saved)
                 .ok()
-                .filter(|(url, root, cookie)| {
-                    url == &scope && root == &file.root && crate::api::is_download_lease(cookie)
+                .filter(|(url, root, token)| {
+                    // The saved URL is the scope the lease was minted for,
+                    // optionally already carrying the lease query the
+                    // admission redirect handed out.
+                    (url == &scope
+                        || url
+                            .strip_prefix(scope.as_str())
+                            .is_some_and(|rest| rest.starts_with("?download_lease=")))
+                        && root == &file.root
+                        && !token.is_empty()
+                        && token
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() || byte == b'.')
                 })
-                .map(|(_, _, cookie)| cookie);
+                .map(|(_, _, token)| token);
             let mut source = |offset: u64| -> Result<Resumed> {
                 let (response, start) =
                     client.download(&file.download_url, cookie, &mut lease, offset, file.bytes)?;
                 if let Some(value) = &lease {
+                    let final_url = format!("{scope}?download_lease={value}");
                     let bytes =
-                        serde_json::to_vec(&(&scope, &file.root, value)).map_err(|error| {
+                        serde_json::to_vec(&(&final_url, &file.root, value)).map_err(|error| {
                             Error::Other(format!("encoding download lease: {error}"))
                         })?;
                     if bytes != saved {
@@ -1046,7 +1058,7 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
-            for step in 0..9 {
+            for step in 0..11 {
                 let mut stream = (0..1000)
                     .find_map(|_| match listener.accept() {
                         Ok((stream, _)) => Some(stream),
@@ -1075,36 +1087,60 @@ mod tests {
                     }
                 }
                 let request = request.to_ascii_lowercase();
-                if matches!(step, 2 | 3 | 6 | 7 | 8) {
+                if matches!(step, 2..=4 | 7..=10) {
                     assert!(
                         request.contains("votport_s_test=grant"),
                         "{step}: {request}"
                     );
                 }
                 let (status, extra, body, length) = match step {
-                    0 | 4 => (
+                    0 | 5 => (
                         200,
                         String::new(),
                         b"{\"has_password\":true,\"authorized\":false}".to_vec(),
                         None,
                     ),
-                    1 | 5 => (
+                    1 | 6 => (
                         200,
                         "Set-Cookie: votport_s_test=grant; Path=/\r\n".to_owned(),
                         b"{}".to_vec(),
                         None,
                     ),
-                    2 | 6 => (200, String::new(), metadata.as_bytes().to_vec(), None),
+                    2 | 7 => (200, String::new(), metadata.as_bytes().to_vec(), None),
+                    // The tokenless first request is admitted with a
+                    // same-origin redirect that carries the per-file lease
+                    // in the URL query and no lease cookie at all.
                     3 => {
-                        assert!(request.starts_with("get /api/s/token/files/0 "));
-                        assert!(!request.contains("votport_d_"));
-                        (200, "Set-Cookie: unrelated=ignored\r\nSet-Cookie: votport_d_test_0=lease; Path=/api/s/token\r\n".to_owned(), bytes[..5].to_vec(), Some(bytes.len()))
+                        assert!(request.starts_with("get /api/s/token/files/0 http"));
+                        assert!(!request.contains("download_lease"), "{request}");
+                        assert!(!request.contains("range:"), "{request}");
+                        (
+                            307,
+                            "Location: /api/s/token/files/0?download_lease=abcdef0123456789.0123456789abcdef\r\n"
+                                .to_owned(),
+                            Vec::new(),
+                            Some(0),
+                        )
                     }
-                    7 => {
-                        assert!(request.starts_with("get /api/s/token/files/0 "));
-                        assert!(request.contains("votport_d_test_0=lease"), "{request}");
-                        assert!(!request.contains("unrelated="));
+                    4 => {
+                        assert!(request.starts_with(
+                            "get /api/s/token/files/0?download_lease=abcdef0123456789.0123456789abcdef http"
+                        ), "{request}");
+                        assert!(
+                            !request.contains("votport_d_"),
+                            "leases no longer ride cookies: {request}"
+                        );
+                        // Cut the body short: the transfer is interrupted
+                        // with the lease already saved in the journal.
+                        (200, String::new(), bytes[..5].to_vec(), Some(bytes.len()))
+                    }
+                    // The retry resumes from the journal's saved final URL.
+                    8 => {
+                        assert!(request.starts_with(
+                            "get /api/s/token/files/0?download_lease=abcdef0123456789.0123456789abcdef http"
+                        ), "{request}");
                         assert!(request.contains("range: bytes=5-"), "{request}");
+                        assert!(!request.contains("votport_d_"), "{request}");
                         (
                             206,
                             format!(
@@ -1116,12 +1152,25 @@ mod tests {
                             None,
                         )
                     }
-                    8 => {
-                        assert!(request.starts_with("get /api/s/token/files/1 "));
+                    9 => {
+                        assert!(request.starts_with("get /api/s/token/files/1 http"));
                         assert!(
-                            !request.contains("votport_d_"),
+                            !request.contains("download_lease"),
                             "previous file's lease leaked: {request}"
                         );
+                        assert!(!request.contains("range:"), "{request}");
+                        (
+                            307,
+                            "Location: /api/s/token/files/1?download_lease=1234567890abcdef.fedcba9876543210\r\n"
+                                .to_owned(),
+                            Vec::new(),
+                            Some(0),
+                        )
+                    }
+                    10 => {
+                        assert!(request.starts_with(
+                            "get /api/s/token/files/1?download_lease=1234567890abcdef.fedcba9876543210 http"
+                        ), "{request}");
                         (200, String::new(), bytes.to_vec(), None)
                     }
                     _ => unreachable!(),
