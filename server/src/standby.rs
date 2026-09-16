@@ -137,6 +137,21 @@ pub async fn pull_once(
     pull_replica(client, config).await
 }
 
+/// Fixed reason for a failed replica pull: reqwest error Display embeds the
+/// source URL, and this string persists in the standby status file.
+fn replica_pull_failure(error: &reqwest::Error, stage: &'static str) -> String {
+    let reason = if error.is_timeout() {
+        "the source did not answer in time"
+    } else if error.is_connect() {
+        "the source could not be reached"
+    } else if error.is_decode() {
+        "the source response was unreadable"
+    } else {
+        "the source request failed"
+    };
+    format!("replica {stage}: {reason}")
+}
+
 async fn pull_replica(
     client: &reqwest::Client,
     config: &Config,
@@ -146,7 +161,7 @@ async fn pull_replica(
         .bearer_auth(&config.token)
         .send()
         .await
-        .map_err(|error| format!("replica request: {error}"))?;
+        .map_err(|error| replica_pull_failure(&error, "request"))?;
     if response.status() != reqwest::StatusCode::OK {
         return Err(format!(
             "replica request answered {}",
@@ -169,7 +184,7 @@ async fn pull_replica(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|error| format!("replica download: {error}"))?
+        .map_err(|error| replica_pull_failure(&error, "download"))?
     {
         file.write_all(&chunk)
             .await
@@ -477,6 +492,24 @@ mod tests {
         .unwrap();
         assert!(sweep_orphans(directory.path()).is_err());
         assert!(stage.is_dir());
+    }
+
+    #[tokio::test]
+    async fn replica_pull_failure_persists_a_classified_reason_without_the_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            data_dir: directory.path().to_path_buf(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            source: "http://127.0.0.1:1".to_owned(),
+            token: "t".to_owned(),
+            interval: Duration::from_secs(60),
+        };
+        let error = pull_once(&reqwest::Client::new(), &config)
+            .await
+            .unwrap_err();
+        // This string is what the puller persists into status.last_error.
+        assert_eq!(error, "replica request: the source could not be reached");
+        assert!(!error.contains("127.0.0.1"), "{error}");
     }
 
     #[tokio::test]

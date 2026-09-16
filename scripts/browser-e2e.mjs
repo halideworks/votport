@@ -208,14 +208,14 @@ if (!receiveListFailed || await page.locator("#create-error").isVisible()) {
 }
 await page.click("#new-link-copy");
 await page.waitForFunction((url) => window.__copiedText === url
-  && document.getElementById("links-action-status").textContent === "Receive link copied.", linkUrl);
+  && document.getElementById("links-action-status").textContent === "Receive link copied.", linkUrl, { polling: 50 });
 await page.evaluate(() => { window.__clipboardFailure = true; window.__clipboardHold = true; window.__releaseClipboard = null; });
 await page.click("#new-link-copy");
-await page.waitForFunction(() => typeof window.__releaseClipboard === "function");
+await page.waitForFunction(() => typeof window.__releaseClipboard === "function", null, { polling: 50 });
 await page.locator("#links-query").focus();
 await page.evaluate(() => { window.__clipboardHold = false; window.__releaseClipboard(); });
 await page.waitForFunction(() => document.activeElement === document.getElementById("links-query")
-  && document.getElementById("links-action-status").textContent === "Could not copy the receive address. Use Copy address below to retry.");
+  && document.getElementById("links-action-status").textContent === "Could not copy the receive address. Use Copy address below to retry.", null, { polling: 50 });
 await page.evaluate(() => { window.__clipboardHold = false; });
 await page.click("#new-link-copy");
 await page.waitForFunction(() => document.activeElement === document.getElementById("new-link-url")
@@ -801,14 +801,14 @@ if (await copyControl.getAttribute("aria-label") !== `Copy file hash: ${cards[0]
   throw new Error("file identity copy control must name its file");
 }
 await copyControl.press("Enter");
-await page.waitForFunction(() => document.querySelector("#done-list .file-id")?.textContent === "Copied");
+await page.waitForFunction(() => document.querySelector("#done-list .file-id")?.textContent === "Copied", null, { timeout: 5000, polling: 50 });
 if (browserEngine === "chromium") {
   const copied = await page.evaluate(() => navigator.clipboard.readText());
   if (copied !== ids[0]) {
     throw new Error(`copy mismatch: ${copied}`);
   }
 }
-await page.waitForFunction(() => document.querySelector("#done-list .file-id")?.getAttribute("aria-label")?.startsWith("Copied file hash: "));
+await page.waitForFunction(() => document.querySelector("#done-list .file-id")?.getAttribute("aria-label")?.startsWith("Copied file hash: "), null, { timeout: 5000, polling: 50 });
 await page.evaluate(() => { window.__copySuccessAt = performance.now(); });
 await page.waitForFunction(() => performance.now() - window.__copySuccessAt >= 750, null, { timeout: 3000, polling: 50 });
 await page.evaluate(() => { window.__clipboardFailure = true; });
@@ -828,8 +828,8 @@ try {
   throw new Error("latest copy failure must outlive an earlier success deadline");
 }
 await page.evaluate(() => { window.__clipboardFailure = false; });
-await page.waitForFunction((expected) => document.querySelector("#done-list .file-id")?.textContent === expected, ids[0], { timeout: 3000 });
-await page.waitForFunction((expected) => document.querySelector("#done-list .file-id")?.getAttribute("aria-label") === expected, `Copy file hash: ${cards[0].name}`, { timeout: 3000 });
+await page.waitForFunction((expected) => document.querySelector("#done-list .file-id")?.textContent === expected, ids[0], { timeout: 5000, polling: 50 });
+await page.waitForFunction((expected) => document.querySelector("#done-list .file-id")?.getAttribute("aria-label") === expected, `Copy file hash: ${cards[0].name}`, { timeout: 5000, polling: 50 });
 await page.setViewportSize({ width: 360, height: 1000 });
 if (!await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth
   && [...document.querySelectorAll("#done-list .file-id")].every((node) => {

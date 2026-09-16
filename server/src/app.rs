@@ -5,7 +5,7 @@ use std::future::Future;
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use axum::extract::{DefaultBodyLimit, State};
@@ -5530,6 +5530,89 @@ mod push_tests {
         config
     }
 
+    #[tokio::test]
+    async fn push_staging_lock_failures_warn_paced_and_receiving_relative() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        app.store
+            .insert_link(crate::store::tests::test_link("resume"))
+            .unwrap();
+        let key = hex::encode([4; 16]);
+        let persisted = crate::store::PersistedUploadSession {
+            committed_upload_id: None,
+            id: hex::encode([5; 16]),
+            push_key: Some(key.clone()),
+            link_id: "resume".to_owned(),
+            tenant: String::new(),
+            dest_dir: app.config.receive_dir.clone(),
+            dest_rel: String::new(),
+            package: vot_sdk::object::ObjectId {
+                suite: 1,
+                root: [7; 32],
+                length: 12,
+            },
+            max_total_bytes: Some(12),
+            started_at: crate::store::now_unix(),
+            files: Vec::new(),
+        };
+        app.store.insert_upload_session(&persisted).unwrap();
+        // The staging directory opens, but without write access the lock file
+        // inside it fails with a non-NotFound error the sweep must report.
+        use std::os::unix::fs::PermissionsExt as _;
+        let staging = app
+            .config
+            .receive_dir
+            .join(".vot-stage")
+            .join(format!(".vot-push-{key}"));
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Other tests sweep staging while a live worker holds its lock, which
+        // primes the shared static pacer; clear it so this test starts due.
+        PUSH_STAGING_LOCK_WARN
+            .get_or_init(|| {
+                Mutex::new(crate::api::outbound::ErrorDeduper::new("push staging lock"))
+            })
+            .lock()
+            .unwrap()
+            .reset();
+
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let writer = log.reopen().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.try_clone().unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            sweep_push_staging(&app);
+            sweep_push_staging(&app);
+        });
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let warns: Vec<String> = std::fs::read_to_string(log.path())
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("push staging could not be locked"))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(warns.len(), 1, "the repeat sweep stays silent: {warns:?}");
+        assert!(warns[0].contains(".vot-stage/.vot-push-"), "{}", warns[0]);
+        assert!(warns[0].contains(&key[..8]), "{}", warns[0]);
+        assert!(
+            !warns[0].contains(
+                directory
+                    .path()
+                    .to_string_lossy()
+                    .get(..16)
+                    .unwrap_or(&directory.path().to_string_lossy())
+            ),
+            "absolute path leaked: {}",
+            warns[0]
+        );
+        // The staging was skipped, not treated as missing: the record stays.
+        assert_eq!(app.store.load_push_sessions().unwrap().len(), 1);
+    }
+
     async fn identity(app: Arc<App>) -> serde_json::Value {
         let response = router(app)
             .oneshot(
@@ -6615,15 +6698,25 @@ fn expire_link_uploads_sync(
         };
         // ponytail: verify twice to bound descriptors with one history rewrite.
         // Normalized file records allow one verified deletion per transaction.
-        let eligible: Vec<_> = candidates.into_iter().filter(|record| {
-            match prepare(record) {
+        let mut retained: Vec<(String, String)> = Vec::new();
+        let eligible: Vec<_> = candidates
+            .into_iter()
+            .filter(|record| match prepare(record) {
                 Ok(_) => true,
                 Err(error) => {
-                    tracing::warn!(path = %record.stored_as, %error, "expired file retained before tombstone");
+                    retained.push((record.stored_as.clone(), error));
                     false
                 }
-            }
-        }).collect();
+            })
+            .collect();
+        if let Some((first_path, first_error)) = retained.first() {
+            tracing::warn!(
+                count = retained.len(),
+                path = %first_path,
+                error = %first_error,
+                "expired file retained before tombstone"
+            );
+        }
         if eligible.is_empty() {
             return Ok(0);
         }
@@ -6635,13 +6728,20 @@ fn expire_link_uploads_sync(
             return Err("request disappeared before retention; files were retained".into());
         }
         let mut removed = 0;
+        let mut retained: Vec<(String, String)> = Vec::new();
         for record in &eligible {
             match prepare(record).and_then(|prepared| prepared.remove(&destinations)) {
                 Ok(()) => removed += 1,
-                Err(error) => {
-                    tracing::warn!(path = %record.stored_as, %error, "expired file retained after tombstone")
-                }
+                Err(error) => retained.push((record.stored_as.clone(), error)),
             }
+        }
+        if let Some((first_path, first_error)) = retained.first() {
+            tracing::warn!(
+                count = retained.len(),
+                path = %first_path,
+                error = %first_error,
+                "expired file retained after tombstone"
+            );
         }
         Ok(removed)
     })();
@@ -6700,6 +6800,13 @@ fn sweep_push_tickets(app: &App) {
     }
 }
 
+static PUSH_STAGING_LOCK_WARN: OnceLock<Mutex<crate::api::outbound::ErrorDeduper>> =
+    OnceLock::new();
+
+/// Fixed dedupe key for the staging-lock warn: any non-NotFound locking
+/// failure warns once per interval, paced, instead of skipping silently.
+const PUSH_STAGING_LOCK_ERROR: &str = "lock failed";
+
 fn sweep_push_staging(app: &App) {
     let Ok(destinations) = app.receiving_destinations() else {
         return;
@@ -6732,7 +6839,24 @@ fn sweep_push_staging(app: &App) {
                 }
                 continue;
             }
-            Err(_) => continue,
+            Err(_) => {
+                // ponytail: static pacer because the sweep owns no state between
+                // passes; replace with a per-app pacer if sweeps ever share one.
+                let due = PUSH_STAGING_LOCK_WARN
+                    .get_or_init(|| {
+                        Mutex::new(crate::api::outbound::ErrorDeduper::new("push staging lock"))
+                    })
+                    .lock()
+                    .expect("push staging warn pacer poisoned")
+                    .observe(PUSH_STAGING_LOCK_ERROR, std::time::Instant::now());
+                if due {
+                    tracing::warn!(
+                        path = %session::push_staging_log_name(&directory),
+                        "push staging could not be locked; it stays for the next sweep"
+                    );
+                }
+                continue;
+            }
         };
         if app.sessions.contains_push_key(key) {
             continue;

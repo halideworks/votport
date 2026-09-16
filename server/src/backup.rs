@@ -10,9 +10,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(test)]
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use age::secrecy::SecretString;
 use object_store::aws::AmazonS3Builder;
@@ -446,6 +445,14 @@ fn data_scratch_kind(name: &str) -> Option<bool> {
         || generated_scratch_name(name, ".votport-replica-", ".tar")
         || generated_scratch_name(name, ".votport-restore-", ".download")
         || generated_scratch_name(name, ".votport-restore-", ".tar")
+        // Stage temps of files this crate and the standby worker write into
+        // the data directory through atomic_write_private: a failed rename
+        // leaves the temp behind for the orphan sweep. The two status files
+        // start with a dot themselves, hence the doubled dot.
+        || generated_scratch_name(name, ".backup-status.json-", ".stage")
+        || generated_scratch_name(name, ".backup-secrets.json-", ".stage")
+        || generated_scratch_name(name, ".votport-restore-pending.json-", ".stage")
+        || generated_scratch_name(name, "..votport-standby-status.json-", ".stage")
     {
         return Some(false);
     }
@@ -791,18 +798,38 @@ impl Drop for CleanupPath {
         if self.keep {
             return;
         }
-        match fs::symlink_metadata(&self.path) {
+        let removal = match fs::symlink_metadata(&self.path) {
             Ok(meta) if self.directory && meta.is_dir() && !meta.file_type().is_symlink() => {
-                let _ = fs::remove_dir_all(&self.path);
+                fs::remove_dir_all(&self.path)
             }
             Ok(meta) if !self.directory && meta.is_file() && !meta.file_type().is_symlink() => {
-                let _ = fs::remove_file(&self.path);
+                fs::remove_file(&self.path)
             }
-            Err(_) => {}
-            Ok(_) => {}
+            Err(_) => return,
+            Ok(_) => return,
+        };
+        if let Err(error) = removal {
+            // ponytail: static pacer because a Drop carries no pacer; sweep
+            // boot cleans leftovers anyway, this only makes failures visible.
+            let due = SCRATCH_REMOVAL_WARN
+                .get_or_init(|| {
+                    Mutex::new(crate::api::outbound::ErrorDeduper::new("scratch removal"))
+                })
+                .lock()
+                .expect("scratch removal warn pacer poisoned")
+                .observe("removal failed", Instant::now());
+            if due {
+                tracing::warn!(
+                    path = %self.path.file_name().unwrap_or_default().to_string_lossy(),
+                    error = ?error.kind(),
+                    "scratch removal failed; it stays until the next orphan sweep"
+                );
+            }
         }
     }
 }
+
+static SCRATCH_REMOVAL_WARN: OnceLock<Mutex<crate::api::outbound::ErrorDeduper>> = OnceLock::new();
 
 fn publish_new(source: &Path, destination: &Path) -> Result<(), String> {
     fs::hard_link(source, destination).map_err(|e| e.to_string())?;
@@ -1584,28 +1611,67 @@ async fn upload_file_parts(
     upload: &mut Box<dyn MultipartUpload>,
     file: &mut tokio::fs::File,
 ) -> Result<(), String> {
+    let mut part = 0usize;
     loop {
         let mut buf = vec![0u8; PART_SIZE];
         let n = match tokio::io::AsyncReadExt::read(file, &mut buf).await {
             Ok(n) => n,
             Err(_) => {
-                let _ = upload.abort().await;
+                abort_upload_parts(upload, part, "reading the backup file").await;
                 return Err("backup file could not be read".into());
             }
         };
         if n == 0 {
             break;
         }
+        part += 1;
         if upload.put_part(buf[..n].to_vec().into()).await.is_err() {
-            let _ = upload.abort().await;
+            abort_upload_parts(upload, part, "uploading a part").await;
             return Err("S3 upload failed".into());
         }
     }
     if upload.complete().await.is_err() {
-        let _ = upload.abort().await;
+        abort_upload_parts(upload, part, "completing the upload").await;
         return Err("S3 upload failed".into());
     }
     Ok(())
+}
+
+/// Reports a failed multipart abort before the upload gives up: unfinished
+/// parts stay in the store until its lifecycle expires them, so the failure
+/// must be visible. The log names the stage and part count, not the object.
+async fn abort_upload_parts(
+    upload: &mut Box<dyn MultipartUpload>,
+    parts: usize,
+    stage: &'static str,
+) {
+    if let Err(error) = upload.abort().await {
+        tracing::warn!(
+            stage,
+            parts,
+            reason = abort_failure_class(&error),
+            "multipart abort failed; unfinished parts stay until the store expires them"
+        );
+    }
+}
+
+/// Class of an S3 abort failure: object_store Display strings carry the
+/// object path and endpoint URL, so only the failure class is logged.
+fn abort_failure_class(error: &object_store::Error) -> &'static str {
+    match error {
+        object_store::Error::NotFound { .. }
+        | object_store::Error::AlreadyExists { .. }
+        | object_store::Error::NotModified { .. }
+        | object_store::Error::Precondition { .. } => {
+            "the store answered the abort with a conflicting object state"
+        }
+        object_store::Error::PermissionDenied { .. }
+        | object_store::Error::Unauthenticated { .. } => "the store refused the abort",
+        object_store::Error::NotSupported { .. } | object_store::Error::NotImplemented { .. } => {
+            "the store cannot abort uploads"
+        }
+        _ => "the store abort request failed",
+    }
 }
 
 fn s3_store(
@@ -2187,6 +2253,87 @@ mod tests {
         (started_rx, release_tx)
     }
 
+    #[test]
+    fn failed_multipart_abort_is_reported_without_changing_the_outcome() {
+        #[derive(Debug)]
+        struct FailingAbortMultipart {
+            aborts: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl MultipartUpload for FailingAbortMultipart {
+            fn put_part(&mut self, _data: object_store::PutPayload) -> object_store::UploadPart {
+                Box::pin(async {
+                    Err(object_store::Error::Generic {
+                        store: "test",
+                        source: Box::new(io::Error::other("part failed")),
+                    })
+                })
+            }
+
+            async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+                Err(object_store::Error::Generic {
+                    store: "test",
+                    source: Box::new(io::Error::other("complete failed")),
+                })
+            }
+
+            async fn abort(&mut self) -> object_store::Result<()> {
+                self.aborts.store(true, Ordering::SeqCst);
+                Err(object_store::Error::Generic {
+                    store: "test",
+                    source: Box::new(io::Error::other("abort refused by the test store")),
+                })
+            }
+        }
+
+        let aborts = Arc::new(AtomicBool::new(false));
+        let mut upload: Box<dyn MultipartUpload> = Box::new(FailingAbortMultipart {
+            aborts: Arc::clone(&aborts),
+        });
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"part bytes").unwrap();
+        let file = std::fs::File::open(file.path()).unwrap();
+
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let writer = log.reopen().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.try_clone().unwrap())
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let mut file = tokio::fs::File::from_std(file);
+                    upload_file_parts(&mut upload, &mut file).await
+                })
+        });
+        assert!(
+            result.is_err(),
+            "the upload still fails when aborting fails"
+        );
+        assert!(aborts.load(Ordering::SeqCst), "abort was attempted");
+        let warns: Vec<String> = std::fs::read_to_string(log.path())
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("multipart abort failed"))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(warns[0].contains("uploading a part"), "{}", warns[0]);
+        assert!(warns[0].contains("\"parts\":1"), "{}", warns[0]);
+        assert!(
+            !warns[0].contains("refused by the test store"),
+            "abort error detail leaked: {}",
+            warns[0]
+        );
+    }
+
     #[derive(Debug)]
     struct FailingMultipart {
         aborted: Arc<AtomicBool>,
@@ -2225,6 +2372,58 @@ mod tests {
         fs::write(root.path().join("receipt.key"), [8; 32]).unwrap();
         crate::paths::tighten_private_file(&root.path().join("receipt.key")).unwrap();
         (root, store)
+    }
+
+    #[test]
+    fn orphan_sweep_matches_status_stage_temps_and_reports_failed_removals() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path();
+        let token = "a".repeat(32);
+        let stage_temps = [
+            format!(".backup-status.json-{token}.stage"),
+            format!(".backup-secrets.json-{token}.stage"),
+            format!(".votport-restore-pending.json-{token}.stage"),
+            format!("..votport-standby-status.json-{token}.stage"),
+        ];
+        for name in &stage_temps {
+            std::fs::write(data.join(name), b"scratch").unwrap();
+        }
+        assert_eq!(sweep_data_dir_orphans(data).unwrap(), 4);
+        assert!(stage_temps.iter().all(|name| !data.join(name).exists()));
+
+        // A removal that fails warns with the file name and error class,
+        // never the absolute path.
+        use std::os::unix::fs::PermissionsExt as _;
+        let guarded = data.join("guarded");
+        std::fs::create_dir(&guarded).unwrap();
+        let stuck = format!(".backup-status.json-{token}.stage");
+        std::fs::write(guarded.join(&stuck), b"scratch").unwrap();
+        std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let writer = log.reopen().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.try_clone().unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            drop(CleanupPath::new(guarded.join(&stuck)));
+        });
+        std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let warns: Vec<String> = std::fs::read_to_string(log.path())
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("scratch removal failed"))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(warns[0].contains(&stuck), "{}", warns[0]);
+        assert!(
+            !warns[0].contains("guarded"),
+            "absolute path leaked: {}",
+            warns[0]
+        );
     }
 
     #[test]

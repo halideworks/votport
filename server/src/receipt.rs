@@ -192,7 +192,9 @@ impl ReceiptSigner {
                     Err(error)
                 }
             })
-            .map_err(|error| format!("write or publish {}: {error}", sidecar.path().display()))?;
+            // The already-computed relative sidecar name, never the absolute
+            // sidecar path: this string surfaces in session warn logs.
+            .map_err(|error| format!("write or publish {}: {error}", name.to_string_lossy()))?;
         Ok(sidecar.path())
     }
 
