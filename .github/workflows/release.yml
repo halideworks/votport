@@ -58,6 +58,18 @@ jobs:
             VOTPORT_VERSION=${{ env.VERSION }}
             VOTPORT_REVISION=${{ github.sha }}
 
+      # Scans the tag just pushed to GHCR; the image is not loaded into the
+      # runner daemon, so trivy pulls it with the credentials the login step
+      # stored. Fails the release on CRITICAL,HIGH, matching the CI posture
+      # of npm audit --audit-level=high.
+      - name: Scan the image for critical and high vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ env.VERSION }}
+          format: table
+          exit-code: '1'
+          severity: CRITICAL,HIGH
+
       - name: Record image digest
         run: |
           {
@@ -119,11 +131,15 @@ jobs:
           ln -s /Applications dist/Votport/Applications
           hdiutil create -volname Votport -srcfolder dist/Votport -ov -format UDZO "dist/votport-${VERSION}-macos-arm64.dmg"
 
+      # No --clobber: a re-run must fail loudly instead of silently
+      # replacing the artifact under the same name.
       - name: Upload the disk image
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         working-directory: client/macos
-        run: gh release upload "$VERSION" "dist/votport-${VERSION}-macos-arm64.dmg" --clobber
+        run: |
+          shasum -a 256 "dist/votport-${VERSION}-macos-arm64.dmg" > "dist/votport-${VERSION}-macos-arm64.dmg.sha256"
+          gh release upload "$VERSION" "dist/votport-${VERSION}-macos-arm64.dmg" "dist/votport-${VERSION}-macos-arm64.dmg.sha256"
 
   windows-app:
     needs: release
@@ -163,9 +179,13 @@ jobs:
 
       # signtool with the code-signing certificate goes here once it is in
       # the repository secrets.
+      # No --clobber: a re-run must fail loudly instead of silently
+      # replacing the artifact under the same name.
       - name: Upload the package
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         working-directory: client/windows
         shell: bash
-        run: gh release upload "$VERSION" "votport-${VERSION}-windows-x64.msix" --clobber
+        run: |
+          sha256sum "votport-${VERSION}-windows-x64.msix" > "votport-${VERSION}-windows-x64.msix.sha256"
+          gh release upload "$VERSION" "votport-${VERSION}-windows-x64.msix" "votport-${VERSION}-windows-x64.msix.sha256"
