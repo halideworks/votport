@@ -27,6 +27,12 @@ export async function copyToClipboard(element, text) {
   }, 1500);
 }
 
+/// The votport: app link for one transfer kind and token, carrying the
+/// current origin so the desktop app can prefill the server address.
+export function appLink(kind, token) {
+  return `votport://${kind}/${encodeURIComponent(token)}?base=${encodeURIComponent(window.location.origin)}`;
+}
+
 export function identityLine(file) {
   return `${file.suite}:${file.root}`;
 }

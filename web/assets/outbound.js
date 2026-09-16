@@ -2,7 +2,7 @@
 
 import { deliveryMetadata, initDeliveryEvidence } from '/assets/delivery-evidence.js';
 import { applyBranding } from '/assets/branding.js';
-import { appendObjectCard, formatBytes } from '/assets/object-card.js';
+import { appLink, appendObjectCard, formatBytes } from '/assets/object-card.js';
 import {
   appendMetadataPage,
   batchDownloadEligible,
@@ -585,7 +585,7 @@ function offerApp(kind) {
   if (/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)) return;
   const link = document.getElementById('open-in-app-link');
   if (!link) return;
-  link.href = `votport://${kind}/${encodeURIComponent(token)}?base=${encodeURIComponent(window.location.origin)}`;
+  link.href = appLink(kind, token);
   link.hidden = false;
   const holder = document.getElementById('open-in-app');
   if (holder) holder.hidden = false;
