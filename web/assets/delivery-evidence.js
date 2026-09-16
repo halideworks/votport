@@ -1,6 +1,6 @@
 /* global crypto, indexedDB, DataView, AbortSignal */
 import { dedupeFilenames } from '/assets/outbound-download.js';
-import { copyToClipboard } from '/assets/object-card.js';
+import { appLink, copyToClipboard } from '/assets/object-card.js';
 
 const encode = new TextEncoder();
 const hex = (bytes) => [...new Uint8Array(bytes)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
@@ -228,7 +228,7 @@ export function initDeliveryEvidence(getMetadata, savedNames) {
     $('evidence-records').dataset.grant = metadata?.grant_id || await stored(`delivery:${token}`) || '';
     await show();
   });
-  $('evidence-open-app').href = `votport://s/${encodeURIComponent(token)}?base=${encodeURIComponent(window.location.origin)}`;
+  $('evidence-open-app').href = appLink('s', token);
 }
 
 export { authorization, manifestDigest, message };
