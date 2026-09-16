@@ -805,16 +805,21 @@ if (browserEngine === "chromium") {
 }
 await page.waitForFunction(() => document.querySelector("#done-list .file-id")?.getAttribute("aria-label")?.startsWith("Copied file hash: "));
 await page.evaluate(() => { window.__copySuccessAt = performance.now(); });
-await page.waitForFunction(() => performance.now() - window.__copySuccessAt >= 750, null, { timeout: 3000 });
+await page.waitForFunction(() => performance.now() - window.__copySuccessAt >= 750, null, { timeout: 3000, polling: 50 });
 await page.evaluate(() => { window.__clipboardFailure = true; });
 await copyControl.press("Enter");
 await page.waitForFunction(() => document.querySelector("#done-list .file-id")?.textContent === "Copy failed");
 if (await copyControl.getAttribute("aria-label") !== `Copy failed: ${cards[0].name}`) {
   throw new Error("denied clipboard copy must expose an accessible failure status");
 }
-await page.waitForFunction(() => performance.now() - window.__copySuccessAt >= 1600, null, { timeout: 3000 });
-if (await copyControl.textContent() !== "Copy failed"
-  || await copyControl.getAttribute("aria-label") !== `Copy failed: ${cards[0].name}`) {
+try {
+  await page.waitForFunction((name) => {
+    if (performance.now() - window.__copySuccessAt < 1600) return false;
+    const control = document.querySelector("#done-list .file-id");
+    return control?.textContent === "Copy failed"
+      && control?.getAttribute("aria-label") === `Copy failed: ${name}`;
+  }, cards[0].name, { timeout: 3000, polling: 50 });
+} catch {
   throw new Error("latest copy failure must outlive an earlier success deadline");
 }
 await page.evaluate(() => { window.__clipboardFailure = false; });
