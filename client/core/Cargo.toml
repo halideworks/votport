@@ -18,7 +18,7 @@ vot-object = { git = "https://github.com/halideworks/VOT", rev = "de66d41343cee7
 vot-manifest = { git = "https://github.com/halideworks/VOT", rev = "de66d41343cee7fb206a0f323d36babea655f032" }
 vot-platform-fs = { git = "https://github.com/halideworks/VOT", rev = "de66d41343cee7fb206a0f323d36babea655f032" }
 
-reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls", "rustls-tls-native-roots"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
