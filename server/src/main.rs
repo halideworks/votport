@@ -51,21 +51,11 @@ async fn main() {
         }
         return;
     }
-    // RUST_LOG wins; info is the right default for a deployed server.
+    // RUST_LOG wins over the default (info with the audit target pinned).
     // VOTPORT_LOG_FORMAT=json emits one JSON object per line for log
-    // pipelines; anything else keeps the human format.
-    let filter = || {
-        tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
-    };
-    if std::env::var("VOTPORT_LOG_FORMAT").as_deref() == Ok("json") {
-        tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(filter())
-            .init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(filter()).init();
-    }
+    // pipelines; anything else keeps the human format. AUDIT_LOG routes
+    // audit-target events to a dedicated append-only file instead of stdout.
+    votport::logging::init();
     tracing::info!(
         version = BUILD_VERSION,
         revision = BUILD_REVISION,

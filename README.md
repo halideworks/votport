@@ -227,8 +227,12 @@ revoke is removing the IdP group.
 
 Every administrative and transfer event — sign-ins (with client IP),
 link lifecycle, received-file deletions, upload completions and failures — is
-written both to the structured log (`RUSTLOG=audit=info`) and to an
-append-only table in the database. Export it as JSONL for a SIEM:
+written both to the structured log (`RUST_LOG` defaults to
+`info,votport=info,audit=info`; tune per target, e.g. `RUST_LOG=audit=debug`) and
+to an append-only table in the database. Set `AUDIT_LOG=/path/audit.log` to
+route audit-target log events to a dedicated append-only file (same line
+format, created on first write) instead of stdout, so the trail survives
+dropping other log noise. Export it as JSONL for a SIEM:
 
 ```sh
 curl -b cookies.txt 'https://drop.example.com/api/admin/audit?since=0&limit=1000'

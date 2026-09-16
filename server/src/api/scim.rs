@@ -316,7 +316,7 @@ fn set_active(app: &App, subject: &str, active: bool, ip: &str) -> ScimResult<bo
     };
     let changed = changed.map_err(ScimError::store)?;
     if changed {
-        tracing::info!(target: "audit", event, subject = %subject, %ip, "principal updated by scim");
+        tracing::info!(target: "audit", event, subject = %crate::logging::reduce_subject(subject), %ip, "principal updated by scim");
         app.store.audit(
             "",
             "scim",
@@ -663,7 +663,7 @@ pub async fn create_user(
             "userName already exists",
         ));
     }
-    tracing::info!(target: "audit", event = "principal_provisioned", subject = %subject, %ip, "principal created by scim");
+    tracing::info!(target: "audit", event = "principal_provisioned", subject = %crate::logging::reduce_subject(&subject), %ip, "principal created by scim");
     app.store.audit(
         "",
         "scim",
@@ -2515,5 +2515,26 @@ mod tests {
         assert!(!parse_active(&json!("FALSE")).unwrap());
         assert!(parse_active(&json!(1)).is_err());
         assert!(parse_active(&json!("yes")).is_err());
+    }
+
+    #[tokio::test]
+    async fn scim_logs_use_the_reduced_subject_form() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = build(directory.path());
+        let (log, _guard) = crate::logging::captured(crate::logging::audit_filter());
+        let (status, _) = scim(
+            &application,
+            "POST",
+            "/scim/v2/Users",
+            Some(r#"{"userName":"jane@example.com"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        set_active(&application, "jane@example.com", false, "203.0.113.9").unwrap();
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        assert!(text.contains("principal_provisioned"), "{text}");
+        assert!(text.contains("principal_revoked"), "{text}");
+        assert!(text.contains("ja..om (16)"), "{text}");
+        assert!(!text.contains("jane@example.com"), "{text}");
     }
 }

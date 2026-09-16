@@ -1649,7 +1649,7 @@ fn mutate_principal(
     } else {
         "principal_unblocked"
     };
-    tracing::info!(target: "audit", event, subject = %subject, "principal updated");
+    tracing::info!(target: "audit", event, subject = %crate::logging::reduce_subject(subject), "principal updated");
     app.store.audit("", actor, event, subject, &json!({}));
     Ok(Json(json!({ "ok": true })))
 }
@@ -10750,6 +10750,22 @@ mod principals_api_tests {
             .unwrap();
         assert!(!row.blocked);
         assert_eq!(row.credential_version, 1);
+    }
+
+    #[test]
+    fn principal_updates_log_the_reduced_subject_form() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .upsert_sso_principal("jane@example.com", &[], &json!([]))
+            .unwrap();
+        let (log, _guard) = crate::logging::captured(crate::logging::audit_filter());
+        let _ = mutate_principal(&application, "local", "jane@example.com", true).unwrap();
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        assert!(text.contains("principal_revoked"), "{text}");
+        assert!(text.contains("ja..om (16)"), "{text}");
+        assert!(!text.contains("jane@example.com"), "{text}");
     }
 }
 
