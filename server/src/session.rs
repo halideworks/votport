@@ -2543,7 +2543,15 @@ pub fn commit_persisted_interruption(
         replayed_chunks: 0,
         rejected_chunks: 0,
     };
-    let _ = record_session_event(store, ended, &session.tenant, &session.link_id, "", event);
+    let _ = record_session_event(
+        store,
+        ended,
+        &session.tenant,
+        &session.link_id,
+        "",
+        &session.id,
+        event,
+    );
 }
 
 fn commit_upload(
@@ -3861,6 +3869,7 @@ fn record_event(
         &setup.tenant,
         &setup.link_id,
         &setup.client_ip,
+        &hex::encode(setup.session_id),
         event,
     );
 }
@@ -3871,10 +3880,13 @@ fn record_session_event(
     tenant: &str,
     link_id: &str,
     client_ip: &str,
+    session_id: &str,
     event: crate::store::SessionEvent,
 ) -> Result<bool, String> {
+    let session_tag = session_id.get(..8).unwrap_or(session_id);
     tracing::warn!(
         target: "audit", event = "upload_session_ended", link = %link_id,
+        session_tag = %session_tag,
         outcome = %event.outcome, detail = %event.detail,
         received_bytes = event.received_bytes, expected_bytes = event.expected_bytes,
         "upload session ended without completing"
@@ -3885,7 +3897,9 @@ fn record_session_event(
         "upload_session_ended",
         link_id,
         &serde_json::json!({
+            "session_tag": session_tag,
             "outcome": event.outcome,
+            "detail": event.detail,
             "received_bytes": event.received_bytes,
             "expected_bytes": event.expected_bytes,
             "client_ip": client_ip
@@ -5394,6 +5408,7 @@ mod push_tests {
             "",
             "deleted-link",
             "",
+            "",
             crate::store::SessionEvent {
                 at: 2,
                 started_at: 1,
@@ -5411,6 +5426,20 @@ mod push_tests {
         assert_eq!(ended.link_id, "deleted-link");
         assert!(ended.label.is_empty());
         assert!(ended.notifications.is_none());
+    }
+
+    #[test]
+    fn ended_session_rows_carry_the_session_tag_and_detail() {
+        let directory = tempfile::tempdir().unwrap();
+        let setup = setup(directory.path(), object(Suite::Blake3Bao64, b""));
+        record_event(&setup, 3, 2, "cancelled", "sender hung up".to_owned(), 1, 0);
+        let rows = setup.store.audit_export(None, 0, 0, 100).unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.event == "upload_session_ended")
+            .expect("the ended session leaves an audit row");
+        assert_eq!(row.detail["session_tag"], "07070707");
+        assert_eq!(row.detail["detail"], "sender hung up");
     }
 
     #[tokio::test]

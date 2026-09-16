@@ -688,6 +688,15 @@ fn refuse_push(
 ) -> Option<vot_cli::PushAdmission> {
     app.push_metrics.refuse(reason);
     tracing::warn!(target: "audit", event = "push_refused", %peer, reason = reason.label(), "native push refused");
+    // The session is not known at refusal time, so like the metric series the
+    // row carries only the reason and the peer address.
+    app.store.audit(
+        "",
+        "",
+        "push_refused",
+        "",
+        &serde_json::json!({ "peer": peer.to_string(), "reason": reason.label() }),
+    );
     None
 }
 
@@ -711,6 +720,7 @@ pub(crate) fn upload_completed(
     app.workflow_ready.notify_one();
     tracing::info!(
         target: "audit", event = "upload_completed", session = %session_id,
+        upload = %report.upload_id,
         files = report.files.len(), bytes = report.files.iter().map(|file| file.bytes).sum::<u64>(),
         "upload finished and recorded"
     );
@@ -725,11 +735,14 @@ pub(crate) fn upload_completed(
         .as_ref()
         .map(|link| link.tenant.as_str())
         .unwrap_or_default();
+    // Subject is the upload id, the name the UI shows; the tenant falls back
+    // to "" only when the link cannot be read (absent, deleted, or a failed
+    // read, which the warn above records).
     app.store.audit(
         completed_tenant,
         "",
         "upload_completed",
-        &session_id[..8.min(session_id.len())],
+        &report.upload_id,
         &serde_json::json!({
             "files": report.files.len(),
             "bytes": report.files.iter().map(|file| file.bytes).sum::<u64>(),
@@ -8002,5 +8015,91 @@ mod sso_slot_tests {
         assert_eq!(*third, 3);
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         assert!(slot.health_peek());
+    }
+}
+
+#[cfg(test)]
+mod audit_observability_tests {
+    use super::*;
+
+    #[test]
+    fn refused_pushes_leave_an_audit_row_with_reason_and_peer() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = crate::api::testing::build(directory.path());
+        refuse_push(
+            &application,
+            PushRefusalReason::Spent,
+            "10.1.2.3:4".parse().unwrap(),
+        );
+        let rows = application.store.audit_export(None, 0, 0, 100).unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.event == "push_refused")
+            .expect("the refused push leaves an audit row");
+        assert_eq!(row.detail["reason"], "spent");
+        assert_eq!(row.detail["peer"], "10.1.2.3:4");
+    }
+
+    #[tokio::test]
+    async fn completed_uploads_are_recorded_under_the_upload_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = crate::api::testing::build(directory.path());
+        application
+            .store
+            .insert_tenant(crate::store::tests::test_tenant("acme"))
+            .unwrap();
+        application
+            .store
+            .insert_link(crate::store::tests::link_in("acme", "link-1"))
+            .unwrap();
+        let report = crate::session::FinishReport {
+            upload_id: "upload-9".to_owned(),
+            files: vec![crate::store::FileRecord {
+                path: "a.bin".to_owned(),
+                stored_as: "a.bin".to_owned(),
+                bytes: 5000,
+                suite: "blake3".to_owned(),
+                root: "00".to_owned(),
+                receipt: false,
+                deleted: false,
+            }],
+            received: 5000,
+        };
+        upload_completed(
+            &application,
+            "07070707070707070707070707070707",
+            Some("link-1".to_owned()),
+            "10.0.0.9",
+            &report,
+            &tokio::runtime::Handle::current(),
+        );
+        let rows = application
+            .store
+            .audit_export(Some("acme"), 0, 0, 100)
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.event == "upload_completed")
+            .expect("the completed upload leaves an audit row");
+        assert_eq!(row.subject, "upload-9");
+        assert_eq!(row.detail["files"], 1);
+        assert_eq!(row.detail["bytes"], 5000);
+        assert_eq!(row.detail["client_ip"], "10.0.0.9");
+
+        // With the link gone the row still lands, on the default tenant.
+        upload_completed(
+            &application,
+            "07070707070707070707070707070707",
+            None,
+            "10.0.0.9",
+            &report,
+            &tokio::runtime::Handle::current(),
+        );
+        let rows = application.store.audit_export(Some(""), 0, 0, 100).unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.event == "upload_completed")
+            .expect("the completed upload is recorded even without its link");
+        assert_eq!(row.subject, "upload-9");
     }
 }

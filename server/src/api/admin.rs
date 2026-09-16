@@ -336,8 +336,19 @@ pub async fn admin_login(
 pub async fn admin_logout(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Response> {
     // A cross-site form POST can force a logout (denial of convenience, not
     // of security); the CSRF header closes even that.
-    let _identity = require_admin(&app, &headers)?;
+    let identity = require_admin(&app, &headers)?;
     require_csrf_header(&headers)?;
+    tracing::info!(
+        target: "audit", event = "admin_signed_out", subject = %identity.subject,
+        "admin signed out"
+    );
+    app.store.audit(
+        "",
+        &identity.subject,
+        "admin_signed_out",
+        "",
+        &serde_json::json!({}),
+    );
     let cookie = format!(
         "{ADMIN_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{}",
         cookie_attributes(&app)
@@ -3362,6 +3373,7 @@ pub struct ChangePasswordRequest {
 /// signed in.
 pub async fn admin_change_password(
     State(app): State<Arc<App>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<ChangePasswordRequest>,
 ) -> ApiResult<Response> {
@@ -3420,6 +3432,20 @@ pub async fn admin_change_password(
         app.change_password_throttle.succeeded();
     }
     if !current_ok {
+        // Same disclosure as the sign-in failure row: the address and the
+        // fact that the check failed, never the password material.
+        let ip = super::client_ip(&headers, &peer, &app.config.trusted_proxies);
+        tracing::warn!(
+            target: "audit", event = "admin_password_change_failed", %ip,
+            "admin password change refused"
+        );
+        app.store.audit(
+            "",
+            "",
+            "admin_password_change_failed",
+            &ip,
+            &serde_json::json!({}),
+        );
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "current password is wrong",
@@ -3432,10 +3458,10 @@ pub async fn admin_change_password(
     app.store
         .set_admin_password_hash(hash)
         .map_err(ApiError::internal)?;
-    tracing::info!(target: "audit", event = "admin_password_changed", "admin password changed; outstanding sessions invalidated");
+    tracing::info!(target: "audit", event = "admin_password_changed", subject = %identity.subject, "admin password changed; outstanding sessions invalidated");
     app.store.audit(
         "",
-        "local",
+        &identity.subject,
         "admin_password_changed",
         "",
         &serde_json::json!({}),
@@ -4632,6 +4658,10 @@ mod handler_tests {
                     .header("cookie", cookie)
                     .header("x-votport", "1")
                     .header("content-type", "application/json")
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        1234,
+                    ))))
                     .body(Body::from(format!(
                         r#"{{"current":"{current}","new":"{new}"}}"#
                     )))
@@ -4639,6 +4669,86 @@ mod handler_tests {
             )
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sign_out_and_password_refusals_reach_the_audit_trail() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = login_cookie(app::router(application.clone())).await;
+
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/logout")
+                    .header("cookie", cookie.clone())
+                    .header("x-votport", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // A wrong current password is refused and recorded like the sibling
+        // sign-in failure row: address and event only, no secret material.
+        let response = change_password_req(
+            application.clone(),
+            &cookie,
+            "not-the-password",
+            "a-much-longer-passphrase",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // A successful rotation carries the acting principal, not a literal.
+        let sso = crate::auth::AdminIdentity {
+            subject: "sso:admin".to_owned(),
+            tenant: String::new(),
+            role: "admin".to_owned(),
+            grants: vec![crate::auth::TenantGrant {
+                incarnation: None,
+                tenant: String::new(),
+                role: "admin".to_owned(),
+            }],
+            credential_version: 1,
+        };
+        let sso_cookie = format!(
+            "votport_admin={}",
+            crate::auth::issue_admin_token(
+                &application.secret,
+                &sso,
+                &admin_token_phc(&application).unwrap(),
+            )
+        );
+        let response = change_password_req(
+            application.clone(),
+            &sso_cookie,
+            testing::TEST_PASSWORD,
+            "another-long-passphrase",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let rows = application.store.audit_export(None, 0, 0, 100).unwrap();
+        let out = rows
+            .iter()
+            .find(|row| row.event == "admin_signed_out")
+            .expect("the sign-out is recorded");
+        assert_eq!(out.actor, "local");
+        let failed = rows
+            .iter()
+            .find(|row| row.event == "admin_password_change_failed")
+            .expect("the refused change is recorded");
+        assert_eq!(failed.subject, "127.0.0.1");
+        assert_eq!(failed.actor, "");
+        assert_eq!(failed.detail, json!({}));
+        let changed = rows
+            .iter()
+            .find(|row| row.event == "admin_password_changed")
+            .expect("the rotation is recorded");
+        assert_eq!(changed.actor, "sso:admin");
     }
 
     #[tokio::test]
@@ -4659,6 +4769,10 @@ mod handler_tests {
                     .header("cookie", &cookie)
                     .header("x-votport", "1")
                     .header("content-type", "application/json")
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [203, 0, 113, 200],
+                        1234,
+                    ))))
                     .body(Body::from(format!(
                         r#"{{"current":"{}","new":"a-much-longer-passphrase"}}"#,
                         testing::TEST_PASSWORD

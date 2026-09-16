@@ -932,6 +932,7 @@ pub async fn mint_fetch(
 
 fn refuse(
     app: &App,
+    runtime: &tokio::runtime::Handle,
     reason: ServeRefusalReason,
     peer: std::net::SocketAddr,
 ) -> Option<vot_cli::ServeAdmission> {
@@ -940,6 +941,20 @@ fn refuse(
         target: "audit", event = "serve_refused", %peer, reason = reason.label(),
         "fetch session refused"
     );
+    // The grant is not always known at refusal time, so like the metric
+    // series the row carries only the reason and the peer address. Off the
+    // calling thread, like every other admission store write.
+    let store = Arc::clone(&app.store);
+    let reason_label = reason.label();
+    blocking(runtime, move || {
+        store.audit(
+            "",
+            "",
+            "serve_refused",
+            "",
+            &json!({ "peer": peer.to_string(), "reason": reason_label }),
+        );
+    });
     None
 }
 
@@ -956,6 +971,7 @@ pub(crate) fn grant_open(grant: &OutboundGrant, now: u64) -> bool {
 
 fn refuse_closed_fetch(
     app: &App,
+    runtime: &tokio::runtime::Handle,
     token: [u8; 16],
     peer: std::net::SocketAddr,
 ) -> Option<vot_cli::ServeAdmission> {
@@ -970,7 +986,7 @@ fn refuse_closed_fetch(
         tracing::debug!(target: "audit", event = "serve_straggler", %peer, "late rail on a delivered ticket turned away");
         None
     } else {
-        refuse(app, ServeRefusalReason::Closed, peer)
+        refuse(app, runtime, ServeRefusalReason::Closed, peer)
     }
 }
 
@@ -999,7 +1015,7 @@ pub(crate) fn admit_fetch(
     let serve = app.serve.as_ref()?;
     let peer = presentation.peer;
     if !app.serve_rate.allow(&peer.ip().to_string()) {
-        return refuse(app, ServeRefusalReason::Rate, peer);
+        return refuse(app, runtime, ServeRefusalReason::Rate, peer);
     }
     // The token id and root are read before authentication only to find
     // the ticket and pick the requirement that then authenticates the
@@ -1011,7 +1027,7 @@ pub(crate) fn admit_fetch(
             vot_capability::Capability::from_canonical_bytes(&signed.capability).ok()
         });
     let Some(capability) = capability else {
-        return refuse(app, ServeRefusalReason::Capability, peer);
+        return refuse(app, runtime, ServeRefusalReason::Capability, peer);
     };
     let token = capability.token_id;
     let root = capability.scope.root;
@@ -1019,36 +1035,36 @@ pub(crate) fn admit_fetch(
     let token_id = hex::encode(token);
     let ticket = match blocking(runtime, move || store.fetch_ticket(&token_id)) {
         Ok(Some(ticket)) => ticket,
-        Ok(None) => return refuse(app, ServeRefusalReason::Unknown, peer),
+        Ok(None) => return refuse(app, runtime, ServeRefusalReason::Unknown, peer),
         Err(error) => {
             tracing::error!(%error, "fetch ticket lookup failed during admission");
-            return refuse(app, ServeRefusalReason::Unknown, peer);
+            return refuse(app, runtime, ServeRefusalReason::Unknown, peer);
         }
     };
     if decode_root(&ticket.manifest_root) != Some(root) {
-        return refuse(app, ServeRefusalReason::Capability, peer);
+        return refuse(app, runtime, ServeRefusalReason::Capability, peer);
     }
     let store = Arc::clone(&app.store);
     let grant_id = ticket.grant_id.clone();
     let grant = match blocking(runtime, move || store.outbound_grant_by_id(&grant_id)) {
         Ok(Some(grant)) => grant,
-        Ok(None) => return refuse(app, ServeRefusalReason::Unknown, peer),
+        Ok(None) => return refuse(app, runtime, ServeRefusalReason::Unknown, peer),
         Err(error) => {
             tracing::error!(%error, "grant lookup failed during fetch admission");
-            return refuse(app, ServeRefusalReason::Unknown, peer);
+            return refuse(app, runtime, ServeRefusalReason::Unknown, peer);
         }
     };
     if ticket.grant_token_hash != grant.token_hash {
-        return refuse(app, ServeRefusalReason::Closed, peer);
+        return refuse(app, runtime, ServeRefusalReason::Closed, peer);
     }
     if !grant_open(&grant, presentation.now) {
-        return refuse_closed_fetch(app, token, peer);
+        return refuse_closed_fetch(app, runtime, token, peer);
     }
     let Some(server) = serve.registry.server(root) else {
         // Built at mint and warmed off-thread after a restart, so a server
         // can be briefly absent for a valid ticket while warming, or absent
         // because a build failed; both refuse unknown, both are in the log.
-        return refuse(app, ServeRefusalReason::Unknown, peer);
+        return refuse(app, runtime, ServeRefusalReason::Unknown, peer);
     };
     let verifying_key = serve.issuer.verifying_key();
     let requirement = vot_cli::authz::Requirement::new(
@@ -1064,7 +1080,7 @@ pub(crate) fn admit_fetch(
         presentation.channel_binding,
         presentation.now,
     ) else {
-        return refuse(app, ServeRefusalReason::Capability, peer);
+        return refuse(app, runtime, ServeRefusalReason::Capability, peer);
     };
     // Acquire before looking at the slot. If the last rail drops between a
     // preliminary check and claim_slot, the permit lets this valid fetch
@@ -1076,7 +1092,7 @@ pub(crate) fn admit_fetch(
         .claim_slot(app, token, &grant.token_hash, admission)
     {
         Ok(admission) => admission,
-        Err(()) => return refuse(app, ServeRefusalReason::Busy, peer),
+        Err(()) => return refuse(app, runtime, ServeRefusalReason::Busy, peer),
     };
     let hold = SessionHold {
         registry: Arc::clone(&serve.registry),
@@ -1084,10 +1100,10 @@ pub(crate) fn admit_fetch(
     };
     match app.store.admit_fetch_ticket(&ticket, presentation.now) {
         Ok(true) => {}
-        Ok(false) => return refuse_closed_fetch(app, token, peer),
+        Ok(false) => return refuse_closed_fetch(app, runtime, token, peer),
         Err(error) => {
             tracing::error!(%error, %peer, "fetch ticket admission failed");
-            return refuse(app, ServeRefusalReason::Unknown, peer);
+            return refuse(app, runtime, ServeRefusalReason::Unknown, peer);
         }
     }
     drop(admission);
@@ -1963,6 +1979,38 @@ mod tests {
         let _ = app
             .store
             .with(|connection| connection.execute_batch("DROP TRIGGER fail_fetch_admission"));
+    }
+
+    #[tokio::test]
+    async fn refused_fetches_leave_an_audit_row_with_reason_and_peer() {
+        let fixture = fetch_admission_fixture("admission-refused-row", 84);
+        let app = fixture.app;
+        let now = fixture.now;
+        let challenge = &fixture.challenge;
+        let open = &fixture.open;
+        let binding = fixture.binding;
+        let peer = "127.0.0.1:2".parse().unwrap();
+        let runtime = tokio::runtime::Handle::current();
+        // Past the grant's expiry the admission refuses as closed.
+        let admission = admit_fetch(
+            &app,
+            vot_cli::ServePresentation {
+                peer,
+                challenge,
+                open,
+                channel_binding: binding,
+                now: now + 601,
+            },
+            &runtime,
+        );
+        assert!(admission.is_none());
+        let rows = app.store.audit_export(None, 0, 0, 100).unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.event == "serve_refused")
+            .expect("the refused fetch leaves an audit row");
+        assert_eq!(row.detail["reason"], "closed");
+        assert_eq!(row.detail["peer"], "127.0.0.1:2");
     }
 
     /// Under a held-open store the admission still completes within the

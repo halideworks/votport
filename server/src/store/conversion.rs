@@ -1442,7 +1442,9 @@ mod tests {
             None,
             "converted existing data starts in the retention hold"
         );
-        assert_eq!(store.audit_count().unwrap(), 4);
+        // Four rows the conversion itself wrote, plus the storage layout
+        // migration naming the tenants whose totals it moved.
+        assert_eq!(store.audit_count().unwrap(), 5);
         let connection = store.connection.lock().unwrap();
         assert_eq!(read_uploads(&connection, "link").unwrap(), vec![upload]);
         assert_eq!(
