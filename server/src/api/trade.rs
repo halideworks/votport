@@ -122,6 +122,22 @@ pub async fn settings(
             ],
         )
         .map_err(store_unavailable)?;
+    // The same settings_updated emission admin settings changes use, so
+    // audit subscribers see a port rename or address move.
+    tracing::info!(
+        target: "audit",
+        event = "settings_updated",
+        keys = 2,
+        reset = 0,
+        "port settings updated"
+    );
+    app.store.audit(
+        "",
+        &actor.subject,
+        "settings_updated",
+        "",
+        &json!({ "keys": ["port_name", "port_address"], "reset": [] }),
+    );
     Ok(private(identity(&app)?))
 }
 pub async fn list(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Response> {
@@ -612,6 +628,7 @@ pub async fn update(
             &body.state,
             body.cancel_active,
             &body.notifications,
+            &actor.subject,
         )
         .map_err(invalid)?;
     if route.direction == "incoming" && body.state != "active" && body.cancel_active {
@@ -718,7 +735,7 @@ pub async fn change_address(
     let origin = address(&body.address).map_err(unprocessable)?;
     probe(&app, &origin, Some(&route.peer_key)).await?;
     app.store
-        .change_trade_address(&actor.tenant, &id, body.revision, &origin)
+        .change_trade_address(&actor.tenant, &id, body.revision, &origin, &actor.subject)
         .map_err(invalid)?;
     Ok(private(json!({"ok":true})))
 }
@@ -1057,6 +1074,153 @@ mod tests {
             "use a port origin such as https://port.example"
         );
         assert_eq!(app.store.audit_count().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn port_settings_rewrite_emits_settings_updated() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::put("/api/trade-routes/port")
+                    .header("X-Votport", "1")
+                    .header(header::COOKIE, admin_cookie(&app))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"name":"Port name","address":"https://port.example"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated = app
+            .store
+            .audit_export(Some(""), 0, 0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.event == "settings_updated")
+            .collect::<Vec<_>>();
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].actor, "local");
+        assert_eq!(
+            updated[0].detail["keys"],
+            serde_json::json!(["port_name", "port_address"])
+        );
+        assert_eq!(updated[0].detail["reset"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn route_update_and_address_change_events_carry_the_acting_principal() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let cookie = admin_cookie(&app);
+        let sender_directory = tempfile::tempdir().unwrap();
+        let sender =
+            crate::receipt::ReceiptSigner::load_or_create(sender_directory.path()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let route_id = "routed-actor".to_owned();
+        let route = TradeRoute {
+            id: route_id.clone(),
+            revision: 1,
+            tenant: String::new(),
+            direction: "outgoing".into(),
+            name: "Remote".into(),
+            peer_name: "Remote".into(),
+            peer_key: sender.public_hex.clone(),
+            address: format!("http://{address}"),
+            endpoint: "endpoint".into(),
+            endpoint_name: "Endpoint".into(),
+            category: "external".into(),
+            forwarding: false,
+            metadata_keys: vec![],
+            state: "active".into(),
+            notifications: crate::store::NotificationPolicy::default(),
+            last_contact: None,
+            error: None,
+            remote_grant: "remote-grant".into(),
+            remote_state: "active".into(),
+            cancel_active: false,
+        };
+        app.store
+            .with(|connection| {
+                connection.execute(
+                    "INSERT INTO trade_routes(id,tenant,direction,peer_key,endpoint,document,credential) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    rusqlite::params![
+                        &route.id,
+                        &route.tenant,
+                        &route.direction,
+                        &route.peer_key,
+                        route.endpoint,
+                        serde_json::to_string(&route).unwrap(),
+                        &crate::auth::random_token(),
+                    ],
+                )
+            })
+            .unwrap();
+        let peer = RotationPeer {
+            app: Arc::clone(&app),
+            route_id: route_id.clone(),
+            remote_grant: route.remote_grant.clone(),
+            replacement: String::new(),
+            signer: Arc::new(sender),
+            mutated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let peer_router = axum::Router::new()
+            .route("/api/port", axum::routing::get(rotation_peer_discovery))
+            .with_state(peer);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, peer_router).await.unwrap();
+        });
+
+        let router = crate::app::router(Arc::clone(&app));
+        let response = router
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/trade-routes/{route_id}"))
+                    .header("X-Votport", "1")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"revision":1,"state":"paused","cancel_active":false,"notifications":crate::store::NotificationPolicy::default()})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = router
+            .oneshot(
+                Request::put(format!("/api/trade-routes/{route_id}/address"))
+                    .header("X-Votport", "1")
+                    .header(header::COOKIE, cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"address": format!("http://{address}"), "revision": 2}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        server.abort();
+        let _ = server.await;
+
+        let events = app.store.delivery_events("", 0, 100).unwrap();
+        let permission = events
+            .iter()
+            .find(|event| event.kind == "route_permission_changed")
+            .unwrap();
+        assert_eq!(permission.payload["actor"], "local");
+        assert_eq!(permission.payload["state"], "paused");
+        let moved = events
+            .iter()
+            .find(|event| event.kind == "route_address_changed")
+            .unwrap();
+        assert_eq!(moved.payload["actor"], "local");
+        assert_eq!(moved.payload["address"], format!("http://{address}"));
     }
 
     #[tokio::test]

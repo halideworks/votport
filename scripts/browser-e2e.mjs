@@ -1212,7 +1212,7 @@ await page.waitForSelector("#verify-result:not([hidden])", {
   timeout: 15000,
 });
 let title = await page.textContent("#verify-title");
-if (title !== "Genuine receipt") {
+if (title !== "Signature verified") {
   throw new Error(`sidecar-only verdict: ${title}`);
 }
 let okClass = await page.$eval("#verify-result", (el) => el.classList.contains("ok"));
