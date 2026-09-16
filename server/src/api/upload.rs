@@ -748,6 +748,7 @@ pub async fn create_session(
         started_at: now_unix(),
         quiet_after_secs: session::quiet_after_secs(app.config.session_idle_secs),
         ended: app.session_ended.clone(),
+        checkpoint_warn: session::CheckpointWarnPacer::new(),
     };
     // Depth matches the client's chunk concurrency so handlers rarely block
     // on send. Register the sender before the worker can create_dir_all.
@@ -923,6 +924,7 @@ pub async fn create_push_session(
         started_at: now_unix(),
         quiet_after_secs: session::quiet_after_secs(app.config.session_idle_secs),
         ended: app.session_ended.clone(),
+        checkpoint_warn: session::CheckpointWarnPacer::new(),
     };
     let (sender, _receiver) = mpsc::channel(1);
     let admission_guard = match register_session(

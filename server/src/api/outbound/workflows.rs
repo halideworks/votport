@@ -608,6 +608,9 @@ pub async fn export_events(
 }
 
 pub async fn worker(app: Arc<App>) {
+    let mut claim_dedupe = super::ErrorDeduper::new("delivery job claim");
+    let mut record_dedupe = super::ErrorDeduper::new("delivery job failure record");
+    let mut pinned_notice = super::SkipNotice::new();
     loop {
         if app.lease_lost.load(std::sync::atomic::Ordering::Relaxed) || app.is_stopping() {
             return;
@@ -615,6 +618,7 @@ pub async fn worker(app: Arc<App>) {
         if let Ok(operation) = begin_outbound_operation(&app, "") {
             match app.store.claim_delivery_job(&app.lease_holder, now_unix()) {
                 Ok(Some(job)) if job.state == "preparing" || job.state == "exporting" => {
+                    claim_dedupe.recovered();
                     let result = match begin_outbound_operation(&app, &job.tenant) {
                         Ok(_tenant_operation) => prepare(&app, job.clone()).await,
                         Err(error) => Err(error),
@@ -624,9 +628,12 @@ pub async fn worker(app: Arc<App>) {
                             app.store
                                 .fail_delivery_job(&job.id, job.attempts, &error.message)
                         {
-                            tracing::error!(%store_error,job_id=%job.id,"record delivery job failure");
+                            if record_dedupe.observe(&store_error, std::time::Instant::now()) {
+                                tracing::error!(%store_error,job_id=%job.id,"record delivery job failure");
+                            }
                             tokio::select! { _ = app.wait_for_shutdown() => return, _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {} }
                         }
+                        record_dedupe.recovered();
                     }
                     if let Ok(Some(current)) = app.store.delivery_job(&job.id) {
                         if current.state == "failed"
@@ -642,8 +649,24 @@ pub async fn worker(app: Arc<App>) {
                     drop(operation);
                     continue;
                 }
-                Err(error) => tracing::error!(%error,"claim delivery job"),
-                _ => {}
+                Err(error) => {
+                    if claim_dedupe.observe(&error, std::time::Instant::now()) {
+                        tracing::error!(%error,"claim delivery job");
+                    }
+                }
+                _ => {
+                    claim_dedupe.recovered();
+                }
+            }
+        } else {
+            match pinned_notice.due(std::time::Instant::now()) {
+                super::SkipLevel::First => tracing::info!(
+                    "delivery worker iteration skipped; the platform tenant is pinned"
+                ),
+                super::SkipLevel::Repeat => tracing::debug!(
+                    "delivery worker iteration skipped; the platform tenant is pinned"
+                ),
+                super::SkipLevel::Silent => {}
             }
         }
         tokio::select! { _ = app.wait_for_shutdown() => return, _ = app.workflow_ready.notified() => {}, _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {} }
@@ -1448,12 +1471,20 @@ pub async fn event_worker(app: Arc<App>) {
         }
     };
     let mut next_retirement = tokio::time::Instant::now();
+    let mut dispatch_dedupe = super::ErrorDeduper::new("delivery event dispatch");
     loop {
         if app.lease_lost.load(std::sync::atomic::Ordering::Relaxed) || app.is_stopping() {
             return;
         }
-        if let Err(error) = dispatch_events(&app, &client).await {
-            tracing::error!(%error,"dispatch delivery events");
+        match dispatch_events(&app, &client).await {
+            Ok(()) => {
+                dispatch_dedupe.recovered();
+            }
+            Err(error) => {
+                if dispatch_dedupe.observe(&error, std::time::Instant::now()) {
+                    tracing::error!(%error,"dispatch delivery events");
+                }
+            }
         }
         if !app.is_stopping() && tokio::time::Instant::now() >= next_retirement {
             match retire_snapshot(&app).await {

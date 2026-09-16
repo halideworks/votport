@@ -1132,6 +1132,105 @@ fn library_root(app: &App, tenant: &str) -> PathBuf {
     }
 }
 
+/// Cadence bound shared by the worker log hygiene helpers: repeat
+/// observations of one condition log at most this often.
+pub(crate) const WORKER_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Bounds recurring worker error logs: an unchanged error from one site
+/// logs at most once per [`WORKER_LOG_INTERVAL`], a changed error logs
+/// immediately, and a cleared condition yields one recovery line. Without
+/// this a stuck two-second loop produces about 43000 error lines per day.
+pub(crate) struct ErrorDeduper {
+    site: &'static str,
+    last_error: Option<String>,
+    last_logged: Option<std::time::Instant>,
+}
+
+impl ErrorDeduper {
+    pub(crate) fn new(site: &'static str) -> Self {
+        Self {
+            site,
+            last_error: None,
+            last_logged: None,
+        }
+    }
+
+    /// True when `error` must be logged now: immediately when it differs
+    /// from the previous error of this site, otherwise at most once per
+    /// [`WORKER_LOG_INTERVAL`]. `now` is injected so tests can pin the
+    /// decision without a clock.
+    pub(crate) fn observe(&mut self, error: &str, now: std::time::Instant) -> bool {
+        let due = self.last_error.as_deref() != Some(error)
+            || self
+                .last_logged
+                .is_none_or(|last| now.duration_since(last) >= WORKER_LOG_INTERVAL);
+        self.last_error = Some(error.to_owned());
+        if due {
+            self.last_logged = Some(now);
+        }
+        due
+    }
+
+    /// Logs one info line naming the site when a previously observed error
+    /// has cleared. Call on every iteration the condition did not fire.
+    /// Returns whether a recovery line was due, so tests can pin the
+    /// exactly-once decision.
+    pub(crate) fn recovered(&mut self) -> bool {
+        let cleared = self.last_error.take().is_some();
+        if cleared {
+            tracing::info!("{} recovered", self.site);
+        }
+        cleared
+    }
+}
+
+/// How loudly a worker should report a skipped iteration.
+pub(crate) enum SkipLevel {
+    /// First occurrence: log at info.
+    First,
+    /// Repeat: log at debug, at most once per [`WORKER_LOG_INTERVAL`].
+    Repeat,
+    /// Suppress entirely.
+    Silent,
+}
+
+/// Bounds the skipped-iteration notice for a worker whose platform-tenant
+/// gate refuses while a tenant deletion is pinned: the first occurrence
+/// logs at info, repeats at most once per [`WORKER_LOG_INTERVAL`] at debug,
+/// so a blocked worker stays visible without joining the log-flood class it
+/// is warning about.
+pub(crate) struct SkipNotice {
+    first: bool,
+    last_logged: Option<std::time::Instant>,
+}
+
+impl SkipNotice {
+    pub(crate) fn new() -> Self {
+        Self {
+            first: true,
+            last_logged: None,
+        }
+    }
+
+    /// Classifies whether a skipped iteration at `now` should log. `now` is
+    /// injected so tests can pin the pacing decision without a clock.
+    pub(crate) fn due(&mut self, now: std::time::Instant) -> SkipLevel {
+        if self.first {
+            self.first = false;
+            self.last_logged = Some(now);
+            return SkipLevel::First;
+        }
+        if self
+            .last_logged
+            .is_none_or(|last| now.duration_since(last) >= WORKER_LOG_INTERVAL)
+        {
+            self.last_logged = Some(now);
+            return SkipLevel::Repeat;
+        }
+        SkipLevel::Silent
+    }
+}
+
 pub(crate) fn begin_outbound_operation<'a>(
     app: &'a App,
     tenant: &str,
@@ -5286,8 +5385,57 @@ mod tests {
     use axum::extract::ConnectInfo;
     use axum::http::Request;
     use http_body_util::BodyExt as _;
+    use std::time::Duration;
     use tower::ServiceExt as _;
     use vot_sdk_file::PublishObservation;
+
+    #[test]
+    fn error_deduper_suppresses_unchanged_errors_and_fires_recovery_once() {
+        let start = std::time::Instant::now();
+        let mut dedupe = ErrorDeduper::new("test site");
+        // First occurrence logs immediately.
+        assert!(dedupe.observe("store locked", start));
+        // An unchanged repeat inside the interval stays quiet.
+        assert!(!dedupe.observe("store locked", start + Duration::from_secs(30)));
+        // A changed error logs immediately.
+        assert!(dedupe.observe("disk full", start + Duration::from_secs(31)));
+        // The new error's own cadence suppresses its immediate repeat.
+        assert!(!dedupe.observe("disk full", start + Duration::from_secs(40)));
+        // After the interval the unchanged error is visible again.
+        assert!(dedupe.observe(
+            "disk full",
+            start + Duration::from_secs(31) + WORKER_LOG_INTERVAL
+        ));
+        // Recovery is due exactly once, and only after an error.
+        assert!(dedupe.recovered());
+        assert!(!dedupe.recovered());
+    }
+
+    #[test]
+    fn skip_notice_logs_first_occurrence_then_paces() {
+        let start = std::time::Instant::now();
+        let mut notice = SkipNotice::new();
+        // The first skipped iteration logs at info.
+        assert!(matches!(notice.due(start), SkipLevel::First));
+        // Repeats inside the interval stay silent.
+        assert!(matches!(
+            notice.due(start + Duration::from_secs(1)),
+            SkipLevel::Silent
+        ));
+        assert!(matches!(
+            notice.due(start + Duration::from_secs(59)),
+            SkipLevel::Silent
+        ));
+        // After the interval a debug reminder is due, then quiet again.
+        assert!(matches!(
+            notice.due(start + Duration::from_secs(60)),
+            SkipLevel::Repeat
+        ));
+        assert!(matches!(
+            notice.due(start + Duration::from_secs(61)),
+            SkipLevel::Silent
+        ));
+    }
 
     /// Wraps the router so tests observe the streamed response the file
     /// download admission redirect produces: the one same-origin 307 is
