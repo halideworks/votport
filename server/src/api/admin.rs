@@ -4941,6 +4941,272 @@ mod handler_tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    /// Axum 0.8 keeps its route table private, so this walks the `.route(`
+    /// registrations in app.rs the way the bare-require-admin lint walks
+    /// handler sources. Every mutating admin, trade and notifications route
+    /// must refuse a viewer session that lacks the X-Votport header: the
+    /// require_admin_write role check and the CSRF header check both answer
+    /// 403, so a route that loses either gate fails here.
+    fn registered_mutating_routes(source: &str) -> Vec<(String, String)> {
+        const METHODS: [(&str, &str); 4] = [
+            ("POST", "post("),
+            ("PUT", "put("),
+            ("PATCH", "patch("),
+            ("DELETE", "delete("),
+        ];
+        let mut routes = Vec::new();
+        let mut rest = source;
+        while let Some(start) = rest.find(".route(") {
+            let arguments = &rest[start + ".route(".len()..];
+            let mut depth = 1usize;
+            let mut end = arguments.len();
+            for (offset, character) in arguments.char_indices() {
+                match character {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = offset;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let span = &arguments[..end];
+            if let Some(path) = span.trim_start().strip_prefix('"') {
+                let path = path.split('"').next().unwrap_or_default().to_owned();
+                for (method, needle) in METHODS {
+                    if span.contains(needle) {
+                        routes.push((method.to_owned(), path.clone()));
+                    }
+                }
+            }
+            rest = &arguments[end..];
+        }
+        routes.sort();
+        routes.dedup();
+        routes
+    }
+
+    #[tokio::test]
+    async fn every_mutating_admin_trade_and_notification_route_rejects_a_viewer_without_the_csrf_header(
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let viewer = super::test_admin_cookie(
+            &application,
+            &crate::auth::AdminIdentity {
+                subject: "sso:router-gate".to_owned(),
+                tenant: String::new(),
+                role: "viewer".to_owned(),
+                grants: vec![crate::auth::TenantGrant {
+                    incarnation: None,
+                    tenant: String::new(),
+                    role: "viewer".to_owned(),
+                }],
+                credential_version: 1,
+            },
+        );
+
+        let signed_message = r#"{"document":{"issuer":"pin","audience":"","purpose":"status","nonce":"pin","expires_at":0,"body":{}},"signature":"pin"}"#;
+        // (method, route template, query, JSON body). Bodies only need to
+        // satisfy each handler's JSON extractor: the gate fires before any
+        // validation, so a minimal well-formed value reaches the 403.
+        let covered: [(&str, &str, &str, &str); 47] = [
+            ("POST", "/api/admin/logout", "", ""),
+            ("PUT", "/api/admin/backups", "", "{}"),
+            ("POST", "/api/admin/backups", "", ""),
+            (
+                "POST",
+                "/api/admin/backups/restore",
+                "",
+                r#"{"source":"local","id":"pin"}"#,
+            ),
+            (
+                "POST",
+                "/api/admin/tenants",
+                "",
+                r#"{"key":"pin","label":"pin"}"#,
+            ),
+            (
+                "POST",
+                "/api/admin/receiving-storage",
+                "",
+                r#"{"storage":{"path":"/pin","filesystem":"pin","source":"pin","mount_root":"pin","inode":"1","service_uid":0}}"#,
+            ),
+            ("PUT", "/api/admin/settings", "", "{}"),
+            (
+                "POST",
+                "/api/admin/settings/retention-clock/acknowledge",
+                "",
+                r#"{"observed_at":1}"#,
+            ),
+            ("PATCH", "/api/admin/tenants/{key}", "", "{}"),
+            ("DELETE", "/api/admin/tenants/{key}", "", ""),
+            ("PUT", "/api/admin/branding/{key}", "", r#"{"name":"pin"}"#),
+            ("DELETE", "/api/admin/branding/{key}", "", ""),
+            ("PUT", "/api/admin/branding/{key}/logo", "", ""),
+            ("DELETE", "/api/admin/branding/{key}/logo", "", ""),
+            ("POST", "/api/admin/tenant", "", r#"{"tenant":"pin"}"#),
+            (
+                "POST",
+                "/api/admin/principals/revoke",
+                "",
+                r#"{"subject":"pin"}"#,
+            ),
+            (
+                "POST",
+                "/api/admin/principals/unblock",
+                "",
+                r#"{"subject":"pin"}"#,
+            ),
+            ("POST", "/api/admin/outbound-grants", "", ""),
+            ("PATCH", "/api/admin/outbound-grants/{id}", "", "{}"),
+            ("DELETE", "/api/admin/outbound-grants/{id}", "", ""),
+            (
+                "POST",
+                "/api/admin/automation-tokens",
+                "",
+                r#"{"label":"pin","expires_days":1}"#,
+            ),
+            ("DELETE", "/api/admin/automation-tokens/{id}", "", ""),
+            ("POST", "/api/admin/outbound-files", "?path=pin", ""),
+            ("DELETE", "/api/admin/outbound-files", "?path=pin", ""),
+            (
+                "POST",
+                "/api/admin/password",
+                "",
+                r#"{"current":"pin","new":"pin2"}"#,
+            ),
+            ("POST", "/api/admin/links", "", r#"{"label":"pin"}"#),
+            ("POST", "/api/admin/links/{id}", "", "{}"),
+            ("PATCH", "/api/admin/links/{id}", "", "{}"),
+            ("DELETE", "/api/admin/links/{id}", "", ""),
+            ("DELETE", "/api/admin/links/{id}/uploads/{upload}", "", ""),
+            (
+                "DELETE",
+                "/api/admin/links/{id}/uploads/{upload}/files/{index}",
+                "",
+                "",
+            ),
+            ("POST", "/api/port/enroll", "", signed_message),
+            ("POST", "/api/port/status", "", signed_message),
+            ("POST", "/api/port/rotate", "", signed_message),
+            (
+                "POST",
+                "/api/trade-routes",
+                "",
+                r#"{"invitation":{"document":{"issuer":"pin","audience":"","purpose":"invitation","nonce":"pin","expires_at":0,"body":{}},"signature":"pin"},"name":"pin","notifications":{"mode":"off"}}"#,
+            ),
+            (
+                "PUT",
+                "/api/trade-routes/port",
+                "",
+                r#"{"name":"pin","address":"https://port.example"}"#,
+            ),
+            (
+                "POST",
+                "/api/trade-routes/endpoints",
+                "",
+                r#"{"id":"pin00000","name":"pin","category":"internal","forwarding":false,"metadata_keys":[],"notifications":{"mode":"off"}}"#,
+            ),
+            (
+                "POST",
+                "/api/trade-routes/invitations",
+                "",
+                r#"{"endpoint":"pin","expires_in":3600}"#,
+            ),
+            ("POST", "/api/trade-routes/inspect", "", "{}"),
+            (
+                "PUT",
+                "/api/trade-routes/{id}",
+                "",
+                r#"{"revision":1,"state":"active","cancel_active":false,"notifications":{"mode":"off"}}"#,
+            ),
+            ("POST", "/api/trade-routes/{id}/test", "", ""),
+            ("POST", "/api/trade-routes/{id}/rotate", "", ""),
+            (
+                "PUT",
+                "/api/trade-routes/{id}/address",
+                "",
+                r#"{"address":"https://port.example","revision":1}"#,
+            ),
+            ("POST", "/api/notifications", "", "{}"),
+            (
+                "PUT",
+                "/api/notifications/defaults",
+                "",
+                r#"{"mode":"off"}"#,
+            ),
+            ("DELETE", "/api/notifications/{id}", "", r#"{"revision":1}"#),
+            ("POST", "/api/notifications/{id}/test", "", ""),
+        ];
+
+        // Sync the table against app.rs: a new mutating route on these
+        // prefixes cannot merge without appearing here (or below as a
+        // documented exemption).
+        let source = std::fs::read_to_string("src/app.rs").unwrap();
+        let prefixes = [
+            "/api/admin",
+            "/api/port",
+            "/api/trade-routes",
+            "/api/notifications",
+        ];
+        let mut registered: Vec<(String, String)> = registered_mutating_routes(&source)
+            .into_iter()
+            .filter(|(_, path)| prefixes.iter().any(|prefix| path.starts_with(prefix)))
+            .collect();
+        // Pre-authentication endpoints: they act for the caller's password or
+        // one-time desktop sign-in code, never on the presented session, so
+        // the viewer and CSRF gates do not apply.
+        let exempt = [
+            ("POST", "/api/admin/login"),
+            ("POST", "/api/admin/sso/exchange"),
+        ];
+        registered.retain(|pair| !exempt.contains(&(pair.0.as_str(), pair.1.as_str())));
+        let mut expected: Vec<(String, String)> = covered
+            .iter()
+            .map(|(method, template, _, _)| (method.to_string(), template.to_string()))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            registered, expected,
+            "route table out of sync with src/app.rs"
+        );
+
+        for (method, template, query, body) in covered {
+            let mut path = String::new();
+            let mut characters = template.chars();
+            while let Some(character) = characters.next() {
+                if character == '{' {
+                    while characters.next() != Some('}') {}
+                    path.push('1');
+                } else {
+                    path.push(character);
+                }
+            }
+            let uri = format!("{path}{query}");
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(&uri)
+                .header("cookie", &viewer)
+                .extension(ConnectInfo(std::net::SocketAddr::from((
+                    [127, 0, 0, 1],
+                    1234,
+                ))));
+            if !body.is_empty() {
+                builder = builder.header("content-type", "application/json");
+            }
+            let request = builder.body(Body::from(body)).unwrap();
+            let response = app::router(application.clone())
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+        }
+    }
+
     #[tokio::test]
     async fn audit_export_requires_sign_in_and_emits_jsonl() {
         let directory = tempfile::tempdir().unwrap();
@@ -5416,6 +5682,13 @@ mod tenant_authz_tests {
             "src/api/mod.rs",
             "src/api/session_rate.rs",
             "src/app.rs",
+            "src/api/trade.rs",
+            "src/api/notifications.rs",
+            "src/api/outbound/workflows.rs",
+            "src/api/outbound/workflows/storage.rs",
+            "src/api/outbound/workflows/routes.rs",
+            "src/api/evidence.rs",
+            "src/api/scim.rs",
         ] {
             let text = std::fs::read_to_string(file).unwrap();
             let mut current_fn = String::new();

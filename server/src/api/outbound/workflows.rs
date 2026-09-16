@@ -4960,4 +4960,110 @@ mod tests {
             .fail_delivery_job("missing", 1, "already removed")
             .unwrap();
     }
+
+    /// Pins the recipient-challenge lifetime at exactly five minutes: the
+    /// issuer stamps issued_at + 300, and the verifier refuses any wider
+    /// window while still accepting a full five minutes.
+    #[tokio::test]
+    async fn recipient_challenges_live_exactly_five_minutes() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        std::fs::create_dir_all(app.config.outbound_dir.join("project")).unwrap();
+        std::fs::write(
+            app.config.outbound_dir.join("project/file.bin"),
+            b"original",
+        )
+        .unwrap();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+        let holder = hex::encode(key.verifying_key().to_bytes());
+        let mut project = crate::workflow::tests::project();
+        project.recipients.push(crate::workflow::Recipient {
+            email: "recipient@example.com".into(),
+            holder: holder.clone(),
+        });
+        let project = app
+            .store
+            .save_delivery_project("", "local", project)
+            .unwrap();
+        let mut request = crate::workflow::tests::request();
+        request.recipients = vec![holder.clone()];
+        let job = app
+            .store
+            .enqueue_delivery_job("", "sender", 1, None, project, request)
+            .unwrap();
+        let running = app
+            .store
+            .claim_delivery_job("boot", now_unix())
+            .unwrap()
+            .unwrap();
+        prepare(&app, running).await.unwrap();
+        let pending = app.store.delivery_job(&job.id).unwrap().unwrap();
+        app.store
+            .change_delivery_job(
+                "",
+                &job.id,
+                "approver",
+                false,
+                "approve",
+                pending.manifest.as_deref(),
+            )
+            .unwrap();
+        let token = app.store.delivery_job_token(&job.tenant, &job.id).unwrap();
+        let path = format!("/api/s/{token}");
+
+        let response = call(
+            &app,
+            Method::POST,
+            &format!("{path}/recipient-challenge"),
+            None,
+            Some(json!({"holder": holder})),
+        )
+        .await;
+        assert_eq!(
+            response.0,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&response.2)
+        );
+        let authorization: SignedChallenge = serde_json::from_slice(&response.2).unwrap();
+
+        // Issuance side: the stamped window is exactly 300 seconds.
+        assert_eq!(
+            authorization.challenge.expires_at - authorization.challenge.issued_at,
+            300
+        );
+
+        // Verification side: a 301-second window is refused even though it
+        // still lies in the future.
+        let mut overlong = authorization.challenge.clone();
+        overlong.expires_at = overlong.issued_at + 301;
+        let proof = AccessProof::sign(app.signer.evidence_challenge(overlong), &key);
+        assert_eq!(
+            call(
+                &app,
+                Method::POST,
+                &format!("{path}/recipient-verify"),
+                None,
+                Some(json!(proof))
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // The five-minute window itself is accepted: the bound is >, not >=.
+        let proof = AccessProof::sign(authorization, &key);
+        assert_eq!(
+            call(
+                &app,
+                Method::POST,
+                &format!("{path}/recipient-verify"),
+                None,
+                Some(json!(proof))
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
 }

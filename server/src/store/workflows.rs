@@ -3437,4 +3437,154 @@ mod tests {
             .unwrap();
         assert!(end.is_empty());
     }
+
+    /// Fails `attempt` of `job_id` and pins the 30s-doubling back-off,
+    /// including that the delay reaches the not_before column claims read.
+    /// Returns the moment the job becomes claimable again.
+    fn fail_and_expect_backoff(store: &Store, job_id: &str, attempt: u64) -> u64 {
+        let before = now_unix();
+        store
+            .fail_delivery_job(job_id, attempt, "pin failure")
+            .unwrap();
+        let failed = store.delivery_job(job_id).unwrap().unwrap();
+        assert_eq!(failed.state, "retrying");
+        assert_eq!(retry_attempts(&failed), attempt);
+        let retry_at = failed.checks["retry_at"].as_u64().unwrap();
+        let expected = before + 30 * (1u64 << attempt.min(4));
+        assert!(
+            retry_at.abs_diff(expected) <= 2,
+            "attempt {attempt}: retry_at {retry_at} != ~{expected}"
+        );
+        let stored: i64 = store
+            .with(|connection| {
+                connection.query_row(
+                    "SELECT not_before FROM delivery_jobs WHERE id=?1",
+                    [job_id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(stored as u64, retry_at);
+        retry_at
+    }
+
+    /// Pins the retry back-off: the exporter waits 30 seconds doubled per
+    /// consecutive attempt, capped at the 4-bit shift, and the delay lands in
+    /// the not_before column the claim query reads.
+    #[test]
+    fn a_failing_export_backs_off_thirty_seconds_doubled_per_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let project = store.save_delivery_project("", "admin", project()).unwrap();
+        let job = store
+            .enqueue_delivery_job("", "sender", 1, None, project, request())
+            .unwrap();
+
+        // The first claim has no manifest yet (preparing); freeze one so the
+        // exporter path retries instead of failing outright.
+        let mut staged = store
+            .claim_delivery_job("boot", now_unix())
+            .unwrap()
+            .unwrap();
+        assert_eq!(staged.attempts, 1);
+        staged.manifest = Some("pin-manifest".into());
+        staged.state = "exporting".into();
+        store
+            .with(|connection| save_job(connection, &staged))
+            .unwrap();
+
+        let mut next_claim_at = fail_and_expect_backoff(&store, &job.id, 1);
+        for retry in 2u64..=4 {
+            let claimed = store
+                .claim_delivery_job("pin", next_claim_at)
+                .unwrap()
+                .unwrap();
+            assert_eq!(claimed.attempts, retry);
+            next_claim_at = fail_and_expect_backoff(&store, &job.id, retry);
+        }
+    }
+
+    /// Pins the retry budget at five consecutive attempts: the sixth stolen
+    /// attempt fails the job for explicit retry, and the fifth failed attempt
+    /// of an exporting job is not rescheduled either.
+    #[test]
+    fn a_job_stops_retrying_after_five_consecutive_attempts() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let project = store.save_delivery_project("", "admin", project()).unwrap();
+        let job = store
+            .enqueue_delivery_job("", "sender", 1, None, project.clone(), request())
+            .unwrap();
+
+        // Claim-side bound: each claim by a new owner steals the preparing
+        // job and counts one attempt; a sixth exceeds the recovery limit.
+        for expected in 1u64..=5 {
+            let owner = if expected % 2 == 0 { "pin-b" } else { "pin-a" };
+            let claimed = store
+                .claim_delivery_job(owner, now_unix())
+                .unwrap()
+                .unwrap();
+            assert_eq!(claimed.id, job.id);
+            assert_eq!(claimed.attempts, expected);
+            assert_ne!(claimed.state, "failed");
+        }
+        let exhausted = store
+            .claim_delivery_job("pin-b", now_unix())
+            .unwrap()
+            .unwrap();
+        assert_eq!(exhausted.attempts, 6);
+        assert_eq!(exhausted.state, "failed");
+        assert_eq!(
+            exhausted.error.as_deref(),
+            Some("job recovery limit reached; retry explicitly")
+        );
+
+        // Fail-side bound: the fifth failed attempt of an exporting job
+        // refuses the retrying state instead of scheduling a sixth try.
+        let mut request = request();
+        request.operation_id = "pin-second".into();
+        let job = store
+            .enqueue_delivery_job("", "sender", 1, None, project.clone(), request)
+            .unwrap();
+        let mut staged = store
+            .claim_delivery_job("boot", now_unix())
+            .unwrap()
+            .unwrap();
+        staged.manifest = Some("pin-manifest".into());
+        staged.state = "exporting".into();
+        store
+            .with(|connection| save_job(connection, &staged))
+            .unwrap();
+        store
+            .fail_delivery_job(&job.id, staged.attempts, "pin failure")
+            .unwrap();
+        let failed = store.delivery_job(&job.id).unwrap().unwrap();
+        assert_eq!(failed.state, "retrying");
+        let mut next_claim_at = failed.checks["retry_at"].as_u64().unwrap() + 1;
+        for retry in 2u64..=4 {
+            let claimed = store
+                .claim_delivery_job("pin", next_claim_at)
+                .unwrap()
+                .unwrap();
+            assert_eq!(claimed.attempts, retry);
+            store
+                .fail_delivery_job(&job.id, claimed.attempts, "pin failure")
+                .unwrap();
+            let failed = store.delivery_job(&job.id).unwrap().unwrap();
+            assert_eq!(failed.state, "retrying");
+            next_claim_at = failed.checks["retry_at"].as_u64().unwrap() + 1;
+        }
+        let fifth = store
+            .claim_delivery_job("pin", next_claim_at)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fifth.attempts, 5);
+        store
+            .fail_delivery_job(&job.id, fifth.attempts, "pin failure")
+            .unwrap();
+        assert_eq!(
+            store.delivery_job(&job.id).unwrap().unwrap().state,
+            "failed"
+        );
+    }
 }

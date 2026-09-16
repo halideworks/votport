@@ -1635,6 +1635,138 @@ mod tests {
         );
     }
 
+    fn fetch_ttl_grant(
+        id: &str,
+        token: &str,
+        expires_at: u64,
+        root_hex: &str,
+        bytes: usize,
+    ) -> crate::store::OutboundGrant {
+        let mut grant = crate::store::tests::test_outbound_grant(id, "", 0);
+        grant.token_hash = crate::auth::hash_token(token);
+        grant.expires_at = expires_at;
+        grant.max_downloads = Some(1);
+        grant.bytes = bytes as u64;
+        grant.root = root_hex.to_owned();
+        grant.files = vec![crate::store::OutboundGrantFile {
+            source: "file.bin".into(),
+            name: "file.bin".into(),
+            suite: "blake3".into(),
+            root: root_hex.to_owned(),
+            bytes: bytes as u64,
+            receipt_b64: String::new(),
+            downloads: 0,
+            first_download_at: None,
+            last_download_at: None,
+        }];
+        grant
+    }
+
+    async fn mint_capability_ticket(
+        app: &std::sync::Arc<crate::app::App>,
+        token: &str,
+        holder_key: [u8; 32],
+    ) -> axum::http::StatusCode {
+        mint_fetch(
+            axum::extract::State(std::sync::Arc::clone(app)),
+            axum::extract::Path(token.to_owned()),
+            axum::http::HeaderMap::new(),
+            axum::Json(FetchRequest {
+                holder_key: hex::encode(holder_key),
+            }),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
+    /// Pins the capability lifetime: a minted fetch ticket lives at most
+    /// CAPABILITY_TTL_SECS (one hour), but never past the grant itself.
+    #[tokio::test]
+    async fn a_fetch_capability_lives_at_most_an_hour_and_never_past_its_grant() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::api::testing::config(directory.path());
+        config.serve_bind = Some("127.0.0.1:0".parse().unwrap());
+        let app = crate::app::build(config).unwrap();
+        let bytes = b"capability ttl";
+        let source = app.config.outbound_dir.join("file.bin");
+        std::fs::write(&source, bytes).unwrap();
+        let mut builder = vot_sdk::object::InMemoryObjectBuilder::new(
+            Suite::Blake3Bao64,
+            Some(bytes.len() as u64),
+            bytes.len() as u64,
+        )
+        .unwrap();
+        builder.update(bytes).unwrap();
+        let root = hex::encode(builder.finish().unwrap().object_id().root);
+
+        let now = now_unix();
+        app.store
+            .insert_outbound_grant(fetch_ttl_grant(
+                "cap-long",
+                &"a".repeat(32),
+                now + 7200,
+                &root,
+                bytes.len(),
+            ))
+            .unwrap();
+        assert_eq!(
+            mint_capability_ticket(
+                &app,
+                &"a".repeat(32),
+                ed25519_dalek::SigningKey::from_bytes(&[7; 32])
+                    .verifying_key()
+                    .to_bytes()
+            )
+            .await,
+            StatusCode::OK
+        );
+        app.store
+            .insert_outbound_grant(fetch_ttl_grant(
+                "cap-short",
+                &"b".repeat(32),
+                now + 600,
+                &root,
+                bytes.len(),
+            ))
+            .unwrap();
+        assert_eq!(
+            mint_capability_ticket(
+                &app,
+                &"b".repeat(32),
+                ed25519_dalek::SigningKey::from_bytes(&[8; 32])
+                    .verifying_key()
+                    .to_bytes()
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        let tickets = app.store.unexpired_fetch_tickets(now_unix()).unwrap();
+        let long = tickets
+            .iter()
+            .find(|ticket| ticket.grant_id == "cap-long")
+            .unwrap();
+        // Two-hour grant, one-hour capability: the cap binds.
+        assert!(
+            long.expires_at.abs_diff(now + 3600) <= 2,
+            "long: {} != ~{}",
+            long.expires_at,
+            now + 3600
+        );
+        let short = tickets
+            .iter()
+            .find(|ticket| ticket.grant_id == "cap-short")
+            .unwrap();
+        // Ten-minute grant: the grant expiry binds, not the cap.
+        assert!(
+            short.expires_at.abs_diff(now + 600) <= 2,
+            "short: {} != ~{}",
+            short.expires_at,
+            now + 600
+        );
+    }
+
     #[test]
     fn a_running_fetch_keeps_its_slot_past_its_ticket() {
         let directory = tempfile::tempdir().unwrap();

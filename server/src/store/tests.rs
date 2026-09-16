@@ -1,6 +1,24 @@
 use super::*;
 
 #[test]
+fn usable_now_requires_an_active_link_that_has_not_expired() {
+    let now = now_unix();
+    let mut link = test_link("usable-now");
+    assert!(link.usable_now());
+
+    link.expires_at = Some(now + 3600);
+    assert!(link.usable_now());
+
+    // Past the expiry the link is dead even though active never changed.
+    link.expires_at = Some(now - 3600);
+    assert!(!link.usable_now());
+
+    link.expires_at = Some(now + 3600);
+    link.active = false;
+    assert!(!link.usable_now());
+}
+
+#[test]
 fn legacy_upload_records_default_to_http_transport() {
     let record: UploadRecord = serde_json::from_str(
         r#"{"id":"legacy","completed_at":1,"package_root":"root","total_bytes":0,"files":[]}"#,
