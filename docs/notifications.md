@@ -108,7 +108,10 @@ Read responses use `Cache-Control: no-store`.
   `clear_token: true` removes an optional bearer token.
 - `POST /api/notifications/{id}/test`: test the saved, enabled destination.
   Failures return 502.
-- `DELETE /api/notifications/{id}` with `{"revision": N}`: delete a destination.
+- `DELETE /api/notifications/{id}`: delete a destination. The revision goes in
+  `If-Match`; the `{"revision": N}` JSON body is still accepted for one release
+  window, and a body that disagrees with `If-Match` is refused with 412. A
+  stale revision is a 409 and a delete with neither header nor body is 428.
   References remain visibly unavailable and send nothing; they never fall back to
   another destination.
 - `PUT /api/notifications/defaults`: save an `off` or `custom` notification policy.

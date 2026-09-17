@@ -25,7 +25,7 @@ fn main() -> ExitCode {
             }
             Err(value) => {
                 println!("{value}");
-                ExitCode::FAILURE
+                ExitCode::from(agent::exit_code(&value))
             }
         };
     }
@@ -50,7 +50,7 @@ fn main() -> ExitCode {
             if args.iter().any(|arg| arg == "--json") {
                 println!(
                     "{}",
-                    serde_json::json!({"event": "error", "error": message, "code": "command_failed"})
+                    serde_json::json!({"error": message, "code": "command_failed", "retryable": false})
                 );
             } else {
                 eprintln!("votport: {message}");
@@ -138,12 +138,12 @@ short-lived CLI processes can flush pending reports with votport evidence retry.
 Agent commands always return JSON and use VOTPORT_URL and VOTPORT_AUTOMATION_TOKEN.
 ");
     eprintln!(
-        "votport send <link> <path>...      [--password <p>] [--json]\n\
-         votport receive <link> <dir>       [--password <p>] [--json]\n\
+        "votport send <link> <path>...      [--password <p> | --password-file <path|->] [--json]\n\
+         votport receive <link> <dir>       [--password <p> | --password-file <path|->] [--json]\n\
          votport inspect <link>\n\
          votport status\n\
-         votport resume <id>                [--password <p>] [--json]\n\
-         votport signin <origin>            [--password <p>]  (else read from stdin)\n\
+         votport resume <id>                [--password <p> | --password-file <path|->] [--json]\n\
+         votport signin <origin>            [--password <p> | --password-file <path|->]  (else read from stdin)\n\
          votport signout\n\
          votport port                       [--json]\n\
          votport requests                   [--json]\n\
@@ -165,8 +165,8 @@ Agent commands always return JSON and use VOTPORT_URL and VOTPORT_AUTOMATION_TOK
 }
 
 fn send(args: &[String]) -> Result<(), String> {
-    let (mut options, positional, json) = parse(args, &["--password"])?;
-    let password = options.remove("--password");
+    let (mut options, positional, json) = parse(args, &["--password", "--password-file"])?;
+    let password = secret_from(&mut options, "--password-file", "--password")?;
     let (link, paths) = positional
         .split_first()
         .ok_or("send needs a link and at least one path")?;
@@ -285,8 +285,8 @@ fn status() -> Result<(), String> {
 
 /// Runs a journalled transfer again, through the same view the shells draw.
 fn resume(args: &[String]) -> Result<(), String> {
-    let (mut options, positional, json) = parse(args, &["--password"])?;
-    let password = options.remove("--password");
+    let (mut options, positional, json) = parse(args, &["--password", "--password-file"])?;
+    let password = secret_from(&mut options, "--password-file", "--password")?;
     let [id] = positional.as_slice() else {
         return Err("resume needs one transfer id from `votport status`".to_owned());
     };
@@ -345,8 +345,8 @@ impl votport_client_core::ffi::TransferListener for ViewPrinter {
 }
 
 fn receive(args: &[String]) -> Result<(), String> {
-    let (mut options, positional, json) = parse(args, &["--password"])?;
-    let password = options.remove("--password");
+    let (mut options, positional, json) = parse(args, &["--password", "--password-file"])?;
+    let password = secret_from(&mut options, "--password-file", "--password")?;
     let [link, dir] = positional.as_slice() else {
         return Err("receive needs one delivery link and one directory".to_owned());
     };
@@ -474,6 +474,44 @@ fn number<T: std::str::FromStr>(options: &Options, flag: &str) -> Result<Option<
         .transpose()
 }
 
+/// Reads a secret from `--password-file` (a path, or `-` for stdin) with
+/// `--password` as the fallback. The file wins and says so on stderr; one
+/// trailing newline is trimmed and an empty secret is refused, because an
+/// empty password never authenticates.
+fn secret_from(
+    options: &mut Options,
+    file_flag: &str,
+    value_flag: &str,
+) -> Result<Option<String>, String> {
+    if let Some(path) = options.remove(file_flag) {
+        if options.contains_key(value_flag) {
+            eprintln!("votport: {value_flag} ignored; {file_flag} takes precedence");
+        }
+        let mut secret = if path == "-" {
+            use std::io::Read;
+            let mut secret = String::new();
+            std::io::stdin()
+                .read_to_string(&mut secret)
+                .map_err(|error| format!("{file_flag}: {error}"))?;
+            secret
+        } else {
+            std::fs::read_to_string(&path)
+                .map_err(|error| format!("{file_flag} {path}: {error}"))?
+        };
+        if secret.ends_with('\n') {
+            secret.pop();
+            if secret.ends_with('\r') {
+                secret.pop();
+            }
+        }
+        if secret.is_empty() {
+            return Err(format!("{file_flag} was empty"));
+        }
+        return Ok(Some(secret));
+    }
+    Ok(options.remove(value_flag))
+}
+
 fn human(error: votport_client_core::Error) -> String {
     format!("{} ({error})", error.headline())
 }
@@ -481,12 +519,12 @@ fn human(error: votport_client_core::Error) -> String {
 /// `votport signin <origin> [--password <p>]`: the password is read from
 /// stdin when not given, so it stays out of the shell history.
 fn signin(args: &[String]) -> Result<(), String> {
-    let (options, positional, _) = parse(args, &["--password"])?;
+    let (mut options, positional, _) = parse(args, &["--password", "--password-file"])?;
     let [base] = positional.as_slice() else {
         return Err("signin takes the votport's origin, e.g. https://drop.example".to_owned());
     };
-    let password = match options.get("--password") {
-        Some(password) => password.clone(),
+    let password = match secret_from(&mut options, "--password-file", "--password")? {
+        Some(password) => password,
         None => {
             eprint!("password: ");
             let mut line = String::new();
@@ -882,6 +920,45 @@ mod tests {
             let args = arguments.into_iter().map(str::to_owned).collect::<Vec<_>>();
             assert!(super::run(&args).unwrap_err().contains("needs one"));
         }
+    }
+
+    #[test]
+    fn password_files_win_over_argv_and_trim_one_newline() {
+        let directory = std::env::temp_dir().join(format!(
+            "votport-cli-secret-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("secret");
+        std::fs::write(&path, "hush\n").unwrap();
+        let mut options = std::collections::HashMap::new();
+        options.insert("--password-file".to_owned(), path.display().to_string());
+        options.insert("--password".to_owned(), "argv".to_owned());
+        // The file wins over the argv password, minus its one trailing newline.
+        assert_eq!(
+            super::secret_from(&mut options, "--password-file", "--password")
+                .unwrap()
+                .as_deref(),
+            Some("hush")
+        );
+        // The argv password remains as the fallback once the file is read.
+        assert_eq!(
+            super::secret_from(&mut options, "--password-file", "--password")
+                .unwrap()
+                .as_deref(),
+            Some("argv")
+        );
+        // An empty secret file is refused, not silently accepted.
+        let empty = directory.join("empty");
+        std::fs::write(&empty, "").unwrap();
+        let mut options = std::collections::HashMap::new();
+        options.insert("--password-file".to_owned(), empty.display().to_string());
+        assert!(super::secret_from(&mut options, "--password-file", "--password").is_err());
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

@@ -2,7 +2,7 @@ use super::*;
 use crate::store::{
     NotificationDestination, NotificationMode, NotificationPolicy, NOTIFICATION_EVENTS,
 };
-use axum::extract::{Path, State};
+use axum::extract::{Path, Request, State};
 use std::sync::Arc;
 
 pub const UPLOAD_EVENTS: [&str; 2] = ["upload_complete", "upload_failed"];
@@ -363,6 +363,28 @@ mod tests {
     }
     async fn body(response: Response) -> serde_json::Value {
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    }
+
+    /// Calls the destination delete handler directly with an optional
+    /// If-Match revision and an optional JSON body.
+    async fn delete_destination(
+        app: &Arc<App>,
+        id: &str,
+        auth: &HeaderMap,
+        if_match: Option<u64>,
+        body_json: Option<serde_json::Value>,
+    ) -> Result<Response, ApiError> {
+        let mut headers = auth.clone();
+        if let Some(revision) = if_match {
+            headers.insert(header::IF_MATCH, revision.to_string().parse().unwrap());
+        }
+        let request = Request::builder()
+            .body(match body_json {
+                Some(value) => Body::from(value.to_string()),
+                None => Body::empty(),
+            })
+            .unwrap();
+        delete(State(app.clone()), Path(id.to_owned()), headers, request).await
     }
     fn connection(label: &str) -> serde_json::Value {
         json!({"label":label,"channel":"slack","target":"Production / #incoming","enabled":true,"url":"https://hooks.example.test/private-secret"})
@@ -837,13 +859,12 @@ mod tests {
             .notification_job_override("", id)
             .unwrap()
             .is_none());
-        delete(
-            State(app.clone()),
-            Path(saved["id"].as_str().unwrap().into()),
-            headers(&app, "", "admin"),
-            Json(DeleteDestination {
-                revision: saved["revision"].as_u64().unwrap(),
-            }),
+        delete_destination(
+            &app,
+            saved["id"].as_str().unwrap(),
+            &headers(&app, "", "admin"),
+            Some(saved["revision"].as_u64().unwrap()),
+            None,
         )
         .await
         .unwrap();
@@ -868,6 +889,106 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn destination_delete_takes_the_revision_from_if_match() {
+        async fn saved(app: &Arc<App>, label: &str) -> serde_json::Value {
+            let response = save(
+                State(app.clone()),
+                headers(app, "", "admin"),
+                Json(connection(label)),
+            )
+            .await
+            .unwrap();
+            body(response).await
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let app = testing::build(directory.path());
+        let revision_of = |saved: &serde_json::Value| saved["revision"].as_u64().unwrap();
+        let id_of = |saved: &serde_json::Value| saved["id"].as_str().unwrap().to_owned();
+
+        // A delete with neither If-Match nor a revision body is refused.
+        let neither = saved(&app, "Neither").await;
+        let error = delete_destination(
+            &app,
+            &id_of(&neither),
+            &headers(&app, "", "admin"),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::PRECONDITION_REQUIRED);
+
+        // A revision body alone still works through the compatibility window.
+        let compat = saved(&app, "Compat").await;
+        delete_destination(
+            &app,
+            &id_of(&compat),
+            &headers(&app, "", "admin"),
+            None,
+            Some(json!({"revision": revision_of(&compat)})),
+        )
+        .await
+        .unwrap();
+
+        // A stale revision is a conflict whatever channel carries it.
+        let stale = saved(&app, "Stale").await;
+        let error = delete_destination(
+            &app,
+            &id_of(&stale),
+            &headers(&app, "", "admin"),
+            Some(revision_of(&stale) + 1),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+
+        // Header and body must agree when both are present.
+        let disagree = saved(&app, "Disagree").await;
+        let error = delete_destination(
+            &app,
+            &id_of(&disagree),
+            &headers(&app, "", "admin"),
+            Some(revision_of(&disagree)),
+            Some(json!({"revision": revision_of(&disagree) + 1})),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::PRECONDITION_FAILED);
+
+        // An unparseable If-Match is a bad request, not a silent match.
+        let garbage = saved(&app, "Garbage").await;
+        let mut auth = headers(&app, "", "admin");
+        auth.insert(header::IF_MATCH, "weak".parse().unwrap());
+        let error = delete_destination(&app, &id_of(&garbage), &auth, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+
+        // The header-only delete succeeds and a repeat finds the row gone.
+        let header_only = saved(&app, "Header").await;
+        delete_destination(
+            &app,
+            &id_of(&header_only),
+            &headers(&app, "", "admin"),
+            Some(revision_of(&header_only)),
+            None,
+        )
+        .await
+        .unwrap();
+        let error = delete_destination(
+            &app,
+            &id_of(&header_only),
+            &headers(&app, "", "admin"),
+            Some(revision_of(&header_only)),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
     }
 
     #[test]
@@ -904,15 +1025,72 @@ pub struct DeleteDestination {
     revision: u64,
 }
 
+/// The revision belongs in `If-Match`; a `{"revision": N}` JSON body is still
+/// accepted for one release window. When both are present they must agree
+/// (otherwise 412), and a delete with neither is refused with 428.
+const DELETE_BODY_LIMIT: usize = 64 * 1024;
+
+/// Reads the delete revision from `If-Match` (an unquoted or quoted revision;
+/// an unparseable value is a bad request).
+fn if_match_revision(headers: &HeaderMap) -> ApiResult<Option<u64>> {
+    let Some(value) = headers.get(header::IF_MATCH) else {
+        return Ok(None);
+    };
+    let text = value
+        .to_str()
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "If-Match is not a revision"))?
+        .trim();
+    let text = text.strip_prefix("W/").unwrap_or(text).trim();
+    let text = text
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(text);
+    text.parse::<u64>().map(Some).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "If-Match must carry the destination revision",
+        )
+    })
+}
+
 pub async fn delete(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(request): Json<DeleteDestination>,
+    request: Request,
 ) -> ApiResult<Response> {
     let identity = admin::require_operator(&app, &headers)?;
     admin::require_admin_write(&headers, &identity)?;
-    if !app.store.with(|connection| connection.execute("DELETE FROM notification_destinations WHERE tenant=?1 AND id=?2 AND json_extract(document,'$.revision')=?3", rusqlite::params![identity.tenant,id,i64::try_from(request.revision).unwrap_or(-1)]).map(|count| count == 1)).map_err(store_unavailable)? {
+    let header_revision = if_match_revision(&headers)?;
+    let bytes = axum::body::to_bytes(request.into_body(), DELETE_BODY_LIMIT)
+        .await
+        .map_err(|_| ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "delete body is too large"))?;
+    let body_revision = if bytes.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::from_slice::<DeleteDestination>(&bytes)
+                .map_err(|error| invalid(error.to_string()))?
+                .revision,
+        )
+    };
+    let revision = match (header_revision, body_revision) {
+        (Some(header), Some(body)) if header != body => {
+            return Err(ApiError::new(
+                StatusCode::PRECONDITION_FAILED,
+                "If-Match does not match the body revision; reload before deleting",
+            ));
+        }
+        (Some(header), _) => header,
+        (None, Some(body)) => body,
+        (None, None) => {
+            return Err(ApiError::new(
+                StatusCode::PRECONDITION_REQUIRED,
+                "supply the destination revision in If-Match",
+            ));
+        }
+    };
+    if !app.store.with(|connection| connection.execute("DELETE FROM notification_destinations WHERE tenant=?1 AND id=?2 AND json_extract(document,'$.revision')=?3", rusqlite::params![identity.tenant,id,i64::try_from(revision).unwrap_or(-1)]).map(|count| count == 1)).map_err(store_unavailable)? {
         return Err(ApiError::new(StatusCode::CONFLICT,"Destination changed or was removed; reload before deleting"));
     }
     app.store.audit(

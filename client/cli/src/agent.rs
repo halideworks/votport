@@ -117,3 +117,42 @@ pub fn run(args: &[String]) -> Result<Value, Value> {
 pub fn invalid(message: &str) -> Value {
     json!({"error": message, "code": "invalid_request", "retryable": false})
 }
+
+/// Exit codes mirror the server's share subcommand: a transport failure or a
+/// 5xx-class server answer may succeed on a retry (exit 2); a usage error or
+/// a 4xx-class refusal will not succeed as given (exit 1).
+pub fn exit_code(value: &Value) -> u8 {
+    if value["code"] == json!("network_error") {
+        return 2;
+    }
+    if value["status"]
+        .as_u64()
+        .is_some_and(|status| (500..600).contains(&status))
+    {
+        return 2;
+    }
+    1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{exit_code, invalid};
+
+    #[test]
+    fn agent_exit_codes_mirror_the_share_subcommand_split() {
+        assert_eq!(exit_code(&invalid("bad arguments")), 1);
+        assert_eq!(
+            exit_code(&serde_json::json!({"code": "network_error", "retryable": true})),
+            2
+        );
+        assert_eq!(
+            exit_code(&serde_json::json!({"code": "request_failed", "status": 502})),
+            2
+        );
+        assert_eq!(
+            exit_code(&serde_json::json!({"code": "not_found", "status": 404})),
+            1
+        );
+        assert_eq!(exit_code(&serde_json::json!({"code": "request_failed"})), 1);
+    }
+}

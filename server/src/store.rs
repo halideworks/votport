@@ -1278,6 +1278,22 @@ impl Store {
         })
     }
 
+    /// Whether the tenant owns the token row at all, revoked or not; lets the
+    /// DELETE handler answer an already-revoked repeat with 200 and only an
+    /// unknown id with 404.
+    pub fn automation_token_exists(&self, tenant: &str, id: &str) -> Result<bool, String> {
+        self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT 1 FROM automation_tokens WHERE tenant = ?1 AND id = ?2",
+                    rusqlite::params![tenant, id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map(|found| found.is_some())
+        })
+    }
+
     pub fn automation_operation(
         &self,
         token_id: &str,
@@ -4274,6 +4290,22 @@ impl Store {
             )
         })
         .map(|changed| changed > 0)
+    }
+
+    /// Whether the tenant owns the grant row at all, revoked or not; lets the
+    /// DELETE handler answer an already-revoked repeat with 200 and only an
+    /// unknown id with 404.
+    pub fn outbound_grant_exists(&self, tenant: &str, id: &str) -> Result<bool, String> {
+        self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT 1 FROM outbound_grants WHERE tenant = ?1 AND id = ?2",
+                    rusqlite::params![tenant, id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map(|found| found.is_some())
+        })
     }
 
     pub fn record_outbound_download(

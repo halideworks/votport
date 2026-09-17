@@ -100,11 +100,21 @@ server/target/release/votport share project/render \
   --operation-id render-2026-09-09 --expires 7d --json
 ```
 
+Its failures split into two exit classes: a usage error or a 4xx-class server
+refusal exits 1 because the request will not succeed as given, and a transport
+failure or a 5xx-class server answer exits 2 because a retry may succeed. With
+`--json` the server's error envelope is printed verbatim, so `error`, `code`,
+`retryable`, and `retry_after_seconds` survive.
+
 The client CLI's existing `send`, `receive`, `inspect`, `status`, and `resume`
 commands remain available for moving local files through normal request and
 delivery links. File bytes travel through the existing verified transfer paths.
 `inspect` prints one JSON object and exits with status 1 when the link is unusable;
-a usable link that needs a password still exits with status 0.
+a usable link that needs a password still exits with status 0. Passwords accept
+`--password-file <path>` (`-` reads stdin) on `send`, `receive`, `resume`, and
+`signin`; the file wins over `--password`, one trailing newline is trimmed, and
+an empty secret is refused. `agent` commands use the same exit split: a
+`network_error` code or a 5xx status exits 2, anything else exits 1.
 
 ## Retry and recovery
 
@@ -217,6 +227,7 @@ omitting it returns 403 with `missing X-Votport header` before permission checks
 | `POST /api/workflows/jobs/{id}` | `jobs:cancel` | `{"action":"cancel"}`; requires project sender membership. |
 | `GET /api/workflows/events` | `jobs:read` | Optional numeric `after`, `limit`; visible signed events and `next`, including gaps outside the token's projects. |
 | `GET /api/workflows/jobs/{id}/evidence` | `jobs:read` | Optional numeric `after`, `limit`; visible job evidence and `next`. |
+| `GET /api/workflows/storage` | `jobs:create` | Connections available to the tenant with id and kind; read-only. |
 
 These endpoints return 200 on success except job creation, which returns 202
 for both a fresh job and an identical replay. Delivery creation and recovery
@@ -229,15 +240,22 @@ Workflow reads require project membership as well as token permissions, and
 the project directory must fit the token's folder scope. Job lifetimes accept
 1 to 365 days; scheduling fields are Unix seconds. HTTP imports use
 `{"import":{"storage_id":"ID","prefix":"folder"}}`; MCP exposes these as
-`import_storage_id` and `import_prefix`. See [Delivery workflows](delivery-workflows.md)
+`import_storage_id` and `import_prefix`. Job creation resolves `storage_id`
+against the authorized storage set immediately: an unknown id, or one that is
+not an S3 connection, is refused with 422 and the reason instead of failing
+minutes later in preparation. `GET /api/workflows/projects` reports the kind
+beside each destination id in `destination_kinds`. See [Delivery workflows](delivery-workflows.md)
 for project rules and job state transitions. Storage administration, webhook
-configuration and webhook attempt history require an operator session; the
-`/api/workflows` prefix does not make those endpoints bearer-accessible.
+configuration and webhook attempt history require an operator session;
+`GET /api/workflows/storage` is the one `/api/workflows` read a bearer token
+may call, with `jobs:create`.
 
 Operator token management uses the existing `/api/admin/automation-tokens`
 GET/POST and `/api/admin/automation-tokens/{id}` DELETE endpoints, with the normal
 operator session and write header. Creation accepts `label`, `directory`,
-`expires_days`, and an array of `permissions`.
+`expires_days`, and an array of `permissions`. Revocation is idempotent: a
+repeat delete of a token or an admin outbound grant the operator owns answers
+200 again, and only an unknown id answers 404.
 
 ## Evidence and activity
 

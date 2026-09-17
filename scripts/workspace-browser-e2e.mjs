@@ -246,7 +246,7 @@ try {
   }
   await page.fill('#ws-label', `${id} renamed`); await saveStorage();
   assert.equal((await api('workflows/storage')).storage.find((item) => item.id === storageId).credential_source, 'saved');
-  const project = (await api('workflows/projects')).projects.find((item) => item.id === id);
+  const { destination_kinds: _readOnlyKinds, ...project } = (await api('workflows/projects')).projects.find((item) => item.id === id);
   await api('workflows/projects', { ...project, destinations: [storageId] }, 'PUT');
   const { credential_source, trade_route, ...disabled } = (await api('workflows/storage')).storage.find((item) => item.id === storageId);
   assert.equal(credential_source, 'saved');

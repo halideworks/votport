@@ -1905,10 +1905,16 @@ pub async fn delete_automation_token(
     let identity = require_automation_admin(&app, &headers)?;
     admin::require_admin_write(&headers, &identity)?;
     let _operation = begin_outbound_operation(&app, &identity.tenant)?;
+    // Idempotent like the automation delivery revoke: a repeat delete of a
+    // row this tenant owns answers 200 again; only an unknown id 404s.
     if !app
         .store
         .revoke_automation_token(&identity.tenant, &id, now_unix())
         .map_err(ApiError::internal)?
+        && !app
+            .store
+            .automation_token_exists(&identity.tenant, &id)
+            .map_err(ApiError::internal)?
     {
         return Err(ApiError::not_found());
     }
@@ -2867,10 +2873,17 @@ pub async fn delete_outbound_grant(
     let identity = admin::require_operator(&app, &headers)?;
     admin::require_admin_write(&headers, &identity)?;
     let _operation = begin_outbound_operation(&app, &identity.tenant)?;
+    // Idempotent like the automation delivery revoke documents: a repeat
+    // delete of a row this tenant owns answers 200 again; only an unknown id
+    // 404s.
     if !app
         .store
         .revoke_outbound_grant(&identity.tenant, &id, now_unix())
         .map_err(ApiError::internal)?
+        && !app
+            .store
+            .outbound_grant_exists(&identity.tenant, &id)
+            .map_err(ApiError::internal)?
     {
         return Err(ApiError::not_found());
     }
@@ -5559,6 +5572,101 @@ mod tests {
             &app.config.admin_token_tag,
         );
         format!("votport_admin={token}")
+    }
+
+    fn admin_headers(app: &App) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, admin_cookie(app).parse().unwrap());
+        headers.insert("x-votport", "1".parse().unwrap());
+        headers
+    }
+
+    /// Idempotent deletes: a repeat delete of an owned automation token
+    /// answers 200 again; only an unknown id 404s.
+    #[tokio::test]
+    async fn automation_token_deletes_are_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let auth = admin_headers(&app);
+        app.store
+            .insert_automation_token(AutomationToken {
+                id: "tok-id".into(),
+                token_hash: hash_token("a".repeat(32).as_str()),
+                tenant: String::new(),
+                label: "jobs".into(),
+                directory: None,
+                permissions: vec!["jobs:read".into()],
+                created_by: String::new(),
+                created_at: now_unix(),
+                expires_at: now_unix() + 3600,
+                revoked_at: None,
+                last_used_at: None,
+            })
+            .unwrap();
+        let first = delete_automation_token(
+            State(app.clone()),
+            AxumPath("tok-id".to_owned()),
+            auth.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.0, json!({"ok": true}));
+        assert_eq!(
+            delete_automation_token(
+                State(app.clone()),
+                AxumPath("tok-id".to_owned()),
+                auth.clone()
+            )
+            .await
+            .unwrap()
+            .0,
+            json!({"ok": true})
+        );
+        assert_eq!(
+            delete_automation_token(State(app.clone()), AxumPath("unknown".to_owned()), auth)
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// Idempotent deletes: a repeat delete of an owned admin outbound grant
+    /// answers 200 again; only an unknown id 404s.
+    #[tokio::test]
+    async fn outbound_grant_deletes_are_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let auth = admin_headers(&app);
+        app.store
+            .insert_outbound_grant(crate::notify::tests::test_grant(vec![]))
+            .unwrap();
+        let first = delete_outbound_grant(
+            State(app.clone()),
+            AxumPath("grant-id".to_owned()),
+            auth.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.0, json!({"ok": true}));
+        assert_eq!(
+            delete_outbound_grant(
+                State(app.clone()),
+                AxumPath("grant-id".to_owned()),
+                auth.clone(),
+            )
+            .await
+            .unwrap()
+            .0,
+            json!({"ok": true})
+        );
+        assert_eq!(
+            delete_outbound_grant(State(app.clone()), AxumPath("unknown".to_owned()), auth)
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::NOT_FOUND
+        );
     }
 
     fn named_admin_cookie(app: &App, tenant: &str) -> String {
