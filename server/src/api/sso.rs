@@ -192,6 +192,8 @@ fn merge_scim_groups(
 /// value counts as absent. An email the provider marks unverified is
 /// refused outright: a self-asserted address must not select a principal.
 /// Providers that omit email_verified (Entra) are accepted as is.
+/// The subject folds to lowercase so a sign-in lands on the same principal
+/// row a SCIM client provisioned, whatever case each source used.
 fn select_subject(
     claim: crate::config::SubjectClaim,
     sub: &str,
@@ -211,7 +213,7 @@ fn select_subject(
     Ok(chosen
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_owned))
+        .map(str::to_lowercase))
 }
 
 fn finish_sso_login(
@@ -752,6 +754,12 @@ pub async fn sso_callback(
     ) {
         Ok(claims) => claims,
         Err(error) => {
+            // A verification failure usually means the IdP rolled its signing
+            // key and discovery's cached JWKS is stale. Drop the Ready slot
+            // into the same Failed cooldown a failed discovery uses so the
+            // next sign-in re-discovers; the cooldown bounds the flip to once
+            // per window, so bad tokens cannot force discovery storms.
+            app.sso_client.invalidate_ready();
             tracing::warn!(target: "audit", event = "sso_failed", error = %error, "id token verification failed");
             return home("identity could not be verified");
         }
@@ -2327,6 +2335,20 @@ mod tests {
             .as_deref(),
             Some("u")
         );
+
+        // The subject folds so sign-in selects the row SCIM provisioned.
+        assert_eq!(
+            select_subject(
+                SubjectClaim::Email,
+                "s",
+                Some("  Alice@Example.com "),
+                Some(true),
+                None
+            )
+            .unwrap()
+            .as_deref(),
+            Some("alice@example.com")
+        );
     }
 
     #[test]
@@ -2356,5 +2378,381 @@ mod tests {
         assert!(text.contains("re..om (19)"), "{text}");
         assert!(!text.contains("jane@example.com"), "{text}");
         assert!(!text.contains("refused@example.com"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn scim_provisioning_and_sso_sign_in_share_one_folded_principal() {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::Request;
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let application = crate::api::testing::build(directory.path());
+        application
+            .store
+            .put_settings(
+                "test",
+                &[(
+                    "scim_token".to_owned(),
+                    crate::store::SettingWrite::Set(crate::api::scim::hash_bearer("scim-token")),
+                )],
+            )
+            .unwrap();
+        // A membership stored the way earlier versions stored it, mixed case,
+        // must still join the folded sign-in subject.
+        application
+            .store
+            .create_scim_group("ops", None, &["Alice@Example.com".to_owned()])
+            .unwrap()
+            .unwrap();
+
+        // Provision through the SCIM API exactly as a provider would.
+        let peer = ConnectInfo("198.51.100.9:1".parse::<std::net::SocketAddr>().unwrap());
+        let router = crate::app::router(std::sync::Arc::clone(&application));
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/scim/v2/Users")
+                    .extension(peer)
+                    .header(header::AUTHORIZATION, "Bearer scim-token")
+                    .header(header::CONTENT_TYPE, "application/scim+json")
+                    .body(Body::from(
+                        r#"{"schemas":["urn:ietf:params:scim:schemas:core:2.0:User"],"userName":"Alice@Example.com","active":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let resource: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            resource["userName"], "alice@example.com",
+            "the folded form is stored and displayed; no display column exists"
+        );
+
+        // The sign-in folds the same claim to the same subject.
+        let subject = select_subject(
+            crate::config::SubjectClaim::Email,
+            "abc123",
+            Some("Alice@Example.com"),
+            Some(true),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(subject, "alice@example.com");
+        let mut groups = Vec::new();
+        merge_scim_groups(&application.store, &subject, &mut groups).unwrap();
+        assert_eq!(groups, ["ops"], "the membership joins by folded subject");
+        let role = sso_role(Some("ops"), None, &groups).to_owned();
+        assert_eq!(role, "admin");
+        let identity = finish_sso_login(&application.store, &subject, role, &groups, true).unwrap();
+        assert_eq!(identity.subject, "alice@example.com");
+
+        // Still exactly one principal row for the identity.
+        let (rows, total) = application.store.scim_principals_page(100, 0).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].subject, "alice@example.com");
+        drop(router);
+    }
+
+    #[tokio::test]
+    async fn id_token_verification_failure_after_a_key_roll_recovers_by_rediscovery() {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::Request;
+        use base64::Engine as _;
+        use http_body_util::BodyExt as _;
+        use openidconnect::core::{
+            CoreEdDsaPrivateSigningKey, CoreGenderClaim, CoreJweContentEncryptionAlgorithm,
+            CoreJwsSigningAlgorithm,
+        };
+        use openidconnect::{IdToken, IdTokenClaims, PrivateSigningKey as _};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tower::ServiceExt as _;
+
+        #[derive(Debug, Deserialize, Serialize)]
+        struct TestClaims {
+            #[serde(flatten)]
+            claims: serde_json::Map<String, serde_json::Value>,
+        }
+        impl openidconnect::AdditionalClaims for TestClaims {}
+        type TestToken = IdToken<
+            TestClaims,
+            CoreGenderClaim,
+            CoreJweContentEncryptionAlgorithm,
+            CoreJwsSigningAlgorithm,
+        >;
+
+        let signing_key = |body: &str| {
+            CoreEdDsaPrivateSigningKey::from_ed25519_pem(
+                &format!("-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----"),
+                None,
+            )
+            .unwrap()
+        };
+        let original =
+            signing_key("MC4CAQAwBQYDK2VwBCIEICWeYPLxoZKHZlQ6rkBi11E9JwchynXtljATLqym/XS9");
+        let rolled =
+            signing_key("MC4CAQAwBQYDK2VwBCIEIAEQTR3uLavgZe8opPUkrWLBohNb4mfwperdSCYD3/Sz");
+        let original_jwks = json!({"keys": [original.as_verification_key()]});
+        let rolled_jwks = json!({"keys": [rolled.as_verification_key()]});
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let metadata = json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": format!("{issuer}/token"),
+            "jwks_uri": format!("{issuer}/jwks"),
+            "response_types_supported": ["code"],
+            "subject_types_supported": ["public"],
+            "id_token_signing_alg_values_supported": ["EdDSA"]
+        });
+        // The IdP starts on the original key; the rotation swaps both the
+        // signing key and the published JWKS, leaving discovery's cached
+        // key set stale.
+        let rotated = Arc::new(AtomicBool::new(false));
+        let discoveries = Arc::new(AtomicUsize::new(0));
+        let token = Arc::new(Mutex::new(String::new()));
+        let expected_challenge: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let rotated_for_provider = Arc::clone(&rotated);
+        let discoveries_for_provider = Arc::clone(&discoveries);
+        let token_for_provider = Arc::clone(&token);
+        let challenge_for_provider = Arc::clone(&expected_challenge);
+        let provider = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let rotated = Arc::clone(&rotated_for_provider);
+            let discoveries = Arc::clone(&discoveries_for_provider);
+            let token = Arc::clone(&token_for_provider);
+            let expected_challenge = Arc::clone(&challenge_for_provider);
+            let metadata = metadata.clone();
+            let original_jwks = original_jwks.clone();
+            let rolled_jwks = rolled_jwks.clone();
+            async move {
+                match request.uri().path() {
+                    "/.well-known/openid-configuration" => {
+                        discoveries.fetch_add(1, Ordering::Relaxed);
+                        axum::Json(metadata).into_response()
+                    }
+                    "/jwks" => {
+                        if rotated.load(Ordering::Relaxed) {
+                            axum::Json(rolled_jwks).into_response()
+                        } else {
+                            axum::Json(original_jwks).into_response()
+                        }
+                    }
+                    "/token" => {
+                        let body = request.into_body().collect().await.unwrap().to_bytes();
+                        let query = reqwest::Url::parse(&format!(
+                            "http://provider.invalid/?{}",
+                            String::from_utf8_lossy(&body)
+                        ))
+                        .unwrap();
+                        let verifier = query
+                            .query_pairs()
+                            .find(|(name, _)| name == "code_verifier")
+                            .map(|(_, value)| value.into_owned());
+                        let valid = verifier.is_some_and(|verifier| {
+                            let digest = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                                .encode(sha2::Sha256::digest(verifier.as_bytes()));
+                            expected_challenge.lock().unwrap().as_deref() == Some(digest.as_str())
+                        });
+                        if !valid {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                axum::Json(json!({"error": "invalid_grant"})),
+                            )
+                                .into_response();
+                        }
+                        axum::Json(json!({
+                            "access_token": "test-access",
+                            "token_type": "Bearer",
+                            "id_token": token.lock().unwrap().clone()
+                        }))
+                        .into_response()
+                    }
+                    _ => StatusCode::NOT_FOUND.into_response(),
+                }
+            }
+        });
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move { axum::serve(listener, provider).await.unwrap() });
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::api::testing::config(directory.path());
+        config.oidc = Some(crate::config::OidcConfig {
+            issuer: issuer.clone(),
+            client_id: "votport".into(),
+            client_secret: "secret".into(),
+            admin_group: None,
+            auditor_group: None,
+            subject_claim: crate::config::SubjectClaim::Sub,
+        });
+        let mut app = crate::app::build(config).unwrap();
+        // The production cooldown is 30 seconds; shrink it so the recovery
+        // step runs inside the test.
+        std::sync::Arc::get_mut(&mut app).unwrap().sso_client =
+            crate::app::SsoSlot::with_cooldown(std::time::Duration::from_millis(300));
+        let router = crate::app::router(std::sync::Arc::clone(&app));
+        let peer = ConnectInfo("198.51.100.7:1".parse::<std::net::SocketAddr>().unwrap());
+
+        async fn start_response(
+            router: &axum::Router,
+            peer: ConnectInfo<std::net::SocketAddr>,
+        ) -> axum::response::Response {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                router.clone().oneshot(
+                    Request::get("/api/admin/sso/start")
+                        .extension(peer)
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+
+        fn flow(response: &axum::response::Response) -> (String, String, String, String) {
+            let cookie = response.headers()[axum::http::header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap()
+                .to_owned();
+            let redirect = reqwest::Url::parse(
+                response.headers()[axum::http::header::LOCATION]
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            let parameter = |name: &str| {
+                redirect
+                    .query_pairs()
+                    .find(|(key, _)| key == name)
+                    .unwrap()
+                    .1
+                    .into_owned()
+            };
+            (
+                cookie,
+                parameter("state"),
+                parameter("nonce"),
+                parameter("code_challenge"),
+            )
+        }
+
+        async fn complete(
+            router: &axum::Router,
+            peer: ConnectInfo<std::net::SocketAddr>,
+            cookie: &str,
+            state: &str,
+        ) -> axum::response::Response {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                router.clone().oneshot(
+                    Request::get(format!("/api/admin/callback?code=test&state={state}"))
+                        .extension(peer)
+                        .header(axum::http::header::COOKIE, cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+
+        let stage_token = |key: &CoreEdDsaPrivateSigningKey, nonce: &str| {
+            let now = crate::store::now_unix();
+            let claims = json!({
+                "iss": issuer, "aud": "votport", "sub": "walker",
+                "iat": now, "exp": now + 300, "nonce": nonce,
+                "groups": ["platform-admins"]
+            });
+            let claims: IdTokenClaims<TestClaims, CoreGenderClaim> =
+                serde_json::from_value(claims).unwrap();
+            *token.lock().unwrap() =
+                TestToken::new(claims, key, CoreJwsSigningAlgorithm::EdDsa, None, None)
+                    .unwrap()
+                    .to_string();
+        };
+
+        // First sign-in: discovery caches the original key, sign-in succeeds.
+        let response = start_response(&router, peer).await;
+        assert_eq!(response.status(), StatusCode::FOUND);
+        let (cookie, state, nonce, challenge) = flow(&response);
+        *expected_challenge.lock().unwrap() = Some(challenge);
+        assert_eq!(discoveries.load(Ordering::Relaxed), 1);
+        stage_token(&original, &nonce);
+        let response = complete(&router, peer, &cookie, &state).await;
+        assert_eq!(response.headers()[axum::http::header::LOCATION], "/");
+        assert!(app.sso_client.health_peek());
+        assert_eq!(discoveries.load(Ordering::Relaxed), 1);
+
+        // The IdP rolls its signing key. The next sign-in verifies against
+        // the stale cached JWKS and fails, which drops the Ready slot.
+        rotated.store(true, Ordering::Relaxed);
+        let response = start_response(&router, peer).await;
+        assert_eq!(response.status(), StatusCode::FOUND);
+        let (cookie, state, nonce, challenge) = flow(&response);
+        *expected_challenge.lock().unwrap() = Some(challenge);
+        assert_eq!(
+            discoveries.load(Ordering::Relaxed),
+            1,
+            "a Ready slot is reused without discovery"
+        );
+        stage_token(&rolled, &nonce);
+        let response = complete(&router, peer, &cookie, &state).await;
+        assert_eq!(
+            response.headers()[axum::http::header::LOCATION],
+            "/?sso_error=identity_unverified"
+        );
+        assert!(
+            !app.sso_client.health_peek(),
+            "the verification failure dropped the Ready slot"
+        );
+        assert_eq!(
+            discoveries.load(Ordering::Relaxed),
+            1,
+            "the flip itself does not discover"
+        );
+
+        // Repeated bad tokens cannot storm discovery: inside the cooldown
+        // sign-in is refused before the provider is contacted.
+        for _ in 0..2 {
+            let response = start_response(&router, peer).await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+        assert_eq!(
+            discoveries.load(Ordering::Relaxed),
+            1,
+            "the cooldown bounds the flip to one discovery per window"
+        );
+
+        // Once the cooldown elapses, the next sign-in re-discovers and the
+        // rolled key verifies.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let response = start_response(&router, peer).await;
+        assert_eq!(response.status(), StatusCode::FOUND);
+        let (cookie, state, nonce, challenge) = flow(&response);
+        *expected_challenge.lock().unwrap() = Some(challenge);
+        assert_eq!(
+            discoveries.load(Ordering::Relaxed),
+            2,
+            "the next sign-in after the cooldown re-discovers"
+        );
+        stage_token(&rolled, &nonce);
+        let response = complete(&router, peer, &cookie, &state).await;
+        assert_eq!(response.headers()[axum::http::header::LOCATION], "/");
+        assert!(app.store.principal("walker").unwrap().is_some());
+        assert!(app.sso_client.health_peek());
+        tasks.shutdown().await;
     }
 }
