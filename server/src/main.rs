@@ -5,8 +5,6 @@
 //! This program is proprietary commercial software. See the VOTPORT
 //! PROPRIETARY LICENSE for the applicable terms and lack of warranty.
 
-use std::future::IntoFuture;
-
 use votport::{app, config};
 
 const BUILD_VERSION: &str = match option_env!("VOTPORT_VERSION") {
@@ -121,14 +119,9 @@ async fn main() {
     // transfers a chance to finish. Tokio can bound cooperative waiting, but
     // it cannot interrupt a blocking VOT listener; process::exit below keeps
     // runtime destruction from joining those threads.
-    let server = axum::serve(
-        listener,
-        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(app::shutdown_signal(application.clone()));
+    let server = serve_http(listener, router, application.clone());
     if let Err(error) =
-        app::drain_and_checkpoint(application.clone(), server.into_future(), HTTP_NATIVE_DRAIN)
-            .await
+        app::drain_and_checkpoint(application.clone(), server, HTTP_NATIVE_DRAIN).await
     {
         tracing::error!("server error: {error}");
         std::process::exit(1);
@@ -137,6 +130,79 @@ async fn main() {
     // the checkpoint. Process exit releases both kernel locks without waiting
     // for NAS cleanup or blocking workers.
     std::process::exit(0);
+}
+
+/// Audit finding 280: the budget for receiving one request's head (request
+/// line and headers). Slowloris-style half-sent requests are cut at this
+/// deadline instead of holding the connection open forever.
+const HTTP_HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Audit finding 280: axum::serve pins hyper's timeouts at their defaults,
+/// so the accept loop is spelled out here. hyper 1.11's HTTP/1 server layer
+/// exposes exactly one timeout knob, the header read deadline above; read,
+/// write, and idle timeouts are enforced by the reverse proxy (see
+/// Caddyfile.example) and by upload-session idleness. Peer addresses still
+/// reach handlers as ConnectInfo, and the stop signal still drains live
+/// connections gracefully through the same drain budget.
+async fn serve_http(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+    application: std::sync::Arc<votport::app::App>,
+) -> Result<(), String> {
+    use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+    use hyper_util::server::conn::auto;
+    use hyper_util::service::TowerToHyperService;
+    use tower::ServiceExt as _;
+
+    let mut stopped = std::pin::pin!(app::shutdown_signal(application));
+    let (_signal_tx, signal_rx) = tokio::sync::watch::channel(());
+    loop {
+        tokio::select! {
+            _ = stopped.as_mut() => return Ok(()),
+            accepted = listener.accept() => {
+                let (socket, peer) = accepted.map_err(|error| error.to_string())?;
+                let mut stopped = signal_rx.clone();
+                // A fresh watch clone has not observed the channel's initial
+                // value, so changed() would resolve immediately and shut every
+                // connection down at once. Mark the current value seen.
+                let _ = stopped.borrow_and_update();
+                let router = router.clone();
+                tokio::spawn(async move {
+                    let mut builder = auto::Builder::new(TokioExecutor::new());
+                    builder
+                        .http1()
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(HTTP_HEADER_READ_TIMEOUT);
+                    let service = TowerToHyperService::new(
+                        router.map_request(move |mut request: hyper::Request<hyper::body::Incoming>| {
+                            request
+                                .extensions_mut()
+                                .insert(axum::extract::ConnectInfo(peer));
+                            request.map(axum::body::Body::new)
+                        }),
+                    );
+                    let mut connection =
+                        std::pin::pin!(builder.serve_connection_with_upgrades(
+                            TokioIo::new(socket),
+                            service
+                        ));
+                    loop {
+                        tokio::select! {
+                            result = connection.as_mut() => {
+                                if let Err(error) = result {
+                                    tracing::debug!(%peer, %error, "http connection error");
+                                }
+                                break;
+                            }
+                            _ = stopped.changed() => {
+                                connection.as_mut().graceful_shutdown();
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]

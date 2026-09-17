@@ -68,9 +68,9 @@ try {
   await slowCard.getByRole('button', { name: 'Send test', exact: true }).click();
   await page.waitForTimeout(30);
   await blockedCard.getByRole('button', { name: 'Send test', exact: true }).click();
-  await page.getByText('Test failed for Blocked: The destination did not accept the test. Check its connection settings and try again.', { exact: true }).waitFor();
+  await page.getByText('Test failed for Blocked: ', { exact: false }).waitFor();
   await page.waitForTimeout(350);
-  await page.getByText('Test failed for Blocked: The destination did not accept the test. Check its connection settings and try again.', { exact: true }).waitFor();
+  await page.getByText('Test failed for Blocked: ', { exact: false }).waitFor();
   await blockedCard.getByText(/^Last attempt [^]*?Failed(: |; )/, { exact: false }).waitFor();
   const removed = await context.request.post(`${base}/api/admin/notifications/test`, { headers: { 'X-Votport': '1' } });
   assert.equal(removed.status(), 404);

@@ -998,7 +998,10 @@ impl Store {
     pub fn claim_delivery_job(&self, owner: &str, now: u64) -> Result<Option<Job>, String> {
         let mut connection = self.connection.lock().expect("store poisoned");
         let tx = connection.transaction().map_err(|e| e.to_string())?;
-        let job: Option<Job> = tx.query_row("SELECT document FROM delivery_jobs WHERE (state IN ('queued','retrying') AND not_before<=?1) OR (state='preparing' AND owner<>?2) OR (state='exporting' AND owner<>?2) ORDER BY not_before,id LIMIT 1", params![now as i64,owner], |row| decode(row.get(0)?)).optional().map_err(|e| e.to_string())?;
+        // Audit finding 266: the count guard keeps a tenant at most two jobs
+        // in flight per owner, so one tenant cannot occupy every claim slot.
+        // It is per-row, so the scan still reaches jobs of other tenants.
+        let job: Option<Job> = tx.query_row("SELECT document FROM delivery_jobs WHERE ((state IN ('queued','retrying') AND not_before<=?1) OR (state='preparing' AND owner<>?2) OR (state='exporting' AND owner<>?2)) AND (SELECT COUNT(*) FROM delivery_jobs active WHERE active.tenant=delivery_jobs.tenant AND active.owner=?2 AND active.state IN ('preparing','exporting') AND active.id<>delivery_jobs.id) < 2 ORDER BY not_before,id LIMIT 1", params![now as i64,owner], |row| decode(row.get(0)?)).optional().map_err(|e| e.to_string())?;
         let Some(mut job) = job else {
             return Ok(None);
         };
@@ -2945,6 +2948,68 @@ mod tests {
         finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         revoker.join().unwrap();
         assert!(store.delivery_access(&grant.id, &grant.token_hash).is_err());
+    }
+
+    #[test]
+    fn claim_caps_a_tenant_at_two_concurrent_jobs_but_still_scans_and_recovers() {
+        // Audit finding 266: with concurrent claim loops the claim query
+        // keeps a tenant at two in-flight jobs, skips capped tenants to the
+        // next claimable row, and still recovers a dead owner's job.
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .insert_tenant(crate::store::tests::test_tenant("acme"))
+            .unwrap();
+        let platform = store.save_delivery_project("", "admin", project()).unwrap();
+        let mut tenant_project = project();
+        tenant_project.id = "second".into();
+        let tenant_project = store
+            .save_delivery_project("acme", "admin", tenant_project)
+            .unwrap();
+        for suffix in ["a", "b", "c"] {
+            let mut request = request();
+            request.operation_id = format!("operation_{suffix}");
+            store
+                .enqueue_delivery_job("", "sender", 1, None, platform.clone(), request)
+                .unwrap();
+        }
+        let mut tenant_request = request();
+        tenant_request.project_id = "second".into();
+        store
+            .enqueue_delivery_job("acme", "sender", 1, None, tenant_project, tenant_request)
+            .unwrap();
+        // Sort the platform jobs before the acme job regardless of id order.
+        store
+            .with(|connection| {
+                connection.execute("UPDATE delivery_jobs SET not_before=0 WHERE tenant=''", [])
+            })
+            .unwrap();
+        let now = now_unix();
+        store.with(|connection| {
+            let mut statement = connection.prepare("SELECT tenant,id,not_before,state,owner FROM delivery_jobs ORDER BY not_before,id").unwrap();
+            let rows = statement.query_map([], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,i64>(2)?, row.get::<_,String>(3)?, row.get::<_,String>(4)?))).unwrap();
+            for row in rows { eprintln!("ROW {:?}", row.unwrap()); }
+            Ok(())
+        }).unwrap();
+        let first = store.claim_delivery_job("worker", now).unwrap().unwrap();
+        let second = store.claim_delivery_job("worker", now).unwrap().unwrap();
+        assert_eq!((first.tenant.as_str(), second.tenant.as_str()), ("", ""));
+        // The platform tenant is capped: the scan skips its third queued job
+        // and claims the acme job instead.
+        let third = store.claim_delivery_job("worker", now).unwrap().unwrap();
+        assert_eq!(third.tenant, "acme");
+        assert!(store.claim_delivery_job("worker", now).unwrap().is_none());
+        // A dead owner's preparing job recovers despite the cap.
+        store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE delivery_jobs SET owner='dead-worker' WHERE id=?1",
+                    params![first.id],
+                )
+            })
+            .unwrap();
+        let recovered = store.claim_delivery_job("worker", now).unwrap().unwrap();
+        assert_eq!(recovered.id, first.id);
     }
 
     #[test]

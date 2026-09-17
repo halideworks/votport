@@ -30,9 +30,11 @@ vot-proof-sha256 = { git = "https://github.com/halideworks/VOT", rev = "de66d413
 vot-scheduler = { git = "https://github.com/halideworks/VOT", rev = "de66d41343cee7fb206a0f323d36babea655f032" }
 
 axum = "0.8"
+hyper = { version = "1", default-features = false }
+hyper-util = { version = "0.1", default-features = false, features = ["server", "http1", "tokio", "service"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "fs", "io-util", "process"] }
 tokio-util = { version = "0.7", features = ["io"] }
-tower = "0.5"
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["fs", "set-header"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

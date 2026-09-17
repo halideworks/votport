@@ -16,6 +16,10 @@ services:
       VOTPORT_ADMIN_PASSWORD: "${VOTPORT_ADMIN_PASSWORD:?set VOTPORT_ADMIN_PASSWORD in .env}"
       VOTPORT_PUBLIC_URL: "${VOTPORT_PUBLIC_URL:?set VOTPORT_PUBLIC_URL in .env}"
       VOTPORT_SESSION_IDLE_SECS: "${VOTPORT_SESSION_IDLE_SECS:-172800}"
+      # Require a bearer token on /metrics. Replace with a long random value
+      # before deploying; scrape from the private upstream, since the public
+      # Caddy examples answer 404 for /metrics and /readyz.
+      VOTPORT_METRICS_TOKEN: "${VOTPORT_METRICS_TOKEN:?set VOTPORT_METRICS_TOKEN in .env}"
     volumes:
       - ./data:/data
       - ./received:/received
