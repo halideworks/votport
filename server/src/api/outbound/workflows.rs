@@ -128,8 +128,7 @@ pub async fn put_project(
     headers: HeaderMap,
     Json(project): Json<Project>,
 ) -> ApiResult<Response> {
-    let identity = admin::require_operator(&app, &headers)?;
-    admin::require_admin_write(&headers, &identity)?;
+    let identity = admin::require_operator_write(&app, &headers)?;
     let _operation = begin_outbound_operation(&app, &identity.tenant)?;
     if let Some(policy) = &project.notifications {
         crate::api::notifications::validate_policy(
@@ -1483,8 +1482,7 @@ pub async fn put_webhook(
     headers: HeaderMap,
     Json(request): Json<WebhookRequest>,
 ) -> ApiResult<Response> {
-    let identity = admin::require_operator(&app, &headers)?;
-    admin::require_admin_write(&headers, &identity)?;
+    let identity = admin::require_operator_write(&app, &headers)?;
     let _operation = begin_outbound_operation(&app, &identity.tenant)?;
     let url =
         reqwest::Url::parse(&request.url).map_err(|_| conflict("invalid webhook URL".into()))?;
@@ -1573,8 +1571,7 @@ pub async fn replay_webhook(
     headers: HeaderMap,
     AxumPath(id): AxumPath<u64>,
 ) -> ApiResult<Response> {
-    let identity = admin::require_operator(&app, &headers)?;
-    admin::require_admin_write(&headers, &identity)?;
+    let identity = admin::require_operator_write(&app, &headers)?;
     let _operation = begin_outbound_operation(&app, &identity.tenant)?;
     if id > i64::MAX as u64
         || !app

@@ -5,12 +5,11 @@
 //! votport policy (hidden files off by default), applied before any path
 //! touches the disk.
 
+use crate::protocol_paths::is_push_staging_name;
 use crate::protocol_paths::is_receipt_name;
 use std::path::{Path, PathBuf};
 
-/// Private subtree for named tenants. Package paths can never name it, so
-/// the default tenant and named tenants cannot collide on disk.
-pub const TENANT_STORAGE_DIR: &str = ".vot-tenants.stage";
+pub use crate::protocol_paths::{admit_component, TENANT_STORAGE_DIR};
 
 pub fn tenant_prefix(key: &str) -> Vec<String> {
     if key.is_empty() {
@@ -304,65 +303,6 @@ pub fn probe_landing_dir(root: &Path, what: &str, vot_publish: bool) -> Result<(
         let _ = (root, what, vot_publish);
         Ok(())
     }
-}
-
-/// Validates one package path component for on-disk placement.
-pub fn admit_component(component: &str, allow_hidden: bool) -> Result<(), String> {
-    if component.is_empty() || component.len() > 255 {
-        return Err("empty or oversized path component".to_owned());
-    }
-    if component == "." || component == ".." {
-        return Err("path component is a directory reference".to_owned());
-    }
-    if component
-        .chars()
-        .any(|ch| ch == '/' || ch == '\\' || ch == '~' || ch == '\0' || ch <= '\u{1f}')
-    {
-        return Err(
-            "path component contains a separator, control character, or DOS alias marker"
-                .to_owned(),
-        );
-    }
-    if is_receipt_name(component) {
-        return Err("name is reserved for signed receipts".into());
-    }
-    if !allow_hidden && component.starts_with('.') {
-        return Err(
-            "hidden file names are not accepted (VOTPORT_ALLOW_HIDDEN=1 to allow)".to_owned(),
-        );
-    }
-    if component.starts_with('.') && !component.is_ascii() {
-        return Err("non-ASCII hidden names are reserved for portable storage".to_owned());
-    }
-    // Reserved even with VOTPORT_ALLOW_HIDDEN: a sender file of this shape
-    // would publish fine and then be deleted by the next boot's staging sweep.
-    if component.eq_ignore_ascii_case(".votport-workflows") {
-        return Err("name is reserved for delivery workflows".into());
-    }
-    if component.eq_ignore_ascii_case(TENANT_STORAGE_DIR) {
-        return Err("name is reserved for tenant storage".to_owned());
-    }
-    if component.eq_ignore_ascii_case(crate::lease::FILE_NAME) {
-        return Err("name is reserved for the instance lease".to_owned());
-    }
-    if component.eq_ignore_ascii_case(".vot-stage")
-        || is_push_staging_name(component)
-        || (component.starts_with(".vot-")
-            && (component.ends_with(".stage") || component.ends_with(".journal")))
-    {
-        return Err("name is reserved for votport staging files".to_owned());
-    }
-    Ok(())
-}
-
-fn is_push_staging_name(name: &str) -> bool {
-    let Some(session) = name.strip_prefix(".vot-push-") else {
-        return false;
-    };
-    session.len() == 32
-        && session
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Validates a link destination subdirectory ("" allowed) and returns its

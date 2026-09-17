@@ -51,7 +51,7 @@ test('the shipped card carries proof the sender can copy', () => {
 
 test('a large file is hashed as leaf-aligned segments across the pool and assembled on its owner', async () => {
   const worker = await readFile(new URL('../web/assets/hash-worker.js', import.meta.url), 'utf8');
-  assert.match(script, /segments\(file\.size, PROOF_LEAF_BYTES, hashWorkers\.length, MIN_SEGMENT_BYTES\)/);
+  assert.match(script, /segments\(file\.size, proofLeafBytes, hashWorkers\.length, MIN_SEGMENT_BYTES\)/);
   assert.match(script, /op: 'leaves'/);
   assert.match(script, /op: 'assemble'/);
   assert.match(worker, /proofLeavesAt\(Suite\.Blake3Bao64, BigInt\(offset\), bytes, BigInt\(file\.size\)\)/);

@@ -2998,8 +2998,14 @@ impl PushReceive {
                 .is_some_and(|file| file.published)
         }) {
             drop(inner);
-            self.finish_object(key)?;
-            return Ok(None);
+            // The done sink: resumed_prefix reports the whole object and
+            // flush is a no-op, so vot-cli takes its already-complete path,
+            // runs the completion hook (which finishes the object here), and
+            // marks it done. Returning None instead would mark it done
+            // without ever running the hook.
+            return Ok(Some(Box::new(PushPublishedSink {
+                length: object.object.length,
+            })));
         }
         if indices.len() <= MAX_OPEN_PUSH_ALIASES {
             for index in &indices {
@@ -3436,6 +3442,35 @@ impl From<PushObjectKey> for ObjectId {
 
 // A single object may appear at thousands of paths in a repeated-frame package.
 const MAX_OPEN_PUSH_ALIASES: usize = 16;
+
+/// The sink for an object that is already fully published. Its bytes exist,
+/// so resumed_prefix reports the whole object and flush is a no-op; vot-cli
+/// then finishes it through the completion hook instead of its `Ok(None)`
+/// directory behaviour, which would mark the object done silently.
+struct PushPublishedSink {
+    length: u64,
+}
+
+impl vot_scheduler::RangeSink for PushPublishedSink {
+    fn write_at(&self, _: u64, _: &[u8]) -> Result<(), vot_scheduler::SinkError> {
+        // Nothing to place: an already-complete object is never scheduled.
+        Err(vot_scheduler::SinkError)
+    }
+}
+
+impl vot_cli::ReceiveSink for PushPublishedSink {
+    fn resumed_prefix(&self) -> Result<u64, vot_cli::Error> {
+        Ok(self.length)
+    }
+
+    fn flush(&self) -> Result<(), vot_cli::Error> {
+        Ok(())
+    }
+
+    fn discard_partial(&self) -> Result<(), vot_cli::Error> {
+        Ok(())
+    }
+}
 
 struct PushFileSink {
     files: PushFiles,
@@ -8228,7 +8263,17 @@ mod push_tests {
         );
         let receive = handle.0.upgrade().unwrap();
         receive.prepare_manifest(summary, &records).unwrap();
-        assert!(receive.choose_sink(&receive_objects[0]).unwrap().is_none());
+        // The published object resumes through the done sink: the whole
+        // length is the prefix, flush is a no-op, and the completion hook
+        // finishes it here.
+        let done = receive.choose_sink(&receive_objects[0]).unwrap().unwrap();
+        assert_eq!(
+            done.resumed_prefix().unwrap(),
+            receive_objects[0].object.length
+        );
+        done.flush().unwrap();
+        drop(done);
+        receive.complete_object(&receive_objects[0]).unwrap();
         let sink: Arc<dyn vot_cli::ReceiveSink> =
             Arc::from(receive.choose_sink(&receive_objects[1]).unwrap().unwrap());
         write_push(Arc::clone(&sink), &receive_objects[1], data[1]);
@@ -8239,6 +8284,136 @@ mod push_tests {
             .iter()
             .all(|file| file.published));
         drop(sink);
+        drop(receive);
+        drop(seams);
+        assert!(!stage.exists());
+        assert!(application.store.load_push_sessions().unwrap().is_empty());
+        for (index, bytes) in data.iter().enumerate() {
+            assert_eq!(
+                fs::read(directory.path().join(format!("receive/file-{index}"))).unwrap(),
+                *bytes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn push_retry_finishes_published_objects_through_the_completion_hook() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = [b"first payload".as_slice(), b"second payload".as_slice()];
+        let objects = data.map(|bytes| object(Suite::Blake3Bao64, bytes));
+        let expected = ObjectId {
+            suite: 1,
+            root: [9; 32],
+            length: data.iter().map(|bytes| bytes.len() as u64).sum(),
+        };
+        let application = crate::api::testing::build(directory.path());
+        let first_setup = setup_with_app(directory.path(), expected.clone(), &application);
+        let mut retry_setup = setup_with_app(directory.path(), expected.clone(), &application);
+        retry_setup.session_id = [8; 16];
+        application
+            .store
+            .insert_link(crate::store::Link {
+                id: "link".to_owned(),
+                tenant: String::new(),
+                label: "retry".to_owned(),
+                dest: String::new(),
+                password_hash: None,
+                created_at: 0,
+                expires_at: None,
+                max_bytes: None,
+                active: true,
+                legal_hold: false,
+
+                notifications: None,
+                uploads: Vec::new(),
+                events: Vec::new(),
+            })
+            .unwrap();
+        let key = hex::encode([3; 16]);
+        let stage = first_setup.destinations.push_directory(&key).unwrap();
+        let records = objects
+            .iter()
+            .enumerate()
+            .map(|(index, object)| {
+                record(
+                    vot_manifest::PackagePath::portable([format!("file-{index}")]).unwrap(),
+                    object,
+                )
+            })
+            .collect::<Vec<_>>();
+        let summary = vot_cli::PackageSummary {
+            root: expected.root,
+            logical_length: expected.length,
+            entries: 2,
+        };
+        let receive_objects = objects
+            .iter()
+            .map(|object| vot_cli::ReceiveObject {
+                object: vot_codec::frames::ObjectId {
+                    suite: object.suite,
+                    root: object.root,
+                    length: object.length,
+                },
+                entries: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        persist_push(&first_setup, key.clone()).unwrap();
+        let control = PushControl::resumable(
+            key.clone(),
+            Some(lock_push_directory(&stage, vot_sdk_file::NasContract::Unqualified).unwrap()),
+        );
+        let (seams, handle) = push_seams(
+            application.clone(),
+            first_setup,
+            control,
+            tokio::runtime::Handle::current(),
+        );
+        let receive = handle.0.upgrade().unwrap();
+        receive.prepare_manifest(summary, &records).unwrap();
+        // Publish both objects in the first session.
+        for (index, bytes) in data.iter().enumerate() {
+            let sink: Arc<dyn vot_cli::ReceiveSink> = Arc::from(
+                receive
+                    .choose_sink(&receive_objects[index])
+                    .unwrap()
+                    .unwrap(),
+            );
+            write_push(Arc::clone(&sink), &receive_objects[index], bytes);
+            sink.flush().unwrap();
+            receive.complete_object(&receive_objects[index]).unwrap();
+            drop(sink);
+        }
+        drop(receive);
+        drop(seams);
+        // The retry session finds every object published: choose_sink hands
+        // back the done sink for each, and the completion hook (not the
+        // sink) finishes the object and the session. The first session
+        // finished completely, so its staging directory was removed; the
+        // retry recreates it.
+        persist_push(&retry_setup, key.clone()).unwrap();
+        retry_setup.destinations.push_directory(&key).unwrap();
+        let control = PushControl::resumable(
+            key,
+            Some(lock_push_directory(&stage, vot_sdk_file::NasContract::Unqualified).unwrap()),
+        );
+        let (seams, handle) = push_seams(
+            application.clone(),
+            retry_setup,
+            control,
+            tokio::runtime::Handle::current(),
+        );
+        let receive = handle.0.upgrade().unwrap();
+        receive.prepare_manifest(summary, &records).unwrap();
+        for requested in &receive_objects {
+            let done = receive.choose_sink(requested).unwrap().unwrap();
+            assert_eq!(done.resumed_prefix().unwrap(), requested.object.length);
+            done.flush().unwrap();
+            receive.complete_object(requested).unwrap();
+        }
+        assert!(application.store.load_push_sessions().unwrap()[0]
+            .files
+            .iter()
+            .all(|file| file.published));
         drop(receive);
         drop(seams);
         assert!(!stage.exists());
