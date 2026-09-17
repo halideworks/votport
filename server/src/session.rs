@@ -12,7 +12,7 @@ use std::io::Read as _;
 use std::io::{Seek as _, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
@@ -288,6 +288,43 @@ mod log_tests {
         assert_eq!(quiet_after_secs(0), 60);
         assert_eq!(quiet_after_secs(20), 5);
         assert_eq!(quiet_after_secs(600), 60);
+    }
+
+    #[test]
+    fn error_path_warns_are_paced_per_distinct_error_and_per_site() {
+        // Test-local pacers: module statics used by production Drop paths must
+        // not carry state into or out of this test.
+        static SITE_A: OnceLock<Mutex<crate::api::outbound::ErrorDeduper>> = OnceLock::new();
+        static SITE_B: OnceLock<Mutex<crate::api::outbound::ErrorDeduper>> = OnceLock::new();
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let writer = log.reopen().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.try_clone().unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            warn_once_per_interval("site a", &SITE_A, "boom", "first message");
+            warn_once_per_interval("site a", &SITE_A, "boom", "first message");
+            warn_once_per_interval("site a", &SITE_A, "changed", "first message");
+            warn_once_per_interval("site b", &SITE_B, "boom", "second message");
+        });
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.contains("first message"))
+                .count(),
+            2,
+            "the repeat is paced away, a changed error logs immediately"
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.contains("second message"))
+                .count(),
+            1,
+            "each site paces independently"
+        );
     }
 }
 
@@ -572,7 +609,14 @@ impl Drop for StagedFile {
         }
         if self.active.is_none() {
             // Reacquire the journal identity before the SDK removes its files.
-            let _ = self.reopen();
+            if self.reopen().is_err() {
+                warn_once_per_interval(
+                    "staged file drop reopen",
+                    &STAGED_DROP_REOPEN_WARN,
+                    "reopen failed",
+                    "staging could not be reopened on drop; it stays on disk for recovery",
+                );
+            }
         }
     }
 }
@@ -1333,6 +1377,7 @@ fn checkpoint_session(setup: &WorkerSetup, files: &mut [FileState]) -> bool {
 
 fn forget_publications(files: &mut [FileState]) -> bool {
     let mut complete = true;
+    let mut retained: Vec<(String, String)> = Vec::new();
     for file in files.iter_mut().filter(|file| file.published) {
         let Some(staged) = file.native.as_ref() else {
             continue;
@@ -1347,10 +1392,18 @@ fn forget_publications(files: &mut [FileState]) -> bool {
         });
         if let Err(error) = result {
             complete = false;
-            tracing::warn!(path = %file.display_path, error = %error.message, "retain publication journal for recovery");
+            retained.push((file.display_path.clone(), error.message));
         } else {
             file.native = None;
         }
+    }
+    if let Some((first_path, first_error)) = retained.first() {
+        tracing::warn!(
+            count = retained.len(),
+            path = %first_path,
+            error = %first_error,
+            "retain publication journal for recovery"
+        );
     }
     complete
 }
@@ -3359,7 +3412,11 @@ impl Drop for PushReceive {
                 .destinations
                 .remove_push_directory(&self.staging, lock)
             {
-                tracing::warn!(path = %self.staging.display(), %error, "clear push staging");
+                tracing::warn!(
+                    path = %push_staging_log_name(&self.staging),
+                    %error,
+                    "clear push staging"
+                );
             }
         }
         self.app.sessions.remove(&sid);
@@ -3954,6 +4011,41 @@ fn record_event(
     );
 }
 
+/// Receiving-relative log form of a push staging directory: the `.vot-stage`
+/// location with its key truncated to 8 characters, matching the session-tag
+/// convention, so raw push keys and absolute paths stay out of logs.
+pub(crate) fn push_staging_log_name(staging: &std::path::Path) -> String {
+    let name = staging
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let key = name.strip_prefix(".vot-push-").unwrap_or(name);
+    format!(".vot-stage/.vot-push-{}", key.get(..8).unwrap_or(key))
+}
+
+static STAGED_DROP_REOPEN_WARN: OnceLock<Mutex<crate::api::outbound::ErrorDeduper>> =
+    OnceLock::new();
+static ENDED_SEND_WARN: OnceLock<Mutex<crate::api::outbound::ErrorDeduper>> = OnceLock::new();
+
+/// Warns at most once per interval per distinct `error` for a `site` whose
+/// surrounding state cannot carry a pacer (a Drop, a fire-and-forget send):
+/// the first occurrence logs immediately, repeats stay bounded.
+fn warn_once_per_interval(
+    site: &'static str,
+    pacer: &OnceLock<Mutex<crate::api::outbound::ErrorDeduper>>,
+    error: &'static str,
+    message: &'static str,
+) {
+    let pacer = pacer.get_or_init(|| Mutex::new(crate::api::outbound::ErrorDeduper::new(site)));
+    let due = pacer
+        .lock()
+        .expect("error-path warn pacer poisoned")
+        .observe(error, Instant::now());
+    if due {
+        tracing::warn!("{message}");
+    }
+}
+
 fn record_session_event(
     store: &Arc<Store>,
     ended_sender: &mpsc::UnboundedSender<SessionEnded>,
@@ -4010,7 +4102,14 @@ fn record_session_event(
             "could not record upload session event"
         ),
     }
-    let _ = ended_sender.send(ended);
+    if ended_sender.send(ended).is_err() {
+        warn_once_per_interval(
+            "session end notification",
+            &ENDED_SEND_WARN,
+            "receiver gone",
+            "session end notification failed; the ended-session receiver is gone",
+        );
+    }
     stored
 }
 
@@ -7452,6 +7551,49 @@ mod push_tests {
         assert!(setup.store.load_upload_sessions().unwrap()[0]
             .committed_upload_id
             .is_some());
+    }
+
+    #[test]
+    fn retained_publication_journals_warn_once_per_batch_with_one_example() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = crate::api::testing::build(directory.path());
+        let object_id = object(Suite::Blake3Bao64, b"");
+        let setup = setup_with_app(directory.path(), object_id.clone(), &application);
+        application
+            .store
+            .insert_link(crate::store::tests::test_link(&setup.link_id))
+            .unwrap();
+        let mut file_a =
+            open_destination_for(&setup, vec!["frame-a".into()], object_id.clone()).unwrap();
+        let mut file_b = open_destination_for(&setup, vec!["frame-b".into()], object_id).unwrap();
+        publish_file(&setup, &mut file_a, || true).unwrap();
+        publish_file(&setup, &mut file_b, || true).unwrap();
+        // Removing the journals makes forgetting the publications fail.
+        let journal_a = file_a.native.as_ref().unwrap().journal.clone();
+        let journal_b = file_b.native.as_ref().unwrap().journal.clone();
+        std::fs::remove_file(&journal_a).unwrap();
+        std::fs::remove_file(&journal_b).unwrap();
+
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let writer = log.reopen().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.try_clone().unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(!forget_publications(&mut [file_a, file_b]));
+        });
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        let warns: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("retain publication journal"))
+            .collect();
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(warns[0].contains("\"count\":2"), "{}", warns[0]);
+        assert!(warns[0].contains("frame-a"), "{}", warns[0]);
+        assert!(!warns[0].contains("frame-b"), "{}", warns[0]);
     }
 
     #[tokio::test]

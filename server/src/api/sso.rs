@@ -22,7 +22,9 @@ use openidconnect::{
     AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce,
     PkceCodeChallenge, RedirectUrl, Scope,
 };
-use openidconnect::{OAuth2TokenResponse as _, TokenResponse as _};
+use openidconnect::{
+    HttpClientError, OAuth2TokenResponse as _, RequestTokenError, TokenResponse as _,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Digest as _;
@@ -558,6 +560,40 @@ pub async fn sso_start(
     }
 }
 
+/// Fixed reason for a failed provider HTTP call: reqwest error Display
+/// embeds the endpoint URL, so only the failure class is logged.
+fn provider_http_failure(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "the identity provider did not answer in time"
+    } else if error.is_connect() {
+        "the identity provider could not be reached"
+    } else {
+        "the identity provider request failed"
+    }
+}
+
+/// Fixed reason per token-exchange failure variant: provider bodies
+/// (ServerResponse payloads and Other strings) and transport URLs stay out
+/// of the audit log.
+fn token_exchange_failure(
+    error: &RequestTokenError<
+        HttpClientError<reqwest::Error>,
+        openidconnect::StandardErrorResponse<core::CoreErrorResponseType>,
+    >,
+) -> &'static str {
+    match error {
+        RequestTokenError::Request(transport) => match transport {
+            HttpClientError::Reqwest(error) => provider_http_failure(error),
+            _ => "the identity provider request failed",
+        },
+        RequestTokenError::ServerResponse(_) => "the identity provider refused the token exchange",
+        RequestTokenError::Parse(..) => "the identity provider token response was unreadable",
+        RequestTokenError::Other(_) => {
+            "the identity provider answered the token exchange unexpectedly"
+        }
+    }
+}
+
 fn sso_error_code(message: &str) -> &'static str {
     match message {
         "the identity provider refused the sign-in" => "provider_refused",
@@ -680,8 +716,8 @@ pub async fn sso_callback(
     // provider configuration problem, not a runtime condition.
     let exchange = match client.client.exchange_code(AuthorizationCode::new(code)) {
         Ok(exchange) => exchange,
-        Err(error) => {
-            tracing::warn!(target: "audit", event = "sso_failed", error = %error, "provider lacks a token endpoint");
+        Err(_) => {
+            tracing::warn!(target: "audit", event = "sso_failed", reason = "token endpoint url is missing", "provider lacks a token endpoint");
             return home("the identity provider is misconfigured");
         }
     };
@@ -692,7 +728,7 @@ pub async fn sso_callback(
     {
         Ok(token) => token,
         Err(error) => {
-            tracing::warn!(target: "audit", event = "sso_failed", error = %error, "token exchange failed");
+            tracing::warn!(target: "audit", event = "sso_failed", reason = token_exchange_failure(&error), "token exchange failed");
             return home("token exchange failed");
         }
     };
@@ -767,13 +803,13 @@ pub async fn sso_callback(
             }
             Ok(response) => match response.json::<serde_json::Value>().await {
                 Ok(value) => value,
-                Err(error) => {
-                    tracing::warn!(target: "audit", event = "sso_failed", error = %error, "userinfo parse failed");
+                Err(_) => {
+                    tracing::warn!(target: "audit", event = "sso_failed", reason = "the identity provider userinfo response was unreadable", "userinfo parse failed");
                     return home("could not verify group membership");
                 }
             },
             Err(error) => {
-                tracing::warn!(target: "audit", event = "sso_failed", error = %error, "userinfo request failed");
+                tracing::warn!(target: "audit", event = "sso_failed", reason = provider_http_failure(&error), "userinfo request failed");
                 return home("could not verify group membership");
             }
         };
@@ -800,8 +836,8 @@ pub async fn sso_callback(
         }
         let group_claims: GroupClaims = match serde_json::from_value(value) {
             Ok(claims) => claims,
-            Err(error) => {
-                tracing::warn!(target: "audit", event = "sso_failed", %error, "userinfo group claims are invalid");
+            Err(_) => {
+                tracing::warn!(target: "audit", event = "sso_failed", reason = "the userinfo response does not match the expected group claims", "userinfo group claims are invalid");
                 return home("could not verify group membership");
             }
         };
@@ -888,6 +924,43 @@ fn browser_login_response(app: &App, admin_cookie: String) -> Response {
 mod tests {
     use super::*;
     use crate::auth::AdminIdentity;
+
+    #[tokio::test]
+    async fn provider_failures_classify_without_provider_detail() {
+        // A refused transport dial classifies without surfacing the URL.
+        let transport = reqwest::Client::new()
+            .get("http://127.0.0.1:1/token")
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            provider_http_failure(&transport),
+            "the identity provider could not be reached"
+        );
+        // Provider-controlled payload strings never reach the audit log.
+        let refused: openidconnect::StandardErrorResponse<core::CoreErrorResponseType> =
+            serde_json::from_str(
+                r#"{"error":"invalid_grant","error_description":"provider text"}"#,
+            )
+            .unwrap();
+        let error = RequestTokenError::ServerResponse(refused);
+        assert!(format!("{error:?}").contains("provider text"));
+        assert_eq!(
+            token_exchange_failure(&error),
+            "the identity provider refused the token exchange"
+        );
+        let other = RequestTokenError::Other("provider body".to_owned());
+        assert_eq!(
+            token_exchange_failure(&other),
+            "the identity provider answered the token exchange unexpectedly"
+        );
+        let transport_error =
+            RequestTokenError::Request(HttpClientError::Reqwest(Box::new(transport)));
+        assert_eq!(
+            token_exchange_failure(&transport_error),
+            "the identity provider could not be reached"
+        );
+    }
 
     #[test]
     fn desktop_handoffs_bind_proof_expire_and_are_single_use() {

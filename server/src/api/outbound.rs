@@ -893,7 +893,7 @@ fn publish_outbound_stage(
         file.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()))
             .and_then(|()| file.sync_all())
     }) {
-        tracing::warn!(%error, path = %stage.display(), "persisting outbound stage expiry failed");
+        tracing::warn!(%error, path = %stage.file_name().unwrap_or_default().to_string_lossy(), "persisting outbound stage expiry failed");
         return Err(ApiError::internal("persist outbound stage expiry failed"));
     }
     if let Err(error) = std::fs::hard_link(stage, path) {
@@ -985,7 +985,11 @@ pub(crate) fn sweep_upload_stages(app: &App, now: std::time::SystemTime) {
                 .is_some_and(|modified| modified <= cutoff);
             if expired {
                 if let Err(error) = std::fs::remove_file(path) {
-                    tracing::warn!(%error, path = %path.display(), "expired library upload cleanup failed");
+                    tracing::warn!(
+                        %error,
+                        path = %path.file_name().unwrap_or_default().to_string_lossy(),
+                        "expired library upload cleanup failed"
+                    );
                 }
             }
             true
@@ -1169,6 +1173,14 @@ impl ErrorDeduper {
             self.last_logged = Some(now);
         }
         due
+    }
+
+    /// Test-only clearing of observed state: statics shared by production
+    /// code must not carry pacing state between tests in one process.
+    #[cfg(test)]
+    pub(crate) fn reset(&mut self) {
+        self.last_error = None;
+        self.last_logged = None;
     }
 
     /// Logs one info line naming the site when a previously observed error
