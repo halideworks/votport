@@ -202,9 +202,15 @@ fn a_paused_http_send_resumes_the_same_session_prefix() {
         panic!("a send journal resumed as a receive");
     };
     assert_eq!(report.transport, votport_client_core::Transport::Http);
+    // The finish cache answers a begin on the completed session with the
+    // cached completion rather than an error, so a lost finish reply
+    // reconciles instead of re-sending.
+    let completed = client
+        .begin(&http.session)
+        .expect("the completed session answers from the finish cache");
     assert!(
-        client.begin(&http.session).is_err(),
-        "the original session was completed rather than replaced"
+        completed.len() == 1 && completed[0].covered_bytes == http.length,
+        "the cached completion covers the whole object: {completed:?}"
     );
     assert_eq!(std::fs::metadata(path).unwrap().len(), http.length);
     assert_eq!(
