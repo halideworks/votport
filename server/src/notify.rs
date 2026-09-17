@@ -622,6 +622,10 @@ async fn send_smtp(
     event: &str,
     transfer_id: Option<&str>,
 ) -> Result<(), &'static str> {
+    if let Some(refusal) = smtp_cleartext_auth_refusal(smtp) {
+        let _ = log_smtp_failure(event, transfer_id, Err::<(), _>(refusal));
+        return Err(refusal);
+    }
     let prepared = (|| -> Result<_, String> {
         let from: Mailbox = smtp
             .from
@@ -734,6 +738,21 @@ fn smtp_tls(smtp: &ResolvedSmtp) -> Result<Tls, String> {
     } else {
         Ok(Tls::None)
     }
+}
+
+/// AUTH PLAIN over a plaintext connection exposes the password on the wire,
+/// so refuse it unless the relay is a loopback one (local relays) or the port
+/// already implies TLS. The flag is database-overridable, so this is checked
+/// at send time, not only at startup.
+fn smtp_cleartext_auth_refusal(smtp: &ResolvedSmtp) -> Option<&'static str> {
+    if smtp.starttls || smtp.port == 465 || smtp.username.is_none() {
+        return None;
+    }
+    (!crate::config::is_loopback_host(&smtp.host)).then_some(
+        "SMTP authentication was refused because STARTTLS is off and the relay is not \
+         loopback; the password would be sent in the clear. Enable STARTTLS, use port 465, \
+         or use a loopback relay.",
+    )
 }
 
 fn tls_params(host: &str) -> Result<TlsParameters, String> {
@@ -2304,6 +2323,89 @@ pub(crate) mod tests {
             log_smtp_failure("notification_test", None, Err::<(), _>("smtp boom")),
             Err("smtp boom")
         );
+    }
+
+    fn cleartext_stub_smtp() -> ResolvedSmtp {
+        ResolvedSmtp {
+            host: "smtp.example.com".into(),
+            port: 25,
+            starttls: false,
+            username: Some("user".into()),
+            password: Some("secret".into()),
+            from: "votport@example.com".into(),
+        }
+    }
+
+    #[test]
+    fn cleartext_smtp_auth_is_refused_only_off_loopback() {
+        let refusal = smtp_cleartext_auth_refusal(&cleartext_stub_smtp())
+            .expect("non-loopback cleartext auth is refused");
+        assert!(refusal.contains("STARTTLS"), "{refusal}");
+        for allowed in [
+            ResolvedSmtp {
+                host: "127.0.0.1".into(),
+                ..cleartext_stub_smtp()
+            },
+            ResolvedSmtp {
+                host: "localhost".into(),
+                ..cleartext_stub_smtp()
+            },
+            ResolvedSmtp {
+                host: "[::1]".into(),
+                ..cleartext_stub_smtp()
+            },
+            ResolvedSmtp {
+                port: 465,
+                ..cleartext_stub_smtp()
+            },
+            ResolvedSmtp {
+                starttls: true,
+                ..cleartext_stub_smtp()
+            },
+            ResolvedSmtp {
+                username: None,
+                password: None,
+                ..cleartext_stub_smtp()
+            },
+        ] {
+            assert_eq!(smtp_cleartext_auth_refusal(&allowed), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn send_smtp_refuses_cleartext_auth_without_connecting() {
+        let smtp = cleartext_stub_smtp();
+        let error = send_smtp(
+            &smtp,
+            &["to@example.com".to_owned()],
+            "title",
+            "body",
+            "event",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, smtp_cleartext_auth_refusal(&smtp).unwrap());
+    }
+
+    #[tokio::test]
+    async fn send_smtp_still_dials_a_loopback_relay_without_starttls() {
+        let smtp = ResolvedSmtp {
+            host: "127.0.0.1".into(),
+            port: 1,
+            ..cleartext_stub_smtp()
+        };
+        let error = send_smtp(
+            &smtp,
+            &["to@example.com".to_owned()],
+            "title",
+            "body",
+            "event",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_ne!(error, smtp_cleartext_auth_refusal(&smtp).unwrap_or(""));
     }
 
     async fn smtp_stub(listener: tokio::net::TcpListener) -> std::io::Result<String> {

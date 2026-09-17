@@ -410,6 +410,34 @@ fn audit_session_rejected(app: &App, tenant: &str, reason: &str) {
     );
 }
 
+/// Audit finding 259: the outbound stage keeps a 1 GiB free-space reserve
+/// while staging, so a begin whose declared total cannot fit above the same
+/// reserve on the receiving volume would run for hours and then fail at
+/// ENOSPC. None (unreadable volume) admits, matching the metrics exporter.
+const RECEIVE_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Reserve kept free on the receiving volume: the flat 1 GiB on large
+/// volumes, but capped at a tenth of free space so small shares (e.g. a
+/// 256 MiB NAS tmpfs) still admit sessions.
+fn usable_bytes(free_bytes: u64) -> u64 {
+    let effective_reserve = RECEIVE_RESERVE_BYTES.min(free_bytes / 10);
+    free_bytes.saturating_sub(effective_reserve)
+}
+
+fn receive_space_refusal(declared: u64, free: Option<u64>) -> Option<(StatusCode, String)> {
+    let free = free?;
+    let usable = usable_bytes(free);
+    (declared > usable).then(|| {
+        (
+            StatusCode::INSUFFICIENT_STORAGE,
+            format!(
+                "the session declares {declared} bytes but the receiving volume only has \
+                 {free} bytes free, {usable} above the reserve"
+            ),
+        )
+    })
+}
+
 struct PreparedSession {
     link: Link,
     expected: ObjectId,
@@ -509,6 +537,13 @@ async fn prepare_session(
             StatusCode::UNPROCESSABLE_ENTITY,
             format!("upload exceeds the {cap} byte limit for this link"),
         ));
+    }
+    if let Some((status, detail)) = receive_space_refusal(
+        expected.length,
+        super::admin::disk_of(&app.config.receive_dir).map(|(free, _)| free),
+    ) {
+        audit_session_rejected(app, &link.tenant, "receive volume short of space");
+        return Err(ApiError::new(status, detail));
     }
     let (max_total, _, max_sessions) = if let Some(tenant) = &tenant {
         (
@@ -1317,7 +1352,7 @@ mod session_rate_tests {
     use crate::app;
     use crate::store::Link;
 
-    fn open_link(id: &str) -> Link {
+    pub(super) fn open_link(id: &str) -> Link {
         Link {
             id: id.to_owned(),
             tenant: String::new(),
@@ -1883,6 +1918,82 @@ mod session_rate_tests {
         let _ = release.send(());
 
         assert_completed(&application, "cancel-before-reply").await;
+    }
+}
+
+#[cfg(test)]
+mod receive_space_tests {
+    use super::*;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt;
+
+    use crate::api::testing;
+    use crate::app;
+
+    use super::session_rate_tests::open_link;
+
+    async fn begin_with_declared(declared: u64, max_upload_bytes: u64) -> (StatusCode, String) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = testing::config(directory.path());
+        config.max_upload_bytes = max_upload_bytes;
+        let app = app::build(config).unwrap();
+        app.store.insert_link(open_link("space")).unwrap();
+        let create = Request::post("/api/r/space/session")
+            .header("content-type", "application/json")
+            .extension(ConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                4000,
+            ))))
+            .body(Body::from(
+                json!({
+                    "package": {
+                        "suite": "blake3",
+                        "root": hex::encode([7u8; 32]),
+                        "length": declared
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app::router(app).oneshot(create).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn begin_over_free_minus_reserve_is_refused_with_the_numbers() {
+        let (status, body) = begin_with_declared(u64::MAX, u64::MAX).await;
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{body}");
+        let detail = &body[body.find("error").unwrap()..];
+        assert!(detail.contains(&u64::MAX.to_string()), "{detail}");
+        assert!(detail.contains("bytes free"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn begin_under_free_minus_reserve_is_accepted() {
+        let (status, body) = begin_with_declared(8, 1024 * 1024).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[test]
+    fn usable_bytes_keeps_flat_reserve_on_large_volumes_and_caps_on_small() {
+        // Large volume: flat 1 GiB reserve.
+        assert_eq!(
+            usable_bytes(100 * 1024 * 1024 * 1024),
+            100 * 1024 * 1024 * 1024 - RECEIVE_RESERVE_BYTES
+        );
+        // 256 MiB NAS share: reserve capped at a tenth of free.
+        let mib = 1024 * 1024;
+        assert_eq!(usable_bytes(256 * mib), 256 * mib - (256 * mib) / 10);
+        // Tiny volume: tiny reserve, never negative.
+        assert_eq!(usable_bytes(40), 36);
+        assert_eq!(usable_bytes(0), 0);
+        // A 4 MiB session over a 256 MiB share admits.
+        assert!(usable_bytes(256 * mib) >= 4 * mib);
     }
 }
 

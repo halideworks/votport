@@ -116,7 +116,9 @@ fn scim_json(status: StatusCode, body: Value) -> Response {
     response
 }
 
-const HASH_PREFIX: &str = "sha256:";
+/// The stored form prefix; env-provided tokens must never carry it (see
+/// `crate::config::bearer_token`).
+pub(crate) const HASH_PREFIX: &str = "sha256:";
 
 /// The stored form of a bearer: the settings row never holds the token.
 pub fn hash_bearer(token: &str) -> String {
