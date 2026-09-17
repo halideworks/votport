@@ -384,6 +384,21 @@ function renderPrincipal(principal) {
         });
         await refreshPrincipals(true);
       }),
+      button('Erase', 'tiny danger', async () => {
+        if (
+          !(await confirmModal(
+            'Erase principal',
+            'Deletes this identity for good: the subject, its sign-in record and its group memberships are removed. Only a blocked principal can be erased.',
+            'Erase',
+          ))
+        )
+          return;
+        await api('/api/admin/principals/purge', {
+          method: 'POST',
+          body: JSON.stringify({ subject: principal.subject }),
+        });
+        await refreshPrincipals(true);
+      }),
     );
   } else {
     actions.append(

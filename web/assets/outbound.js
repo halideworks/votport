@@ -137,13 +137,39 @@ function showPasswordGate() {
   $('download-password').focus();
 }
 
+// A refused download answers JSON, so every handoff probes with HEAD and
+// renders the refusal here instead of navigating the top frame to it.
+// HEAD runs the same admission checks without recording a download.
+async function triggerDownload(url, name) {
+  let response;
+  try {
+    response = await fetch(url, { method: 'HEAD' });
+  } catch {
+    showError('The download could not be reached. Check your connection and try again.');
+    return false;
+  }
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    showError(body?.error || `The download was refused (${response.status}).`);
+    return false;
+  }
+  const link = document.createElement('a');
+  link.href = url;
+  if (name) link.download = name;
+  link.hidden = true;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  return true;
+}
+
 function downloadButton(text, url, classes, name) {
   const button = document.createElement('button');
   button.type = 'button';
   button.className = classes;
   button.textContent = text;
   button.setAttribute('aria-label', `${text}: ${name}`);
-  button.addEventListener('click', () => { window.location.assign(url); });
+  button.addEventListener('click', () => { triggerDownload(url, name); });
   return button;
 }
 
@@ -509,7 +535,7 @@ async function loadMetadata() {
   manifestStatus();
   const bundle = $('bundle-download');
   bundle.hidden = !body.bundle_url;
-  if (body.bundle_url) $('bundle-download-button').onclick = () => window.location.assign(body.bundle_url);
+  if (body.bundle_url) $('bundle-download-button').onclick = () => triggerDownload(body.bundle_url);
   const separateNote = $('separate-download-note');
   const separateButton = $('separate-download-button');
   setSeparateDownloadStatus('');
@@ -529,9 +555,9 @@ async function loadMetadata() {
     separateButton.textContent = 'Download file';
     separateNote.textContent = '';
     const only = metadataFiles[0];
-    separateButton.onclick = () => {
+    separateButton.onclick = async () => {
+      if (!(await triggerDownload(only.download_url, only.name))) return;
       setSeparateDownloadStatus('Download handed to the browser. Check browser downloads for completion.');
-      window.location.assign(only.download_url);
     };
   }
   const fetchBlock = $('vot-fetch');
