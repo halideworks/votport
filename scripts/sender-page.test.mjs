@@ -26,6 +26,25 @@ test('each staged file carries a state badge and a meter while sending', () => {
   assert.match(script, /files verified`\)/);
 });
 
+test('the progress note keeps ticking between progress callbacks', () => {
+  // renderNote drops stale rate clauses itself, but only when it runs: a
+  // tick bounded to the transfer keeps it honest through quiet stretches,
+  // and the submit handler's finally is the single clear on every end path.
+  assert.match(script, /const noteTick = setInterval\(renderNote, 1000\);/);
+  assert.match(script, /finally \{\s*\n\s*clearInterval\(noteTick\);/);
+  assert.match(script, /clearInterval\(noteTick\);[\s\S]{0,120}releaseWakeLock\(\);/);
+});
+
+test('a rebegin keeps delivered marks for rows past the visible limit', () => {
+  // Rows past MAX_VISIBLE_FILE_ROWS have no element, so the delivered check
+  // reads the set, not the row's class.
+  assert.match(
+    script,
+    /if \(!deliveredPaths\.has\(item\.path\)\) \{\s*\n\s*setStatus\(item\.path, 'Continuing'\);/,
+  );
+  assert.doesNotMatch(script, /rows\.get\(item\.path\)\?\.classList/);
+});
+
 test('the shipped card carries proof the sender can copy', () => {
   assert.match(page, /id="done-summary"/);
   assert.match(page, /id="copy-proof" class="tiny"/);

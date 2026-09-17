@@ -1680,6 +1680,46 @@ pub async fn revoke_principal(
     mutate_principal(&app, &identity.subject, &request.subject, true)
 }
 
+/// Erases a revoked principal: the identity row and its SCIM memberships
+/// are deleted, so nothing about the person persists in the store. Only a
+/// blocked principal can be purged, and the store call re-checks that, so a
+/// race with an unblock cannot erase an active identity.
+pub async fn purge_principal(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(request): Json<PrincipalSubjectRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_platform_admin_write(&app, &headers)?;
+    let subject = subject_for_mutation(&request.subject, "purge")?;
+    let existing = app.store.principal(subject).map_err(ApiError::internal)?;
+    match existing {
+        None => return Err(ApiError::not_found()),
+        Some(principal) if !principal.blocked => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "revoke the principal before purging it",
+            ));
+        }
+        Some(_) => {}
+    }
+    let changed = app
+        .store
+        .purge_principal(subject)
+        .map_err(ApiError::internal)?;
+    if !changed {
+        return Err(ApiError::not_found());
+    }
+    tracing::info!(target: "audit", event = "principal_purged", subject = %crate::logging::reduce_subject(subject), "principal erased");
+    app.store.audit(
+        "",
+        &identity.subject,
+        "principal_purged",
+        subject,
+        &json!({}),
+    );
+    Ok(Json(json!({ "ok": true })))
+}
+
 pub async fn unblock_principal(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -1689,12 +1729,9 @@ pub async fn unblock_principal(
     mutate_principal(&app, &identity.subject, &request.subject, false)
 }
 
-fn mutate_principal(
-    app: &App,
-    actor: &str,
-    subject: &str,
-    revoke: bool,
-) -> ApiResult<Json<serde_json::Value>> {
+/// The trimmed subject every principal mutation acts on, rejecting an
+/// empty subject and naming the action that the local administrator resists.
+fn subject_for_mutation<'a>(subject: &'a str, action: &str) -> ApiResult<&'a str> {
     let subject = subject.trim();
     if subject.is_empty() {
         return Err(ApiError::new(
@@ -1703,12 +1740,21 @@ fn mutate_principal(
         ));
     }
     if subject == "local" {
-        let action = if revoke { "revoke" } else { "unblock" };
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             format!("cannot {action} the local administrator"),
         ));
     }
+    Ok(subject)
+}
+
+fn mutate_principal(
+    app: &App,
+    actor: &str,
+    subject: &str,
+    revoke: bool,
+) -> ApiResult<Json<serde_json::Value>> {
+    let subject = subject_for_mutation(subject, if revoke { "revoke" } else { "unblock" })?;
     let changed = if revoke {
         app.store.revoke_principal(subject)
     } else {
@@ -4316,6 +4362,16 @@ pub async fn delete_link(
             "active download links must be revoked first",
         ));
     }
+    if app
+        .store
+        .link_has_existing_files(&identity.tenant, &id)
+        .map_err(ApiError::internal)?
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "files still exist for this request; delete them first, because removing the record would leave their stored paths unnamed",
+        ));
+    }
     let removed = app
         .store
         .remove_link(&identity.tenant, &id)
@@ -4358,7 +4414,9 @@ pub async fn link_qr(
     Ok(([(header::CONTENT_TYPE, "image/svg+xml")], svg).into_response())
 }
 
-/// Removes one upload from a link's history. Files on disk are untouched.
+/// Removes one upload from a link's history. Refused while any of its files
+/// still exists: the record is the only registry of each payload's stored
+/// path, so clearing it first would orphan the file and its sidecar on disk.
 pub async fn delete_upload_record(
     State(app): State<Arc<App>>,
     Path((id, upload)): Path<(String, String)>,
@@ -4409,6 +4467,16 @@ pub async fn delete_upload_record(
         .link_upload(&identity.tenant, &id, &upload)
         .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
+    if app
+        .store
+        .upload_has_existing_files(&identity.tenant, &id, &upload)
+        .map_err(ApiError::internal)?
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "files still exist for this upload; delete them first, because removing the record would leave their stored paths unnamed",
+        ));
+    }
     for index in 0..record.files.len() {
         if app
             .store
@@ -5025,6 +5093,106 @@ mod handler_tests {
     }
 
     #[tokio::test]
+    async fn record_deletes_refuse_while_received_files_exist() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_link(crate::store::Link {
+                id: "link".to_owned(),
+                label: "link".to_owned(),
+                tenant: String::new(),
+                dest: String::new(),
+                password_hash: None,
+                created_at: 0,
+                expires_at: None,
+                max_bytes: None,
+                active: true,
+                legal_hold: false,
+
+                notifications: None,
+                uploads: vec![crate::store::UploadRecord {
+                    partial: false,
+                    log: Vec::new(),
+                    id: "upload".to_owned(),
+                    started_at: 0,
+                    completed_at: 1,
+                    replayed_chunks: 0,
+                    rejected_chunks: 0,
+                    transport: Some("http".to_owned()),
+                    package_root: "root".to_owned(),
+                    total_bytes: 4,
+                    files: vec![crate::store::FileRecord {
+                        path: "received.bin".to_owned(),
+                        stored_as: "received.bin".to_owned(),
+                        bytes: 4,
+                        suite: "blake3".to_owned(),
+                        root: "aa".repeat(32),
+                        receipt: false,
+                        deleted: false,
+                    }],
+                }],
+                events: Vec::new(),
+            })
+            .unwrap();
+        let cookie = login_cookie(app::router(application.clone())).await;
+        // The record is the only registry of the payload's stored path, so
+        // both record deletes refuse while the file exists.
+        for uri in [
+            "/api/admin/links/link/uploads/upload",
+            "/api/admin/links/link",
+        ] {
+            let response = app::router(application.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(uri)
+                        .header("cookie", &cookie)
+                        .header("x-votport", "1")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{uri}");
+        }
+        assert!(application.store.link("", "link").unwrap().is_some());
+        assert!(application
+            .store
+            .link_upload("", "link", "upload")
+            .unwrap()
+            .is_some());
+
+        // Deleting the file itself unblocks both: the tombstone plus the
+        // unlink means the record no longer names anything on disk.
+        let delete = |uri: &str| {
+            Request::builder()
+                .method("DELETE")
+                .uri(uri)
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let response = app::router(application.clone())
+            .oneshot(delete("/api/admin/links/link/uploads/upload/files/0"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app::router(application.clone())
+            .oneshot(delete("/api/admin/links/link/uploads/upload"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app::router(application.clone())
+            .oneshot(delete("/api/admin/links/link"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(application.store.link("", "link").unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn paged_links_return_a_stable_cursor() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
@@ -5236,7 +5404,7 @@ mod handler_tests {
         // (method, route template, query, JSON body). Bodies only need to
         // satisfy each handler's JSON extractor: the gate fires before any
         // validation, so a minimal well-formed value reaches the 403.
-        let covered: [(&str, &str, &str, &str); 47] = [
+        let covered: [(&str, &str, &str, &str); 48] = [
             ("POST", "/api/admin/logout", "", ""),
             ("PUT", "/api/admin/backups", "", "{}"),
             ("POST", "/api/admin/backups", "", ""),
@@ -5281,6 +5449,12 @@ mod handler_tests {
             (
                 "POST",
                 "/api/admin/principals/unblock",
+                "",
+                r#"{"subject":"pin"}"#,
+            ),
+            (
+                "POST",
+                "/api/admin/principals/purge",
                 "",
                 r#"{"subject":"pin"}"#,
             ),
@@ -10412,6 +10586,75 @@ mod principals_api_tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn purge_erases_a_blocked_principal_and_refuses_an_active_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .upsert_sso_principal("user@example.com", &["employees".to_owned()], &json!([]))
+            .unwrap();
+        // The membership names the subject with mixed case, like a SCIM
+        // client may have stored it; the purge must reach it folded.
+        application
+            .store
+            .create_scim_group("employees", None, &["User@Example.com".to_owned()])
+            .unwrap();
+        let platform = platform_cookie(&application);
+        let purge = |subject: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/principals/purge")
+                .header("cookie", &platform)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"subject":"{subject}"}}"#)))
+                .unwrap()
+        };
+
+        // An active principal cannot be erased; revoke comes first.
+        let (status, _, _) = send(application.clone(), purge("user@example.com")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(application
+            .store
+            .principal("user@example.com")
+            .unwrap()
+            .is_some());
+
+        let (status, _, _) = send(
+            application.clone(),
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/principals/revoke")
+                .header("cookie", &platform)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"subject":"user@example.com"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _, _) = send(application.clone(), purge("user@example.com")).await;
+        assert_eq!(status, StatusCode::OK);
+        // The row and its memberships are gone, matched folded like the row
+        // itself, and a retried purge answers 404 like a missing principal.
+        assert!(application
+            .store
+            .principal("USER@example.com")
+            .unwrap()
+            .is_none());
+        assert!(application
+            .store
+            .scim_groups_of("user@example.com")
+            .unwrap()
+            .is_empty());
+        let (status, _, _) = send(application.clone(), purge("user@example.com")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, _) = send(application.clone(), purge("missing@example.com")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

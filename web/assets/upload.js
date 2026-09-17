@@ -950,8 +950,10 @@ async function runUpload() {
           try {
             ({ entries } = await postWithRetry(`/api/session/${sessionId}/begin`, {}));
             for (const item of items) {
-              // A row already marked delivered keeps that mark.
-              if (!rows.get(item.path)?.classList.contains('done')) {
+              // deliveredPaths is the authority: rows past the visible
+              // limit have no element, so a done-class check would reset
+              // their delivered mark on every rebegin.
+              if (!deliveredPaths.has(item.path)) {
                 setStatus(item.path, 'Continuing');
               }
             }
@@ -1348,6 +1350,11 @@ $('upload-form').addEventListener('submit', async (event) => {
   $('send').disabled = true;
   $('clear-files').disabled = true;
   $('upload-error').hidden = true;
+  // renderNote only runs from progress callbacks, so its staleness windows
+  // never re-evaluate during a quiet stretch and the note freezes. A tick
+  // bounded to the transfer keeps rate and time-left honest; the finally
+  // below clears it on every end path.
+  const noteTick = setInterval(renderNote, 1000);
   try {
     await runUpload();
   } catch (error) {
@@ -1385,6 +1392,7 @@ $('upload-form').addEventListener('submit', async (event) => {
     if (restoreFocus) $('send').focus();
     showResumeNote();
   } finally {
+    clearInterval(noteTick);
     uploading = false;
     controller = null;
     stopWorkers();

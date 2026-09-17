@@ -2057,6 +2057,40 @@ impl Store {
         Ok(true)
     }
 
+    /// Whether any payload of the upload is still on the books (not yet
+    /// tombstoned by delete_received_file). While one exists, the upload
+    /// record is the only registry of the payload's stored path, so removing
+    /// the record would orphan the file and its sidecar on disk.
+    pub fn upload_has_existing_files(
+        &self,
+        tenant: &str,
+        id: &str,
+        upload_id: &str,
+    ) -> Result<bool, String> {
+        self.with(|connection| {
+            connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM files
+                 WHERE tenant=?1 AND link_id=?2 AND upload_id=?3 AND deleted=0)",
+                rusqlite::params![tenant, id, upload_id],
+                |row| row.get(0),
+            )
+        })
+    }
+
+    /// Whether any received file of the link is still on the books. While
+    /// one exists, removing the link record would orphan its payloads: the
+    /// Receive page, tenant usage, the retention sweep and
+    /// delete_received_file all derive their paths from these rows.
+    pub fn link_has_existing_files(&self, tenant: &str, id: &str) -> Result<bool, String> {
+        self.with(|connection| {
+            connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM files WHERE tenant=?1 AND link_id=?2 AND deleted=0)",
+                rusqlite::params![tenant, id],
+                |row| row.get(0),
+            )
+        })
+    }
+
     pub fn remove_link(&self, tenant: &str, id: &str) -> Result<bool, String> {
         let mut connection = self.connection.lock().expect("store poisoned");
         let transaction = connection
@@ -3182,6 +3216,32 @@ impl Store {
             )?;
             Ok(true)
         })
+    }
+
+    /// Erases a blocked principal: the row and its SCIM memberships go, so
+    /// the subject, external id, last sign-in stamp and role snapshots stop
+    /// persisting in the store and every backup taken after it. A revoke
+    /// must come first, since it already invalidates credentials and tokens;
+    /// the deleted predicate keeps an unblocked principal un-erasable here.
+    pub fn purge_principal(&self, subject: &str) -> Result<bool, String> {
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let changed = transaction
+            .execute(
+                "DELETE FROM principals WHERE lower(subject) = lower(?1) AND blocked = 1",
+                [subject],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM scim_group_members WHERE lower(subject) = lower(?1)",
+                [subject],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(changed > 0)
     }
 
     // ------------------------------------------------- operations helpers

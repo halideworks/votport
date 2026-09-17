@@ -5531,6 +5531,7 @@ pub fn router(app: Arc<App>) -> Router {
             "/api/admin/principals/unblock",
             post(api::unblock_principal),
         )
+        .route("/api/admin/principals/purge", post(api::purge_principal))
         .route(
             "/api/admin/outbound-grants",
             get(api::list_outbound_grants).merge(post(api::create_outbound_grant).layer(

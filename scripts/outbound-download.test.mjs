@@ -55,13 +55,76 @@ test('anchor fallback copy explains multiple downloads', () => {
   assert.match(sendPage, />Start downloads<\/button>/);
 });
 
-test('single-file handoff reports browser ownership before navigation', () => {
+test('single-file handoff probes first and reports browser ownership after success', () => {
   const singleFileBranch = outboundScript.slice(
     outboundScript.indexOf('  } else {', outboundScript.indexOf('if (metadataTotal > 1)')),
     outboundScript.indexOf('\n  const fetchBlock', outboundScript.indexOf('if (metadataTotal > 1)')),
   );
-  assert.match(singleFileBranch, /setSeparateDownloadStatus\('Download handed to the browser\./);
-  assert.ok(singleFileBranch.indexOf('setSeparateDownloadStatus') < singleFileBranch.indexOf('window.location.assign'));
+  assert.match(singleFileBranch, /await triggerDownload\(only\.download_url, only\.name\)/);
+  assert.ok(singleFileBranch.indexOf('triggerDownload') < singleFileBranch.indexOf('setSeparateDownloadStatus(\'Download handed to the browser.'));
+});
+
+test('download handoffs probe and never navigate the top frame', async () => {
+  // Every download button routes through triggerDownload, so a refusal is
+  // rendered by the page instead of replacing it with raw JSON.
+  assert.doesNotMatch(outboundScript, /location\.assign\(/);
+  assert.match(outboundScript, /downloadButton\('Download file', file\.download_url, 'tiny', file\.name\)/);
+  assert.match(outboundScript, /\$\('bundle-download-button'\)\.onclick = \(\) => triggerDownload\(body\.bundle_url\)/);
+  const source = outboundScript.slice(
+    outboundScript.indexOf('async function triggerDownload('),
+    outboundScript.indexOf('function downloadButton('),
+  );
+  const clicks = [];
+  let shown = null;
+  const trigger = runInNewContext(`${source}\ntriggerDownload`, {
+    fetch: async () => ({
+      ok: true,
+    }),
+    document: {
+      body: { append() {} },
+      createElement() {
+        return { click() { clicks.push(1); }, remove() {} };
+      },
+    },
+    showError(message) { shown = message; },
+  });
+  assert.equal(await trigger('/api/s/t/file', 'report.pdf'), true);
+  assert.equal(clicks.length, 1);
+  assert.equal(shown, null);
+
+  const refused = runInNewContext(`${source}\ntriggerDownload`, {
+    fetch: async () => ({
+      ok: false,
+      status: 404,
+      json: async () => ({ error: 'not found' }),
+    }),
+    document: {
+      body: { append() {} },
+      createElement() {
+        return { click() { clicks.push(1); }, remove() {} };
+      },
+    },
+    showError(message) { shown = message; },
+  });
+  assert.equal(await refused('/api/s/t/file', 'report.pdf'), false);
+  assert.equal(clicks.length, 1, 'a refused download must not hand off');
+  assert.equal(shown, 'not found');
+
+  const unreachable = runInNewContext(`${source}\ntriggerDownload`, {
+    fetch: async () => {
+      throw new TypeError('lost');
+    },
+    document: {
+      body: { append() {} },
+      createElement() {
+        return { click() { clicks.push(1); }, remove() {} };
+      },
+    },
+    showError(message) { shown = message; },
+  });
+  assert.equal(await unreachable('/api/s/t/file', 'report.pdf'), false);
+  assert.equal(clicks.length, 1);
+  assert.match(shown, /could not be reached/);
 });
 
 test('anchor requests stop before the next click and report each handoff', async () => {
