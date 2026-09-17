@@ -307,6 +307,14 @@ Keep an external recovery copy of the encryption passphrase. An
 encrypted archive is unrecoverable without it, and storing that passphrase in
 the same deployment backup defeats recovery isolation.
 
+Any single archive can also be discarded on demand: `DELETE
+/api/admin/backups/{source}/{id}` (platform admin; `source` is `local` or
+`s3`, matching the inventory) removes that copy only. Retention days or count
+of `0` keeps every archive until one is deleted this way. The backup window is
+the erasure floor: content removed on the server by retention or deletion
+stays restorable from every archive that still contains it, until each copy is
+deleted or ages out.
+
 | Store | Mechanism | RPO | RTO |
 | --- | --- | --- | --- |
 | `data/votport.db` | Litestream (or equivalent WAL replica) continuous | seconds (Litestream's default interval is about 1s of WAL) | minutes: stop container, `litestream restore`, start |

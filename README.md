@@ -128,7 +128,10 @@ the database and VOTPort-managed identity files only; a blank local path uses
 `<data_dir>/backups` (normally `/data/backups`), while a custom path must be a
 writable service-filesystem path mounted by the operator. S3 prefix settings
 cover VOTPort backup objects only, and `/received` and `/outbound` remain
-operator backups.
+operator backups. Archives are copies, not a tomb: erased content stays
+restorable from every archive that still contains it until each copy is
+deleted (`DELETE /api/admin/backups/{source}/{id}`) or ages out; retention 0
+keeps archives forever.
 Optional backup secrets are unchanged when left blank and never returned by
 GET. A restore rotates the cookie secret and signs out existing sessions. A
 written settings key wins; `""` disables a URL or token; JSON `null` deletes
@@ -181,7 +184,7 @@ remain retained while in flight.
 | `VOTPORT_OIDC_SUBJECT_CLAIM` | `sub` | Id-token claim used as the principal subject: `sub`, `email`, or `preferred_username`. Must match the SCIM `userName` mapping. |
 | `VOTPORT_NOTIFY_SMTP_FROM` | — | SMTP From address (required with the relay host). |
 | `VOTPORT_AUDIT_RETENTION_DAYS` | `400` | Days to keep queryable audit rows; `0` disables pruning. Overridable via `PUT /api/admin/settings`. |
-| `VOTPORT_UPLOAD_RETENTION_DAYS` | off | Days to keep received files and their records; a daily sweep deletes expired content and audits it. `0` (default) keeps everything. Overridable via `PUT /api/admin/settings`. |
+| `VOTPORT_UPLOAD_RETENTION_DAYS` | off | Days to keep received files; a daily sweep deletes expired content, blanks the records' in-package path, and audits it. The record itself (size and content identity) stays until the link is cleared. `0` (default) keeps everything. Overridable via `PUT /api/admin/settings`. |
 | `VOTPORT_DEFAULT_MAX_TOTAL_BYTES` | unlimited | Fills a new tenant's byte quota when the request omits it, and caps received bytes on the unnamed default tenant. Named tenants keep the quota on their row. |
 | `VOTPORT_DEFAULT_MAX_LINKS` | unlimited | Same overlay for max links (new tenants when omitted, and the unnamed default tenant). |
 | `VOTPORT_DEFAULT_MAX_SESSIONS` | unlimited | Same overlay for max concurrent sessions. |

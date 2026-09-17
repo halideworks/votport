@@ -996,7 +996,7 @@ async fn export_destination(app: &Arc<App>, job: &Job, config: &Storage) -> ApiR
     app.store
         .require_delivery_destination(&job.id, job.attempts, &config.id)
         .map_err(conflict)?;
-    let document = json!({"format": "votport-delivery-export-v1","job_id": job.id,"manifest": manifest,"metadata": job.request.metadata,"project_id": job.project.id,"policy_revision": job.project.revision,"approved_by": job.approved_by,"checks": export_checks(job),"files": files,"issuer": app.signer.public_hex});
+    let document = json!({"format": "votport-delivery-export-v1","created_at": grant.created_at,"expires_at": grant.expires_at,"job_id": job.id,"manifest": manifest,"metadata": job.request.metadata,"project_id": job.project.id,"policy_revision": job.project.revision,"approved_by": job.approved_by,"checks": export_checks(job),"files": files,"issuer": app.signer.public_hex});
     let attestation =
         json!({"document": document,"signature": app.signer.sign_delivery_export(&document)});
     let bytes = serde_json::to_vec(&attestation)
@@ -1037,6 +1037,65 @@ async fn export_destination(app: &Arc<App>, job: &Job, config: &Storage) -> ApiR
     app.store
         .complete_delivery_export(&job.id, job.attempts, &config.id, completion.as_ref())
         .map_err(conflict)?;
+    Ok(())
+}
+
+/// Audit finding 375: a completed export whose delivery was retired,
+/// cancelled or revoked is indistinguishable from a live one. At retirement
+/// the server writes a signed marker beside each completed external export,
+/// so the destination itself records the delivery's state.
+pub(super) async fn mark_exports_retired(app: &Arc<App>, job: &Job) -> Result<(), String> {
+    let mut targets = Vec::new();
+    for id in &job.project.destinations {
+        let state = &job.checks["destinations"][id];
+        let Some(location) = state["location"].as_str() else {
+            continue;
+        };
+        if state["state"] != "complete" || location.starts_with("receipt:") {
+            continue;
+        }
+        let revision = job.checks["destination_revisions"][id].as_u64();
+        targets.push((id.clone(), revision));
+    }
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let storages = app.store.delivery_storages().map_err(|e| e.to_string())?;
+    for (id, revision) in targets {
+        let Some(config) = storages
+            .iter()
+            .find(|config| config.id == id && Some(config.revision) == revision)
+        else {
+            return Err(format!(
+                "retired export marker skipped: destination {id} changed since export"
+            ));
+        };
+        let store = config.connect(&app.store).map_err(|e| e.to_string())?;
+        let manifest = job
+            .manifest
+            .as_deref()
+            .ok_or("retired export marker needs the frozen manifest")?;
+        let key = config
+            .key(&format!("deliveries/{}/{manifest}/retired.json", job.id))
+            .map_err(|error| error.message)?;
+        guard_folder_key(config, &key).map_err(|error| error.message)?;
+        let document = json!({
+            "format": "votport-delivery-retired-v1",
+            "job_id": job.id,
+            "manifest": manifest,
+            "retired_at": crate::store::now_unix(),
+        });
+        let attestation =
+            json!({"document": document,"signature": app.signer.sign_delivery_export(&document)});
+        let bytes = serde_json::to_vec(&attestation)
+            .map_err(|_| "serialize retired export marker".to_owned())?;
+        // Overwrite, not Create: retirement retries after a crash must not
+        // fail on their own marker.
+        store
+            .put(&key, bytes.into())
+            .await
+            .map_err(|_| "retired export marker upload failed".to_owned())?;
+    }
     Ok(())
 }
 
@@ -1424,5 +1483,100 @@ mod tests {
             .unwrap();
         assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(error.message.contains("collide"));
+    }
+
+    // Audit finding 375: the export attestation carries the grant window,
+    // and retirement writes a signed marker beside the completed export.
+    #[tokio::test]
+    async fn export_attestation_carries_the_window_and_retirement_writes_a_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let mut grant = crate::store::tests::test_outbound_grant("existing", "", 0);
+        let now = crate::store::now_unix();
+        grant.created_at = now;
+        grant.expires_at = now + 3_600;
+        app.store.insert_outbound_grant(grant.clone()).unwrap();
+        let mut project = crate::workflow::tests::project();
+        project.require_approval = false;
+        project.destinations = vec!["destination".into()];
+        let mut job: Job = serde_json::from_value(json!({
+            "id":grant.id,"tenant":"","token_generation":0,"actor":"local","credential_version":1,
+            "request":crate::workflow::tests::request(),"project":project,
+            "state":"exporting","manifest":"frozen","attempts":1,"created_at":1,"updated_at":1,
+            "checks":{"destination_revisions":{"destination":0}}
+        }))
+        .unwrap();
+        app.store
+            .with(|connection| {
+                connection.execute(
+                    "INSERT INTO principals(subject, credential_version, blocked, created_at)
+                     VALUES ('local',1,0,0)
+                     ON CONFLICT(subject) DO UPDATE SET credential_version=1, blocked=0",
+                    [],
+                )?;
+                connection.execute(
+                    "INSERT INTO delivery_projects(tenant,id,revision,document)
+                     VALUES ('','project',0,?1)",
+                    rusqlite::params![serde_json::to_string(&project).unwrap()],
+                )?;
+                connection.execute(
+                    "INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,created_at,deadline,document,token)
+                     VALUES (?1,'','local','op','project','exporting',0,1,0,?2,'token')",
+                    rusqlite::params![job.id, serde_json::to_string(&job).unwrap()],
+                )
+            })
+            .unwrap();
+        let config: Storage = serde_json::from_value(json!({
+            "id":"destination","revision":0,"label":"Destination","kind":"folder",
+            "directory":directory.path().join("destination"),"tenants":[""],"enabled":true
+        }))
+        .unwrap();
+        std::fs::create_dir(directory.path().join("destination")).unwrap();
+        let config = app
+            .store
+            .save_delivery_storage("local", config, None)
+            .unwrap();
+        job.checks["destination_revisions"]["destination"] = json!(config.revision);
+        app.store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE delivery_jobs SET document=?2 WHERE id=?1",
+                    rusqlite::params![job.id, serde_json::to_string(&job).unwrap()],
+                )
+            })
+            .unwrap();
+        export_destination(&app, &job, &config).await.unwrap();
+        let completion = directory
+            .path()
+            .join("destination/deliveries/existing/frozen/complete.json");
+        let attestation: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&completion).unwrap()).unwrap();
+        assert_eq!(
+            attestation["document"]["format"],
+            "votport-delivery-export-v1"
+        );
+        assert_eq!(attestation["document"]["created_at"], grant.created_at);
+        assert_eq!(attestation["document"]["expires_at"], grant.expires_at);
+
+        let stored = app.store.delivery_job(&job.id).unwrap().unwrap();
+        assert_eq!(
+            stored.checks["destinations"]["destination"]["state"],
+            "complete"
+        );
+        mark_exports_retired(&app, &stored).await.unwrap();
+        let marker = directory
+            .path()
+            .join("destination/deliveries/existing/frozen/retired.json");
+        let marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+        assert_eq!(marker["document"]["format"], "votport-delivery-retired-v1");
+        assert_eq!(marker["document"]["job_id"], grant.id);
+        assert_eq!(marker["document"]["manifest"], "frozen");
+        assert!(marker["document"]["retired_at"].as_u64().is_some());
+        assert!(marker["signature"]
+            .as_str()
+            .is_some_and(|signature| !signature.is_empty()));
+        // Retirement retries after a crash must not fail on their own marker.
+        mark_exports_retired(&app, &stored).await.unwrap();
     }
 }

@@ -1728,6 +1728,12 @@ async fn retire_snapshot(app: &Arc<App>) -> Result<bool, String> {
     })
     .await
     .map_err(|_| "retire snapshot task failed")??;
+    // Audit finding 375: leave a signed retired.json beside each completed
+    // external export, so a retired delivery is not mistaken for a live one.
+    // Best effort: the snapshot cleanup must not stall on a dead destination.
+    if let Err(error) = storage::mark_exports_retired(app, &job).await {
+        tracing::warn!(job_id = %job.id, %error, "retired export marker failed");
+    }
     app.store
         .complete_snapshot_retirement(&job.id, now_unix())
         .map(|()| true)

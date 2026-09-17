@@ -3207,7 +3207,7 @@ fn audit_rows_round_trip_export_and_prune() {
 
     // Pruning removes only rows strictly older than the cutoff.
     let now = now_unix();
-    let pruned = store.audit_prune(now + 1).unwrap();
+    let pruned = store.audit_prune(now + 1, &[]).unwrap();
     assert_eq!(pruned, 2);
     assert!(store.audit_export(None, 0, 0, 100).unwrap().is_empty());
 
@@ -3254,7 +3254,7 @@ fn audit_count_tracks_mutations_rollbacks_pruning_and_reopen() {
         .with(|connection| connection.execute("DELETE FROM audit_log WHERE event='direct'", []))
         .unwrap();
     assert_eq!(store.audit_count().unwrap(), 1);
-    assert_eq!(store.audit_prune(now_unix() + 1).unwrap(), 1);
+    assert_eq!(store.audit_prune(now_unix() + 1, &[]).unwrap(), 1);
     assert_eq!(store.audit_count().unwrap(), 0);
 
     drop(store);
@@ -5960,4 +5960,54 @@ fn corrupt_grant_byte_limbs_are_refused_not_saturated() {
         page.is_err(),
         "corrupt limbs refuse the row instead of fabricating a total"
     );
+}
+
+// Audit finding 377: retention deletes the bytes but the tombstoned row
+// kept the in-package path, which can carry a person or project name. The
+// tombstone must blank the path while keeping the identity fields.
+#[test]
+fn tombstoning_blanks_the_in_package_path_but_keeps_the_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    let record = |id: &str, path: &str| UploadRecord {
+        id: id.to_owned(),
+        started_at: 0,
+        completed_at: 0,
+        transport: None,
+        package_root: "root".to_owned(),
+        total_bytes: 1,
+        partial: false,
+        replayed_chunks: 0,
+        rejected_chunks: 0,
+        log: Vec::new(),
+        files: vec![FileRecord {
+            path: path.into(),
+            stored_as: path.into(),
+            bytes: 1,
+            suite: "blake3".into(),
+            root: "aa".into(),
+            receipt: false,
+            deleted: false,
+        }],
+    };
+    let mut link = test_link("link");
+    link.uploads = vec![record("upload", "Report Final v2.xlsx")];
+    store.insert_link(link).unwrap();
+    assert!(store
+        .tombstone_files(
+            "",
+            "link",
+            &std::collections::HashSet::from(["Report Final v2.xlsx"])
+        )
+        .unwrap());
+    let file = store
+        .link_upload("", "link", "upload")
+        .unwrap()
+        .unwrap()
+        .files[0]
+        .clone();
+    assert!(file.deleted);
+    assert_eq!(file.stored_as, "Report Final v2.xlsx");
+    assert_eq!(file.path, "");
+    assert_eq!(store.tenant_received_bytes("").unwrap(), 0);
 }

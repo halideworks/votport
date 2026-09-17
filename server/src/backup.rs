@@ -1846,6 +1846,43 @@ async fn prune_s3_store(
     Ok(())
 }
 
+/// Audit finding 371: an operator must be able to discard a backup copy, or
+/// every pre-erasure archive keeps the full database restorable forever.
+pub fn delete_local_backup(root: &Path, id: &str) -> Result<bool, String> {
+    validate_id(id)?;
+    let root = ensure_backup_root(root)?;
+    let Some(_lock) = try_lock_backup_root(&root)? else {
+        return Err("backup root is busy".into());
+    };
+    let path = root.join(id);
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.to_string()),
+    };
+    if !meta.is_file() {
+        return Ok(false);
+    }
+    fs::remove_file(&path).map_err(|e| e.to_string())?;
+    sync_directory(&root)?;
+    Ok(true)
+}
+
+/// Audit finding 371: the S3 half of the on-demand backup deletion.
+pub async fn delete_s3_backup(
+    config: &BackupConfig,
+    secrets: &BackupSecrets,
+    id: &str,
+) -> Result<bool, String> {
+    validate_id(id)?;
+    let store = s3_store(config, secrets)?;
+    match store.delete(&s3_path(config, id)).await {
+        Ok(()) => Ok(true),
+        Err(object_store::Error::NotFound { .. }) => Ok(false),
+        Err(_) => Err("S3 backup deletion failed".to_owned()),
+    }
+}
+
 pub fn inventory_local_root(root: &Path) -> Result<Vec<InventoryItem>, String> {
     validate_private_ancestry(root, None)?;
     let mut result = Vec::new();

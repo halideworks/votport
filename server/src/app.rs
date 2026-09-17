@@ -12,7 +12,7 @@ use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse as _, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Json;
 use axum::Router;
 use rand::RngCore as _;
@@ -1168,6 +1168,65 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
 }
 
 impl App {
+    /// Audit finding 376: the legal-hold flag lives in a restorable row, so
+    /// a restore predating the hold would clear it and the next sweep could
+    /// delete held files. This marker lives outside the backup archive, so a
+    /// hold stays enforced until an operator releases it explicitly.
+    fn legal_holds_dir(&self) -> std::path::PathBuf {
+        self.config.data_dir.join("legal-holds")
+    }
+
+    fn valid_hold_id(id: &str) -> bool {
+        !id.is_empty()
+            && id.len() <= 255
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    }
+
+    /// Whether an out-of-database hold marker pins this link. Marker ids come
+    /// from the store or the admin route, never from client input.
+    pub(crate) fn link_hold_pinned(&self, id: &str) -> bool {
+        Self::valid_hold_id(id) && self.legal_holds_dir().join(id).is_file()
+    }
+
+    /// Creates or removes the hold marker. Ordered so a failure can only
+    /// leave a hold active, never silently dropped.
+    pub(crate) fn set_link_hold_pin(&self, id: &str, held: bool) -> std::io::Result<()> {
+        if !Self::valid_hold_id(id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid link id",
+            ));
+        }
+        let marker = self.legal_holds_dir().join(id);
+        if !held {
+            return match std::fs::remove_file(&marker) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            };
+        }
+        let dir = self.legal_holds_dir();
+        std::fs::create_dir_all(&dir)?;
+        crate::paths::tighten_private_dir(&dir)
+            .map_err(|error| std::io::Error::other(format!("tighten legal-holds dir: {error}")))?;
+        std::fs::File::create_new(&marker)?.sync_all()
+    }
+
+    /// Every pinned link id, for exempting their audit rows from pruning.
+    pub(crate) fn held_link_ids(&self) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(self.legal_holds_dir()) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| Self::valid_hold_id(name))
+            .collect()
+    }
+
     pub(crate) fn retention_observation(&self) -> Result<RetentionObservation, String> {
         self.retention_clock.observe(&self.store, now_unix())
     }
@@ -5493,6 +5552,10 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route("/api/admin/backups/restore", post(api::restore_backup))
         .route(
+            "/api/admin/backups/{source}/{id}",
+            delete(api::delete_backup),
+        )
+        .route(
             "/api/admin/tenants",
             get(api::list_tenants).post(api::create_tenant),
         )
@@ -7164,7 +7227,7 @@ fn expire_link_uploads_sync(
     effective_now: u64,
 ) -> Result<(), String> {
     app.receiving_destinations()?;
-    if candidate.legal_hold {
+    if candidate.legal_hold || app.link_hold_pinned(&candidate.id) {
         return Ok(());
     }
     match app
@@ -7535,7 +7598,11 @@ async fn sweep_daily_at(app: &Arc<App>, retention: RetentionObservation) {
     if settings.audit_retention_days > 0 {
         let cutoff = now.saturating_sub(settings.audit_retention_days.saturating_mul(86_400));
         sweep_task(app, "audit rows", move |app| {
-            match app.store.audit_prune(cutoff) {
+            // Finding 376: audit rows naming a held link establish who
+            // uploaded, so they outlive the retention cutoff until the hold
+            // is released.
+            let held = app.held_link_ids();
+            match app.store.audit_prune(cutoff, &held) {
                 Ok(count) => {
                     if count > 0 {
                         tracing::info!(count, "pruned expired audit rows");
@@ -9028,5 +9095,180 @@ mod audit_observability_tests {
             .find(|row| row.event == "upload_completed")
             .expect("the completed upload is recorded even without its link");
         assert_eq!(row.subject, "upload-9");
+    }
+}
+
+#[cfg(test)]
+mod legal_hold_marker_tests {
+    use super::*;
+    use crate::store::{Link, UploadRecord};
+    use axum::body::Body;
+    use tower::ServiceExt as _;
+
+    async fn login_cookie(router: Router) -> String {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/login")
+                    .header("content-type", "application/json")
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        1234,
+                    ))))
+                    .body(Body::from(format!(
+                        "{{\"password\":\"{}\"}}",
+                        crate::api::testing::TEST_PASSWORD
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+
+    // Audit finding 376: the legal-hold flag is a restorable row, so this
+    // test clears it the way a pre-hold restore would and proves the
+    // out-of-database marker still pins the sweep, the delete handlers, and
+    // audit pruning.
+    #[tokio::test]
+    async fn hold_marker_enforces_the_hold_after_a_restore_clears_the_flag() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        std::fs::create_dir_all(&app.config.receive_dir).unwrap();
+        let path = app.config.receive_dir.join("held.txt");
+        let file = crate::receiving::tests::published_file(
+            &path,
+            b"held",
+            vot_verifier::Suite::Blake3Bao64,
+            &app.signer,
+        );
+        app.store
+            .insert_link(Link {
+                id: "held".to_owned(),
+                tenant: String::new(),
+                label: "held".to_owned(),
+                dest: String::new(),
+                password_hash: None,
+                created_at: 0,
+                expires_at: None,
+                max_bytes: None,
+                active: true,
+                legal_hold: false,
+                notifications: None,
+                uploads: vec![UploadRecord {
+                    partial: false,
+                    log: Vec::new(),
+                    id: "upload".to_owned(),
+                    started_at: 0,
+                    completed_at: 1,
+                    replayed_chunks: 0,
+                    rejected_chunks: 0,
+                    transport: None,
+                    package_root: "root".to_owned(),
+                    total_bytes: file.bytes,
+                    files: vec![file],
+                }],
+                events: Vec::new(),
+            })
+            .unwrap();
+        let cookie = login_cookie(router(app.clone())).await;
+        let response = router(app.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/links/held")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{\"legal_hold\":true}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(app.link_hold_pinned("held"), "the API pins the marker");
+
+        // A backup restored from before the hold clears the restorable flag;
+        // the marker file is not in the archive and survives.
+        app.store
+            .set_link_legal_hold("", "held", false, "restore")
+            .unwrap();
+        assert!(!app.store.link("", "held").unwrap().unwrap().legal_hold);
+        assert!(app.link_hold_pinned("held"));
+
+        // The retention sweep skips the link and keeps its bytes.
+        let cutoff = now_unix() + 1;
+        let candidate = app.store.link("", "held").unwrap().unwrap();
+        expire_link_uploads(&app, candidate, cutoff, cutoff)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(path.exists(), "the marker alone must hold the sweep");
+        // Delete handlers refuse every received-data deletion for the link.
+        for uri in [
+            "/api/admin/links/held",
+            "/api/admin/links/held/uploads/upload",
+            "/api/admin/links/held/uploads/upload/files/0",
+        ] {
+            let response = router(app.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(uri)
+                        .header("cookie", &cookie)
+                        .header("x-votport", "1")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{uri}");
+        }
+        // Audit rows naming the held link survive pruning.
+        app.store
+            .audit("", "", "upload_completed", "held", &serde_json::json!({}));
+        app.store
+            .audit("", "", "upload_completed", "gone", &serde_json::json!({}));
+        app.store.audit_prune(cutoff, &app.held_link_ids()).unwrap();
+        let rows = app.store.audit_export(None, 0, 0, 100).unwrap();
+        assert!(rows
+            .iter()
+            .any(|row| row.event == "upload_completed" && row.subject == "held"));
+        assert!(!rows
+            .iter()
+            .any(|row| row.event == "upload_completed" && row.subject == "gone"));
+
+        // Releasing the hold removes the marker and lets retention run.
+        let response = router(app.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/links/held")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{\"legal_hold\":false}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!app.link_hold_pinned("held"));
+        let candidate = app.store.link("", "held").unwrap().unwrap();
+        expire_link_uploads(&app, candidate, cutoff, cutoff)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!path.exists());
     }
 }
