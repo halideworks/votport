@@ -690,6 +690,13 @@ environment:
   VOTPORT_TRUSTED_PROXIES: "10.1.2.3/32"      # example only
 ```
 
+The tracked `docker-compose.yml` sets `172.16.0.0/12` because its reverse
+proxy is the Caddy container on the same compose network, and every
+Docker-created user bridge draws from that range. Change it when that trust
+assumption changes: name the proxy's exact address (found as below) when
+other containers on the host are not trusted, and replace it when the proxy
+moves off the compose network.
+
 Do not copy an address out of this document, and do not assume a container
 bridge gateway is stable, because Docker assigns those when it creates the
 network. Determine it for your own deployment: send one request **through the

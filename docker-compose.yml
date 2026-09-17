@@ -45,6 +45,12 @@ services:
     environment:
       VOTPORT_ADMIN_PASSWORD: "${VOTPORT_ADMIN_PASSWORD:?set VOTPORT_ADMIN_PASSWORD in .env}"
       VOTPORT_PUBLIC_URL: "https://receive.davidtorcivia.com"
+      # The reverse proxy (Caddy) connects from the shared compose network,
+      # so its X-Forwarded-For is believed; anything else is keyed on its
+      # socket address. 172.16.0.0/12 is the Docker user-bridge range; name
+      # the proxy's exact address instead if other containers are untrusted
+      # (docs/deployment.md, Client addresses).
+      VOTPORT_TRUSTED_PROXIES: "172.16.0.0/12"
       # 500 GiB per upload session.
       VOTPORT_MAX_UPLOAD_BYTES: "536870912000"
       VOTPORT_ALLOW_HIDDEN: "1"

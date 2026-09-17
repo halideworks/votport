@@ -864,9 +864,27 @@ pub(super) async fn export(app: &Arc<App>, job: &Job) -> ApiResult<()> {
     .buffer_unordered(2);
     while let Some((id, label, result)) = transfers.next().await {
         if let Err(error) = result {
-            app.store
-                .fail_delivery_destination(&job.id, job.attempts, &id, &error.message)
-                .map_err(conflict)?;
+            // Record the leg failure without returning early: the sibling
+            // leg may still hold an in-flight multipart upload, and a
+            // dropped future never aborts it (object_store has no Drop
+            // abort), so already-uploaded parts stay billable until a
+            // lifecycle rule expires them. Draining both legs is also the
+            // only shape that helps here: the server's SIGTERM path exits
+            // the process, which skips destructors, so an abort-on-drop
+            // guard would not fire on shutdown either.
+            if let Err(record) =
+                app.store
+                    .fail_delivery_destination(&job.id, job.attempts, &id, &error.message)
+            {
+                tracing::warn!(
+                    job_id = %job.id,
+                    destination = %id,
+                    %record,
+                    "record delivery destination failure"
+                );
+                failures.push(format!("{}: {}", label, record));
+                continue;
+            }
             if job.checks["destinations"][&id]["state"] != "failed" {
                 if let (Ok(Some(route)), Ok(policy)) = (
                     app.store.trade_route(&job.tenant, &id),

@@ -10515,11 +10515,14 @@ mod tests {
         write(&expired, old);
         write(&abandoned, old);
         write(&recent, old + Duration::from_secs(1));
+        let completed_stripe = outbound_upload_stripe(&completed_destination);
         let active_destination = (0..1000)
             .map(|i| root.join(format!("active-{i}.bin")))
             .find(|path| {
                 let stripe = outbound_upload_stripe(path);
-                stripe > 1 && stripe != outbound_upload_stripe(&destination)
+                stripe > 1
+                    && stripe != outbound_upload_stripe(&destination)
+                    && stripe != completed_stripe
             })
             .unwrap();
         let active = stage(&active_destination, &"d".repeat(64));

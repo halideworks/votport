@@ -896,6 +896,7 @@ mod tests {
             actor: "sso:sender".into(),
             credential_version: 3,
             automation_token_id: None,
+            actor_human: None,
             request,
             project: project(),
             state: if grant { "ready" } else { "queued" }.into(),

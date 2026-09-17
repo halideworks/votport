@@ -44,6 +44,12 @@ Both scripts need bash, curl, `timeout`, and python3 on the host running
 them; python3 builds the sign-in body and parses `/readyz`, and both scripts
 check for it before changing any state.
 
+The scripts sign in with `VOTPORT_ADMIN_PASSWORD`, and that must be the
+**current** password: one changed on the System page lives in the database and
+takes precedence over the environment value, so a stale variable fails
+sign-in. `planned.sh` says so when `/api/admin/login` refuses it; update the
+variable before the next run.
+
 Run `scripts/restart-e2e.mjs` in both modes before relying on either script;
 it exercises the same sequence against the real binary. `DRY_RUN=1` on
 either script prints every step and changes nothing (no sign-in, no drain);

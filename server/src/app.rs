@@ -3804,6 +3804,32 @@ mod health_tests {
     }
 
     #[tokio::test]
+    async fn strict_transport_security_follows_the_https_public_origin() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let response = router(app)
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers()[header::STRICT_TRANSPORT_SECURITY],
+            "max-age=31536000"
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::api::testing::config(directory.path());
+        config.public_url = Some("http://localhost:8103".to_owned());
+        let app = crate::app::build(config).unwrap();
+        let response = router(app)
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(!response
+            .headers()
+            .contains_key(header::STRICT_TRANSPORT_SECURITY));
+    }
+
+    #[tokio::test]
     async fn suspension_deadline_includes_a_full_worker_queue() {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
@@ -5413,7 +5439,7 @@ pub fn router(app: Arc<App>) -> Router {
         })
     };
 
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         // Pages.
@@ -5839,8 +5865,28 @@ pub fn router(app: Arc<App>) -> Router {
             Arc::clone(&app),
             request_observability,
         ))
-        .layer(axum::middleware::from_fn(api_response_policy))
-        .with_state(app)
+        .layer(axum::middleware::from_fn(api_response_policy));
+    // HSTS follows the same rule as the Secure cookie attribute: the
+    // operator-declared public origin decides. The request scheme is
+    // invisible behind a terminating proxy and X-Forwarded-Proto is only
+    // believed from named proxies, so public_url is the one honest signal;
+    // browsers ignore the header over plain http either way.
+    let router = if app
+        .config
+        .public_url
+        .as_deref()
+        .is_some_and(|url| url.starts_with("https://"))
+    {
+        router.layer(
+            tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+                header::STRICT_TRANSPORT_SECURITY,
+                header::HeaderValue::from_static("max-age=31536000"),
+            ),
+        )
+    } else {
+        router
+    };
+    router.with_state(app)
 }
 
 async fn push_identity(State(app): State<Arc<App>>) -> Response {
