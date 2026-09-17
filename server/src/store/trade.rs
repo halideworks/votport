@@ -109,6 +109,18 @@ fn write_route(connection: &Connection, route: &TradeRoute) -> Result<(), String
 }
 
 impl Store {
+    /// Routes a peer has marked unreachable in its own state document.
+    /// Drives the votport_trade_routes_unreachable gauge.
+    pub fn unreachable_trade_routes(&self) -> Result<u64, String> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM trade_routes WHERE json_extract(document,'$.state')='unreachable'",
+                [],
+                |r| r.get::<_, i64>(0).map(|count| count.max(0) as u64),
+            )
+        })
+    }
+
     pub fn trade_endpoints(&self, tenant: &str) -> Result<Vec<TradeEndpoint>, String> {
         self.with(|c| {
             c.prepare("SELECT document FROM trade_endpoints WHERE tenant=?1 ORDER BY id")?

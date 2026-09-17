@@ -312,6 +312,13 @@ pub struct App {
     /// Set when a heartbeat finds another holder in the lease file; the
     /// process is then shutting down and /readyz reports it.
     pub lease_lost: AtomicBool,
+    /// How often the process lost the receive-root lease. The process exits
+    /// on the same heartbeat, so the final log line and the `lease_lost`
+    /// audit row carry the value; a scrape rarely observes it live.
+    pub lease_lost_total: AtomicU64,
+    /// Set with the `mount_disqualified` audit row when the storage was
+    /// remounted instead of taken over; /readyz reports it alongside lease.
+    pub mount_disqualified: AtomicBool,
     health: HealthCache,
 }
 
@@ -1120,6 +1127,8 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         receiving_permits: Arc::new(tokio::sync::Semaphore::new(RECEIVING_CHECK_CONCURRENCY)),
         receiving_reconfigure: Arc::new(tokio::sync::Semaphore::new(1)),
         lease_lost: AtomicBool::new(false),
+        lease_lost_total: AtomicU64::new(0),
+        mount_disqualified: AtomicBool::new(false),
         health: HealthCache::default(),
         config,
     }))
@@ -1888,7 +1897,9 @@ pub fn release_data_lock(app: &App) {
     let _ = rustix::fs::flock(&app._data_lock, rustix::fs::FlockOperation::Unlock);
 }
 
-/// Any failed ownership check stops receiving before another heartbeat can renew.
+/// Any failed ownership check stops receiving before another heartbeat can
+/// renew. A lease takeover and a remount of disqualified storage both stop
+/// receiving here, but each writes its own audit row and final log line.
 pub fn renew_lease(app: &App, now: u64) -> bool {
     if app.lease_lost.load(Ordering::Relaxed) {
         return false;
@@ -1904,8 +1915,28 @@ pub fn renew_lease(app: &App, now: u64) -> bool {
     match active.renew(now) {
         Ok(()) => true,
         Err(error) => {
-            tracing::error!(%error, "receiving storage ownership check failed");
             app.lease_lost.store(true, Ordering::Relaxed);
+            if active.destinations.disqualified() {
+                tracing::error!(%error, "receiving storage was remounted with disqualifying options");
+                app.mount_disqualified.store(true, Ordering::Release);
+                app.store.audit(
+                    "",
+                    "",
+                    "mount_disqualified",
+                    "",
+                    &serde_json::json!({ "holder": app.lease_holder, "error": error }),
+                );
+            } else {
+                tracing::error!(%error, "receiving storage ownership check failed");
+                app.lease_lost_total.fetch_add(1, Ordering::Relaxed);
+                app.store.audit(
+                    "",
+                    "",
+                    "lease_lost",
+                    "",
+                    &serde_json::json!({ "holder": app.lease_holder }),
+                );
+            }
             false
         }
     }
@@ -1934,6 +1965,16 @@ pub async fn lease_keeper(app: Arc<App>) {
         if !renew_lease_once(&app).await {
             app.lease_lost.store(true, Ordering::Release);
             suspend_sessions(&app).await;
+            if app.mount_disqualified.load(Ordering::Relaxed) {
+                tracing::error!(
+                    "exiting: the receiving mount was remounted with disqualifying options"
+                );
+            } else {
+                tracing::error!(
+                    lease_lost_total = app.lease_lost_total.load(Ordering::Relaxed),
+                    "exiting: the receive-root lease was lost"
+                );
+            }
             std::process::exit(1);
         }
     }
@@ -3019,57 +3060,59 @@ async fn healthz(State(app): State<Arc<App>>) -> Response {
 /// up on purpose (docs/deployment.md, Scaling and availability). The body
 /// carries the active upload count so a failover script can wait for zero.
 async fn readyz(State(app): State<Arc<App>>) -> Response {
-    if app.is_stopping() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "ready": false,
-                "draining": true,
-                "sessions_active": app.sessions.total(),
-                "lease": {
-                    "holder": serde_json::Value::Null,
-                    "mine": false,
-                    "age_secs": serde_json::Value::Null,
-                    "lost": app.lease_lost.load(Ordering::Relaxed),
-                },
-            })),
-        )
-            .into_response();
-    }
-    let snapshot = health_snapshot(&app).await;
-    let lease_lost = app.lease_lost.load(Ordering::Relaxed);
-    let (ready, draining) = match snapshot.as_ref() {
-        Some(HealthSnapshot {
-            healthy: true,
-            draining: Some(draining),
-            ..
-        }) => (!draining && !lease_lost, *draining),
-        _ => (false, false),
-    };
-    let now = now_unix();
-    let lease = snapshot
-        .and_then(|snapshot| snapshot.lease)
-        .filter(|_| !lease_lost);
+    let mut body = health_status(&app).await;
+    body["sessions_active"] = serde_json::json!(app.sessions.total());
+    let ready = body["ready"].as_bool().unwrap_or(false);
     let status = if ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (
-        status,
-        Json(serde_json::json!({
-            "ready": ready,
-            "draining": draining,
-            "sessions_active": app.sessions.total(),
-            "lease": {
-                "holder": lease.as_ref().map(|lease| lease.holder.clone()),
-                "mine": lease.as_ref().is_some_and(|lease| lease.holder == app.lease_holder),
-                "age_secs": lease.as_ref().map(|lease| lease.age(now)),
-                "lost": lease_lost,
-            },
-        })),
-    )
-        .into_response()
+    (status, Json(body)).into_response()
+}
+
+/// The health and readiness state /healthz and /readyz report, as one
+/// document for the admin status strip and the readiness endpoint. One
+/// source of truth: the dashboard cannot disagree with the probes.
+pub(crate) async fn health_status(app: &Arc<App>) -> serde_json::Value {
+    let stopping = app.is_stopping();
+    let snapshot = if stopping {
+        None
+    } else {
+        health_snapshot(app).await
+    };
+    let lease_lost = app.lease_lost.load(Ordering::Relaxed);
+    let healthy = snapshot.as_ref().is_some_and(|s| s.healthy) && !lease_lost;
+    let (ready, draining) = if stopping {
+        (false, true)
+    } else {
+        match snapshot.as_ref() {
+            Some(HealthSnapshot {
+                healthy: true,
+                draining: Some(draining),
+                ..
+            }) => (!draining && !lease_lost, *draining),
+            _ => (false, false),
+        }
+    };
+    let lease = snapshot
+        .and_then(|snapshot| snapshot.lease)
+        .filter(|_| !lease_lost);
+    let now = now_unix();
+    serde_json::json!({
+        "healthy": healthy,
+        "ready": ready,
+        "draining": draining,
+        "lease": {
+            "holder": lease.as_ref().map(|lease| lease.holder.clone()),
+            "mine": lease.as_ref().is_some_and(|lease| lease.holder == app.lease_holder),
+            "age_secs": lease.as_ref().map(|lease| lease.age(now)),
+            "lost": lease_lost,
+        },
+        "mount": {
+            "disqualified": app.mount_disqualified.load(Ordering::Relaxed),
+        },
+    })
 }
 
 #[cfg(test)]
@@ -4146,6 +4189,73 @@ mod health_tests {
     }
 
     #[test]
+    fn lease_loss_writes_an_audit_row_and_counts_the_loss() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let path = crate::lease::path(&app.config.receive_dir);
+        // Another writer overwrites the lease file while we still hold the
+        // lock: the next heartbeat is the takeover path.
+        std::fs::write(
+            &path,
+            br#"{"holder":"other-instance","acquired_at":1,"renewed_at":1}"#,
+        )
+        .unwrap();
+
+        assert!(!renew_lease(&app, crate::store::now_unix()));
+        assert!(app.lease_lost.load(Ordering::Relaxed));
+        assert_eq!(app.lease_lost_total.load(Ordering::Relaxed), 1);
+        assert!(!app.mount_disqualified.load(Ordering::Relaxed));
+        let rows = app.store.audit_recent(None, u64::MAX, 10).unwrap();
+        let lost = rows
+            .iter()
+            .find(|row| row.event == "lease_lost")
+            .expect("lease takeover writes an audit row");
+        assert_eq!(lost.detail["holder"], app.lease_holder.as_str());
+        assert!(metrics_text(&app)
+            .unwrap()
+            .contains("votport_lease_lost_total 1\n"));
+        release_data_lock(&app);
+    }
+
+    #[tokio::test]
+    async fn a_remounted_receive_root_is_reported_as_mount_disqualified() {
+        use http_body_util::BodyExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        // Swap the directory under the held path, the way a remount onto a
+        // new filesystem would: the stored identity no longer matches.
+        let receive = app.config.receive_dir.clone();
+        let moved = receive.with_extension("moved");
+        std::fs::rename(&receive, &moved).unwrap();
+        std::fs::create_dir(&receive).unwrap();
+
+        assert!(!renew_lease(&app, crate::store::now_unix()));
+        assert!(app.mount_disqualified.load(Ordering::Relaxed));
+        assert!(app.lease_lost.load(Ordering::Relaxed));
+        assert_eq!(app.lease_lost_total.load(Ordering::Relaxed), 0);
+        let rows = app.store.audit_recent(None, u64::MAX, 10).unwrap();
+        let disqualified = rows
+            .iter()
+            .find(|row| row.event == "mount_disqualified")
+            .expect("a remount writes its own audit row");
+        assert_eq!(disqualified.detail["holder"], app.lease_holder.as_str());
+        assert!(disqualified.detail["error"]
+            .as_str()
+            .unwrap()
+            .contains("receiving folder or mount changed"));
+        let response = router(app.clone())
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["mount"]["disqualified"], true);
+        assert_eq!(json["ready"], false);
+        release_data_lock(&app);
+    }
+
+    #[test]
     fn metrics_reports_the_maintained_audit_count() {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
@@ -4155,6 +4265,75 @@ mod health_tests {
         let metrics = metrics_text(&app).unwrap();
         assert!(metrics.contains("votport_audit_rows 1\n"));
         assert!(metrics.contains("votport_delivery_event_chain_failures_total "));
+    }
+
+    #[test]
+    fn metrics_expose_the_detectable_failure_states() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let document = serde_json::json!({
+            "id":"d1","revision":1,"label":"Ops","channel":"webhook",
+            "target":"https://example.test/hook","enabled":true,
+            "url":"https://example.test/hook","token":"","user":"",
+            "recipients":[],"thread_id":""
+        })
+        .to_string();
+        app.store
+            .with(|c| {
+                c.execute(
+                    "INSERT INTO notification_destinations(id,tenant,document,last_at,last_delivered) VALUES('d1','fixture',?1,1,0)",
+                    [&document],
+                )?;
+                c.execute(
+                    "INSERT INTO delivery_webhook_attempts(tenant,event_id,revision,status,attempts,next_try) VALUES('fixture',1,1,'dead',12,0)",
+                    [],
+                )?;
+                c.execute(
+                    "INSERT INTO trade_routes(id,tenant,direction,peer_key,endpoint,document,credential) VALUES('r1','fixture','inbound','peer','endpoint','{\"state\":\"unreachable\"}','secret')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let metrics = metrics_text(&app).unwrap();
+        for line in [
+            "votport_backup_failing 0\n",
+            "votport_standby_lag_seconds 0\n",
+            "votport_notification_destinations_failing 1\n",
+            "votport_webhook_attempts_dead 1\n",
+            "votport_trade_routes_unreachable 1\n",
+            "votport_retention_sweep_failures_total 0\n",
+            "votport_migration_pending 0\n",
+            "votport_lease_lost_total 0\n",
+        ] {
+            assert!(metrics.contains(line), "expected metrics line {line}");
+        }
+
+        // An enabled backup whose last attempt failed counts as failing.
+        std::fs::write(
+            app.config.data_dir.join("backup-status.json"),
+            br#"{"running":false,"last_attempt_at":1,"last_success_at":null,"last_error":"disk full"}"#,
+        )
+        .unwrap();
+        app.store
+            .put_settings(
+                "test",
+                &[(
+                    crate::backup::SETTING_KEY.to_owned(),
+                    crate::store::SettingWrite::Set(
+                        serde_json::to_string(&crate::backup::BackupConfig {
+                            enabled: true,
+                            interval_secs: 86_400,
+                            ..Default::default()
+                        })
+                        .unwrap(),
+                    ),
+                )],
+            )
+            .unwrap();
+        let metrics = metrics_text(&app).unwrap();
+        assert!(metrics.contains("votport_backup_failing 1\n"));
     }
 }
 
@@ -6422,6 +6601,27 @@ async fn metrics(State(app): State<std::sync::Arc<App>>, headers: HeaderMap) -> 
         .into_response()
 }
 
+/// True when an enabled backup has failed, never completed, or its last
+/// success is overdue by more than two intervals: the worker is stuck or
+/// stopped. Sourced from the same status file and config the backups API
+/// reports, at scrape time.
+fn backup_failing(app: &App, now: u64) -> bool {
+    let Ok(setting) = app.store.setting(crate::backup::SETTING_KEY) else {
+        return false;
+    };
+    let Ok(config) = crate::backup::decode_config(setting) else {
+        return true;
+    };
+    if !config.enabled {
+        return false;
+    }
+    let status = crate::backup::read_status(&app.config.data_dir).unwrap_or_default();
+    status.last_error.is_some()
+        || status
+            .last_success_at
+            .is_none_or(|at| now.saturating_sub(at) >= config.interval_secs.saturating_mul(2))
+}
+
 fn metrics_text(app: &App) -> Result<String, String> {
     let usage = app.store.tenant_usage()?;
     let mut body = format!(
@@ -6526,6 +6726,55 @@ fn metrics_text(app: &App) -> Result<String, String> {
         "# TYPE votport_integrity_failures_total counter\nvotport_integrity_failures_total {}\n",
         crate::api::outbound::OUTBOUND_INTEGRITY_FAILURES
             .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    let _ = write!(
+        body,
+        "# TYPE votport_retention_sweep_failures_total counter\nvotport_retention_sweep_failures_total {}\n",
+        RETENTION_SWEEP_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    // Every gauge below is read from state another code path already
+    // detects: the store rows, the backup and standby status files, and the
+    // staged restore marker. No new background work at scrape time.
+    let _ = write!(
+        body,
+        "# TYPE votport_backup_failing gauge\nvotport_backup_failing {}\n",
+        u8::from(backup_failing(app, now_unix()))
+    );
+    let standby_lag = crate::standby::read_status(&app.config.data_dir)
+        .and_then(|status| status.last_success_at)
+        .map_or(0, |at| now_unix().saturating_sub(at));
+    let _ = write!(
+        body,
+        "# TYPE votport_standby_lag_seconds gauge\nvotport_standby_lag_seconds {standby_lag}\n"
+    );
+    let _ = write!(
+        body,
+        "# TYPE votport_notification_destinations_failing gauge\nvotport_notification_destinations_failing {}\n",
+        app.store.failing_notification_destinations()?
+    );
+    let _ = write!(
+        body,
+        "# TYPE votport_webhook_attempts_dead gauge\nvotport_webhook_attempts_dead {}\n",
+        app.store.dead_delivery_webhooks()?
+    );
+    let _ = write!(
+        body,
+        "# TYPE votport_trade_routes_unreachable gauge\nvotport_trade_routes_unreachable {}\n",
+        app.store.unreachable_trade_routes()?
+    );
+    let _ = write!(
+        body,
+        "# TYPE votport_migration_pending gauge\nvotport_migration_pending {}\n",
+        u8::from(
+            crate::backup::pending_restore_stage(&app.config.data_dir)
+                .map(|staged| staged.is_some())
+                .unwrap_or(false)
+        )
+    );
+    let _ = write!(
+        body,
+        "# TYPE votport_lease_lost_total counter\nvotport_lease_lost_total {}\n",
+        app.lease_lost_total.load(Ordering::Relaxed)
     );
     let _ = write!(
         body,
@@ -6828,10 +7077,14 @@ async fn expire_link_uploads(
     cutoff: u64,
     effective_now: u64,
 ) -> Option<Result<(), String>> {
-    sweep_task(app, "upload retention", move |app| {
+    let result = sweep_task(app, "upload retention", move |app| {
         expire_link_uploads_sync(app, candidate, cutoff, effective_now)
     })
-    .await
+    .await;
+    if result.is_none() {
+        retention_sweep_failure();
+    }
+    result
 }
 
 fn expire_link_uploads_sync(
@@ -6851,6 +7104,7 @@ fn expire_link_uploads_sync(
         Ok(false) => {}
         Ok(true) => return Ok(()),
         Err(error) => {
+            retention_sweep_failure();
             tracing::error!(%error, "read incoming workflows; skipping retention");
             return Ok(());
         }
@@ -6865,6 +7119,7 @@ fn expire_link_uploads_sync(
         Ok(Some(link)) if !link.legal_hold => link,
         Ok(_) => return Ok(()),
         Err(error) => {
+            retention_sweep_failure();
             tracing::error!(%error, "link re-read failed; skipping retention for link");
             return Ok(());
         }
@@ -6884,6 +7139,7 @@ fn expire_link_uploads_sync(
         {
             Ok(keys) => keys,
             Err(error) => {
+                retention_sweep_failure();
                 tracing::error!(%error, "outbound grant read failed; skipping retention for link");
                 return Ok(());
             }
@@ -6900,6 +7156,7 @@ fn expire_link_uploads_sync(
         }
     }
     if !active_outbound_files.is_empty() {
+        retention_sweep_failure();
         tracing::error!("outbound grant references a missing file; skipping retention for link");
         return Ok(());
     }
@@ -6985,6 +7242,7 @@ fn expire_link_uploads_sync(
             );
         }
         Err(error) => {
+            retention_sweep_failure();
             tracing::error!(link = %link.id, %error, "retention failed; files were retained")
         }
     }
@@ -7132,6 +7390,14 @@ async fn session_sweeper_with_delays(
     );
 }
 
+/// Counts every retention sweep that skipped or failed work. The sweep
+/// paths log each occurrence where it happens; this is the scrapeable sum.
+static RETENTION_SWEEP_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+fn retention_sweep_failure() {
+    RETENTION_SWEEP_FAILURES.fetch_add(1, Ordering::Relaxed);
+}
+
 async fn sweep_task<T: Send + 'static>(
     app: &Arc<App>,
     duty: &'static str,
@@ -7165,10 +7431,14 @@ async fn sweep_daily(app: &Arc<App>) {
         match sweep_task(app, "retention clock", |app| app.retention_observation()).await {
             Some(Ok(retention)) => retention,
             Some(Err(error)) => {
+                retention_sweep_failure();
                 tracing::error!(%error, "retention clock read failed; skipping this sweep");
                 return;
             }
-            None => return,
+            None => {
+                retention_sweep_failure();
+                return;
+            }
         };
     sweep_daily_at(app, retention).await;
 }
@@ -7189,6 +7459,7 @@ async fn sweep_daily_at(app: &Arc<App>, retention: RetentionObservation) {
     {
         Some(Ok(settings)) => settings,
         Some(Err(error)) => {
+            retention_sweep_failure();
             tracing::error!(%error, "settings read failed; skipping this sweep");
             return;
         }
@@ -7221,7 +7492,10 @@ async fn sweep_daily_at(app: &Arc<App>, retention: RetentionObservation) {
                         }),
                     );
                 }
-                Err(error) => tracing::warn!("audit prune failed: {error}"),
+                Err(error) => {
+                    retention_sweep_failure();
+                    tracing::warn!("audit prune failed: {error}")
+                }
             }
         })
         .await;
@@ -7245,10 +7519,14 @@ async fn sweep_daily_at(app: &Arc<App>, retention: RetentionObservation) {
             {
                 Some(Ok(link_ids)) => link_ids,
                 Some(Err(error)) => {
+                    retention_sweep_failure();
                     tracing::error!(%error, "link read failed; skipping the retention sweep");
                     return;
                 }
-                None => return,
+                None => {
+                    retention_sweep_failure();
+                    return;
+                }
             };
             let page_len = link_ids.len();
             for (tenant, id) in link_ids {
@@ -7263,14 +7541,19 @@ async fn sweep_daily_at(app: &Arc<App>, retention: RetentionObservation) {
                     Some(Ok(Some(link))) => link,
                     Some(Ok(None)) => continue,
                     Some(Err(error)) => {
+                        retention_sweep_failure();
                         tracing::error!(%error, "link read failed; skipping retention for link");
                         continue;
                     }
-                    None => return,
+                    None => {
+                        retention_sweep_failure();
+                        return;
+                    }
                 };
                 match expire_link_uploads(app, link, cutoff, now).await {
                     Some(Ok(())) => {}
                     Some(Err(error)) => {
+                        retention_sweep_failure();
                         tracing::error!(%error, "retention stopped; receiving storage unavailable");
                         return;
                     }

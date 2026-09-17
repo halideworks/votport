@@ -997,6 +997,7 @@ pub async fn admin_status(
     if stale_error.is_none() && stale {
         stale_error = Some("cached status is older than its refresh window".to_owned());
     }
+    let health = crate::app::health_status(&app).await;
     Ok(Json(json!({
         "now": now,
         "sessions_active": receiving.len(),
@@ -1009,6 +1010,11 @@ pub async fn admin_status(
         "sampled_at": sampled_at,
         "stale": stale,
         "stale_error": stale_error,
+        "health": health["healthy"].clone(),
+        "ready": health["ready"].clone(),
+        "draining": health["draining"].clone(),
+        "lease": health["lease"].clone(),
+        "mount": health["mount"].clone(),
     })))
 }
 
@@ -1020,6 +1026,35 @@ mod status_cache_tests {
     use axum::http::Request;
     use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
+
+    #[tokio::test]
+    async fn admin_status_carries_health_readiness_lease_and_draining() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = crate::api::testing::build(directory.path());
+        let cookie = test_admin_cookie(&application, &auth::AdminIdentity::local_admin());
+        let response = crate::app::router(Arc::clone(&application))
+            .oneshot(
+                Request::get("/api/admin/status")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // The dashboard strip paints a banner from these fields; they must
+        // mirror what /readyz reports.
+        assert_eq!(body["health"], true);
+        assert_eq!(body["ready"], true);
+        assert_eq!(body["draining"], false);
+        assert_eq!(body["lease"]["mine"], true);
+        assert_eq!(body["lease"]["lost"], false);
+        assert_eq!(body["lease"]["holder"], application.lease_holder);
+        assert!(body["lease"]["age_secs"].as_u64().is_some());
+        assert_eq!(body["mount"]["disqualified"], false);
+    }
 
     #[tokio::test]
     async fn concurrent_polls_share_one_refresh_and_publish_stale_metadata() {

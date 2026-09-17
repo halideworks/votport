@@ -71,7 +71,7 @@ try {
   await page.getByText('Test failed for Blocked: The destination did not accept the test. Check its connection settings and try again.', { exact: true }).waitFor();
   await page.waitForTimeout(350);
   await page.getByText('Test failed for Blocked: The destination did not accept the test. Check its connection settings and try again.', { exact: true }).waitFor();
-  await blockedCard.getByText('Failed; check connection settings', { exact: false }).waitFor();
+  await blockedCard.getByText(/^Last attempt [^]*?Failed(: |; )/, { exact: false }).waitFor();
   const removed = await context.request.post(`${base}/api/admin/notifications/test`, { headers: { 'X-Votport': '1' } });
   assert.equal(removed.status(), 404);
   const rejected = await context.request.put(`${base}/api/admin/settings`, { headers: { 'X-Votport': '1' }, data: { notify_slack: 'https://example.test/removed' } });
