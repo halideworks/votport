@@ -49,7 +49,7 @@
       <p class="field-help">Destinations belong to the current tenant. The destination name identifies the connection; its label helps people choose it. Adding one does not subscribe existing transfers.</p>
       <form data-unsaved id="notification-form" class="card editor" hidden>
         <div class="section-heading"><h2 id="notification-editor-title">Add destination</h2><button id="notification-cancel" type="button" class="ghost">Cancel</button></div>
-        <div class="grid"><label>Destination name<input id="nd-label" required maxlength="100" placeholder="Production updates" /></label><label>Service<select id="nd-channel"></select></label></div>
+        <div class="grid"><label>Destination name<input id="nd-label" required maxlength="100" placeholder="Production updates" aria-describedby="notification-error" /></label><label>Service<select id="nd-channel"></select></label></div>
         <label>Label<input id="nd-target" required maxlength="200" placeholder="Production workspace · #incoming" /><span class="field-help">Shown when people choose a destination. It does not change the service channel, chat, space, or recipients that receive messages.</span></label>
         <p id="nd-guide" class="field-help"></p>
         <label id="nd-url-field">Webhook or topic URL<input id="nd-url" type="password" autocomplete="new-password" maxlength="8192" spellcheck="false" /><span class="field-help">Use a separate destination for each channel or chat. When editing, leave blank to keep the saved URL.</span></label>

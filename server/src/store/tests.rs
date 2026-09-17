@@ -975,8 +975,14 @@ fn automation_tokens_round_trip_and_list_by_tenant() {
         .insert_automation_token(test_automation_token("t2", "other"))
         .unwrap();
 
-    assert_eq!(store.automation_tokens("acme").unwrap(), vec![token]);
-    assert!(store.automation_tokens("missing").unwrap().is_empty());
+    assert_eq!(
+        store.automation_tokens("acme", "", 100).unwrap(),
+        vec![token]
+    );
+    assert!(store
+        .automation_tokens("missing", "", 100)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -1050,7 +1056,7 @@ fn remove_tenant_cleans_outbound_credentials_atomically() {
             .unwrap(),
         0
     );
-    assert!(store.automation_tokens("acme").unwrap().is_empty());
+    assert!(store.automation_tokens("acme", "", 100).unwrap().is_empty());
     assert!(store
         .authenticate_automation_token("hash-token", 15)
         .unwrap()
@@ -1070,7 +1076,10 @@ fn automation_token_authentication_updates_last_used_atomically() {
         .unwrap()
         .unwrap();
     assert_eq!(authenticated.last_used_at, Some(15));
-    assert_eq!(store.automation_tokens("acme").unwrap()[0], authenticated);
+    assert_eq!(
+        store.automation_tokens("acme", "", 100).unwrap()[0],
+        authenticated
+    );
     assert!(store
         .authenticate_automation_token("hash-t1", 20)
         .unwrap()
@@ -1093,7 +1102,7 @@ fn automation_token_revocation_is_tenant_scoped_and_idempotent() {
     assert!(store.revoke_automation_token("acme", "t1", 16).unwrap());
     assert!(!store.revoke_automation_token("acme", "t1", 17).unwrap());
     assert_eq!(
-        store.automation_tokens("acme").unwrap()[0].revoked_at,
+        store.automation_tokens("acme", "", 100).unwrap()[0].revoked_at,
         Some(16)
     );
     assert!(store
@@ -1118,13 +1127,13 @@ fn automation_token_records_creator_and_revoking_the_creator_revokes_it() {
         .unwrap();
 
     // The list payload carries the creator the mint recorded.
-    let listed = store.automation_tokens("acme").unwrap();
+    let listed = store.automation_tokens("acme", "", 100).unwrap();
     assert_eq!(listed, vec![minted.clone(), other.clone()]);
 
     // Revoking the principal deactivates exactly the tokens it minted,
     // matched case-insensitively like the principals row itself.
     assert!(store.revoke_principal("minter@example.com").unwrap());
-    let listed = store.automation_tokens("acme").unwrap();
+    let listed = store.automation_tokens("acme", "", 100).unwrap();
     assert!(listed[0].revoked_at.is_some());
     assert_eq!(listed[1].revoked_at, None);
     assert!(store
@@ -1139,7 +1148,7 @@ fn automation_token_records_creator_and_revoking_the_creator_revokes_it() {
     // Revoking again leaves already-revoked tokens untouched.
     assert!(store.revoke_principal("MINTER@example.com").unwrap());
     assert_eq!(
-        store.automation_tokens("acme").unwrap()[0].revoked_at,
+        store.automation_tokens("acme", "", 100).unwrap()[0].revoked_at,
         listed[0].revoked_at
     );
 }

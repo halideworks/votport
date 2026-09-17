@@ -100,7 +100,7 @@
         </label>
         <p id="library-selection-status" class="muted" aria-live="polite">0 files selected · 0 B</p>
         <p id="library-selection-error" class="error" role="alert" hidden></p>
-        <fieldset id="library-files" class="library-list" aria-label="Library files"></fieldset>
+        <fieldset id="library-files" class="library-list" aria-label="Library files" aria-describedby="library-selection-error"></fieldset>
         <div id="library-pagination" class="actions" hidden>
           <button id="library-pagination-previous" type="button" class="tiny ghost">Previous page</button>
           <button id="library-pagination-next" type="button" class="tiny ghost">Next page</button>
@@ -114,7 +114,7 @@
           <fieldset id="deliver-fields" aria-label="Download link settings">
           <div class="grid">
             <label>Name
-              <input data-draft-field id="deliver-label" required maxlength="200" placeholder="Project files" />
+              <input data-draft-field id="deliver-label" required maxlength="200" placeholder="Project files" aria-describedby="deliver-error" />
             </label>
             <label>Expires after <span class="muted">days</span>
               <input data-draft-field id="deliver-expires" type="number" min="1" max="30" value="7" required />

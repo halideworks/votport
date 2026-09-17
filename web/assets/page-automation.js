@@ -1,6 +1,11 @@
 import { markFormSaved } from '/assets/form-drafts.js';
 import { api, button, confirmModal, copyToClipboard, formatWhen, requireSession } from '/assets/admin-common.js';
+import { fieldError } from '/assets/object-card.js';
 const $ = (id) => document.getElementById(id);
+// Page size follows the server convention (50 default, 100 max); the list
+// follows `next` until it runs out, like the workflows page.
+const TOKEN_PAGE_SIZE = 50;
+let tokenRows = [], tokenNext = null, tokenLoading = false;
 const permissionLabels = {
   'library:read': 'browse files',
   'jobs:read': 'read jobs and verification',
@@ -17,20 +22,22 @@ function automationTokenStatus(token) {
   return 'active';
 }
 
-function renderAutomationTokens(tokens) {
+function renderAutomationTokens() {
   const container = $('automation-tokens');
-  $('automation-token-status').textContent = tokens.length
-    ? `${tokens.length} automation token${tokens.length === 1 ? '' : 's'} issued.`
+  $('automation-token-status').textContent = tokenRows.length
+    ? `${tokenRows.length} automation token${tokenRows.length === 1 ? '' : 's'} issued.`
     : 'No automation tokens issued.';
+  $('automation-token-more').hidden = !tokenNext;
+  $('automation-token-more').disabled = tokenLoading;
   container.replaceChildren();
-  if (!tokens.length) {
+  if (!tokenRows.length) {
     const empty = document.createElement('p');
     empty.className = 'muted';
     empty.textContent = 'No automation tokens issued.';
     container.append(empty);
     return;
   }
-  for (const token of [...tokens].reverse()) {
+  for (const token of [...tokenRows].reverse()) {
     const card = document.createElement('div');
     card.className = 'card link-item';
     const head = document.createElement('div');
@@ -73,7 +80,7 @@ function renderAutomationTokens(tokens) {
           await api(`/api/admin/automation-tokens/${encodeURIComponent(token.id)}`, {
             method: 'DELETE',
           });
-          await refreshAutomationTokens();
+          await refreshAutomationTokens(true);
         }),
       );
     }
@@ -81,10 +88,19 @@ function renderAutomationTokens(tokens) {
   }
 }
 
-async function refreshAutomationTokens() {
+async function refreshAutomationTokens(reset = false) {
+  if (tokenLoading) return;
+  if (reset) { tokenRows = []; tokenNext = null; }
+  tokenLoading = true;
   try {
-    const { tokens } = await api('/api/admin/automation-tokens');
-    renderAutomationTokens(tokens || []);
+    // First page is queryless (server default 50); continuations carry the
+    // keyset cursor.
+    let path = '/api/admin/automation-tokens';
+    if (tokenNext) path += `?after=${encodeURIComponent(tokenNext)}&limit=${TOKEN_PAGE_SIZE}`;
+    const page = await api(path);
+    tokenRows = tokenRows.concat(page.tokens || []);
+    tokenNext = page.next || null;
+    renderAutomationTokens();
   } catch (error) {
     $('automation-token-status').textContent = 'Automation tokens could not be loaded.';
     const message = document.createElement('p');
@@ -92,30 +108,34 @@ async function refreshAutomationTokens() {
     message.setAttribute('role', 'alert');
     message.textContent = error.message;
     $('automation-tokens').replaceChildren(message);
+    $('automation-token-more').hidden = true;
+  } finally {
+    tokenLoading = false;
+    $('automation-token-more').disabled = false;
   }
 }
 
+$('automation-token-more').addEventListener('click', () => refreshAutomationTokens());
+
+const tokenError = fieldError($('automation-token-label'), $('automation-token-error'));
+
 $('automation-token-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const error = $('automation-token-error');
-  error.hidden = true;
+  tokenError.clear();
   const label = $('automation-token-label').value.trim();
   const expires = Number($('automation-token-expires').value);
   const directory = $('automation-token-directory').value.trim();
   if (!label || label.length > 100) {
-    error.textContent = 'Name must be 1 to 100 characters.';
-    error.hidden = false;
+    tokenError.show('Name must be 1 to 100 characters.');
     return;
   }
   if (!Number.isInteger(expires) || expires < 1 || expires > 365) {
-    error.textContent = 'Expiry must be between 1 and 365 days.';
-    error.hidden = false;
+    tokenError.show('Expiry must be between 1 and 365 days.');
     return;
   }
   const permissions = [...$('automation-token-permissions').querySelectorAll('input:checked')].map((input) => input.value);
   if (!permissions.length) {
-    error.textContent = 'Choose at least one allowed action.';
-    error.hidden = false;
+    tokenError.show('Choose at least one allowed action.');
     return;
   }
   const submit = $('automation-token-submit');
@@ -133,10 +153,9 @@ $('automation-token-form').addEventListener('submit', async (event) => {
     const config = JSON.stringify({ mcpServers: { votport: { command: 'votport', args: ['mcp'], env: { VOTPORT_URL: window.location.origin, VOTPORT_AUTOMATION_TOKEN: response.token } } } }, null, 2);
     $('automation-mcp-config').textContent = config;
     $('automation-mcp-copy').onclick = () => copyToClipboard($('automation-mcp-copy'), config);
-    await refreshAutomationTokens();
+    await refreshAutomationTokens(true);
   } catch (requestError) {
-    error.textContent = requestError.message;
-    error.hidden = false;
+    tokenError.show(requestError.message);
   } finally {
     submit.disabled = false;
   }

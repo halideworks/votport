@@ -160,8 +160,16 @@ $('ws-kind').onchange = destinationKind;
 for (const event of ['input', 'change']) $('workflow-save-storage').addEventListener(event, () => { editorGeneration += 1; $('storage-test').disabled = true; $('storage-test-result').textContent = 'Save changes before testing.'; });
 await guard(async () => {
   if (admin) {
-    const [tenantResult, storage] = await Promise.all([api('/api/admin/tenants'), api('/api/admin/receiving-storage')]);
-    tenants = tenantResult.tenants; showReceiving(storage);
+    const storage = await api('/api/admin/receiving-storage');
+    // The tenant switcher needs every namespace, so it follows tenants_next
+    // through all pages (server pages at 50 per request, 100 max).
+    let after = '';
+    do {
+      const tenantResult = await api(`/api/admin/tenants?limit=100${after ? `&after=${encodeURIComponent(after)}` : ''}`);
+      tenants = tenants.concat(tenantResult.tenants || []);
+      after = tenantResult.tenants_next || '';
+    } while (after);
+    showReceiving(storage);
   }
   await refresh();
 });
