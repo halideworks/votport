@@ -104,6 +104,12 @@ pub struct Job {
     pub actor: String,
     pub credential_version: u64,
     pub automation_token_id: Option<String>,
+    /// The human principal that operated the automation token which created
+    /// this job; None for direct password submissions. Approval refuses both
+    /// the token subject and this principal, so one person cannot submit
+    /// through the token and approve as themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_human: Option<String>,
     pub request: JobRequest,
     pub project: Project,
     pub state: String,

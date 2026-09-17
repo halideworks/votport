@@ -1708,6 +1708,7 @@ mod tests {
             actor: "sender".to_owned(),
             credential_version: 0,
             automation_token_id: None,
+            actor_human: None,
             request: crate::workflow::tests::request(),
             project: crate::workflow::tests::project(),
             state: "failed".to_owned(),

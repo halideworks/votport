@@ -100,25 +100,38 @@ fi
 
 : "${VOTPORT_ADMIN_PASSWORD:?VOTPORT_ADMIN_PASSWORD is required}"
 
-jar="$(mktemp)"
+# The admin cookie jar lives in its own directory: a single file cleaned only
+# by the EXIT trap would survive INT and TERM (and be a 7-day session sitting
+# in /tmp after SIGKILL), while the directory is removed by the same traps and
+# is at least self-contained debris otherwise.
+jar_dir="$(mktemp -d)"
+jar="$jar_dir/cookies"
 drained=0
 cleanup() {
   if [ "$drained" = 1 ]; then
     log "aborting with the drain on; clearing it on $LIVE_URL"
     set_drain "$LIVE_URL" false || log "could not clear the drain; clear it by hand on the System page"
   fi
-  rm -f "$jar"
+  rm -rf "$jar_dir"
 }
+# INT and TERM handlers exit, which runs the EXIT trap; without them a
+# Ctrl-C or kill during the drain would leave the session jar behind.
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Signs in with the local password and keeps the cookie in the jar. The
 # body arrives on stdin so the password never sits in an argv.
 login() {
   local url="$1"
-  printf '%s' "$VOTPORT_ADMIN_PASSWORD" \
+  if printf '%s' "$VOTPORT_ADMIN_PASSWORD" \
     | python3 -c 'import json,sys; print(json.dumps({"password": sys.stdin.read()}))' \
     | curl -fsS -m 30 -c "$jar" -b "$jar" -H 'Content-Type: application/json' \
-        -d @- "$url/api/admin/login" >/dev/null
+        -d @- "$url/api/admin/login" >/dev/null; then
+    return 0
+  fi
+  log "sign-in to $url failed; VOTPORT_ADMIN_PASSWORD may be stale: a password changed on the System page takes precedence over the environment value"
+  return 1
 }
 
 # Sets the draining flag through the settings API.

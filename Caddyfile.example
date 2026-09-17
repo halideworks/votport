@@ -9,6 +9,10 @@ drop.example.com {
 	# votport itself sends uncompressed responses and relies on the proxy.
 	encode zstd gzip
 
+	# The proxy serves TLS, so HSTS belongs here too; votport sends the
+	# same header when VOTPORT_PUBLIC_URL is https.
+	header Strict-Transport-Security "max-age=31536000"
+
 	# Scrape metrics directly from the private upstream.
 	respond /metrics 404
 	reverse_proxy 127.0.0.1:8103

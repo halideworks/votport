@@ -414,6 +414,7 @@ pub(super) fn queue_received(
         actor,
         credential_version: 0,
         automation_token_id: None,
+        actor_human: None,
         request,
         project,
         state: if error.is_some() { "failed" } else { "queued" }.into(),
@@ -879,6 +880,21 @@ impl Store {
             return Err(WorkflowMutationError::conflict("active job limit reached"));
         }
         let checks = trade::snapshot(&tx, tenant, &project)?;
+        // The human principal behind the token, recorded for four-eyes
+        // approval: string equality on the automation subject alone would
+        // let the person who minted and operated the token approve their
+        // own submission as a different actor.
+        let actor_human = match &automation_token_id {
+            Some(token_id) => tx
+                .query_row(
+                    "SELECT created_by FROM automation_tokens WHERE id=?1 AND tenant=?2",
+                    params![token_id, tenant],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?,
+            None => None,
+        };
         let job = Job {
             id: crate::auth::random_token(),
             tenant: tenant.into(),
@@ -886,6 +902,7 @@ impl Store {
             actor: actor.into(),
             credential_version,
             automation_token_id,
+            actor_human,
             request,
             project,
             state: "queued".into(),
@@ -1183,6 +1200,7 @@ impl Store {
             actor: identity.subject.clone(),
             credential_version: identity.credential_version,
             automation_token_id: None,
+            actor_human: None,
             request,
             checks: trade::snapshot(&tx, &identity.tenant, &project)?,
             project,
@@ -1251,12 +1269,27 @@ impl Store {
         match action {
             "approve" => {
                 if actor.starts_with("automation:")
-                    || actor == job.actor
                     || !project.allows(actor, "approver", administrator)
                 {
                     return Err(WorkflowMutationError::conflict(
                         "approval requires a different authorized human operator",
                     ));
+                }
+                // Four-eyes: refuse the submitter and, for a job created
+                // through an automation token, the human who operated that
+                // token. Matching the token subject alone let one person
+                // submit through the token and approve as themselves.
+                if actor == job.actor {
+                    return Err(WorkflowMutationError::conflict(
+                        "approval requires a different authorized human operator",
+                    ));
+                }
+                if job.actor_human.as_deref() == Some(actor) {
+                    return Err(WorkflowMutationError::conflict(format!(
+                        "approval requires a different authorized human operator: \
+                         {actor} submitted this delivery through {}",
+                        job.actor
+                    )));
                 }
                 if job.state != "awaiting_approval"
                     || job.manifest.as_deref() != manifest
@@ -3256,6 +3289,124 @@ mod tests {
                 .id,
             job.id
         );
+    }
+
+    #[test]
+    fn token_submitted_jobs_refuse_the_operating_human_as_approver() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut project = project();
+        project.members.insert("human-a".into(), "approver".into());
+        project.members.insert("human-b".into(), "approver".into());
+        let project = store.save_delivery_project("", "admin", project).unwrap();
+        store
+            .insert_automation_token(crate::store::AutomationToken {
+                id: "agent1".into(),
+                token_hash: "hash-agent1".into(),
+                tenant: String::new(),
+                label: "Agent".into(),
+                directory: None,
+                permissions: vec!["jobs:create".into()],
+                created_by: "human-a".into(),
+                created_at: 0,
+                expires_at: now_unix() + 3600,
+                revoked_at: None,
+                last_used_at: None,
+            })
+            .unwrap();
+        let job = store
+            .enqueue_delivery_job(
+                "",
+                "automation:agent1",
+                0,
+                Some("agent1".into()),
+                project.clone(),
+                request(),
+            )
+            .unwrap();
+        assert_eq!(job.actor_human.as_deref(), Some("human-a"));
+        let claimed = store
+            .claim_delivery_job("boot", now_unix())
+            .unwrap()
+            .unwrap();
+        store
+            .insert_workflow_grant(grant(&claimed), None, Some(&claimed), None)
+            .unwrap();
+        let manifest = store
+            .delivery_job(&job.id)
+            .unwrap()
+            .unwrap()
+            .manifest
+            .clone();
+        // The human who operated the token is refused and both identities
+        // are named.
+        let refusal = store
+            .change_delivery_job(
+                "",
+                &job.id,
+                "human-a",
+                false,
+                "approve",
+                manifest.as_deref(),
+            )
+            .unwrap_err();
+        assert!(refusal.contains("human-a"), "{refusal:?}");
+        assert!(refusal.contains("automation:agent1"), "{refusal:?}");
+        // A different human approves.
+        let approved = store
+            .change_delivery_job(
+                "",
+                &job.id,
+                "human-b",
+                false,
+                "approve",
+                manifest.as_deref(),
+            )
+            .unwrap();
+        assert_eq!(approved.approved_by.as_deref(), Some("human-b"));
+
+        // A password-created job keeps the plain four-eyes refusal.
+        let plain = store
+            .enqueue_delivery_job("", "sender", 1, None, project, request())
+            .unwrap();
+        assert_eq!(plain.actor_human, None);
+        let claimed = store
+            .claim_delivery_job("boot2", now_unix())
+            .unwrap()
+            .unwrap();
+        store
+            .insert_workflow_grant(grant(&claimed), None, Some(&claimed), None)
+            .unwrap();
+        let manifest = store
+            .delivery_job(&plain.id)
+            .unwrap()
+            .unwrap()
+            .manifest
+            .clone();
+        assert_eq!(
+            store
+                .change_delivery_job(
+                    "",
+                    &plain.id,
+                    "sender",
+                    false,
+                    "approve",
+                    manifest.as_deref()
+                )
+                .unwrap_err(),
+            "approval requires a different authorized human operator",
+        );
+        let approved = store
+            .change_delivery_job(
+                "",
+                &plain.id,
+                "approver",
+                false,
+                "approve",
+                manifest.as_deref(),
+            )
+            .unwrap();
+        assert_eq!(approved.approved_by.as_deref(), Some("approver"));
     }
 
     #[test]
