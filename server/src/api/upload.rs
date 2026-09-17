@@ -1168,6 +1168,13 @@ pub async fn upload_begin(
     State(app): State<Arc<App>>,
     Path(sid): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // A finished upload kept for proof: the begin a reconciling sender sends
+    // after a lost finish reply is answered with every entry complete, so
+    // the confirmation arrives without resending a byte. The worker behind
+    // this id has exited, which is why the live dispatch cannot answer.
+    if let Some(entries) = app.sessions.finished_entries(&sid) {
+        return Ok(Json(json!({ "entries": entries })));
+    }
     let stopping = Arc::clone(&app.stopping);
     let entries = dispatch(&app, &sid, |reply, _lease| Cmd::Begin {
         reply,
@@ -1232,6 +1239,13 @@ pub async fn upload_finish(
 ) -> ApiResult<Json<session::FinishReport>> {
     let runtime = tokio::runtime::Handle::current();
     let ip = client_ip(&headers, &peer, &app.config.trusted_proxies);
+    // The finish reply was lost once already and the sender is retrying: the
+    // first finish committed the record, so replay the stored report instead
+    // of dispatching into an exited worker (which would answer 404/410) or
+    // landing a second record and notification.
+    if let Some(report) = app.sessions.finished_report(&sid) {
+        return Ok(Json(report));
+    }
     // Off the runtime thread: completion does a link read plus an fsync'd
     // audit insert, once per finished file. The push path calls this from
     // its own OS thread and needs no wrapper.
@@ -1249,6 +1263,12 @@ pub async fn upload_finish(
         .await?;
         #[cfg(test)]
         application.sessions.wait_finish_stall().await;
+        // Keep the answer around before the bookkeeping: this is what a
+        // retried finish replays and a re-attached begin reconciles against.
+        let report_for_memory = report.clone();
+        application
+            .sessions
+            .remember_finished(&session_id, report_for_memory);
         let report_for_completion = report.clone();
         let app_for_completion = Arc::clone(&application);
         if let Err(error) = tokio::task::spawn_blocking(move || {
@@ -1918,6 +1938,66 @@ mod session_rate_tests {
         let _ = release.send(());
 
         assert_completed(&application, "cancel-before-reply").await;
+    }
+
+    /// Finding 361: a lost finish reply must not read back as a discarded
+    /// transfer. The retried finish replays the stored report instead of
+    /// answering 404/410, and a re-attached begin answers every entry
+    /// complete, so the sender reconciles without resending bytes or landing
+    /// a second record and notification.
+    #[tokio::test]
+    async fn a_lost_finish_reply_replays_the_report_and_begin_proves_completion() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_link(open_link("finish-replay"))
+            .unwrap();
+        let session = create_received_session(&application, "finish-replay").await;
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], 4000));
+        let finish = |application: Arc<App>, session: String| async move {
+            app::router(application)
+                .oneshot(
+                    Request::post(format!("/api/session/{session}/finish"))
+                        .extension(ConnectInfo(address))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        };
+        let first = finish(application.clone(), session.clone()).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let report: serde_json::Value =
+            serde_json::from_slice(&first.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(report["files"].as_array().unwrap().len(), 1);
+        // The sender retried after losing the first reply: same report, no
+        // second record, no second completion notification.
+        let second = finish(application.clone(), session.clone()).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let replayed: serde_json::Value =
+            serde_json::from_slice(&second.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(replayed, report);
+        // A reconciling begin after the worker exited: every entry complete.
+        let begin = app::router(application.clone())
+            .oneshot(
+                Request::post(format!("/api/session/{session}/begin"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(begin.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&begin.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let entries = body["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        for entry in entries {
+            assert_eq!(entry["complete"], serde_json::json!(true));
+            assert_eq!(entry["covered_bytes"], entry["bytes"]);
+        }
+        assert_completed(&application, "finish-replay").await;
     }
 }
 

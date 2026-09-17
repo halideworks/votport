@@ -11,6 +11,8 @@ export default [
         window: 'readonly',
         navigator: 'readonly',
         localStorage: 'readonly',
+        sessionStorage: 'readonly',
+        crypto: 'readonly',
         performance: 'readonly',
         fetch: 'readonly',
         AbortController: 'readonly',

@@ -4,6 +4,15 @@
 import { applyBranding } from '/assets/branding.js';
 import { appendObjectCard, appLink, copyToClipboard, fieldError, formatBytes } from '/assets/object-card.js';
 import { entryFiles, runUploadBatch } from '/assets/upload-entries.js';
+import {
+  clearResumeRecord,
+  expireForeignResumes,
+  finishMayBeComplete,
+  loadResumeRecord,
+  resumeDropId,
+  retryDecision,
+  saveResumeRecord,
+} from '/assets/upload-retry.js';
 import { segments } from '/assets/hash-plan.js';
 import init, {
   ObjectId,
@@ -241,20 +250,13 @@ function offerApp(kind) {
 // A record of the session currently in flight, so an interrupted transfer can
 // re-attach to it instead of re-sending bytes the server already verified.
 // Cleared on success and on cancel, kept on failure — failure is the case it
-// exists for. The server sweeps the session itself once it goes idle.
-const RESUME_KEY = `votport-resume-${token}`;
-
-function saveResume(record) {
-  try { localStorage.setItem(RESUME_KEY, JSON.stringify(record)); } catch { /* private mode */ }
-}
-
-function loadResume() {
-  try { return JSON.parse(localStorage.getItem(RESUME_KEY) || 'null'); } catch { return null; }
-}
-
-function clearResume() {
-  try { localStorage.removeItem(RESUME_KEY); } catch { /* private mode */ }
-}
+// exists for. Keyed per drop with an id this tab mints on the first save, so
+// two tabs on one link hold separate records instead of fighting over one
+// session. The server sweeps the session itself once it goes idle.
+const dropId = () => resumeDropId(token);
+const saveResume = (record) => saveResumeRecord(token, record);
+const loadResume = () => loadResumeRecord(token, dropId());
+const clearResume = () => clearResumeRecord(token, dropId());
 
 // The verified-password cookie replaced the plaintext copy an earlier build
 // kept in localStorage; scrub any leftover.
@@ -587,38 +589,79 @@ async function apiJson(path, options = {}) {
   return body;
 }
 
+// Every POST in the send path goes through here. A transient failure — a
+// 5xx, a 429, a lost connection — is retried a bounded number of times
+// within a bounded budget and honoring the server's Retry-After, instead of
+// pausing forever against a server that may be down. A refusal the server
+// names (admission caps, draining) stops the transfer with the server's own
+// words, and a user cancel never retries. A single-shot POST is never
+// replayed into its session: on a transient failure the caller restarts the
+// session, since a replay that reached the server is refused outright.
 async function postWithRetry(path, options = {}) {
+  const { singleShot = false, ...request } = options;
+  const startedAt = Date.now();
   for (let attempt = 0; ; attempt += 1) {
     checkCancelled();
+    let status = null;
+    let body = null;
+    let retryAfterMs = null;
+    let failure = null;
     try {
       const response = await fetch(path, {
         method: 'POST',
         signal: controller?.signal,
-        ...options,
+        ...request,
       });
-      if (response.status >= 500 || response.status === 429) {
-        throw Object.assign(new Error(`server busy (${response.status})`), { transient: true });
+      status = response.status;
+      if (status === 429 || status >= 500) {
+        // An absent header must keep the exponential backoff (Number(null)
+        // is 0); only a real Retry-After may replace it.
+        const header = response.headers.get('Retry-After');
+        const seconds = header === null ? NaN : Number(header);
+        if (Number.isFinite(seconds) && seconds >= 0) retryAfterMs = seconds * 1000;
       }
-      let body = null;
       try { body = await response.json(); } catch { /* not JSON */ }
-      if (!response.ok) {
-        throw Object.assign(new Error(body?.error || `failed (${response.status})`), {
-          status: response.status,
-          fatal: true,
-        });
+      if (response.ok) {
+        resumePhase();
+        return body;
       }
-      resumePhase();
-      return body;
+      failure = Object.assign(new Error(body?.error || `request failed (${status})`), { status });
     } catch (error) {
       checkCancelled();
-      // An AbortError outside the shared controller is a network-layer pause.
-      const transient = error.transient
-        || error.name === 'AbortError'
-        || error instanceof TypeError
-        || navigator.onLine === false;
-      if (!transient) throw error;
-      await pauseBackoff(attempt);
+      failure = error;
     }
+    const decision = retryDecision({
+      attempt,
+      elapsedMs: Date.now() - startedAt,
+      status,
+      body,
+      retryAfterMs,
+      failure,
+      online: navigator.onLine !== false,
+    });
+    if (!decision.retry) {
+      // A refusal ends the transfer with its message; an exhausted transient
+      // failure pauses the send loop, which resumes from the server's own
+      // coverage. An AbortError outside the shared controller propagates raw.
+      const refused = decision.message !== undefined
+        || (status !== null && status !== 429 && status < 500)
+        || body?.retryable === false;
+      if (refused) failure.fatal = true;
+      else if (failure?.name !== 'AbortError') failure.paused = true;
+      throw failure;
+    }
+    if (singleShot) {
+      // The seal and pages cannot be replayed into the session they were
+      // addressed to: a replay that reached the server is refused (409
+      // already provided, 422 malformed). Mark the session for a fresh
+      // start, as the expired-session path does; the server's per-link
+      // dedupe keeps the restart from resending delivered bytes.
+      failure.restart = true;
+      throw failure;
+    }
+    setPhase('Paused');
+    await sleepCancellable(decision.delayMs);
+    resumePhase();
   }
 }
 
@@ -636,14 +679,6 @@ function sleepCancellable(ms) {
       reject(cancelled ? new Cancelled() : controller.signal.reason);
     }, 250);
   });
-}
-
-// Transient failures pause instead of failing: back off 1s, 2s, 4s, 8s, then
-// hold at 15s until the line or server comes back, or the sender cancels.
-async function pauseBackoff(attempt) {
-  setPhase('Paused');
-  await sleepCancellable(Math.min(15, 2 ** attempt) * 1000);
-  resumePhase();
 }
 
 // ------------------------------------------------------------------- phases
@@ -925,6 +960,9 @@ async function runUpload() {
             // Session swept or server restarted: fall through and create a
             // fresh one, seal and pages included. Anything else is fatal.
             if (!isExpiredSession(error)) throw error;
+            // The server no longer holds this session, so the saved record
+            // (and the note built on it) would claim bytes it has dropped.
+            clearResume();
             sessionId = null;
           }
         }
@@ -951,11 +989,13 @@ async function runUpload() {
             chunk: chunkBytes,
           });
           await postWithRetry(`/api/session/${sessionId}/seal`, {
+            singleShot: true,
             headers: { 'Content-Type': 'application/octet-stream' },
             body: seal,
           });
           for (const page of pages) {
             await postWithRetry(`/api/session/${sessionId}/page`, {
+              singleShot: true,
               headers: { 'Content-Type': 'application/octet-stream' },
               body: page,
             });
@@ -1029,6 +1069,13 @@ async function runUpload() {
           // is 422, so the earlier check for 400 never matched.
           if (error.status === 422 && /not fully received/.test(error.message || '')) {
             error.rebegin = true;
+          } else if (finishMayBeComplete(error)) {
+            // The finish may have committed before its reply was lost; a
+            // resend would re-hash every byte and land a second record. Keep
+            // the resume record: the next begin reconciles against the
+            // server's stored report, so the confirmation arrives without
+            // resending bytes.
+            error.mayComplete = true;
           }
           throw error;
         }
@@ -1045,6 +1092,22 @@ async function runUpload() {
         if (error.cancelled) {
           await abortSession(sessionId);
           throw error;
+        }
+        if (error.mayComplete) {
+          // Do not re-begin or abort a session that may have finished; the
+          // record and the message below carry the reconciliation.
+          throw error;
+        }
+        if (error.restart) {
+          // The manifest phase cannot be replayed into the same session; the
+          // abort records what did publish now and frees the link's slot.
+          await abortSession(sessionId);
+          sessionId = null;
+          stalledRounds += 1;
+          if (stalledRounds > 100) {
+            throw new Error('Transfer kept pausing');
+          }
+          continue;
         }
         if (error.paused || error.rebegin) {
           // The pool may have died again while we were between proves.
@@ -1295,22 +1358,25 @@ $('upload-form').addEventListener('submit', async (event) => {
     if (!error.cancelled) await reloadIfServerUpdated();
     // The server no longer holds the session, so the saved resume record is
     // useless; clearing it also hides the stale "held on the server" note and
-    // keeps the advice below honest.
+    // keeps the advice below honest. A finish that may have committed is the
+    // exception: the record is what the reload re-attaches to.
     const expired = error.status === 404
       || error.status === 410
       || /unknown or expired session/.test(error.message);
-    if (expired) clearResume();
+    if (expired && !error.mayComplete) clearResume();
     // Permanent refusals need corrected files, with any deliveries kept.
     const unverified = error.status === 422 || error.status === 409 || error.sourceChanged;
     const kept = deliveredPaths.size;
     const keptNote = keptPhrase(kept);
     fail(error.cancelled
       ? error.message
-      : unverified
-        ? `${error.message}.${keptNote} ${kept ? 'Fix the rest and send them again.' : 'Any files already delivered are kept. Fix the selection and send again.'}`
-        : expired
-          ? `${error.message}.${keptNote} The partial transfer was discarded, reselect the same files to send them again from the start.`
-          : `${error.message}.${keptNote} Reselect the same files to resume where this stopped.`);
+      : error.mayComplete
+        ? `${error.message}.${keptNote} The transfer may have completed. Reload this page and reselect the same files to confirm.`
+        : unverified
+          ? `${error.message}.${keptNote} ${kept ? 'Fix the rest and send them again.' : 'Any files already delivered are kept. Fix the selection and send again.'}`
+          : expired
+            ? `${error.message}.${keptNote} The partial transfer was discarded, reselect the same files to send them again from the start.`
+            : `${error.message}.${keptNote} Reselect the same files to resume where this stopped.`);
     $('confirm-cancel').close('keep');
     const restoreFocus = $('progress-card').contains(document.activeElement);
     $('progress-card').hidden = true;
@@ -1327,6 +1393,9 @@ $('upload-form').addEventListener('submit', async (event) => {
 });
 
 function showResumeNote() {
+  // Expire records other tabs left behind before reading this tab's own, so
+  // the note never speaks for a session no live sender holds.
+  expireForeignResumes(token);
   const saved = loadResume();
   const note = $('resume-note');
   if (!saved) {

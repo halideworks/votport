@@ -4225,8 +4225,30 @@ impl Drop for LinkPin {
     }
 }
 
+/// A finished upload kept briefly answerable: the report it committed and the
+/// begin entries synthesized from it, both cloned out under the registry
+/// mutex. A sender whose finish reply was lost retries and gets the stored
+/// report instead of a 404 it would read as a discarded transfer, and a
+/// re-attached begin answers every entry complete, so neither path resends
+/// bytes or lands a second record.
+#[derive(Clone, Debug)]
+struct FinishedUpload {
+    at: Instant,
+    report: FinishReport,
+    entries: Vec<EntryInfo>,
+}
+
+/// How long a finished upload stays answerable: long enough for a sender to
+/// notice the drop, reload, and confirm — far shorter than the upload record
+/// itself, which is permanent.
+const FINISHED_TTL: Duration = Duration::from_secs(300);
+/// How many finished uploads are kept at once; beyond this the oldest give
+/// way, and their senders fall back to the pre-finding 404 behavior.
+const FINISHED_CAP: usize = 64;
+
 struct SessionsInner {
     map: HashMap<String, SessionHandle>,
+    finished: HashMap<String, FinishedUpload>,
     admission_closed: bool,
     commands_closed: bool,
     active_admissions: usize,
@@ -4247,6 +4269,16 @@ struct SessionsInner {
     finish_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
     #[cfg(test)]
     finish_dispatch_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+}
+
+impl SessionsInner {
+    /// Drops finished uploads past their answerable window. Lazy, on access:
+    /// no timer owns this map, the registry mutex already serializes it, and
+    /// an unanswered map entry costs nothing.
+    fn prune_finished(&mut self) {
+        self.finished
+            .retain(|_, finished| finished.at.elapsed() < FINISHED_TTL);
+    }
 }
 
 pub struct OutboundOperation<'a> {
@@ -4384,6 +4416,7 @@ impl Sessions {
         Self {
             inner: Arc::new(Mutex::new(SessionsInner {
                 map: HashMap::new(),
+                finished: HashMap::new(),
                 admission_closed: false,
                 commands_closed: false,
                 active_admissions: 0,
@@ -4970,6 +5003,68 @@ impl Sessions {
 
     pub fn remove(&self, id: &str) -> Option<SessionHandle> {
         self.inner.lock().expect("sessions poisoned").map.remove(id)
+    }
+
+    /// Remembers a finished upload so its finish and begin stay answerable
+    /// for [`FINISHED_TTL`]. Entries are synthesized complete from the
+    /// report's records: every file a finished upload committed is fully on
+    /// disk. Called once, after the record is committed; the oldest entry is
+    /// dropped once the cap is reached rather than refusing the newest.
+    pub fn remember_finished(&self, id: &str, report: FinishReport) {
+        let entries = report
+            .files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| EntryInfo {
+                index,
+                path: file.path.clone(),
+                stored_as: file.stored_as.clone(),
+                bytes: file.bytes,
+                complete: true,
+                covered_bytes: file.bytes,
+            })
+            .collect();
+        let mut inner = self.inner.lock().expect("sessions poisoned");
+        inner.prune_finished();
+        if inner.finished.len() >= FINISHED_CAP {
+            if let Some(oldest) = inner
+                .finished
+                .iter()
+                .min_by_key(|(_, finished)| finished.at)
+                .map(|(id, _)| id.clone())
+            {
+                inner.finished.remove(&oldest);
+            }
+        }
+        inner.finished.insert(
+            id.to_owned(),
+            FinishedUpload {
+                at: Instant::now(),
+                report,
+                entries,
+            },
+        );
+    }
+
+    /// The stored report for a finished upload, if still fresh.
+    pub fn finished_report(&self, id: &str) -> Option<FinishReport> {
+        let mut inner = self.inner.lock().expect("sessions poisoned");
+        inner.prune_finished();
+        inner
+            .finished
+            .get(id)
+            .map(|finished| finished.report.clone())
+    }
+
+    /// The begin entries for a finished upload, if still fresh: every entry
+    /// complete, so a reconciling sender re-selects without resending.
+    pub fn finished_entries(&self, id: &str) -> Option<Vec<EntryInfo>> {
+        let mut inner = self.inner.lock().expect("sessions poisoned");
+        inner.prune_finished();
+        inner
+            .finished
+            .get(id)
+            .map(|finished| finished.entries.clone())
     }
 
     /// Bytes accepted so far by every live session, for the metrics gauge.
