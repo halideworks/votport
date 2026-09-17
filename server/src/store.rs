@@ -2045,7 +2045,11 @@ impl Store {
         }
         {
             let mut statement = transaction.prepare_cached(
-                "UPDATE files SET deleted=1 WHERE tenant=?1 AND link_id=?2 AND stored_as=?3 AND deleted=0",
+                // Audit finding 377: the in-package path can carry a person's
+                // name or a project name, so retention blanks it when the
+                // bytes go. The row keeps stored_as and the identity fields
+                // that dedupe and the audit trail still need.
+                "UPDATE files SET deleted=1, path='' WHERE tenant=?1 AND link_id=?2 AND stored_as=?3 AND deleted=0",
             ).map_err(|e| e.to_string())?;
             for path in stored_paths {
                 statement
@@ -6093,12 +6097,34 @@ impl Store {
     }
 
     /// Deletes audit rows older than `before`; returns how many.
-    pub fn audit_prune(&self, before: u64) -> Result<usize, String> {
+    pub fn audit_prune(&self, before: u64, keep_subjects: &[String]) -> Result<usize, String> {
         self.with(|connection| {
-            connection.execute(
-                "DELETE FROM audit_log WHERE at < ?1",
-                [i64::try_from(before).unwrap_or(0)],
-            )
+            if keep_subjects.is_empty() {
+                return connection.execute(
+                    "DELETE FROM audit_log WHERE at < ?1",
+                    [i64::try_from(before).unwrap_or(0)],
+                );
+            }
+            // Held links keep their audit rows: they are the only record of
+            // who uploaded. Link ids are unique tokens, so matching the
+            // subject alone cannot exempt another entity's rows.
+            let placeholders = keep_subjects
+                .iter()
+                .enumerate()
+                .map(|(index, _)| format!("?{}", index + 2))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql =
+                format!("DELETE FROM audit_log WHERE at < ?1 AND subject NOT IN ({placeholders})");
+            let mut parameters = vec![rusqlite::types::Value::Integer(
+                i64::try_from(before).unwrap_or(0),
+            )];
+            parameters.extend(
+                keep_subjects
+                    .iter()
+                    .map(|subject| rusqlite::types::Value::Text(subject.clone())),
+            );
+            connection.execute(&sql, rusqlite::params_from_iter(parameters))
         })
     }
 }

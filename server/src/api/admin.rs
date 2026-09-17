@@ -2684,6 +2684,79 @@ pub async fn create_backup(
     Ok(Json(json!({ "id": id })))
 }
 
+/// Audit finding 371: without this route no control could discard a backup
+/// copy, so pre-erasure archives holding the full database lived forever.
+/// Source-scoped because an id can exist in both the local root and S3.
+pub async fn delete_backup(
+    State(app): State<Arc<App>>,
+    Path((source, id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_platform_admin_write(&app, &headers)?;
+    crate::backup::validate_id(&id)
+        .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    let _guard = Arc::clone(&app.backup_lock)
+        .try_lock_owned()
+        .map_err(|_| ApiError::new(StatusCode::CONFLICT, "backup already running"))?;
+    crate::backup::ensure_no_pending_restore(&app.config.data_dir)
+        .map_err(|error| ApiError::new(StatusCode::CONFLICT, error))?;
+    let config = crate::backup::parse_config(
+        app.store
+            .setting(crate::backup::SETTING_KEY)
+            .map_err(super::store_unavailable)?,
+        &app.config.data_dir,
+    )
+    .map_err(ApiError::internal)?;
+    let deleted = match source.as_str() {
+        "local" => {
+            let root = config
+                .local_root(&app.config.data_dir)
+                .map_err(ApiError::internal)?;
+            crate::backup::delete_local_backup(&root, &id).map_err(ApiError::internal)?
+        }
+        "s3" => {
+            if !matches!(
+                config.destination,
+                crate::backup::Destination::S3 | crate::backup::Destination::Both
+            ) {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "S3 backups are not configured",
+                ));
+            }
+            let secrets =
+                crate::backup::read_secrets(&app.config.data_dir).map_err(ApiError::internal)?;
+            if secrets.access_key_id.is_none() || secrets.secret_access_key.is_none() {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "S3 credentials are required",
+                ));
+            }
+            crate::backup::delete_s3_backup(&config, &secrets, &id)
+                .await
+                .map_err(ApiError::internal)?
+        }
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "source must be local or s3",
+            ))
+        }
+    };
+    if !deleted {
+        return Err(ApiError::not_found());
+    }
+    tracing::info!(target: "audit", event = "backup_deleted", id = %id, source = %source, "request backup copy deleted");
+    app.store.audit(
+        "",
+        &identity.subject,
+        "backup_deleted",
+        &id,
+        &json!({ "source": source }),
+    );
+    Ok(Json(json!({ "ok": true })))
+}
+
 pub async fn restore_backup(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -4255,12 +4328,24 @@ pub async fn update_link(
                 "link lifecycle update in progress; try again",
             )
         })?;
+        // The marker goes down before the flag and comes off only after the
+        // flag is cleared: a crash can leave a hold active, never dropped.
+        if legal_hold {
+            app.set_link_hold_pin(&id, true)
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+        }
         let found = app
             .store
             .set_link_legal_hold(&identity.tenant, &id, legal_hold, &identity.subject)
             .map_err(super::store_unavailable)?;
         if !found {
+            app.set_link_hold_pin(&id, false)
+                .map_err(|error| ApiError::internal(format!("stale legal hold marker: {error}")))?;
             return Err(ApiError::not_found());
+        }
+        if !legal_hold {
+            app.set_link_hold_pin(&id, false)
+                .map_err(|error| ApiError::internal(error.to_string()))?;
         }
         tracing::info!(target: "audit", event = "link_legal_hold_changed", id = %id, legal_hold, "request link legal hold changed");
         return Ok(Json(json!({ "ok": true })));
@@ -4333,7 +4418,9 @@ pub async fn delete_link(
         .link_metadata(&identity.tenant, &id)
         .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
-    if link.legal_hold {
+    // Finding 376: a marker outside the database also holds, so a restore
+    // predating the flag cannot clear the hold.
+    if link.legal_hold || app.link_hold_pinned(&id) {
         return Err(ApiError::new(StatusCode::CONFLICT, "link is on legal hold"));
     }
     if app.sessions.active_for_link(&id) > 0 {
@@ -4456,7 +4543,7 @@ pub async fn delete_upload_record(
         .link_metadata(&identity.tenant, &id)
         .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
-    if link.legal_hold {
+    if link.legal_hold || app.link_hold_pinned(&id) {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "received records cannot be deleted while the link is on legal hold",
@@ -4566,7 +4653,7 @@ fn delete_received_file_sync(
         .link_metadata(&identity.tenant, id)
         .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
-    if link.legal_hold {
+    if link.legal_hold || app.link_hold_pinned(id) {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "received files cannot be deleted while the link is on legal hold",
@@ -5404,7 +5491,7 @@ mod handler_tests {
         // (method, route template, query, JSON body). Bodies only need to
         // satisfy each handler's JSON extractor: the gate fires before any
         // validation, so a minimal well-formed value reaches the 403.
-        let covered: [(&str, &str, &str, &str); 48] = [
+        let covered: [(&str, &str, &str, &str); 49] = [
             ("POST", "/api/admin/logout", "", ""),
             ("PUT", "/api/admin/backups", "", "{}"),
             ("POST", "/api/admin/backups", "", ""),
@@ -5468,6 +5555,12 @@ mod handler_tests {
                 r#"{"label":"pin","expires_days":1}"#,
             ),
             ("DELETE", "/api/admin/automation-tokens/{id}", "", ""),
+            (
+                "DELETE",
+                "/api/admin/backups/{source}/{id}",
+                "",
+                r#"{"source":"local"}"#,
+            ),
             ("POST", "/api/admin/outbound-files", "?path=pin", ""),
             ("DELETE", "/api/admin/outbound-files", "?path=pin", ""),
             (
@@ -11665,5 +11758,128 @@ mod received_page_tests {
         );
         assert_eq!(scratch(), 0);
         assert_eq!(application.sessions.active_outbound_for_tenant("team"), 0);
+    }
+}
+
+#[cfg(test)]
+mod backup_delete_tests {
+    use super::*;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt as _;
+
+    use crate::api::testing;
+    use crate::app;
+
+    fn admin_cookie(application: &Arc<App>) -> String {
+        super::test_admin_cookie(
+            application,
+            &auth::AdminIdentity {
+                subject: "platform-admin".to_owned(),
+                tenant: String::new(),
+                role: "admin".to_owned(),
+                grants: vec![auth::TenantGrant {
+                    incarnation: None,
+                    tenant: String::new(),
+                    role: "admin".to_owned(),
+                }],
+                credential_version: 1,
+            },
+        )
+    }
+
+    async fn delete_backup(application: &Arc<App>, cookie: &str, uri: &str) -> StatusCode {
+        app::router(application.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(uri)
+                    .header("cookie", cookie)
+                    .header("x-votport", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn delete_route_removes_a_local_archive_and_audits_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let backups = crate::backup::ensure_backups_dir(&application.config.data_dir).unwrap();
+        let snapshot = backups.join("votport-backup-v2-1-deadbeef.tar");
+        std::fs::write(&snapshot, b"snapshot").unwrap();
+        let cookie = admin_cookie(&application);
+        // Unknown source and invalid identifiers are refused before touching disk.
+        assert_eq!(
+            delete_backup(
+                &application,
+                &cookie,
+                "/api/admin/backups/scsi/votport-backup-v2-1-deadbeef.tar"
+            )
+            .await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            delete_backup(
+                &application,
+                &cookie,
+                "/api/admin/backups/local/votport-1-%3Cbad%3E"
+            )
+            .await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert!(snapshot.exists());
+        // S3 deletion without an S3 destination is refused.
+        assert_eq!(
+            delete_backup(
+                &application,
+                &cookie,
+                "/api/admin/backups/s3/votport-backup-v2-1-deadbeef.tar"
+            )
+            .await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        // A file with a non-archive name in the backup root is not deletable as an archive.
+        assert_eq!(
+            delete_backup(
+                &application,
+                &cookie,
+                "/api/admin/backups/local/votport-backup-v2-1-deadbeef.tar.bad"
+            )
+            .await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert!(snapshot.exists());
+        assert_eq!(
+            delete_backup(
+                &application,
+                &cookie,
+                "/api/admin/backups/local/votport-backup-v2-1-deadbeef.tar"
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert!(!snapshot.exists());
+        // Deleting an already deleted archive is 404, not a silent success.
+        assert_eq!(
+            delete_backup(
+                &application,
+                &cookie,
+                "/api/admin/backups/local/votport-backup-v2-1-deadbeef.tar"
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+        let audits = application.store.audit_export(None, 0, 0, 100).unwrap();
+        let row = audits
+            .iter()
+            .find(|row| row.event == "backup_deleted")
+            .expect("deletion is audited");
+        assert_eq!(row.subject, "votport-backup-v2-1-deadbeef.tar");
+        assert_eq!(row.detail["source"], "local");
     }
 }
