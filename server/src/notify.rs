@@ -525,7 +525,9 @@ fn escape_slack_entities(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn notification_connection_failure(error: &reqwest::Error) -> &'static str {
+/// Audit finding 337: shared by the notification and storage test endpoints
+/// so an unreachable destination answers with the same failure class.
+pub(crate) fn notification_connection_failure(error: &reqwest::Error) -> &'static str {
     if error.is_timeout() {
         "The destination timed out. Try again or check the service status."
     } else {

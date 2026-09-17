@@ -277,6 +277,7 @@ jobs:
             if [ "$status" -ne 0 ]; then
               docker logs votport-s3-minio || true
               docker logs votport-s3-server || true
+              cat "$e2e_root/server.log" || true
             fi
             docker rm -f votport-s3-server votport-s3-minio >/dev/null 2>&1 || true
             rm -rf "$s3_root"

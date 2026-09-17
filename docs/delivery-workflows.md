@@ -296,8 +296,10 @@ media rules check the first video stream's codec, dimensions and rational frame
 rate using `ffprobe`. `VOTPORT_FFPROBE` can name its executable. Required malware
 scanning uses `clamdscan --fdpass`; `VOTPORT_CLAMDSCAN` can name its executable.
 Install and operate the scanner daemon separately. Missing, failing or timed-out
-checkers withhold release. Checks have a five-minute timeout per file and a
-64 KiB output bound. Inspect job errors and retry after correcting the problem.
+checkers withhold release. Each checker is bounded by the remaining time of the
+job's 30-minute media-check budget (per checker at most five minutes) and a
+64 KiB output bound; when the budget is exhausted, remaining files fail the job
+with a named reason. Inspect job errors and retry after correcting the problem.
 
 Library media/scanning jobs and S3 imports use private snapshots. Reception jobs
 check their pinned original files directly. A global snapshot reservation budget

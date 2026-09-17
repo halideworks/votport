@@ -140,6 +140,14 @@ transfers; the portable Compose example uses 172800 seconds (48 hours). Keep
 this environment setting the same on a promoted failover host. Active requests
 remain retained while in flight.
 
+HTTP connections are bounded on both sides. The server itself caps how long a
+connection may spend sending request headers (30 seconds per connection,
+enforced by the HTTP/1 listener); there are no server-side limits on transfer
+duration. The Caddy examples add the outer bounds: header reads 30 seconds,
+read and write windows of 1 hour (reset as data flows), and 5-minute idle
+keep-alives. Large uploads and downloads ride chunked multi-MiB requests, so
+per-request windows stay well inside these limits.
+
 For a customer release, use the GHCR image reference and digest recorded in the
 GitHub release notes and workflow summary instead of rebuilding from source:
 
@@ -764,7 +772,9 @@ invalid client cursors and unrelated database errors do not increment it.
 Request metrics never include paths, tenants, addresses,
 methods, or tokens. Set `VOTPORT_METRICS_TOKEN` to require a bearer token, and
 scrape the private upstream directly. The public Caddy examples return 404 for
-`/metrics`, including requests with a bearer token. See the
+`/metrics` and `/readyz`, including requests with a bearer token: metrics
+expose tenant keys and `/readyz` reports lease ownership, so both stay on the
+private upstream. See the
 [Prometheus example](load-testing.md#scraping-metrics-into-prometheus).
 Platform admins can fetch the same per-tenant link and live-byte totals as JSON
 from `GET /api/admin/holdings`.
@@ -940,6 +950,7 @@ Layout:
 ```caddyfile
 drop.example.com {
 	respond /metrics 404
+	respond /readyz 404
 	reverse_proxy live:8321 standby:8321 {
 		lb_policy first
 		health_uri /healthz

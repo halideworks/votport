@@ -607,7 +607,23 @@ pub async fn export_events(
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(export)).into_response())
 }
 
+/// Audit finding 266: concurrent delivery workers. Each slot runs the same
+/// claim loop; the claim transaction stays the single job handoff (a job in
+/// preparing or exporting keeps its owner, so no other slot can claim it),
+/// and the claim query caps a tenant at two in-flight jobs.
+const WORKER_CONCURRENCY: usize = 4;
+
 pub async fn worker(app: Arc<App>) {
+    let mut workers = Vec::new();
+    for _ in 0..WORKER_CONCURRENCY {
+        workers.push(tokio::spawn(delivery_claim_loop(Arc::clone(&app))));
+    }
+    for claim_loop in workers {
+        let _ = claim_loop.await;
+    }
+}
+
+async fn delivery_claim_loop(app: Arc<App>) {
     let mut claim_dedupe = super::ErrorDeduper::new("delivery job claim");
     let mut record_dedupe = super::ErrorDeduper::new("delivery job failure record");
     let mut pinned_notice = super::SkipNotice::new();
@@ -619,11 +635,18 @@ pub async fn worker(app: Arc<App>) {
             match app.store.claim_delivery_job(&app.lease_holder, now_unix()) {
                 Ok(Some(job)) if job.state == "preparing" || job.state == "exporting" => {
                     claim_dedupe.recovered();
+                    tracing::debug!(
+                        job_id = %job.id,
+                        tenant = %job.tenant,
+                        state = %job.state,
+                        attempt = job.attempts,
+                        "claimed delivery job"
+                    );
                     let result = match begin_outbound_operation(&app, &job.tenant) {
                         Ok(_tenant_operation) => prepare(&app, job.clone()).await,
                         Err(error) => Err(error),
                     };
-                    if let Err(error) = result {
+                    if let Err(error) = &result {
                         while let Err(store_error) =
                             app.store
                                 .fail_delivery_job(&job.id, job.attempts, &error.message)
@@ -635,6 +658,12 @@ pub async fn worker(app: Arc<App>) {
                         }
                         record_dedupe.recovered();
                     }
+                    tracing::debug!(
+                        job_id = %job.id,
+                        tenant = %job.tenant,
+                        ok = result.is_ok(),
+                        "delivery job finished"
+                    );
                     notify_delivery_attention(&app, &job);
                     drop(operation);
                     continue;
@@ -1047,16 +1076,38 @@ fn copy_snapshot(
     )
 }
 
+/// Audit finding 266: whole-job budget for media and malware checks
+/// (chosen: 1800 seconds). Exhausting it fails the job with the reason
+/// instead of granting every remaining file a fresh per-check timeout.
+const MEDIA_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// Per checker-invocation ceiling; each run_check is bounded by this or the
+/// job's remaining media budget, whichever is less.
+const SINGLE_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 async fn check_media(app: &Arc<App>, job: &Job, names: &[String]) -> ApiResult<()> {
     if job.project.media.is_none() && !job.project.scan_required {
         return Ok(());
     }
+    // Audit finding 266: the whole job's media and malware checks share this
+    // budget; when it runs out the job fails with the reason instead of each
+    // remaining file getting a fresh timeout, so a hung scanner cannot pin a
+    // worker slot for days.
+    let deadline = tokio::time::Instant::now() + MEDIA_CHECK_BUDGET;
+    let remaining = || deadline.saturating_duration_since(tokio::time::Instant::now());
     let received = if job.received.is_some() {
         Some(received_files(app, job).await?)
     } else {
         None
     };
     for name in names {
+        if remaining().is_zero() {
+            return Err(conflict(format!(
+                "media and malware checks exceeded the {}-second job budget; {} and any later files were not checked",
+                MEDIA_CHECK_BUDGET.as_secs(),
+                name
+            )));
+        }
         let path = if let Some(received) = &received {
             let file = received.get(name).ok_or_else(ApiError::not_found)?;
             admin::stored_path(app, &job.tenant, &file.stored_as).ok_or_else(ApiError::not_found)?
@@ -1078,6 +1129,7 @@ async fn check_media(app: &Arc<App>, job: &Job, names: &[String]) -> ApiResult<(
                     "json",
                 ],
                 &path,
+                remaining().min(SINGLE_CHECK_TIMEOUT),
             )
             .await?;
             let document: serde_json::Value = serde_json::from_slice(&output)
@@ -1110,19 +1162,29 @@ async fn check_media(app: &Arc<App>, job: &Job, names: &[String]) -> ApiResult<(
         if job.project.scan_required {
             let binary =
                 std::env::var_os("VOTPORT_CLAMDSCAN").unwrap_or_else(|| "clamdscan".into());
-            run_check(binary, &["--no-summary", "--fdpass", "--"], &path)
-                .await
-                .map_err(|_| {
-                    conflict(format!(
-                        "malware scan did not clear {name}; delivery remains quarantined"
-                    ))
-                })?;
+            run_check(
+                binary,
+                &["--no-summary", "--fdpass", "--"],
+                &path,
+                remaining().min(SINGLE_CHECK_TIMEOUT),
+            )
+            .await
+            .map_err(|_| {
+                conflict(format!(
+                    "malware scan did not clear {name}; delivery remains quarantined"
+                ))
+            })?;
         }
     }
     Ok(())
 }
 
-async fn run_check(binary: std::ffi::OsString, args: &[&str], path: &Path) -> ApiResult<Vec<u8>> {
+async fn run_check(
+    binary: std::ffi::OsString,
+    args: &[&str],
+    path: &Path,
+    timeout: std::time::Duration,
+) -> ApiResult<Vec<u8>> {
     use tokio::io::AsyncReadExt;
     let mut child = tokio::process::Command::new(binary)
         .args(args)
@@ -1137,7 +1199,7 @@ async fn run_check(binary: std::ffi::OsString, args: &[&str], path: &Path) -> Ap
         .stdout
         .take()
         .ok_or_else(|| ApiError::internal("checker stdout missing"))?;
-    let result = tokio::time::timeout(std::time::Duration::from_secs(300), async {
+    let result = tokio::time::timeout(timeout, async {
         let mut output = vec![];
         stdout
             .take(65537)
@@ -4313,23 +4375,59 @@ mod tests {
     async fn required_checkers_fail_closed_and_bound_output() {
         let path = Path::new("fixture");
         assert_eq!(
-            run_check("/bin/sh".into(), &["-c", "printf checked"], path)
-                .await
-                .unwrap(),
+            run_check(
+                "/bin/sh".into(),
+                &["-c", "printf checked"],
+                path,
+                SINGLE_CHECK_TIMEOUT
+            )
+            .await
+            .unwrap(),
             b"checked"
         );
         for script in ["exit 1", "head -c 65537 /dev/zero"] {
             assert!(tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                run_check("/bin/sh".into(), &["-c", script], path)
+                run_check(
+                    "/bin/sh".into(),
+                    &["-c", script],
+                    path,
+                    SINGLE_CHECK_TIMEOUT
+                )
             )
             .await
             .expect("checker limit must not hang")
             .is_err());
         }
-        assert!(run_check("/nonexistent-votport-checker".into(), &[], path)
-            .await
-            .is_err());
+        assert!(run_check(
+            "/nonexistent-votport-checker".into(),
+            &[],
+            path,
+            SINGLE_CHECK_TIMEOUT
+        )
+        .await
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_check_respects_a_shortened_job_budget() {
+        // Audit finding 266: each checker is bounded by the job's remaining
+        // media budget rather than a fixed 300 seconds.
+        let path = Path::new("fixture");
+        let start = std::time::Instant::now();
+        assert!(run_check(
+            "/bin/sh".into(),
+            &["-c", "sleep 3"],
+            path,
+            std::time::Duration::from_millis(100)
+        )
+        .await
+        .is_err());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "checker ran past its budget"
+        );
     }
 
     #[tokio::test]

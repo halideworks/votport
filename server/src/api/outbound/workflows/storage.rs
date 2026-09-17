@@ -447,7 +447,7 @@ pub async fn test_connection(
     }
     // Both probe outcomes are audited, so each arm yields its result instead
     // of returning early.
-    let attempt: ApiResult<&'static str> = match config.kind {
+    let attempt: Result<ConnectionProbe, ApiError> = match config.kind {
         StorageKind::S3 => async {
             let store = config.connect(&app.store).map_err(conflict)?;
             let prefix = if config.prefix.is_empty() {
@@ -462,7 +462,7 @@ pub async fn test_connection(
             if !matches!(result, Ok(Ok(_))) {
                 return Err(conflict("Could not list this storage location. Check the endpoint, bucket, credentials and list permission, then try again.".into()));
             }
-            Ok("Connection verified. Bucket listing works; exports also require permission to write objects.")
+            Ok(ConnectionProbe::Verified("Connection verified. Bucket listing works; exports also require permission to write objects."))
         }
         .await,
         StorageKind::Folder => {
@@ -476,7 +476,7 @@ pub async fn test_connection(
             })
             .await
             .map_err(|_| ApiError::internal("shared folder check failed"))?
-            .map(|_| "Connection verified. The server can read this shared folder; mirroring also requires write permission.")
+            .map(|_| ConnectionProbe::Verified("Connection verified. The server can read this shared folder; mirroring also requires write permission."))
         }
         StorageKind::Votport => async {
             let Some(Credentials::Votport {
@@ -492,12 +492,19 @@ pub async fn test_connection(
                 ));
             };
             let (origin, token) = receive_url(&request_url).map_err(conflict)?;
-            let response = app
+            let response = match app
                 .http
                 .get(format!("{origin}/api/r/{token}"))
                 .send()
                 .await
-                .map_err(|_| conflict("The destination port could not be reached.".into()))?;
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    return Ok(ConnectionProbe::Unreachable(
+                        crate::notify::notification_connection_failure(&error),
+                    ))
+                }
+            };
             if !response.status().is_success() {
                 return Err(conflict(
                     "The destination did not return a usable receive request.".into(),
@@ -516,23 +523,28 @@ pub async fn test_connection(
                             .into(),
                     )
                 })?;
-                let response = app
+                let response = match app
                     .http
                     .post(format!("{origin}/api/r/{token}/verify"))
                     .header("X-Votport", "1")
                     .json(&json!({"password":password}))
                     .send()
                     .await
-                    .map_err(|_| {
-                        conflict("The destination password could not be checked.".into())
-                    })?;
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        return Ok(ConnectionProbe::Unreachable(
+                            crate::notify::notification_connection_failure(&error),
+                        ))
+                    }
+                };
                 if !response.status().is_success() {
                     return Err(conflict(
                         "The destination rejected the receive-request password.".into(),
                     ));
                 }
             }
-            Ok("Connection verified. The destination port is accepting files into this receive request.")
+            Ok(ConnectionProbe::Verified("Connection verified. The destination port is accepting files into this receive request."))
         }
         .await,
     };
@@ -542,6 +554,7 @@ pub async fn test_connection(
     } else {
         crate::api::audit_url(&config.endpoint)
     };
+    let verified = matches!(&attempt, Ok(ConnectionProbe::Verified(_)));
     app.store.audit(
         &identity.tenant,
         &identity.subject,
@@ -550,18 +563,39 @@ pub async fn test_connection(
         &json!({
             "kind": config.kind,
             "address": address,
-            "outcome": if attempt.is_ok() { "success" } else { "failure" }
+            "outcome": if verified { "success" } else { "failure" }
         }),
     );
-    let message = attempt?;
-    app.store
-        .delivery_storage_credentials(&id, body.revision)
-        .map_err(conflict)?;
-    Ok((
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(json!({"ok": true, "message": message})),
-    )
-        .into_response())
+    // Audit finding 337: an unreachable destination is a probe outcome, so
+    // it answers 200 with the connection failure class inside the normal
+    // envelope; only refused probes keep an error status. `message` mirrors
+    // the reason so the storage page renders both outcomes unchanged.
+    match attempt {
+        Ok(ConnectionProbe::Unreachable(reason)) => Ok((
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({"delivered": false, "reason": reason, "message": reason})),
+        )
+            .into_response()),
+        Ok(ConnectionProbe::Verified(message)) => {
+            app.store
+                .delivery_storage_credentials(&id, body.revision)
+                .map_err(conflict)?;
+            Ok((
+                [(header::CACHE_CONTROL, "no-store")],
+                Json(json!({"ok": true, "message": message})),
+            )
+                .into_response())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Audit finding 337: outcome of a destination connection probe. Verified
+/// carries the success message; Unreachable carries the connection failure
+/// class instead of an API error.
+enum ConnectionProbe {
+    Verified(&'static str),
+    Unreachable(&'static str),
 }
 
 fn folder_root(config: &Storage) -> ApiResult<PathBuf> {
@@ -1115,6 +1149,78 @@ async fn upload_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn connection_test_reports_unreachable_votport_port_with_reason_and_no_error_envelope() {
+        // Audit finding 337: an unreachable destination port is a probe
+        // outcome (200, delivered false, reason), not a 409 conflict.
+        use http_body_util::BodyExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = closed.local_addr().unwrap();
+        drop(closed);
+        let config: Storage = serde_json::from_value(json!({
+            "id":"destination","revision":0,"label":"Destination","kind":"votport",
+            "endpoint":format!("http://{address}"),"tenants":[""],"enabled":true
+        }))
+        .unwrap();
+        let config = app
+            .store
+            .save_delivery_storage(
+                "local",
+                config,
+                Some(Credentials::Votport {
+                    request_url: format!("http://{address}/r/{}", "a".repeat(32)),
+                    password: None,
+                }),
+            )
+            .unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!(
+                "votport_admin={}",
+                crate::auth::issue_admin_token(
+                    &app.secret,
+                    &crate::auth::AdminIdentity::local_admin(),
+                    &app.config.admin_token_tag
+                )
+            )
+            .parse()
+            .unwrap(),
+        );
+        headers.insert("x-votport", "1".parse().unwrap());
+        let response = test_connection(
+            State(app.clone()),
+            headers,
+            axum::extract::Path(config.id),
+            Json(TestStorage {
+                revision: config.revision,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["delivered"], false);
+        assert!(
+            body["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
+            "{}",
+            body
+        );
+        assert!(
+            body.get("error").is_none()
+                && body.get("code").is_none()
+                && body.get("retryable").is_none(),
+            "{}",
+            body
+        );
+    }
 
     #[test]
     fn s3_keys_limit_complete_utf8_bytes_for_all_operation_paths() {

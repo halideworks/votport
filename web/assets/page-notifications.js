@@ -70,8 +70,10 @@ async function refresh() {
         test.disabled = true;
         $('notification-notice').textContent = `Testing ${destination.label}…`;
         try {
-          await api(`/api/notifications/${destination.id}/test`, { method: 'POST' });
-          if (attempt === testAttempt) $('notification-notice').textContent = `Test accepted for ${destination.label}. Check that it appeared in ${destination.target}.`;
+          const result = await api(`/api/notifications/${destination.id}/test`, { method: 'POST' });
+          if (attempt === testAttempt) $('notification-notice').textContent = result?.delivered === false
+            ? `Test failed for ${destination.label}: ${result.reason ?? 'the destination did not accept the test'}`
+            : `Test accepted for ${destination.label}. Check that it appeared in ${destination.target}.`;
         } catch (error) {
           if (attempt === testAttempt) $('notification-notice').textContent = `Test failed for ${destination.label}: ${error.message}`;
         }

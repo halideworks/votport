@@ -306,13 +306,15 @@ pub async fn test(
         &destination.id,
         &detail,
     );
+    // Audit finding 337: a failed test is a probe outcome, not a server
+    // error, so it answers 200 with the delivery reason inside the normal
+    // envelope instead of a status code outside it.
     Ok((
-        if result.is_ok() {
-            StatusCode::OK
-        } else {
-            StatusCode::BAD_GATEWAY
-        },
-        Json(json!({"delivered":result.is_ok(),"error":result.err()})),
+        StatusCode::OK,
+        Json(match result {
+            Ok(()) => json!({"delivered": true}),
+            Err(reason) => json!({"delivered": false, "reason": reason}),
+        }),
     )
         .into_response())
 }
@@ -424,7 +426,7 @@ mod tests {
         .await
         .expect("SMTP Test fixture timed out");
         let response = response.unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.status(), StatusCode::OK);
         let response = body(response).await;
         assert_eq!(response["delivered"], false);
         assert_eq!(
@@ -466,7 +468,7 @@ mod tests {
             false,
         )
         .await;
-        assert_eq!(response["error"], "SMTP relay rejected the request. Check the recipients and ask the platform administrator to check relay policy and credentials.");
+        assert_eq!(response["reason"], "SMTP relay rejected the request. Check the recipients and ask the platform administrator to check relay policy and credentials.");
     }
 
     #[tokio::test]
@@ -479,7 +481,7 @@ mod tests {
             true,
         )
         .await;
-        assert_eq!(response["error"], "SMTP settings are incompatible with the relay. Ask the platform administrator to check TLS and authentication settings.");
+        assert_eq!(response["reason"], "SMTP settings are incompatible with the relay. Ask the platform administrator to check TLS and authentication settings.");
     }
 
     #[tokio::test]
@@ -494,8 +496,61 @@ mod tests {
                   ("STARTTLS", "220 begin TLS\r\n")], true,
              "SMTP connection failed. Ask the platform administrator to check the host, port and TLS settings."),
         ] {
-            assert_eq!(smtp_test_response(&steps, starttls).await["error"], expected);
+            assert_eq!(smtp_test_response(&steps, starttls).await["reason"], expected);
         }
+    }
+
+    #[tokio::test]
+    async fn webhook_test_reports_unreachable_destination_with_reason_and_no_error_envelope() {
+        // Audit finding 337: an unreachable endpoint is a probe outcome, not
+        // a 502 outside the envelope.
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        app.store.insert_tenant(tenant("studio")).unwrap();
+        // A closed port: the listener is dropped before the request fires.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = closed.local_addr().unwrap();
+        drop(closed);
+        let mut destination = crate::store::NotificationDestination {
+            id: "fixture".into(),
+            revision: 0,
+            label: "Webhook".into(),
+            channel: "webhook".into(),
+            target: "Loopback test".into(),
+            enabled: true,
+            url: format!("http://{address}/hook"),
+            token: String::new(),
+            user: String::new(),
+            recipients: vec![],
+            thread_id: String::new(),
+            last_reason: None,
+        };
+        app.store
+            .save_notification_destination("studio", &mut destination)
+            .unwrap();
+        let response = test(
+            State(app.clone()),
+            Path(destination.id.clone()),
+            headers(&app, "studio", "admin"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body(response).await;
+        assert_eq!(body["delivered"], false);
+        assert!(
+            body["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
+            "{}",
+            body
+        );
+        let text = body.to_string();
+        assert!(!text.contains("error") && !text.contains(&address.to_string()));
+        assert_eq!(
+            app.store.notification_outcomes("studio").unwrap()[&destination.id]["delivered"],
+            false
+        );
     }
 
     #[tokio::test]
