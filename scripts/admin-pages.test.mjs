@@ -256,3 +256,15 @@ test('admin pages preload their module graph and fetch data alongside the sessio
   assert.match(receiveScript, /Promise\.all\(\[sessionReady, refreshLinksSafe\(\)\]\)/);
   assert.match(deliverScript, /Promise\.all\(\[sessionReady, refreshGrants\(\)/);
 });
+
+test('status strip banners a failed health probe or a draining instance', async () => {
+  const statusStrip = await readFile(new URL('../web/assets/status-strip.js', import.meta.url), 'utf8');
+  // The banner renders from the shared poll, so both pages inherit it.
+  assert.match(statusStrip, /id = 'status-health-banner'/);
+  assert.match(statusStrip, /status\?\.health === false/);
+  assert.match(statusStrip, /status\?\.draining === true/);
+  assert.match(statusStrip, /setAttribute\('role', 'alert'\)/);
+  assert.match(statusStrip, /banner\?\.remove\(\)/);
+  assert.match(statusStrip, /renderHealth\(status\)/);
+  assert.match(style, /\.status-health-banner/);
+});

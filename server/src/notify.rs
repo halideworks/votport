@@ -926,6 +926,7 @@ pub(crate) mod tests {
                 vec![]
             },
             thread_id: String::new(),
+            last_reason: None,
         };
         app.store
             .save_notification_destination("", &mut destination)

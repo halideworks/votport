@@ -759,6 +759,14 @@ textarea { resize: vertical; }
  font-size: 0.8rem;
  margin: 0.7rem 0 0;
 }
+.status-health-banner {
+ color: var(--danger);
+ border: 1px solid var(--danger);
+ border-radius: 8px;
+ padding: 0.6rem 0.8rem;
+ margin: 0 0 0.9rem;
+ font-size: 0.85rem;
+}
 
 /* Addresses to copy sit in a field-shaped well, not as running text. */
 .card > p.mono {

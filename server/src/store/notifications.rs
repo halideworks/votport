@@ -115,6 +115,11 @@ pub struct NotificationDestination {
     pub recipients: Vec<String>,
     #[serde(default)]
     pub thread_id: String,
+    /// Failure reason class from the last attempt. Stored in this same
+    /// document cell (no schema change) and reset when the destination is
+    /// saved, together with the last_at/last_delivered columns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reason: Option<String>,
 }
 
 impl NotificationDestination {
@@ -195,6 +200,7 @@ impl Store {
             }
         }
         destination.revision += 1;
+        destination.last_reason = None;
         let document = serde_json::to_string(destination).map_err(|e| e.to_string())?;
         tx.execute("INSERT INTO notification_destinations(id,tenant,document) VALUES (?1,?2,?3) ON CONFLICT(id) DO UPDATE SET document=excluded.document,last_at=NULL,last_delivered=NULL WHERE notification_destinations.tenant=excluded.tenant", params![destination.id,tenant,document]).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
@@ -228,9 +234,21 @@ impl Store {
 
     pub fn notification_outcomes(&self, tenant: &str) -> Result<serde_json::Value, String> {
         self.with(|connection| {
-            let mut query = connection.prepare("SELECT id,last_at,last_delivered FROM notification_destinations WHERE tenant=?1 AND last_at IS NOT NULL")?;
-            let pairs = query.query_map([tenant], |row| Ok((row.get::<_, String>(0)?,serde_json::json!({"at":row.get::<_, i64>(1)?,"delivered":row.get::<_, bool>(2)?}))))?.collect::<rusqlite::Result<serde_json::Map<String,serde_json::Value>>>()?;
+            let mut query = connection.prepare("SELECT id,last_at,last_delivered,json_extract(document,'$.last_reason') FROM notification_destinations WHERE tenant=?1 AND last_at IS NOT NULL")?;
+            let pairs = query.query_map([tenant], |row| Ok((row.get::<_, String>(0)?,serde_json::json!({"at":row.get::<_, i64>(1)?,"delivered":row.get::<_, bool>(2)?,"reason":row.get::<_, Option<String>>(3)?}))))?.collect::<rusqlite::Result<serde_json::Map<String,serde_json::Value>>>()?;
             Ok(serde_json::Value::Object(pairs))
+        })
+    }
+
+    /// Destinations whose last delivery attempt failed. Drives the
+    /// votport_notification_destinations_failing gauge.
+    pub fn failing_notification_destinations(&self) -> Result<u64, String> {
+        self.with(|connection| {
+            connection.query_row(
+                "SELECT COUNT(*) FROM notification_destinations WHERE last_delivered=0 AND last_at IS NOT NULL AND json_extract(document,'$.enabled')=1",
+                [],
+                |row| row.get::<_, i64>(0).map(|count| count.max(0) as u64),
+            )
         })
     }
 
@@ -239,8 +257,9 @@ impl Store {
         tenant: &str,
         destination: &NotificationDestination,
         delivered: bool,
+        reason: Option<&str>,
     ) -> Result<(), String> {
-        self.with(|connection| connection.execute("UPDATE notification_destinations SET last_at=?3,last_delivered=?4 WHERE tenant=?1 AND id=?2 AND json_extract(document,'$.revision')=?5", params![tenant,destination.id,now_unix() as i64,delivered,destination.revision as i64]).map(|_| ()))
+        self.with(|connection| connection.execute("UPDATE notification_destinations SET last_at=?3,last_delivered=?4,document=json_set(document,'$.last_reason',json_quote(?6)) WHERE tenant=?1 AND id=?2 AND json_extract(document,'$.revision')=?5", params![tenant,destination.id,now_unix() as i64,delivered,destination.revision as i64,reason]).map(|_| ()))
     }
 
     pub fn set_outbound_notifications(

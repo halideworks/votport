@@ -126,6 +126,19 @@ impl Store {
         tx.commit().map_err(|e| e.to_string())
     }
 
+    /// Attempts exhausted to the dead state (attempts >= 12), so their
+    /// events will never deliver until the webhooks are changed. Drives the
+    /// votport_webhook_attempts_dead gauge.
+    pub fn dead_delivery_webhooks(&self) -> Result<u64, String> {
+        self.with(|connection| {
+            connection.query_row(
+                "SELECT COUNT(*) FROM delivery_webhook_attempts WHERE status='dead'",
+                [],
+                |row| row.get::<_, i64>(0).map(|count| count.max(0) as u64),
+            )
+        })
+    }
+
     pub fn due_delivery_webhooks(&self, now: u64) -> Result<Vec<WebhookAttempt>, String> {
         self.with(|connection| {
             let mut query = connection.prepare("SELECT a.tenant,a.event_id,a.revision,a.status,a.attempts,a.next_try,a.error,a.id FROM delivery_webhook_attempts a JOIN delivery_webhooks h ON h.tenant=a.tenant AND h.revision=a.revision WHERE h.enabled=1 AND a.status='pending' AND a.next_try<=?1 ORDER BY a.next_try,a.event_id LIMIT 16")?;

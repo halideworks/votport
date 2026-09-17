@@ -204,6 +204,10 @@ impl Drop for Active {
 
 pub struct Destinations {
     stopped: Arc<AtomicBool>,
+    /// Set when a check finds the mount remounted with a changed identity or
+    /// with disqualifying client options, so the exit path can report a
+    /// remount instead of a lease takeover.
+    disqualified: Arc<AtomicBool>,
     root: Directory,
     path: PathBuf,
     directories: Mutex<Vec<(PathBuf, ReceiveDirectory)>>,
@@ -348,6 +352,7 @@ impl Destinations {
     fn from_directory(root: Directory, path: &Path) -> Self {
         Self {
             stopped: Arc::new(AtomicBool::new(false)),
+            disqualified: Arc::new(AtomicBool::new(false)),
             root,
             path: path.to_owned(),
             directories: Mutex::new(Vec::new()),
@@ -374,6 +379,13 @@ impl Destinations {
         }
     }
 
+    /// True once a check found the storage remounted: the mount identity
+    /// changed or the client options no longer qualify. Unlike a lease
+    /// takeover, the process never shared this storage with another writer.
+    pub fn disqualified(&self) -> bool {
+        self.disqualified.load(Ordering::Acquire)
+    }
+
     pub fn check_current(&self) -> Result<(), String> {
         self.check_live()?;
         #[cfg(test)]
@@ -383,6 +395,16 @@ impl Destinations {
                 gate.wait();
             }
         }
+        if let Err(error) = self.check_remount() {
+            self.disqualified.store(true, Ordering::Release);
+            return Err(error);
+        }
+        self.check_live()
+    }
+
+    /// Rejects a remount: the mount under the held path changed, or the
+    /// current client options no longer carry the qualified guarantees.
+    fn check_remount(&self) -> Result<(), String> {
         if storage_identity(&self.path)? != self.identity()? {
             return Err("receiving folder or mount changed; reopen storage in Storage".to_owned());
         }
@@ -391,7 +413,7 @@ impl Destinations {
         if self.contract() == NasContract::ServerAcknowledged {
             vot_platform_fs::validate_nas_mount(self.root.file()).map_err(|e| e.to_string())?;
         }
-        self.check_live()
+        Ok(())
     }
 
     pub fn push_directory(&self, key: &str) -> Result<PathBuf, String> {

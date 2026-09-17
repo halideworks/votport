@@ -56,8 +56,11 @@ async function refresh() {
     head.append(node('h3', destination.label), node('span', destination.enabled ? 'Enabled' : 'Disabled', 'badge')); card.append(head);
     card.append(node('p', `${notificationServices[destination.channel]} · ${destination.target}`, 'connection-meta'));
     const outcome = data.outcomes[destination.id];
-    if (outcome) card.append(node('p', `Last attempt ${formatWhen(outcome.at)} · ${outcome.delivered ? 'Accepted by destination' : 'Failed; check connection settings'}`, outcome.delivered ? 'field-help' : 'error'));
-    else card.append(node('p', 'No delivery attempted yet. Send a test to check the destination.', 'field-help'));
+    if (outcome) {
+      const verdict = outcome.delivered ? 'Accepted by destination'
+        : outcome.reason ? `Failed: ${outcome.reason}` : 'Failed; check connection settings';
+      card.append(node('p', `Last attempt ${formatWhen(outcome.at)} · ${verdict}`, outcome.delivered ? 'field-help' : 'error'));
+    } else card.append(node('p', 'No delivery attempted yet. Send a test to check the destination.', 'field-help'));
     if (admin) {
       const actions = node('div', '', 'actions');
       actions.append(button('Edit', 'ghost', () => edit(destination)));

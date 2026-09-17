@@ -19,6 +19,29 @@ export function startStatusPoll({ render, active = () => false }) {
     clearTimeout(timer);
     timer = setTimeout(tick, status && active(status) ? 4_000 : 30_000);
   };
+  // A failed health probe or a drain must be visible on both pages even
+  // though their own cells keep painting: transfers are failing or refused.
+  function renderHealth(status) {
+    const strip = document.getElementById('status-strip');
+    if (!strip) return;
+    let banner = document.getElementById('status-health-banner');
+    const failing = status?.health === false;
+    const draining = status?.draining === true;
+    if (!failing && !draining) {
+      banner?.remove();
+      return;
+    }
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.id = 'status-health-banner';
+      banner.className = 'status-health-banner';
+      banner.setAttribute('role', 'alert');
+      strip.prepend(banner);
+    }
+    banner.textContent = failing
+      ? 'This instance is failing its own health probe. Transfers may fail or hang; check the server before sending work.'
+      : 'This instance is draining. New transfers are refused; existing downloads keep running.';
+  }
   async function tick() {
     clearTimeout(timer);
     if (document.hidden) return;
@@ -36,6 +59,7 @@ export function startStatusPoll({ render, active = () => false }) {
       return;
     }
     try {
+      renderHealth(status);
       await render(status);
     } finally {
       schedule(status);
