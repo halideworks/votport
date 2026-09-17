@@ -89,8 +89,7 @@ pub async fn defaults(
     headers: HeaderMap,
     Json(policy): Json<NotificationPolicy>,
 ) -> ApiResult<Response> {
-    let identity = admin::require_operator(&app, &headers)?;
-    admin::require_admin_write(&headers, &identity)?;
+    let identity = admin::require_operator_write(&app, &headers)?;
     if policy.mode == NotificationMode::Default {
         return Err(invalid("Tenant defaults must be off or custom"));
     }
@@ -197,8 +196,7 @@ pub async fn save(
     headers: HeaderMap,
     Json(mut value): Json<serde_json::Value>,
 ) -> ApiResult<Response> {
-    let identity = admin::require_operator(&app, &headers)?;
-    admin::require_admin_write(&headers, &identity)?;
+    let identity = admin::require_operator_write(&app, &headers)?;
     let object = value
         .as_object_mut()
         .ok_or_else(|| invalid("A connection object is required"))?;
@@ -281,8 +279,7 @@ pub async fn test(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let identity = admin::require_operator(&app, &headers)?;
-    admin::require_admin_write(&headers, &identity)?;
+    let identity = admin::require_operator_write(&app, &headers)?;
     let destination = crate::notify::destination(&app, &identity.tenant, &id)
         .map_err(store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
@@ -1059,8 +1056,7 @@ pub async fn delete(
     headers: HeaderMap,
     request: Request,
 ) -> ApiResult<Response> {
-    let identity = admin::require_operator(&app, &headers)?;
-    admin::require_admin_write(&headers, &identity)?;
+    let identity = admin::require_operator_write(&app, &headers)?;
     let header_revision = if_match_revision(&headers)?;
     let bytes = axum::body::to_bytes(request.into_body(), DELETE_BODY_LIMIT)
         .await

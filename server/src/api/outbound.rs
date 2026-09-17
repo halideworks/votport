@@ -497,8 +497,7 @@ pub async fn upload_outbound_file(
     // Every refusal of a chunk before its body is read drains it first, so
     // a client still writing reads the status (a session that ended
     // mid-upload must arrive as the 401 it is, not a reset connection).
-    let admitted = admin::require_operator(&app, &headers).and_then(|identity| {
-        admin::require_admin_write(&headers, &identity)?;
+    let admitted = admin::require_operator_write(&app, &headers).and_then(|identity| {
         let operation = begin_outbound_operation(&app, &identity.tenant)?;
         Ok((identity, operation))
     });
@@ -1066,8 +1065,7 @@ pub async fn delete_outbound_file(
     headers: HeaderMap,
     Query(query): Query<OutboundPathQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = admin::require_operator(&app, &headers)?;
-    admin::require_admin_write(&headers, &identity)?;
+    let identity = admin::require_operator_write(&app, &headers)?;
     let operation = begin_outbound_operation_owned(&app, &identity.tenant)?;
     let relative_path = query.path.trim_matches('/').to_owned();
     let path = safe_library_path(&app, &identity.tenant, &relative_path)?;
@@ -1986,8 +1984,7 @@ pub async fn create_outbound_grant(
     headers: HeaderMap,
     request: Request,
 ) -> ApiResult<Response> {
-    let identity = admin::require_operator(&app, &headers)?;
-    admin::require_admin_write(&headers, &identity)?;
+    let identity = admin::require_operator_write(&app, &headers)?;
     let _grant_permit = app.outbound_grant_permits.try_acquire().map_err(|_| {
         ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -2915,8 +2912,7 @@ pub async fn delete_outbound_grant(
     AxumPath(id): AxumPath<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = admin::require_operator(&app, &headers)?;
-    admin::require_admin_write(&headers, &identity)?;
+    let identity = admin::require_operator_write(&app, &headers)?;
     let _operation = begin_outbound_operation(&app, &identity.tenant)?;
     // Idempotent like the automation delivery revoke documents: a repeat
     // delete of a row this tenant owns answers 200 again; only an unknown id
@@ -2958,8 +2954,7 @@ pub async fn update_outbound_grant(
     headers: HeaderMap,
     Json(request): Json<UpdateOutboundGrantRequest>,
 ) -> ApiResult<Response> {
-    let identity = admin::require_operator(&app, &headers)?;
-    admin::require_admin_write(&headers, &identity)?;
+    let identity = admin::require_operator_write(&app, &headers)?;
     let _operation = begin_outbound_operation(&app, &identity.tenant)?;
     let fields = [
         request.rotate.is_some(),

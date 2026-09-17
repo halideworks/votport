@@ -3,9 +3,9 @@
 //! The client refuses a bad name before it hashes gigabytes, so a drop fails
 //! in milliseconds rather than after a long hash that the server would reject
 //! at begin. Two authorities decide a name: vot-manifest's portable profile,
-//! applied by building a [`PackagePath`], and votport's own `admit_component`
-//! (the rule the server applies at begin), ported here. The check is the
-//! union; the server re-checks everything.
+//! applied by building a [`PackagePath`], and the shared
+//! `protocol_paths::admit_component` (the rule the server applies at begin).
+//! The check is the union; the server re-checks everything.
 
 use std::path::PathBuf;
 
@@ -25,9 +25,6 @@ pub fn display_path(path: &PackagePath) -> String {
         .collect();
     parts.join("/")
 }
-
-/// The reserved tenant-storage directory name, from votport's `paths` module.
-const TENANT_STORAGE_DIR: &str = ".vot-tenants.stage";
 
 /// A file selected for a drop: the path it takes in the package, and the file
 /// on disk that holds its bytes.
@@ -51,66 +48,6 @@ impl std::fmt::Display for Rejected {
     }
 }
 
-/// Whether a name is `.vot-push-<32 hex>`, the push staging shape.
-fn is_push_staging_name(name: &str) -> bool {
-    match name.strip_prefix(".vot-push-") {
-        Some(rest) => {
-            rest.len() == 32
-                && rest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        }
-        None => false,
-    }
-}
-
-/// votport's per-component policy, the rule the server applies at begin.
-///
-/// This is the delta over vot-manifest's portable profile: the hidden-name
-/// gate, the DOS alias marker `~`, and the reserved staging names. It is
-/// ported from `server/src/paths.rs::admit_component` so a name that would
-/// fail at begin fails here first, before any bytes are read.
-fn admit_component(component: &str, allow_hidden: bool) -> Result<(), String> {
-    if component.is_empty() || component.len() > 255 {
-        return Err("empty or oversized path component".to_owned());
-    }
-    if component == "." || component == ".." {
-        return Err("path component is a directory reference".to_owned());
-    }
-    if component
-        .chars()
-        .any(|ch| ch == '/' || ch == '\\' || ch == '~' || ch == '\0' || ch <= '\u{1f}')
-    {
-        return Err(
-            "path component contains a separator, control character, or DOS alias marker"
-                .to_owned(),
-        );
-    }
-    if crate::protocol_paths::is_receipt_name(component) {
-        return Err("name is reserved for signed receipts".into());
-    }
-    if !allow_hidden && component.starts_with('.') {
-        return Err("hidden file names are not accepted here".to_owned());
-    }
-    if component.starts_with('.') && !component.is_ascii() {
-        return Err("non-ASCII hidden names are reserved for portable storage".to_owned());
-    }
-    if component.eq_ignore_ascii_case(TENANT_STORAGE_DIR) {
-        return Err("name is reserved for tenant storage".to_owned());
-    }
-    // Resume journals, identities, and leases must not alias delivered names on
-    // case-insensitive filesystems.
-    let lower = component.to_ascii_lowercase();
-    if is_push_staging_name(component)
-        || (component.starts_with(".vot-") && component.ends_with(".stage"))
-        || (lower.starts_with(".vot-")
-            && (lower.ends_with(".id") || lower.ends_with(".journal") || lower.ends_with(".lease")))
-    {
-        return Err("name is reserved for votport staging files".to_owned());
-    }
-    Ok(())
-}
-
 /// Validates a single relative path and turns it into an [`Entry`].
 ///
 /// `relative` is the package path with `/` separators (a folder drop keeps its
@@ -132,9 +69,11 @@ pub fn admit(relative: &str, source: PathBuf, allow_hidden: bool) -> Result<Entr
         });
     }
     for component in &components {
-        admit_component(component, allow_hidden).map_err(|reason| Rejected {
-            path: relative.to_owned(),
-            reason,
+        crate::protocol_paths::admit_component(component, allow_hidden).map_err(|reason| {
+            Rejected {
+                path: relative.to_owned(),
+                reason,
+            }
         })?;
     }
     crate::protocol_paths::check_payload_name_length(components.last().unwrap()).map_err(
@@ -211,7 +150,7 @@ mod tests {
                 "reserved for signed receipts",
             ),
             (".vot-receipt", true, "reserved for signed receipts"),
-            (".VOT-anything.LEASE", true, "reserved for votport staging"),
+            (".VOTPORT-LEASE", true, "reserved for the instance lease"),
             (".vot-tenants.stage", true, "reserved for tenant storage"),
             (
                 ".vot-push-00112233445566778899aabbccddeeff",
@@ -220,14 +159,6 @@ mod tests {
             ),
             (
                 ".vot-anything.journal",
-                true,
-                "reserved for votport staging",
-            ),
-            (".vot-anything.id", true, "reserved for votport staging"),
-            // Case-insensitively, so an uppercased variant cannot alias the
-            // client's own resume temporary on a case-insensitive filesystem.
-            (
-                ".VOT-anything.JOURNAL",
                 true,
                 "reserved for votport staging",
             ),

@@ -24,8 +24,7 @@ fn notify_later(app: &Arc<App>, route: &TradeRoute, event: &'static str, detail:
     });
 }
 fn write(app: &App, headers: &HeaderMap) -> ApiResult<admin::AdminSession> {
-    let identity = admin::require_operator(app, headers)?;
-    admin::require_admin_write(headers, &identity)?;
+    let identity = admin::require_operator_write(app, headers)?;
     Ok(identity)
 }
 fn now() -> u64 {

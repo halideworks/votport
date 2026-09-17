@@ -12,7 +12,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use vot_platform_fs::{Directory, FileLocation};
 
-pub const FILE_NAME: &str = ".votport-lease";
+pub use crate::protocol_paths::LEASE_FILE_NAME as FILE_NAME;
 pub const RENEW_EVERY: Duration = Duration::from_secs(30);
 const LOCK_NAME: &str = "writer.lock";
 

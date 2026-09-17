@@ -312,8 +312,7 @@ pub async fn put(
     headers: HeaderMap,
     Json(body): Json<SaveStorage>,
 ) -> ApiResult<Response> {
-    let identity = admin::require_operator(&app, &headers)?;
-    admin::require_admin_write(&headers, &identity)?;
+    let identity = admin::require_operator_write(&app, &headers)?;
     if !identity.tenant.is_empty() {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
@@ -433,8 +432,7 @@ pub async fn test_connection(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(body): Json<TestStorage>,
 ) -> ApiResult<Response> {
-    let identity = admin::require_operator(&app, &headers)?;
-    admin::require_admin_write(&headers, &identity)?;
+    let identity = admin::require_operator_write(&app, &headers)?;
     if !identity.tenant.is_empty() {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,

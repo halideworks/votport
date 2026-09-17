@@ -11,6 +11,7 @@ import init, {
   PackageEntry,
   PackagePath,
   Suite,
+  proofLeafSize,
 } from '/assets/vendor/vot_wasm.js';
 
 const $ = (id) => document.getElementById(id);
@@ -65,7 +66,10 @@ const MAX_WORKERS = 8;
 // worker and a join, worth it only when the file dwarfs that.
 const PARALLEL_MIN_BYTES = 64 * 1024 * 1024;
 const MIN_SEGMENT_BYTES = 16 * 1024 * 1024;
-const PROOF_LEAF_BYTES = 65536;
+// Proof leaf size, read from the wasm once it is up, so a repin that
+// changes the leaf cannot leave a stale literal misaligning the segment
+// plan. Segments are only built after init.
+let proofLeafBytes = 0;
 // One file at a time takes the whole pool for segments while the other
 // lanes keep hashing whole files, so live read buffers can reach twice the
 // pool size.
@@ -830,7 +834,7 @@ async function runUpload() {
           renderNote();
         };
         const plan = file.size >= PARALLEL_MIN_BYTES && !parallelHashing
-          ? segments(file.size, PROOF_LEAF_BYTES, hashWorkers.length, MIN_SEGMENT_BYTES)
+          ? segments(file.size, proofLeafBytes, hashWorkers.length, MIN_SEGMENT_BYTES)
           : [[0, file.size]];
         if (plan.length < 2) {
           done = await workerCall({ op: 'hash', key: path, file }, index, onStep);
@@ -1386,6 +1390,7 @@ $('resume-discard').addEventListener('click', () => {
   webBuild = info.web_build || null;
   try {
     await init();
+    proofLeafBytes = Number(proofLeafSize());
   } catch {
     $('subtitle').textContent =
       'This browser could not load the verification engine. It requires WebAssembly '

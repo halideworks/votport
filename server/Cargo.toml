@@ -25,8 +25,6 @@ vot-cli = { git = "https://github.com/halideworks/VOT", rev = "de66d41343cee7fb2
 vot-capability = { git = "https://github.com/halideworks/VOT", rev = "de66d41343cee7fb206a0f323d36babea655f032" }
 vot-manifest = { git = "https://github.com/halideworks/VOT", rev = "de66d41343cee7fb206a0f323d36babea655f032" }
 vot-platform-fs = { git = "https://github.com/halideworks/VOT", rev = "de66d41343cee7fb206a0f323d36babea655f032" }
-vot-proof-blake3 = { git = "https://github.com/halideworks/VOT", rev = "de66d41343cee7fb206a0f323d36babea655f032" }
-vot-proof-sha256 = { git = "https://github.com/halideworks/VOT", rev = "de66d41343cee7fb206a0f323d36babea655f032" }
 vot-scheduler = { git = "https://github.com/halideworks/VOT", rev = "de66d41343cee7fb206a0f323d36babea655f032" }
 
 axum = "0.8"
@@ -66,6 +64,8 @@ tar = { version = "0.4", default-features = false }
 x509-parser = "0.18"
 
 [dev-dependencies]
+vot-proof-blake3 = { git = "https://github.com/halideworks/VOT", rev = "de66d41343cee7fb206a0f323d36babea655f032" }
+vot-proof-sha256 = { git = "https://github.com/halideworks/VOT", rev = "de66d41343cee7fb206a0f323d36babea655f032" }
 vot-codec = { git = "https://github.com/halideworks/VOT", rev = "de66d41343cee7fb206a0f323d36babea655f032" }
 async-trait = "0.1"
 http-body-util = "0.1"

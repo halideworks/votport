@@ -214,6 +214,21 @@ pub(crate) fn require_admin_write(
     require_csrf_header(headers)
 }
 
+/// Platform admin AND mutating: the combined gate for default-tenant write
+/// routes, so a handler cannot pass one check and miss the other.
+fn require_platform_admin_write(app: &App, headers: &HeaderMap) -> ApiResult<AdminSession> {
+    let identity = require_platform_admin(app, headers)?;
+    require_admin_write(headers, &identity)?;
+    Ok(identity)
+}
+
+/// Operator AND mutating: the combined gate for tenant write routes.
+pub(crate) fn require_operator_write(app: &App, headers: &HeaderMap) -> ApiResult<AdminSession> {
+    let identity = require_operator(app, headers)?;
+    require_admin_write(headers, &identity)?;
+    Ok(identity)
+}
+
 fn require_csrf_header(headers: &HeaderMap) -> ApiResult<()> {
     if !headers.contains_key("x-votport") {
         return Err(ApiError::new(
@@ -1481,8 +1496,7 @@ pub async fn create_tenant(
     headers: HeaderMap,
     Json(request): Json<CreateTenantRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_platform_admin(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
+    let identity = require_platform_admin_write(&app, &headers)?;
     let key = admit_tenant_key(&request.key)?;
     let _pin = app.sessions.try_pin_tenant(&key).ok_or_else(|| {
         ApiError::new(StatusCode::CONFLICT, "tenant mutation already in progress")
@@ -1662,8 +1676,7 @@ pub async fn revoke_principal(
     headers: HeaderMap,
     Json(request): Json<PrincipalSubjectRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_platform_admin(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
+    let identity = require_platform_admin_write(&app, &headers)?;
     mutate_principal(&app, &identity.subject, &request.subject, true)
 }
 
@@ -1672,8 +1685,7 @@ pub async fn unblock_principal(
     headers: HeaderMap,
     Json(request): Json<PrincipalSubjectRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_platform_admin(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
+    let identity = require_platform_admin_write(&app, &headers)?;
     mutate_principal(&app, &identity.subject, &request.subject, false)
 }
 
@@ -1721,8 +1733,7 @@ pub async fn delete_tenant(
     Path(key): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_platform_admin(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
+    let identity = require_platform_admin_write(&app, &headers)?;
     let key = admit_tenant_ref(&key)?;
     let pin = app.sessions.try_pin_tenant(&key).ok_or_else(|| {
         ApiError::new(StatusCode::CONFLICT, "tenant mutation already in progress")
@@ -1893,8 +1904,7 @@ pub async fn update_tenant(
     headers: HeaderMap,
     Json(request): Json<PatchTenantRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_platform_admin(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
+    let identity = require_platform_admin_write(&app, &headers)?;
     let Some(mut tenant) = app.store.tenant(&key).map_err(super::store_unavailable)? else {
         return Err(ApiError::not_found());
     };
@@ -2058,8 +2068,7 @@ pub async fn put_branding(
     headers: HeaderMap,
     Json(request): Json<PutBrandingRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_operator(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
+    let identity = require_operator_write(&app, &headers)?;
     let (tenant, _target_operation) = branding_tenant(&app, &key, &identity)?;
     admit_brand_color(&request.color)?;
     let previous = app
@@ -2161,8 +2170,7 @@ pub async fn delete_branding(
     Path(key): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_operator(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
+    let identity = require_operator_write(&app, &headers)?;
     let (tenant, _target_operation) = branding_tenant(&app, &key, &identity)?;
     let logo_ext = app
         .store
@@ -2223,8 +2231,7 @@ pub async fn put_branding_logo(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_operator(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
+    let identity = require_operator_write(&app, &headers)?;
     let (tenant, _target_operation) = branding_tenant(&app, &key, &identity)?;
     if body.len() > MAX_LOGO_BYTES {
         return Err(ApiError::new(
@@ -2312,8 +2319,7 @@ pub async fn delete_branding_logo(
     Path(key): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_operator(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
+    let identity = require_operator_write(&app, &headers)?;
     let (tenant, _target_operation) = branding_tenant(&app, &key, &identity)?;
     let branding = app
         .store
@@ -2380,8 +2386,7 @@ pub async fn backup_database(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let identity = require_platform_admin(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
+    let identity = require_platform_admin_write(&app, &headers)?;
     let guard = Arc::clone(&app.backup_lock)
         .try_lock_owned()
         .map_err(|_| ApiError::new(StatusCode::CONFLICT, "backup already running"))?;
@@ -2502,8 +2507,7 @@ pub async fn put_backups_config(
     headers: HeaderMap,
     Json(mut body): Json<BackupConfigRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_platform_admin(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
+    let identity = require_platform_admin_write(&app, &headers)?;
     for value in [
         &mut body.config.local_path,
         &mut body.config.s3_endpoint,
@@ -2606,8 +2610,7 @@ pub async fn create_backup(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_platform_admin(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
+    let identity = require_platform_admin_write(&app, &headers)?;
     let guard = Arc::clone(&app.backup_lock)
         .try_lock_owned()
         .map_err(|_| ApiError::new(StatusCode::CONFLICT, "backup already running"))?;
@@ -2640,8 +2643,7 @@ pub async fn restore_backup(
     headers: HeaderMap,
     Json(body): Json<crate::backup::RestoreRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_platform_admin(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
+    let identity = require_platform_admin_write(&app, &headers)?;
     crate::backup::validate_id(&body.id)
         .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e))?;
     let guard = Arc::clone(&app.backup_lock)
@@ -2828,8 +2830,7 @@ pub async fn acknowledge_retention_clock(
     headers: HeaderMap,
     Json(request): Json<RetentionClockAcknowledgement>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_platform_admin(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
+    let identity = require_platform_admin_write(&app, &headers)?;
     match app.acknowledge_retention_clock_at(&identity.subject, request.observed_at, now_unix()) {
         Ok(()) => {}
         Err(crate::app::RetentionClockAcknowledgementError::FutureObservation) => {
@@ -2945,8 +2946,7 @@ pub async fn check_receiving_storage(
     headers: HeaderMap,
     Json(request): Json<ReceivingStorageCheck>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_platform_admin(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
+    let identity = require_platform_admin_write(&app, &headers)?;
     let permit = Arc::clone(&app.receiving_reconfigure)
         .try_acquire_owned()
         .map_err(|_| {
@@ -3226,8 +3226,7 @@ pub async fn put_settings(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_platform_admin(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
+    let identity = require_platform_admin_write(&app, &headers)?;
     let object = body
         .as_object()
         .ok_or_else(|| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "expected a JSON object"))?;
@@ -3439,8 +3438,7 @@ pub async fn admin_change_password(
     headers: HeaderMap,
     Json(request): Json<ChangePasswordRequest>,
 ) -> ApiResult<Response> {
-    let identity = require_operator(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
+    let identity = require_operator_write(&app, &headers)?;
     // The local password is the break-glass credential for the platform;
     // SSO tenant admins rotate access at their identity provider instead.
     if !identity.tenant.is_empty() || identity.role != "admin" {
@@ -4004,8 +4002,7 @@ pub async fn create_link(
     headers: HeaderMap,
     Json(request): Json<CreateLinkRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_operator(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
+    let identity = require_operator_write(&app, &headers)?;
     let label = request.label.trim().to_owned();
     if label.is_empty() || label.len() > 200 {
         return Err(ApiError::new(
@@ -4163,8 +4160,7 @@ pub async fn update_link(
     headers: HeaderMap,
     Json(request): Json<UpdateLinkRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_operator(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
+    let identity = require_operator_write(&app, &headers)?;
     let fields = [
         request.active.is_some(),
         request.legal_hold.is_some(),
@@ -4273,8 +4269,7 @@ pub async fn delete_link(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_operator(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
+    let identity = require_operator_write(&app, &headers)?;
     if app
         .store
         .link_metadata(&identity.tenant, &id)
@@ -4369,8 +4364,7 @@ pub async fn delete_upload_record(
     Path((id, upload)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_operator(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
+    let identity = require_operator_write(&app, &headers)?;
     if app
         .store
         .link_metadata(&identity.tenant, &id)
@@ -4453,8 +4447,7 @@ pub async fn delete_received_file(
     Path((id, upload, index)): Path<(String, String, usize)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_operator(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
+    let identity = require_operator_write(&app, &headers)?;
     tokio::task::spawn_blocking(move || {
         delete_received_file_sync(&app, &identity, &id, &upload, index)
     })
