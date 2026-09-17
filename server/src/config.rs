@@ -827,8 +827,14 @@ pub fn from_env() -> Result<Config, String> {
         smtp_starttls,
         smtp_username: optional("VOTPORT_NOTIFY_SMTP_USERNAME"),
         smtp_password: optional("VOTPORT_NOTIFY_SMTP_PASSWORD"),
-        scim_token: optional("VOTPORT_SCIM_TOKEN"),
-        replica_token: optional("VOTPORT_REPLICA_TOKEN"),
+        scim_token: bearer_token(
+            "VOTPORT_SCIM_TOKEN",
+            optional("VOTPORT_SCIM_TOKEN").as_deref(),
+        )?,
+        replica_token: bearer_token(
+            "VOTPORT_REPLICA_TOKEN",
+            optional("VOTPORT_REPLICA_TOKEN").as_deref(),
+        )?,
         smtp_from: optional("VOTPORT_NOTIFY_SMTP_FROM"),
 
         public_url,
@@ -912,7 +918,42 @@ fn push_address(
     public_url: Option<&str>,
     bind: SocketAddr,
 ) -> Result<String, String> {
-    listener_address("PUSH", explicit, public_url, bind)
+    let address = listener_address("PUSH", explicit, public_url, bind)?;
+    let loopback = reqwest::Url::parse(&format!("vot://{address}"))
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(is_loopback_host))
+        .unwrap_or(false);
+    if loopback && !bind.ip().is_loopback() {
+        return Err(format!(
+            "VOTPORT_PUSH_ADVERTISE is loopback ({address}) but VOTPORT_PUSH_BIND is not; \
+             senders would dial their own machine. Bind push on loopback or advertise a \
+             routable address"
+        ));
+    }
+    Ok(address)
+}
+
+/// A loopback host literal: `localhost` in any case, or a loopback IP.
+/// DNS names are never resolved.
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_matches(['[', ']']);
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+/// The env value of a bearer token is always the raw token; the `sha256:`
+/// digest form is only how stored tokens are hashed. Accepting a digest here
+/// would make every byte comparison fail and silently break replication.
+fn bearer_token(name: &str, value: Option<&str>) -> Result<Option<String>, String> {
+    match value {
+        Some(token) if token.starts_with(crate::api::scim::HASH_PREFIX) => Err(format!(
+            "{name} must be the raw bearer token, not a {} digest; the digest form is only for stored values",
+            crate::api::scim::HASH_PREFIX
+        )),
+        token => Ok(token.map(str::to_owned)),
+    }
 }
 
 /// The advertised address for a UDP listener named by `kind` (`PUSH` or
@@ -1121,7 +1162,53 @@ mod public_url_tests {
 
 #[cfg(test)]
 mod push_tests {
-    use super::push_address;
+    use super::{bearer_token, push_address};
+
+    #[test]
+    fn loopback_push_advertise_requires_a_loopback_bind() {
+        for host in ["127.0.0.1", "localhost", "[::1]"] {
+            let advertise = format!("{host}:8322");
+            assert_eq!(
+                push_address(
+                    Some(advertise.clone()),
+                    None,
+                    "127.0.0.1:8322".parse().unwrap()
+                )
+                .unwrap(),
+                advertise
+            );
+            let error = push_address(
+                Some(advertise.clone()),
+                None,
+                "0.0.0.0:8322".parse().unwrap(),
+            )
+            .unwrap_err();
+            assert!(error.contains("VOTPORT_PUSH_ADVERTISE"), "{error}");
+            assert!(error.contains("VOTPORT_PUSH_BIND"), "{error}");
+        }
+        // Private non-loopback addresses stay allowed for multi-host LANs.
+        assert!(push_address(
+            Some("10.0.0.5:8322".to_owned()),
+            None,
+            "0.0.0.0:8322".parse().unwrap()
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn bearer_token_env_refuses_the_digest_form() {
+        for name in ["VOTPORT_SCIM_TOKEN", "VOTPORT_REPLICA_TOKEN"] {
+            let error = bearer_token(name, Some("sha256:abc")).unwrap_err();
+            assert!(error.contains(name), "{error}");
+            assert!(error.contains("raw bearer token"), "{error}");
+            assert!(error.contains("stored"), "{error}");
+            assert_eq!(
+                bearer_token(name, Some("raw-token")).unwrap().as_deref(),
+                Some("raw-token")
+            );
+            assert!(bearer_token(name, None).unwrap().is_none());
+        }
+    }
 
     #[test]
     fn push_address_uses_the_public_host_and_udp_port() {

@@ -191,11 +191,21 @@ environment:
   VOTPORT_PUSH_ADVERTISE: "203.0.113.10:8322"
 ```
 
-Replace the example address with the numeric public address reachable by the
-sender, and allow that UDP port in the host and cloud firewalls. Do not put
-the UDP mapping behind the normal Caddy `reverse_proxy`: it proxies HTTP/TCP,
-not the VOT QUIC listener. The HTTPS `VOTPORT_PUBLIC_URL` remains the address
-used for the link and native-push preflight.
+Replace the example address with the numeric public address reachable by
+the sender. Because the port is published, Docker DNATs push packets before
+the host INPUT chain: no `ufw allow` is needed for UDP 8322, and an INPUT
+rule cannot restrict it either. Restrict sender sources in the `DOCKER-USER`
+chain instead, using the original destination port, for example:
+
+```sh
+sudo iptables -I DOCKER-USER -m conntrack --ctorigdstport 8322 \
+  ! -s 203.0.113.0/24 -j DROP
+```
+
+Cloud-level firewalls that sit in front of the host still apply normally. Do
+not put the UDP mapping behind the normal Caddy `reverse_proxy`: it proxies
+HTTP/TCP, not the VOT QUIC listener. The HTTPS `VOTPORT_PUBLIC_URL` remains
+the address used for the link and native-push preflight.
 
 If `VOTPORT_PUSH_CERT` and `VOTPORT_PUSH_KEY` are both unset, votport creates
 and retains a self-signed certificate in `data/` and exposes its digest from
@@ -730,7 +740,10 @@ Transfers are covered by `votport_upload_sessions_ended_total` with a fixed
 `votport_upload_bytes` and `votport_upload_duration_seconds` histograms over
 published uploads (1 MiB through 16 GiB, and 1s through 6h), the
 `votport_upload_bytes_in_flight` gauge, and `votport_disk_free_bytes` and
-`votport_disk_total_bytes` per `volume` (`receive`, `outbound`).
+`votport_disk_total_bytes` per `volume` (`receive`, `outbound`). Alert on
+`votport_disk_free_bytes` for either `volume`: session admission refuses new
+sessions whose declared total would not fit above a 1 GiB reserve on the
+receiving volume, and outbound staging keeps the same reserve.
 Ownership and admission state use the `votport_draining`, `votport_lease_held`
 and diagnostic `votport_lease_age_seconds` gauges. QUIC delivery exports
 `votport_serve_sessions_active`, `votport_serve_bytes_total`,
