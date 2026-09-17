@@ -60,7 +60,7 @@
         <div class="grid">
           <label
             >Key
-            <input id="tenant-key" placeholder="acme" required maxlength="128" />
+            <input id="tenant-key" placeholder="acme" required maxlength="128" aria-describedby="tenant-error" />
           </label>
           <label
             >Label
@@ -89,6 +89,7 @@
 
       <h2>Namespaces</h2>
       <div id="tenants"></div>
+      <button id="tenant-load-more" type="button" class="ghost" hidden>Load more</button>
 
       <div class="section-heading"><h2>Principals</h2><button type="button" class="hint-button" aria-label="Help about principals" data-hint="A principal is a person or agent identity. Its grants determine which tenant it can access and what it can do there.">?</button></div>
       <div class="card">

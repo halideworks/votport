@@ -7321,3 +7321,155 @@ async fn mounted_nas_recovery_lock_loss_stops_receiving() {
     drop(state);
     app::release_data_lock(&server.application);
 }
+
+// The token listing follows the delivery-jobs keyset shape: cursor is the
+// previous page's last token id, pages run oldest first, and creation is
+// capped per tenant so the listing stays finite.
+#[tokio::test(flavor = "multi_thread")]
+async fn automation_token_list_pages_by_creation_and_caps_creation() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let response = client
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let mut created = Vec::new();
+    for index in 0..100 {
+        let response = client
+            .post(format!("{base}/api/admin/automation-tokens"))
+            .header("X-Votport", "1")
+            .json(&json!({ "label": format!("agent-{index:03}"), "expires_days": 7 }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "token {index} refused");
+        let body = response.json::<Value>().await.unwrap();
+        created.push(body["automation_token"]["id"].as_str().unwrap().to_owned());
+    }
+    let response = client
+        .post(format!("{base}/api/admin/automation-tokens"))
+        .header("X-Votport", "1")
+        .json(&json!({ "label": "one-too-many", "expires_days": 7 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 422, "creation must stop at the cap");
+
+    let mut seen = Vec::new();
+    let mut stamps = Vec::new();
+    let mut after = String::new();
+    loop {
+        let mut request = client.get(format!("{base}/api/admin/automation-tokens"));
+        if !after.is_empty() {
+            request = request.query(&[("after", after.clone())]);
+        }
+        let response = request.query(&[("limit", "30")]).send().await.unwrap();
+        assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+        let page = response.json::<Value>().await.unwrap();
+        for token in page["tokens"].as_array().unwrap() {
+            stamps.push(token["created_at"].as_i64().unwrap());
+            seen.push(token["id"].as_str().unwrap().to_owned());
+        }
+        match page["next"].as_str() {
+            Some(next) => after = next.to_owned(),
+            None => break,
+        }
+    }
+    assert_eq!(seen.len(), 100, "every token appears exactly once");
+    assert_eq!(
+        seen.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        100
+    );
+    assert_eq!(
+        seen.iter().collect::<std::collections::BTreeSet<_>>(),
+        created.iter().collect::<std::collections::BTreeSet<_>>(),
+        "pages cover every created token with no gaps"
+    );
+    // Pages run in (created_at, id) keyset order: creation-second ties break
+    // by id, not insertion order.
+    let mut sorted = stamps.clone();
+    sorted.sort();
+    assert_eq!(stamps, sorted, "pages run oldest first");
+
+    let response = client
+        .get(format!("{base}/api/admin/automation-tokens"))
+        .query(&[("limit", "101")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 422, "oversized pages are refused");
+}
+
+// Tenants list pagination: same keyset shape, unambiguous tenants_next so
+// the principals block keeps its own shape.
+#[tokio::test(flavor = "multi_thread")]
+async fn tenant_list_pages_by_creation() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let response = client
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    for key in ["acme-1", "acme-2", "acme-3"] {
+        let response = client
+            .post(format!("{base}/api/admin/tenants"))
+            .header("X-Votport", "1")
+            .json(&json!({ "key": key, "label": key }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    }
+
+    let response = client
+        .get(format!("{base}/api/admin/tenants"))
+        .query(&[("limit", "2")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let page = response.json::<Value>().await.unwrap();
+    let keys: Vec<&str> = page["tenants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tenant| tenant["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, vec!["acme-1", "acme-2"]);
+    let next = page["tenants_next"].as_str().unwrap().to_owned();
+    assert_eq!(next, "acme-2", "the cursor is the page's last tenant key");
+    assert!(page["principals"].as_array().is_some());
+
+    let response = client
+        .get(format!("{base}/api/admin/tenants"))
+        .query(&[("after", next), ("limit", "2".to_owned())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let page = response.json::<Value>().await.unwrap();
+    let keys: Vec<&str> = page["tenants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tenant| tenant["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, vec!["acme-3"]);
+    assert!(page["tenants_next"].is_null());
+}

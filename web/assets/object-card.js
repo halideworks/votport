@@ -33,6 +33,26 @@ export function appLink(kind, token) {
   return `votport://${kind}/${encodeURIComponent(token)}?base=${encodeURIComponent(window.location.origin)}`;
 }
 
+/// Binds an error alert to the field that must change: the field's
+/// aria-describedby names the alert and aria-invalid holds while it shows.
+/// Alerts with no owning field stay standalone role=alerts.
+export function fieldError(field, alert) {
+  const described = new Set((field.getAttribute('aria-describedby') ?? '').split(/\s+/).filter(Boolean));
+  described.add(alert.id);
+  field.setAttribute('aria-describedby', [...described].join(' '));
+  return {
+    show(message) {
+      alert.textContent = message;
+      alert.hidden = false;
+      field.setAttribute('aria-invalid', 'true');
+    },
+    clear() {
+      alert.hidden = true;
+      field.removeAttribute('aria-invalid');
+    },
+  };
+}
+
 export function identityLine(file) {
   return `${file.suite}:${file.root}`;
 }

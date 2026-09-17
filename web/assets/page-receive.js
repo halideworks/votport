@@ -3,7 +3,7 @@ import { notificationEditor, notificationDetails, uploadEvents, workflowEvents }
 // votport receive page: issue transfer requests and manage received files.
 // VOTPORT PROPRIETARY LICENSE.
 
-import { appendObjectCard } from '/assets/object-card.js';
+import { appendObjectCard, fieldError } from '/assets/object-card.js';
 import { narrate, summarize } from '/assets/timeline.js';
 import { startStatusPoll } from '/assets/status-strip.js';
 import {
@@ -24,6 +24,7 @@ import {
 } from '/assets/admin-common.js';
 
 const $ = (id) => document.getElementById(id);
+const createError = fieldError($('create-label'), $('create-error'));
 const creatingRoute = new URLSearchParams(window.location.search).get('trade-route') === '1';
 $('trade-return-guide').hidden = !creatingRoute;
 if (creatingRoute) {
@@ -879,7 +880,7 @@ $('create-form').addEventListener('submit', async (event) => {
   const submittedFocus = document.activeElement;
   let created = false;
   submit.disabled = true; $('create-form').inert = true;
-  $('create-error').hidden = true;
+  createError.clear();
   const maxGib = parseInt($('create-max').value, 10);
   const expires = parseInt($('create-expires').value, 10);
   try {
@@ -922,8 +923,7 @@ $('create-form').addEventListener('submit', async (event) => {
     };
     refreshLinksSafe();
   } catch (error) {
-    $('create-error').textContent = error.message;
-    $('create-error').hidden = false;
+    createError.show(error.message);
   } finally {
     submit.disabled = !receiveAdministrator; $('create-form').inert = !receiveAdministrator;
     if (created && $('create-error').hidden && (document.activeElement === submittedFocus || document.activeElement === document.body)) {
@@ -957,7 +957,7 @@ const projectsReady = Promise.all([sessionReady, api('/api/workflows/projects')]
   receiveProjects = response.projects.filter((project) => project.receive);
   createWorkflow?.destroy();
   createWorkflow = workflowEditor(); $('create-workflow').replaceChildren(createWorkflow.element);
-}).catch((error) => { $('create-error').textContent = `Could not load reception projects: ${error.message}`; $('create-error').hidden = false; })
+}).catch((error) => { createError.show(`Could not load reception projects: ${error.message}`); })
   .finally(async () => {
     await sessionReady;
     const submit = $('create-form').querySelector('button[type="submit"]');

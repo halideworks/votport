@@ -4,6 +4,7 @@ import { isFormDirty, markFormChanged, markFormSaved } from '/assets/form-drafts
 
 import { api, colorPair, confirmModal, defaultAccent, formatBytes, formatWhen, requireSession } from '/assets/admin-common.js';
 import { applyFooter } from '/assets/branding.js';
+import { fieldError } from '/assets/object-card.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -322,19 +323,31 @@ function formControls(form) {
   return { note: $(`${prefix}-note`), error: $(`${prefix}-error`) };
 }
 
+// Each form's error alert is bound to its first field (aria-describedby +
+// aria-invalid) so screen readers announce the alert where the fix belongs.
+const formErrors = new WeakMap();
+
+function formFieldError(form) {
+  const cached = formErrors.get(form);
+  if (cached) return cached;
+  const { error } = formControls(form);
+  const field = form.querySelector('input, select, textarea');
+  if (!error || !field) return null;
+  const bound = fieldError(field, error);
+  formErrors.set(form, bound);
+  return bound;
+}
+
 function formNote(form, message) {
-  const { note, error } = formControls(form);
+  const { note } = formControls(form);
   if (note) note.textContent = message;
-  if (error) error.hidden = true;
+  formFieldError(form)?.clear();
 }
 
 function formError(form, error) {
-  const { note, error: box } = formControls(form);
+  const { note } = formControls(form);
   if (note) note.textContent = '';
-  if (box) {
-    box.textContent = error.message;
-    box.hidden = false;
-  }
+  formFieldError(form)?.show(error.message);
 }
 
 async function putSettings(body) {
@@ -357,8 +370,7 @@ async function saveSettings(form, body) {
 $('password-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const form = event.currentTarget; if (form.inert) return; form.inert = true;
-  $('password-error').hidden = true;
-  $('password-note').textContent = '';
+  formNote(form, '');
   try {
     await api('/api/admin/password', {
       method: 'POST',
@@ -368,11 +380,9 @@ $('password-form').addEventListener('submit', async (event) => {
       }),
     });
     markFormSaved($('password-form')); $('password-form').reset();
-    $('password-note').textContent =
-      'Password updated. Every other session was signed out.';
+    formNote(form, 'Password updated. Every other session was signed out.');
   } catch (error) {
-    $('password-error').textContent = error.message;
-    $('password-error').hidden = false;
+    formError(form, error);
   } finally { form.inert = false; }
 });
 

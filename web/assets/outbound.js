@@ -2,7 +2,7 @@
 
 import { deliveryMetadata, initDeliveryEvidence } from '/assets/delivery-evidence.js';
 import { applyBranding } from '/assets/branding.js';
-import { appLink, appendObjectCard, formatBytes } from '/assets/object-card.js';
+import { appLink, appendObjectCard, fieldError, formatBytes } from '/assets/object-card.js';
 import {
   appendMetadataPage,
   batchDownloadEligible,
@@ -21,6 +21,7 @@ import {
 } from '/assets/outbound-download.js';
 
 const $ = (id) => document.getElementById(id);
+const votFetchError = fieldError($('vot-fetch-key'), $('vot-fetch-error'));
 const token = window.location.pathname.split('/').filter(Boolean).pop();
 let metadataHasPassword = false;
 let evidenceMetadata = null;
@@ -541,9 +542,8 @@ async function loadMetadata() {
     // the recipient's machine.
     $('vot-fetch-form').onsubmit = async (event) => {
       event.preventDefault();
-      const error = $('vot-fetch-error');
       const command = $('vot-fetch-command');
-      error.hidden = true;
+      votFetchError.clear();
       command.hidden = true;
       try {
         const response = await fetch(body.fetch.mint_url, {
@@ -566,8 +566,7 @@ async function loadMetadata() {
         ].join('\n');
         command.hidden = false;
       } catch (failure) {
-        error.textContent = failure.message || 'Could not mint a fetch token.';
-        error.hidden = false;
+        votFetchError.show(failure.message || 'Could not mint a fetch token.');
       }
     };
   }
@@ -617,11 +616,12 @@ $('show-more-files').addEventListener('click', async () => {
   }
 });
 
+const downloadPasswordError = fieldError($('download-password'), $('download-password-error'));
+
 $('download-password-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const error = $('download-password-error');
   const submit = $('download-password-submit');
-  error.hidden = true;
+  downloadPasswordError.clear();
   submit.disabled = true;
   try {
     const response = await fetch(`/api/s/${encodeURIComponent(token)}/verify`, {
@@ -644,8 +644,7 @@ $('download-password-form').addEventListener('submit', async (event) => {
     }
     await loadMetadata();
   } catch (verificationError) {
-    error.textContent = verificationError.message;
-    error.hidden = false;
+    downloadPasswordError.show(verificationError.message);
     $('download-password').focus();
   } finally {
     submit.disabled = false;

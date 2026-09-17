@@ -1,6 +1,7 @@
 import { discardForm, markFormSaved } from '/assets/form-drafts.js';
 import { api, button, confirmModal, formatWhen, requireSession } from '/assets/admin-common.js';
 import { loadNotificationSettings, notificationEditor, notificationServices } from '/assets/notifications.js';
+import { fieldError } from '/assets/object-card.js';
 
 const $ = (id) => document.getElementById(id);
 const node = (tag, text, className = '') => { const element = document.createElement(tag); element.textContent = text; element.className = className; return element; };
@@ -19,9 +20,11 @@ const guides = {
   ntfy: ['Enter the full topic URL and, if required, an access token.'],
   pushover: ['Enter your Pushover application token and recipient user or group key.'],
 };
+const notificationError = fieldError($('nd-label'), $('notification-error'));
+
 async function guard(action) {
-  $('notification-error').hidden = true;
-  try { await action(); } catch (error) { $('notification-error').textContent = error.message; $('notification-error').hidden = false; }
+  notificationError.clear();
+  try { await action(); } catch (error) { notificationError.show(error.message); }
 }
 function fields() {
   const channel = $('nd-channel').value;

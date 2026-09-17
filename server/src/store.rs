@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(test)]
 use std::cell::Cell;
 
-use rusqlite::{Connection, OptionalExtension as _};
+use rusqlite::{params, Connection, OptionalExtension as _};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use vot_sdk::object::ObjectId;
 
@@ -1232,16 +1232,55 @@ impl Store {
         })
     }
 
-    pub fn automation_tokens(&self, tenant: &str) -> Result<Vec<AutomationToken>, String> {
+    // Pages follow creation order; the cursor is the previous page's last
+    // token id, resolved to its creation stamp for a keyset seek over
+    // automation_tokens_tenant_created. An unknown cursor restarts from the
+    // oldest token.
+    pub fn automation_tokens(
+        &self,
+        tenant: &str,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<AutomationToken>, String> {
         self.with(|connection| {
+            let after_created: i64 = if after.is_empty() {
+                -1
+            } else {
+                connection
+                    .query_row(
+                        "SELECT created_at FROM automation_tokens WHERE id=?1",
+                        params![after],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or(-1)
+            };
             let mut statement = connection.prepare(
                 "SELECT id, token_hash, tenant, label, created_at, expires_at, revoked_at,
                         last_used_at, directory, permissions, created_by
                  FROM automation_tokens
-                 WHERE tenant = ?1 ORDER BY created_at, rowid",
+                 WHERE tenant = ?1 AND (created_at,id) > (?2,?3)
+                 ORDER BY created_at,id LIMIT ?4",
             )?;
-            let rows = statement.query_map([tenant], map_automation_token)?;
+            let rows = statement.query_map(
+                params![tenant, after_created, after, limit as i64],
+                map_automation_token,
+            )?;
             rows.collect::<Result<Vec<_>, _>>()
+        })
+    }
+
+    /// Bounded per tenant: creation refuses past this many rows, revoked
+    /// tokens included, so the listing stays finite.
+    pub fn automation_token_count(&self, tenant: &str) -> Result<u64, String> {
+        self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM automation_tokens WHERE tenant = ?1",
+                    [tenant],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|count| count.max(0) as u64)
         })
     }
 
@@ -2151,6 +2190,36 @@ impl Store {
                  FROM tenants ORDER BY rowid",
             )?;
             let rows = statement.query_map([], map_tenant)?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+    }
+
+    // Pages follow creation order; the cursor is the previous page's last
+    // tenant key, resolved to its creation stamp for a keyset seek. An
+    // unknown cursor restarts from the oldest tenant.
+    pub fn tenants_page(&self, after: &str, limit: usize) -> Result<Vec<Tenant>, String> {
+        self.with(|connection| {
+            let after_created: i64 = if after.is_empty() {
+                -1
+            } else {
+                connection
+                    .query_row(
+                        "SELECT created_at FROM tenants WHERE key=?1",
+                        params![after],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or(-1)
+            };
+            let mut statement = connection.prepare(
+                "SELECT key, label, admin_group, CAST(max_total_bytes AS TEXT),
+                        CAST(max_links AS TEXT), CAST(max_sessions AS TEXT), created_at, incarnation
+                 FROM tenants
+                 WHERE (created_at,key) > (?1,?2)
+                 ORDER BY created_at,key LIMIT ?3",
+            )?;
+            let rows =
+                statement.query_map(params![after_created, after, limit as i64], map_tenant)?;
             rows.collect::<Result<Vec<_>, _>>()
         })
     }

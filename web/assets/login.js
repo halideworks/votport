@@ -3,12 +3,14 @@
 import { api } from '/assets/admin-common.js';
 import { collapseLocalPassword } from '/assets/login-disclosure.js';
 import { ssoErrorMessage } from '/assets/login-errors.js';
+import { fieldError } from '/assets/object-card.js';
 
 const $ = (id) => document.getElementById(id);
+const loginError = fieldError($('login-password'), $('login-error'));
 
 $('login-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  $('login-error').hidden = true;
+  loginError.clear();
   try {
     await api('/api/admin/login', {
       method: 'POST',
@@ -17,8 +19,7 @@ $('login-form').addEventListener('submit', async (event) => {
     $('login-password').value = '';
     window.location.replace('/receive');
   } catch (error) {
-    $('login-error').textContent = error.message;
-    $('login-error').hidden = false;
+    loginError.show(error.message);
   }
 });
 
@@ -33,8 +34,7 @@ try {
 const ssoError = new URLSearchParams(window.location.search).get('sso_error');
 if (ssoError !== null) {
   if (ssoError) {
-    $('login-error').textContent = ssoErrorMessage(ssoError);
-    $('login-error').hidden = false;
+    loginError.show(ssoErrorMessage(ssoError));
   }
   window.history.replaceState({}, '', '/');
 }

@@ -2,7 +2,7 @@
 // streams proven ranges to the server. VOTPORT PROPRIETARY LICENSE.
 
 import { applyBranding } from '/assets/branding.js';
-import { appendObjectCard, appLink, copyToClipboard, formatBytes } from '/assets/object-card.js';
+import { appendObjectCard, appLink, copyToClipboard, fieldError, formatBytes } from '/assets/object-card.js';
 import { entryFiles, runUploadBatch } from '/assets/upload-entries.js';
 import { segments } from '/assets/hash-plan.js';
 import init, {
@@ -1235,9 +1235,11 @@ window.addEventListener('beforeunload', (event) => {
   if (uploading && !reloading) event.preventDefault();
 });
 
+const gateError = fieldError($('link-password'), $('gate-error'));
+
 $('gate-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  $('gate-error').hidden = true;
+  gateError.clear();
   const button = $('gate-continue');
   button.disabled = true;
   try {
@@ -1251,8 +1253,8 @@ $('gate-form').addEventListener('submit', async (event) => {
     $('gate').hidden = true;
     $('uploader').hidden = false;
   } catch (error) {
-    $('gate-error').textContent = error.message;
-    $('gate-error').hidden = false;
+    gateError.show(error.message);
+    $('link-password').focus();
   } finally {
     button.disabled = false;
   }

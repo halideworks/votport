@@ -1533,17 +1533,44 @@ pub async fn create_tenant(
     Ok(Json(json!({ "key": key })))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TenantsPage {
+    after: Option<String>,
+    limit: Option<usize>,
+}
+
 pub async fn list_tenants(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
+    Query(page): Query<TenantsPage>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let _identity = require_platform_admin(&app, &headers)?;
+    let limit = page.limit.unwrap_or(PRINCIPAL_PAGE_DEFAULT);
+    if !(1..=PRINCIPAL_PAGE_MAX).contains(&limit)
+        || page.after.as_ref().is_some_and(|after| after.len() > 100)
+    {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid tenant page",
+        ));
+    }
     let (principals, total) = app
         .store
         .principals_page(PRINCIPAL_PAGE_DEFAULT, 0, None)
         .map_err(super::store_unavailable)?;
+    let mut tenants = app
+        .store
+        .tenants_page(page.after.as_deref().unwrap_or(""), limit + 1)
+        .map_err(super::store_unavailable)?;
+    let more = tenants.len() > limit;
+    tenants.truncate(limit);
+    let next = more
+        .then(|| tenants.last().map(|tenant| tenant.key.clone()))
+        .flatten();
     Ok(Json(json!({
-        "tenants": app.store.tenants().map_err(super::store_unavailable)?,
+        "tenants": tenants,
+        "tenants_next": next,
         "principals": principals,
         "principals_truncated": total > PRINCIPAL_PAGE_DEFAULT as u64,
     })))

@@ -13,9 +13,13 @@ import {
   formatWhen,
   requireSession,
 } from '/assets/admin-common.js';
+import { fieldError } from '/assets/object-card.js';
 
 const $ = (id) => document.getElementById(id);
 const PRINCIPAL_PAGE_SIZE = 50;
+// Page size follows the server convention (50 default, 100 max); the list
+// follows `tenants_next` until it runs out, like the workflows page.
+const TENANT_PAGE_SIZE = 50;
 let principalRows = [];
 let principalOffset = 0;
 let principalHasMore = false;
@@ -23,6 +27,7 @@ let principalTotal = 0;
 let principalLoading = false;
 let principalReloadPending = false;
 let principalSearchTimer;
+let tenantRows = [], tenantNext = null, tenantLoading = false;
 
 function quotaText(tenant) {
   const parts = [];
@@ -89,12 +94,14 @@ function editTenantForm(tenant) {
   const error = document.createElement('p');
   error.className = 'error';
   error.setAttribute('role', 'alert');
+  error.id = `tenant-quota-error-${tenant.key}`;
   error.hidden = true;
+  const quotaError = fieldError(inputs.label, error);
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     if (!form.reportValidity()) return;
     save.disabled = true; form.inert = true;
-    error.hidden = true;
+    quotaError.clear();
     try {
       const storageBytes = nullableStorageBytes(inputs.max_total_bytes.value);
       await api(`/api/admin/tenants/${encodeURIComponent(tenant.key)}`, {
@@ -107,10 +114,9 @@ function editTenantForm(tenant) {
           max_sessions: nullableNumber(inputs.max_sessions.value),
         }),
       });
-      markFormSaved(form); await refreshTenants();
+      markFormSaved(form); await refreshTenants(true);
     } catch (requestError) {
-      error.textContent = requestError.message;
-      error.hidden = false;
+      quotaError.show(requestError.message);
     } finally { save.disabled = false; form.inert = false; }
   });
   const actions = document.createElement('div');
@@ -179,7 +185,9 @@ function brandingForm(tenant, { open = false } = {}) {
   const error = document.createElement('p');
   error.className = 'error';
   error.setAttribute('role', 'alert');
+  error.id = `tenant-branding-error-${key}`;
   error.hidden = true;
+  const brandingError = fieldError(nameInput, error);
 
   const load = async () => {
     const branding = await api(`/api/admin/branding/${key}`);
@@ -208,7 +216,7 @@ function brandingForm(tenant, { open = false } = {}) {
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     save.disabled = true; form.inert = true;
-    error.hidden = true;
+    brandingError.clear();
     try {
       await api(`/api/admin/branding/${key}`, {
         method: 'PUT',
@@ -220,8 +228,7 @@ function brandingForm(tenant, { open = false } = {}) {
       });
       markFormSaved(form);
     } catch (requestError) {
-      error.textContent = requestError.message;
-      error.hidden = false;
+      brandingError.show(requestError.message);
     } finally { save.disabled = false; form.inert = false; }
   });
 
@@ -401,27 +408,50 @@ function renderPrincipal(principal) {
   return card;
 }
 
-async function refreshTenants() {
-  const [{ tenants }, { holdings }] = await Promise.all([
-    api('/api/admin/tenants'),
-    api('/api/admin/holdings'),
-  ]);
+async function refreshTenants(reset = false) {
+  if (tenantLoading) return;
+  if (reset) { tenantRows = []; tenantNext = null; }
+  tenantLoading = true;
+  $('tenant-load-more').disabled = true;
+  try {
+    // First page is queryless (server default 50) so existing fixtures and
+    // response matchers keep working; continuations carry the keyset cursor.
+    let path = '/api/admin/tenants';
+    if (tenantNext) path += `?after=${encodeURIComponent(tenantNext)}&limit=${TENANT_PAGE_SIZE}`;
+    const [page, { holdings }] = await Promise.all([
+      api(path),
+      api('/api/admin/holdings'),
+    ]);
+    tenantRows = tenantRows.concat(page.tenants || []);
+    tenantNext = page.tenants_next || null;
+    renderTenants(holdings);
+  } finally {
+    tenantLoading = false;
+    $('tenant-load-more').disabled = !tenantNext;
+    $('tenant-load-more').hidden = !tenantNext;
+  }
+}
+
+function renderTenants(holdings) {
   const usage = new Map((holdings || []).map((item) => [item.tenant, item]));
   const container = $('tenants');
   const editing = new Map([...container.children].filter((card) => [...card.querySelectorAll('form')].some(isFormDirty)).map((card) => [card.dataset.tenant, card]));
   container.replaceChildren();
-  if (!tenants.length) {
+  if (!tenantRows.length) {
     const empty = document.createElement('p');
     empty.className = 'muted';
     empty.textContent = 'No named tenants yet.';
     container.append(empty);
   } else {
-    for (const tenant of tenants) {
+    for (const tenant of tenantRows) {
       container.append(editing.get(tenant.key) || renderTenant(tenant, usage.get(tenant.key)));
     }
   }
-
 }
+
+$('tenant-load-more').addEventListener('click', () =>
+  refreshTenants().catch((error) => alertModal(error.message)),
+);
 
 function renderPrincipals() {
   const list = $('principals');
@@ -481,10 +511,12 @@ async function refreshPrincipals(reset = false) {
   }
 }
 
+const tenantCreateError = fieldError($('tenant-key'), $('tenant-error'));
+
 $('tenant-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const form = event.currentTarget; if (form.inert) return; form.inert = true;
-  $('tenant-error').hidden = true;
+  tenantCreateError.clear();
   const maxTotal = parseInt($('tenant-max-total').value, 10);
   const maxLinks = parseInt($('tenant-max-links').value, 10);
   const maxSessions = parseInt($('tenant-max-sessions').value, 10);
@@ -501,10 +533,9 @@ $('tenant-form').addEventListener('submit', async (event) => {
       }),
     });
     markFormSaved($('tenant-form')); $('tenant-form').reset();
-    await refreshTenants();
+    await refreshTenants(true);
   } catch (error) {
-    $('tenant-error').textContent = error.message;
-    $('tenant-error').hidden = false;
+    tenantCreateError.show(error.message);
   } finally { form.inert = false; }
 });
 

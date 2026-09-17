@@ -425,6 +425,9 @@ fn delivery_page(
     } else {
         "active"
     };
+    // download_starts is the documented name (docs/agents.md) for the
+    // per-file transport-handoff counter; grant.files[].download_starts in
+    // the embedded grant reports the same counter under the same name.
     let files = page.files.iter().map(|(index, file)| json!({"index": index, "name": file.name, "suite": file.suite, "root": file.root, "bytes": file.bytes, "download_starts": file.downloads, "first_download_at": file.first_download_at, "last_download_at": file.last_download_at})).collect::<Vec<_>>();
     Ok(
         json!({"grant": public_grant_with_file_count(&page.grant, page.file_count), "state": state, "total_bytes": page.total_bytes, "files": files, "offset": offset, "has_more": has_more, "next_offset": has_more.then_some(offset + files.len())}),
@@ -944,7 +947,9 @@ mod tests {
                 .0,
             StatusCode::OK
         );
-        let token_id = app.store.automation_tokens("").unwrap()[0].id.clone();
+        let token_id = app.store.automation_tokens("", "", 100).unwrap()[0]
+            .id
+            .clone();
         let db = rusqlite::Connection::open(app.config.data_dir.join("votport.db")).unwrap();
         db.execute("UPDATE automation_tokens SET last_used_at = NULL", [])
             .unwrap();
@@ -956,7 +961,7 @@ mod tests {
             request(&waiting_app, "POST", "/api/automation/share", &raw, spec).await
         });
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while app.store.automation_tokens("").unwrap()[0]
+            while app.store.automation_tokens("", "", 100).unwrap()[0]
                 .last_used_at
                 .is_none()
             {

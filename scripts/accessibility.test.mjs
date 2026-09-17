@@ -17,6 +17,15 @@ const commonScript = await readFile(new URL('../web/assets/admin-common.js', imp
 const automationScript = await readFile(new URL('../web/assets/page-automation.js', import.meta.url), 'utf8');
 const objectCardScript = await readFile(new URL('../web/assets/object-card.js', import.meta.url), 'utf8');
 const style = await readFile(new URL('../web/assets/style.css', import.meta.url), 'utf8');
+const index = await readFile(new URL('../web/index.html', import.meta.url), 'utf8');
+const notifications = await readFile(new URL('../web/notifications.html', import.meta.url), 'utf8');
+const sendPage = await readFile(new URL('../web/send.html', import.meta.url), 'utf8');
+const loginScript = await readFile(new URL('../web/assets/login.js', import.meta.url), 'utf8');
+const receiveScript = await readFile(new URL('../web/assets/page-receive.js', import.meta.url), 'utf8');
+const tenantsScript = await readFile(new URL('../web/assets/page-tenants.js', import.meta.url), 'utf8');
+const notificationsScript = await readFile(new URL('../web/assets/page-notifications.js', import.meta.url), 'utf8');
+const outboundScript = await readFile(new URL('../web/assets/outbound.js', import.meta.url), 'utf8');
+const systemScript = await readFile(new URL('../web/assets/page-system.js', import.meta.url), 'utf8');
 
 test('drop zones are named and keyboard controls are not nested', () => {
   assert.match(request, /id="drop" class="drop">[\s\S]+id="pick"[^>]+>files<\/button>[\s\S]+id="pick-folder"[^>]+>a folder<\/button>/);
@@ -92,4 +101,62 @@ test('accessible controls keep names, focus cues, and quiet list updates', () =>
   assert.match(objectCardScript, /element\.dataset\.ariaLabel \?\?= element\.getAttribute\('aria-label'\)/);
   assert.match(objectCardScript, /element\.setAttribute\('aria-label', 'Copied'\)/);
   assert.match(objectCardScript, /if \(copyPending\) return/);
+});
+
+// Error alerts name the field they report: aria-describedby on the field,
+// aria-invalid while the alert shows. Global alerts (no owning field) stay
+// standalone role=alerts and must not claim a field relationship.
+test('error alerts are bound to the field that must change', () => {
+  assert.match(objectCardScript, /export function fieldError\(field, alert\)/);
+  assert.match(
+    objectCardScript,
+    /described\.add\(alert\.id\);[\s\S]+field\.setAttribute\('aria-describedby', \[\.\.\.described\]\.join\(' '\)\)/,
+  );
+  assert.match(objectCardScript, /show\(message\) \{[\s\S]+alert\.hidden = false;[\s\S]+field\.setAttribute\('aria-invalid', 'true'\)/);
+  assert.match(objectCardScript, /clear\(\) \{[\s\S]+alert\.hidden = true;[\s\S]+field\.removeAttribute\('aria-invalid'\)/);
+
+  // Sign-in errors report on the password field.
+  assert.match(index, /id="login-password"[\s\S]+aria-describedby="login-error"/);
+  assert.match(loginScript, /fieldError\(\$\('login-password'\), \$\('login-error'\)\)/);
+  assert.match(loginScript, /loginError\.clear\(\)/);
+  assert.match(loginScript, /loginError\.show\(/);
+
+  // Link gate errors report on the access password field.
+  assert.match(request, /id="link-password"[^>]+aria-describedby="gate-error"/);
+  assert.match(uploadScript, /fieldError\(\$\('link-password'\), \$\('gate-error'\)\)/);
+  assert.match(uploadScript, /gateError\.show\(error\.message\);[\s\S]+\$\('link-password'\)\.focus\(\)/);
+
+  // Reception link creation errors report on the label field.
+  assert.match(receive, /id="create-label"[^>]+aria-describedby="create-error"/);
+  assert.match(receiveScript, /fieldError\(\$\('create-label'\), \$\('create-error'\)\)/);
+  assert.match(receiveScript, /createError\.show\(/);
+
+  // Notification destination errors, including send-test failures, report on the name field.
+  assert.match(notifications, /id="nd-label"[^>]+aria-describedby="notification-error"/);
+  assert.match(notificationsScript, /fieldError\(\$\('nd-label'\), \$\('notification-error'\)\)/);
+  assert.match(notificationsScript, /catch \(error\) \{ notificationError\.show\(error\.message\); \}/);
+
+  // System forms bind each form's alert to its first field through the shared funnel.
+  assert.match(systemScript, /formFieldError\(form\)\?\.show\(error\.message\)/);
+  assert.match(systemScript, /form\.querySelector\('input, select, textarea'\)/);
+
+  // Outbound mint errors report on the holder key field; send.html's password
+  // error keeps its describedby and gains the invalid toggle.
+  assert.match(sendPage, /id="vot-fetch-key"[^>]+aria-describedby="vot-fetch-error"/);
+  assert.match(outboundScript, /fieldError\(\$\('vot-fetch-key'\), \$\('vot-fetch-error'\)\)/);
+  assert.match(sendPage, /id="download-password"[\s\S]+aria-describedby="download-password-error"/);
+  assert.match(outboundScript, /fieldError\(\$\('download-password'\), \$\('download-password-error'\)\)/);
+
+  // Delivery, tenant, and automation token forms wire their alerts the same way.
+  assert.match(deliver, /id="deliver-label"[^>]+aria-describedby="deliver-error"/);
+  assert.match(deliver, /id="library-files"[^>]+aria-describedby="library-selection-error"/);
+  assert.match(deliverScript, /fieldError\(\$\('deliver-label'\), \$\('deliver-error'\)\)/);
+  assert.match(tenants, /id="tenant-key"[^>]+aria-describedby="tenant-error"/);
+  assert.match(tenantsScript, /fieldError\(\$\('tenant-key'\), \$\('tenant-error'\)\)/);
+  assert.match(tenantsScript, /error\.id = `tenant-quota-error-\$\{tenant\.key\}`/);
+  assert.match(tenantsScript, /fieldError\(inputs\.label, error\)/);
+  assert.match(tenantsScript, /error\.id = `tenant-branding-error-\$\{key\}`/);
+  assert.match(tenantsScript, /fieldError\(nameInput, error\)/);
+  assert.match(automation, /id="automation-token-label"/);
+  assert.match(automationScript, /fieldError\(\$\('automation-token-label'\), \$\('automation-token-error'\)\)/);
 });

@@ -25,8 +25,10 @@ import {
   showGrantResult,
 } from '/assets/admin-common.js';
 import { startStatusPoll } from '/assets/status-strip.js';
+import { fieldError } from '/assets/object-card.js';
 
 const $ = (id) => document.getElementById(id);
+const deliverError = fieldError($('deliver-label'), $('deliver-error'));
 const createNotifications = notificationEditor({ events: downloadEvents });
 $('deliver-notifications').append(createNotifications.element);
 let notificationsReadOnly = true;
@@ -776,7 +778,7 @@ document.addEventListener('drop', async (event) => {
 });
 
 function deliverFormValues() {
-  $('deliver-error').hidden = true;
+  deliverError.clear();
   if (librarySelectionsPending) throw new Error('Wait for the folder selection to finish before creating a link.');
   const paths = [...selectedLibraryPaths.keys()];
   if (paths.length > MAX_LIBRARY_SELECTION) {
@@ -808,13 +810,12 @@ function deliverFormValues() {
 async function submitDeliverGrant() {
   if (!deliverAdministrator || deliverGrantBusy) return;
   const error = $('deliver-error');
-  error.hidden = true;
+  deliverError.clear();
   let request;
   try {
     request = deliverFormValues();
   } catch (validationError) {
-    error.textContent = validationError.message;
-    error.hidden = false;
+    deliverError.show(validationError.message);
     return;
   }
   deliverGrantBusy = true;
@@ -845,8 +846,7 @@ async function submitDeliverGrant() {
     $('deliver-password').value = '';
     refreshGrants();
   } catch (requestError) {
-    $('deliver-error').textContent = requestError.message;
-    $('deliver-error').hidden = false;
+    deliverError.show(requestError.message);
   } finally {
     const focusError = !error.hidden && (document.activeElement === progress || document.activeElement === document.body);
     deliverGrantBusy = false;

@@ -1345,11 +1345,26 @@ pub fn automation_tokens() -> Result<Vec<AutomationToken>> {
     #[derive(Deserialize)]
     struct Tokens {
         tokens: Vec<AutomationToken>,
+        #[serde(default)]
+        next: Option<String>,
     }
+    // The list is paged; follow `next` through every page like the web app.
     run(|client, cookie| {
-        client
-            .admin_get::<Tokens>("/api/admin/automation-tokens", cookie)
-            .map(|reply| reply.tokens)
+        let mut tokens = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let mut path = "/api/admin/automation-tokens?limit=100".to_owned();
+            if let Some(after) = &after {
+                path.push_str("&after=");
+                path.push_str(&url_segment(after));
+            }
+            let reply = client.admin_get::<Tokens>(&path, cookie)?;
+            tokens.extend(reply.tokens);
+            match reply.next {
+                Some(next) => after = Some(next),
+                None => return Ok(tokens),
+            }
+        }
     })
 }
 

@@ -1805,18 +1805,53 @@ pub struct AutomationTokenRequest {
     permissions: Vec<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutomationTokenPage {
+    after: Option<String>,
+    limit: Option<usize>,
+}
+
+// Page size follows the jobs and principals convention: 50 default, 100 max.
+const AUTOMATION_TOKEN_PAGE_DEFAULT: usize = 50;
+const AUTOMATION_TOKEN_PAGE_MAX: usize = 100;
+// Creation cap per tenant, in the style of the workflows project limit: it
+// keeps the token table and its listing finite even under automation that
+// mints tokens on a schedule.
+const MAX_AUTOMATION_TOKENS_PER_TENANT: u64 = 100;
+
 pub async fn list_automation_tokens(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
+    Query(page): Query<AutomationTokenPage>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_automation_admin(&app, &headers)?;
     let _operation = begin_outbound_operation(&app, &identity.tenant)?;
-    let tokens = app
+    let limit = page.limit.unwrap_or(AUTOMATION_TOKEN_PAGE_DEFAULT);
+    if !(1..=AUTOMATION_TOKEN_PAGE_MAX).contains(&limit)
+        || page.after.as_ref().is_some_and(|after| after.len() > 100)
+    {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid token page",
+        ));
+    }
+    let mut tokens = app
         .store
-        .automation_tokens(&identity.tenant)
+        .automation_tokens(
+            &identity.tenant,
+            page.after.as_deref().unwrap_or(""),
+            limit + 1,
+        )
         .map_err(super::store_unavailable)?;
+    let more = tokens.len() > limit;
+    tokens.truncate(limit);
+    let next = more
+        .then(|| tokens.last().map(|token| token.id.clone()))
+        .flatten();
     Ok(Json(json!({
-        "tokens": tokens.iter().map(public_automation_token).collect::<Vec<_>>()
+        "tokens": tokens.iter().map(public_automation_token).collect::<Vec<_>>(),
+        "next": next,
     })))
 }
 
@@ -1828,6 +1863,16 @@ pub async fn create_automation_token(
     let identity = require_automation_admin(&app, &headers)?;
     admin::require_admin_write(&headers, &identity)?;
     let _operation = begin_outbound_operation(&app, &identity.tenant)?;
+    let count = app
+        .store
+        .automation_token_count(&identity.tenant)
+        .map_err(super::store_unavailable)?;
+    if count >= MAX_AUTOMATION_TOKENS_PER_TENANT {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("this tenant allows at most {MAX_AUTOMATION_TOKENS_PER_TENANT} automation tokens; revoke one first"),
+        ));
+    }
     let label = request.label.trim().to_owned();
     if label.is_empty() || label.chars().count() > MAX_AUTOMATION_LABEL_CHARS {
         return Err(ApiError::new(
@@ -5149,6 +5194,10 @@ fn public_grant(grant: &OutboundGrant) -> serde_json::Value {
 fn public_grant_with_file_count(grant: &OutboundGrant, file_count: usize) -> serde_json::Value {
     let files_truncated = file_count > OUTBOUND_GRANT_PREVIEW_FILES
         || (file_count > 1 && grant.files.len() < file_count);
+    // Per-file counters are named download_starts (docs/agents.md): a count
+    // of transport handoffs, the same counter the automation deliveries
+    // response reports as files[].download_starts. The grant-wide pair
+    // downloads/max_downloads is a different counter and keeps its name.
     let files = if files_truncated {
         Vec::new()
     } else {
@@ -5156,7 +5205,7 @@ fn public_grant_with_file_count(grant: &OutboundGrant, file_count: usize) -> ser
             .files
             .iter()
             .map(|file| {
-                json!({ "name": file.name, "suite": file.suite, "root": file.root, "bytes": file.bytes, "downloads": file.downloads, "first_download_at": file.first_download_at, "last_download_at": file.last_download_at })
+                json!({ "name": file.name, "suite": file.suite, "root": file.root, "bytes": file.bytes, "download_starts": file.downloads, "first_download_at": file.first_download_at, "last_download_at": file.last_download_at })
             })
             .collect()
     };
