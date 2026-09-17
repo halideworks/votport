@@ -571,6 +571,7 @@ mod tests {
                 label: "agent".to_owned(),
                 directory: Some("project".to_owned()),
                 permissions: permissions.iter().map(|s| s.to_string()).collect(),
+                created_by: String::new(),
                 created_at: now_unix(),
                 expires_at: now_unix() + 3600,
                 revoked_at: None,

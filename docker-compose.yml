@@ -3,6 +3,22 @@ services:
     build: .
     container_name: votport
     restart: unless-stopped
+    # Worst-case queued-body memory for the default session caps: 32
+    # sessions x 8 in-flight chunks x ~9 MiB is roughly 2.3 GiB
+    # (docs/deployment.md, session limits). Raise this together with
+    # VOTPORT_MAX_TOTAL_SESSIONS; the queued bodies scale linearly with it.
+    mem_limit: 2304m
+    # The runtime's blocking pool alone can grow to 512 threads; 1024 leaves
+    # headroom for workers and helpers while bounding a runaway fork.
+    pids_limit: 1024
+    # Each upload session holds staging and journal descriptors, and the
+    # load-test acceptance runs passed at a 1024 soft limit
+    # (docs/load-testing.md). 8192 keeps headroom above the tested limit and
+    # bounds descriptor leaks.
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 8192
     # Docker's default 10s SIGKILL cuts off streaming downloads mid-transfer.
     # No value covers a 500 GiB upload; for upgrades, drain first (stop
     # admitting sessions, watch votport_sessions_active reach 0).

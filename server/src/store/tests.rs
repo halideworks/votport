@@ -466,6 +466,7 @@ fn test_automation_token(id: &str, tenant: &str) -> AutomationToken {
         label: format!("Token {id}"),
         directory: None,
         permissions: vec!["deliveries:create".to_owned()],
+        created_by: String::new(),
         created_at: 10,
         expires_at: 20,
         revoked_at: None,
@@ -1102,6 +1103,48 @@ fn automation_token_revocation_is_tenant_scoped_and_idempotent() {
 }
 
 #[test]
+fn automation_token_records_creator_and_revoking_the_creator_revokes_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    let mut minted = test_automation_token("minted", "acme");
+    minted.created_by = "Minter@Example.com".to_owned();
+    store.insert_automation_token(minted.clone()).unwrap();
+    let mut other = test_automation_token("other", "acme");
+    other.created_by = "someone.else@example.com".to_owned();
+    store.insert_automation_token(other.clone()).unwrap();
+    // The minter is a real principal: revoking it must take its tokens with it.
+    store
+        .upsert_sso_principal("Minter@Example.com", &[], &serde_json::json!([]))
+        .unwrap();
+
+    // The list payload carries the creator the mint recorded.
+    let listed = store.automation_tokens("acme").unwrap();
+    assert_eq!(listed, vec![minted.clone(), other.clone()]);
+
+    // Revoking the principal deactivates exactly the tokens it minted,
+    // matched case-insensitively like the principals row itself.
+    assert!(store.revoke_principal("minter@example.com").unwrap());
+    let listed = store.automation_tokens("acme").unwrap();
+    assert!(listed[0].revoked_at.is_some());
+    assert_eq!(listed[1].revoked_at, None);
+    assert!(store
+        .authenticate_automation_token("hash-minted", 15)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .authenticate_automation_token("hash-other", 15)
+        .unwrap()
+        .is_some());
+
+    // Revoking again leaves already-revoked tokens untouched.
+    assert!(store.revoke_principal("MINTER@example.com").unwrap());
+    assert_eq!(
+        store.automation_tokens("acme").unwrap()[0].revoked_at,
+        listed[0].revoked_at
+    );
+}
+
+#[test]
 fn outbound_grant_expiry_and_revoke_control_active_state() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path()).unwrap();
@@ -1526,6 +1569,7 @@ fn schema41_upgrade_preserves_existing_grants_and_can_store_new_addresses() {
              ALTER TABLE outbound_grants DROP COLUMN share_token;
              ALTER TABLE delivery_jobs DROP COLUMN created_at;
              ALTER TABLE delivery_jobs DROP COLUMN snapshot_bytes;
+             ALTER TABLE automation_tokens DROP COLUMN created_by;
              UPDATE meta SET value='41' WHERE key='schema_version';",
             )
         })
@@ -1621,6 +1665,7 @@ fn schema45_upgrade_backfills_delivery_job_snapshot_and_created_columns() {
                  DROP INDEX delivery_jobs_tenant_snapshot;
                  ALTER TABLE delivery_jobs DROP COLUMN created_at;
                  ALTER TABLE delivery_jobs DROP COLUMN snapshot_bytes;
+                 ALTER TABLE automation_tokens DROP COLUMN created_by;
                  UPDATE meta SET value='44' WHERE key='schema_version';",
             )
         })
@@ -1696,6 +1741,86 @@ fn schema45_upgrade_backfills_delivery_job_snapshot_and_created_columns() {
         })
         .unwrap();
     assert_eq!(preserved, 17);
+}
+
+#[test]
+fn schema46_upgrade_backfills_automation_token_creator() {
+    let directory = tempfile::tempdir().unwrap();
+    // Fresh databases stamp 46 and carry the creator column from the start.
+    let store = Store::open(directory.path()).unwrap();
+    assert_eq!(
+        store
+            .with(|connection| {
+                connection.query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap(),
+        SCHEMA_VERSION.to_string()
+    );
+    // Seed rows the way schema 45 stored them (the creation audit row names
+    // the minter of one token; the other's audit row is already pruned),
+    // then strip the 46 column and stamp the old version.
+    store
+        .with(|connection| {
+            connection.execute_batch(
+                "INSERT INTO automation_tokens(id,token_hash,tenant,label,created_at,expires_at,revoked_at,last_used_at,directory,permissions)
+                 VALUES ('audited','hash-audited','acme','Audited',1,2,NULL,NULL,NULL,'[\"deliveries:create\"]'),
+                        ('pruned','hash-pruned','acme','Pruned',1,2,NULL,NULL,NULL,'[\"deliveries:create\"]');
+                 INSERT INTO audit_log(at,tenant,actor,event,subject,detail)
+                 VALUES (1,'acme','Minter@Example.com','automation_token_created','audited','{}');
+                 ALTER TABLE automation_tokens DROP COLUMN created_by;
+                 UPDATE meta SET value='45' WHERE key='schema_version';",
+            )
+        })
+        .unwrap();
+    drop(store);
+    // The upgrade runs inside one transaction, so a restart mid-migration
+    // presents exactly as this 45 database does and the next open reruns
+    // the whole step.
+    let store = Store::open(directory.path()).unwrap();
+    assert_eq!(
+        store
+            .with(|connection| {
+                connection.query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap(),
+        SCHEMA_VERSION.to_string()
+    );
+    let creators: Vec<(String, String)> = store
+        .with(|connection| {
+            let mut statement =
+                connection.prepare("SELECT id, created_by FROM automation_tokens ORDER BY id")?;
+            let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()
+        })
+        .unwrap();
+    assert_eq!(
+        creators,
+        [
+            ("audited".to_owned(), "Minter@Example.com".to_owned()),
+            ("pruned".to_owned(), String::new())
+        ]
+    );
+    drop(store);
+    // Restarting an already upgraded database changes nothing.
+    let store = Store::open(directory.path()).unwrap();
+    let preserved: String = store
+        .with(|connection| {
+            connection.query_row(
+                "SELECT created_by FROM automation_tokens WHERE id='audited'",
+                [],
+                |row| row.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(preserved, "Minter@Example.com");
 }
 
 #[test]
@@ -5244,13 +5369,14 @@ mod settings_tests {
                  DROP INDEX delivery_jobs_tenant_snapshot;
                  ALTER TABLE delivery_jobs DROP COLUMN created_at;
                  ALTER TABLE delivery_jobs DROP COLUMN snapshot_bytes;
+                 ALTER TABLE automation_tokens DROP COLUMN created_by;
                  UPDATE meta SET value='43' WHERE key='schema_version';",
             )
             .unwrap();
         drop(connection);
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "45");
+        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
         assert_eq!(store.audit_count().unwrap(), 2);
         store.audit("", "", "third", "three", &serde_json::json!({}));
         assert_eq!(store.audit_count().unwrap(), 3);

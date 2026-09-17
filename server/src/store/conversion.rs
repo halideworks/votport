@@ -533,7 +533,15 @@ fn normalize_uploads(connection: &Connection, target: &Connection) -> Result<()>
     connection.execute_batch("DROP TABLE files; ALTER TABLE conversion_files RENAME TO files;")?;
     target_indexes(connection, target, "files")?;
     target_indexes(connection, target, "link_uploads")?;
-    rebuild(connection, target, "links", &[], |_| Ok(()))
+    rebuild(connection, target, "links", &[], |_| Ok(()))?;
+    // Schema 35 tokens predate creator tracking; the column stays ''.
+    rebuild(
+        connection,
+        target,
+        "automation_tokens",
+        &["created_by"],
+        |_| Ok(()),
+    )
 }
 
 fn convert_jobs(

@@ -191,6 +191,9 @@ pub struct AutomationToken {
     /// any directory in the tenant's library.
     pub directory: Option<String>,
     pub permissions: Vec<String>,
+    /// Subject that minted the token; revoking that principal revokes it,
+    /// so a departed operator cannot leave year-long tokens behind.
+    pub created_by: String,
     pub created_at: u64,
     pub expires_at: u64,
     pub revoked_at: Option<u64>,
@@ -486,7 +489,7 @@ struct ValidatedSettings {
     draining: Option<bool>,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 45;
+pub(crate) const SCHEMA_VERSION: u64 = 46;
 pub(crate) const DELIVERED_CANDIDATE_PAGE: usize = 128;
 pub(crate) const RETENTION_CLOCK_KEY: &str = "retention_clock_trusted_at";
 
@@ -705,7 +708,8 @@ CREATE TABLE IF NOT EXISTS automation_tokens (
     revoked_at INTEGER,
     last_used_at INTEGER,
     directory TEXT,
-    permissions TEXT NOT NULL DEFAULT '[\"deliveries:create\"]'
+    permissions TEXT NOT NULL DEFAULT '[\"deliveries:create\"]',
+    created_by TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS automation_tokens_tenant_created
     ON automation_tokens(tenant, created_at);
@@ -1204,8 +1208,8 @@ impl Store {
                 .execute(
                     "INSERT INTO automation_tokens
                          (id, token_hash, tenant, label, created_at, expires_at, revoked_at,
-                          last_used_at, directory, permissions)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                          last_used_at, directory, permissions, created_by)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     rusqlite::params![
                         token.id,
                         token.token_hash,
@@ -1221,6 +1225,7 @@ impl Store {
                             .map(|at| i64::try_from(at).unwrap_or(i64::MAX)),
                         token.directory,
                         serde_json::to_string(&token.permissions).unwrap(),
+                        token.created_by,
                     ],
                 )
                 .map(|_| ())
@@ -1231,7 +1236,7 @@ impl Store {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT id, token_hash, tenant, label, created_at, expires_at, revoked_at,
-                        last_used_at, directory, permissions
+                        last_used_at, directory, permissions, created_by
                  FROM automation_tokens
                  WHERE tenant = ?1 ORDER BY created_at, rowid",
             )?;
@@ -1253,7 +1258,7 @@ impl Store {
                      SET last_used_at = ?2
                      WHERE token_hash = ?1 AND revoked_at IS NULL AND expires_at > ?2
                      RETURNING id, token_hash, tenant, label, created_at, expires_at,
-                               revoked_at, last_used_at, directory, permissions",
+                               revoked_at, last_used_at, directory, permissions, created_by",
                     rusqlite::params![token_hash, at],
                     map_automation_token,
                 )
@@ -3050,14 +3055,30 @@ impl Store {
     }
 
     pub fn revoke_principal(&self, subject: &str) -> Result<bool, String> {
-        self.with(|connection| {
-            let changed = connection.execute(
+        let at = i64::try_from(now_unix()).unwrap_or(i64::MAX);
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let changed = transaction
+            .execute(
                 "UPDATE principals SET credential_version = credential_version + 1, blocked = 1
                  WHERE lower(subject) = lower(?1)",
                 [subject],
-            )?;
-            Ok(changed > 0)
-        })
+            )
+            .map_err(|error| error.to_string())?;
+        // A deactivated principal must not leave the tokens it minted valid
+        // for up to their full 365-day expiry. Matched case-insensitively
+        // like the principals row itself.
+        transaction
+            .execute(
+                "UPDATE automation_tokens SET revoked_at = ?2
+                 WHERE revoked_at IS NULL AND lower(created_by) = lower(?1)",
+                rusqlite::params![subject, at],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(changed > 0)
     }
 
     pub fn unblock_principal(&self, subject: &str) -> Result<bool, String> {
@@ -5514,6 +5535,7 @@ fn map_automation_token(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationT
         last_used_at: row
             .get::<_, Option<i64>>("last_used_at")?
             .and_then(|value| u64::try_from(value).ok()),
+        created_by: row.get("created_by")?,
     })
 }
 
@@ -6008,6 +6030,29 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
             transaction
                 .execute("UPDATE meta SET value='45' WHERE key='schema_version'", [])
+                .map_err(|e| e.to_string())?;
+            transaction.commit().map_err(|e| e.to_string())?;
+        }
+        if stored == 45 || stored == 44 || stored == 41 || stored == 42 || stored == 43 {
+            validate_schema(connection, 45)?;
+            // One transaction keeps the bump atomic: a restart mid-migration
+            // rolls back to 45 and the next open reruns the whole step. The
+            // creator backfill is one pass over automation_tokens, deriving
+            // the minter from the creation audit row where the retention
+            // sweep has not pruned it yet, and leaving '' where it has.
+            let transaction = connection.transaction().map_err(|e| e.to_string())?;
+            transaction
+                .execute_batch(
+                    "ALTER TABLE automation_tokens ADD COLUMN created_by TEXT NOT NULL DEFAULT '';
+                     UPDATE automation_tokens SET created_by = COALESCE(
+                         (SELECT actor FROM audit_log
+                          WHERE event = 'automation_token_created'
+                            AND tenant = automation_tokens.tenant
+                            AND subject = automation_tokens.id
+                          ORDER BY at DESC LIMIT 1),
+                         '');
+                     UPDATE meta SET value='46' WHERE key='schema_version';",
+                )
                 .map_err(|e| e.to_string())?;
             transaction.commit().map_err(|e| e.to_string())?;
         }
