@@ -8,8 +8,8 @@ pub use routing::{destination, test_destination};
 use routing::{send_policy, Route};
 
 use std::borrow::Cow;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use futures_util::{stream, StreamExt};
 use lettre::message::{Mailbox, SinglePart};
@@ -63,22 +63,59 @@ fn title_brand(app: &App, tenant: &str) -> String {
         .unwrap_or_else(|| "VOTPort".to_owned())
 }
 
-pub async fn trade_uploaded(app: &App, tenant: &str, upload: &str) {
-    if let Ok(Some(incoming)) = app.store.received_route(tenant, upload) {
-        if let Some(permission) = &incoming.source.document.permission {
-            if let (Ok(Some(route)), Ok(Some(policy))) = (
-                app.store.trade_route(tenant, &permission.grant),
-                app.store.trade_delivery_policy(&incoming.id),
-            ) {
-                let detail = incoming
-                    .receipt
-                    .as_ref()
-                    .map(|receipt| format!("receipt:{}", receipt.digest()))
-                    .unwrap_or_else(|| format!("upload:{upload}"));
-                trade_event(app, &route, &policy, "route_received", Some(&detail)).await;
-            }
-        }
+static TRADE_ROUTE_WARN: OnceLock<Mutex<crate::api::outbound::ErrorDeduper>> = OnceLock::new();
+
+/// The route alert is best-effort, but a store error that suppresses it must
+/// not vanish: warn with the route identity and error class, paced per
+/// route and error.
+fn warn_route_alert_suppressed(route: &str, error: &str) {
+    let due = TRADE_ROUTE_WARN
+        .get_or_init(|| {
+            Mutex::new(crate::api::outbound::ErrorDeduper::new(
+                "inbound route alert",
+            ))
+        })
+        .lock()
+        .expect("inbound route alert warn pacer poisoned")
+        .observe(&format!("{route}: {error}"), Instant::now());
+    if due {
+        tracing::warn!(
+            route = %route,
+            %error,
+            "inbound route read failed; the route alert is suppressed"
+        );
     }
+}
+
+pub async fn trade_uploaded(app: &App, tenant: &str, upload: &str) {
+    let incoming = match app.store.received_route(tenant, upload) {
+        Ok(Some(incoming)) => incoming,
+        Ok(None) => return,
+        Err(error) => {
+            warn_route_alert_suppressed(upload, &error);
+            return;
+        }
+    };
+    let Some(permission) = &incoming.source.document.permission else {
+        return;
+    };
+    let (route, policy) = match (
+        app.store.trade_route(tenant, &permission.grant),
+        app.store.trade_delivery_policy(&incoming.id),
+    ) {
+        (Ok(Some(route)), Ok(Some(policy))) => (route, policy),
+        (Err(error), _) | (_, Err(error)) => {
+            warn_route_alert_suppressed(upload, &error);
+            return;
+        }
+        _ => return,
+    };
+    let detail = incoming
+        .receipt
+        .as_ref()
+        .map(|receipt| format!("receipt:{}", receipt.digest()))
+        .unwrap_or_else(|| format!("upload:{upload}"));
+    trade_event(app, &route, &policy, "route_received", Some(&detail)).await;
 }
 
 /// Sends every configured notification for one completed upload.
@@ -761,6 +798,42 @@ pub(crate) mod tests {
         NotificationPolicy, NotificationRule, OutboundDownloadResult, OutboundGrant,
         OutboundGrantFile, Tenant, TradeRoute, UploadRecord, NOTIFICATION_EVENTS,
     };
+
+    /// Audit finding 226: a store error that suppresses the inbound
+    /// route_received alert must warn with the route identity, and the
+    /// unchanged repeat stays paced to one line.
+    #[tokio::test]
+    async fn trade_route_alert_warns_when_the_store_fails_and_paces() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .with(|connection| connection.execute_batch("DROP TABLE inbound_routes"))
+            .unwrap();
+        TRADE_ROUTE_WARN
+            .get_or_init(|| {
+                Mutex::new(crate::api::outbound::ErrorDeduper::new(
+                    "inbound route alert",
+                ))
+            })
+            .lock()
+            .unwrap()
+            .reset();
+        let (log, _guard) = crate::logging::captured(crate::logging::stdout_filter(None, false));
+        trade_uploaded(&application, "team", "upload-1").await;
+        trade_uploaded(&application, "team", "upload-1").await;
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        let warns: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("inbound route read failed"))
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "the unchanged repeat stays paced: {warns:?}"
+        );
+        assert!(warns[0].contains("upload-1"), "{}", warns[0]);
+    }
 
     pub(crate) fn test_grant(files: Vec<OutboundGrantFile>) -> OutboundGrant {
         OutboundGrant {

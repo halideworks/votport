@@ -1941,61 +1941,122 @@ pub async fn lease_keeper(app: Arc<App>) {
 
 /// Remove only VOTPORT-owned outbound staging entries. `symlink_metadata` and
 /// per-entry removal keep cleanup from traversing an operator-created link.
+/// The sweep runs once per start and covers a bounded directory, so every
+/// failure warns with the entry's relative name instead of vanishing.
 fn clean_outbound_stage(data_dir: &std::path::Path) {
     let root = data_dir.join("outbound.stage");
-    let Ok(root_meta) = std::fs::symlink_metadata(&root) else {
-        return;
+    let root_meta = match std::fs::symlink_metadata(&root) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            tracing::warn!(%error, path = %root.display(), "outbound stage scan failed");
+            return;
+        }
     };
     if !root_meta.file_type().is_dir() || root_meta.file_type().is_symlink() {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return;
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(%error, path = %root.display(), "outbound stage scan failed");
+            return;
+        }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(%error, "outbound stage entry could not be inspected");
+                continue;
+            }
+        };
         let path = entry.path();
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         if !name.starts_with(".vot-outbound-") {
             continue;
         }
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(error) => {
+                tracing::warn!(%error, entry = %name, "outbound stage entry could not be inspected");
+                continue;
+            }
         };
         if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
-            let _ = std::fs::remove_file(path);
+            if let Err(error) = std::fs::remove_file(&path) {
+                tracing::warn!(%error, entry = %name, "outbound stage cleanup failed");
+            }
             continue;
         }
-        let Ok(children) = std::fs::read_dir(&path) else {
-            continue;
+        let children = match std::fs::read_dir(&path) {
+            Ok(children) => children,
+            Err(error) => {
+                tracing::warn!(%error, entry = %name, "outbound stage scan failed");
+                continue;
+            }
         };
-        for child in children.flatten() {
+        for child in children {
+            let child = match child {
+                Ok(child) => child,
+                Err(error) => {
+                    tracing::warn!(%error, entry = %name, "outbound stage entry could not be inspected");
+                    continue;
+                }
+            };
             let child_path = child.path();
+            let child_name = child.file_name();
             let Ok(child_meta) = std::fs::symlink_metadata(&child_path) else {
                 continue;
             };
-            if child_meta.file_type().is_dir() && !child_meta.file_type().is_symlink() {
-                let _ = std::fs::remove_dir(child_path);
+            let removal = if child_meta.file_type().is_dir() && !child_meta.file_type().is_symlink()
+            {
+                std::fs::remove_dir(&child_path)
             } else {
-                let _ = std::fs::remove_file(child_path);
+                std::fs::remove_file(&child_path)
+            };
+            if let Err(error) = removal {
+                let child = child_name.to_string_lossy();
+                tracing::warn!(%error, entry = %name, child = %child, "outbound stage cleanup failed");
             }
         }
-        let _ = std::fs::remove_dir(path);
+        if let Err(error) = std::fs::remove_dir(&path) {
+            tracing::warn!(%error, entry = %name, "outbound stage cleanup failed");
+        }
     }
 }
 
+/// The stage sweep runs once per start, so every failure warns with the
+/// entry's relative name instead of vanishing.
 fn clean_outbound_proof_stages(data_dir: &std::path::Path) {
     let root = data_dir.join("outbound.proofs");
-    let Ok(meta) = std::fs::symlink_metadata(&root) else {
-        return;
+    let meta = match std::fs::symlink_metadata(&root) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            tracing::warn!(%error, path = %root.display(), "outbound catalog stage scan failed");
+            return;
+        }
     };
     if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(%error, path = %root.display(), "outbound catalog stage scan failed");
+            return;
+        }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(%error, "outbound catalog stage entry could not be inspected");
+                continue;
+            }
+        };
         let path = entry.path();
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
@@ -2003,33 +2064,56 @@ fn clean_outbound_proof_stages(data_dir: &std::path::Path) {
         if !owned_catalog_stage_name(&name) {
             continue;
         }
-        if let Ok(meta) = std::fs::symlink_metadata(&path) {
-            if meta.file_type().is_file() && !meta.file_type().is_symlink() {
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_file() && !meta.file_type().is_symlink() => {
                 if let Err(error) = std::fs::remove_file(path) {
                     tracing::warn!(%error, stage = %name, "outbound catalog stage cleanup failed");
                 }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, stage = %name, "outbound catalog stage entry could not be inspected");
             }
         }
     }
 }
 
-fn active_catalog_names(keys: Vec<(String, String, u64)>) -> HashSet<String> {
-    keys.into_iter()
-        .filter_map(|(suite, root, length)| {
-            let suite = match suite.as_str() {
-                "blake3" => 1,
-                "sha256" => 2,
-                _ => return None,
-            };
-            let bytes = hex::decode(root).ok()?;
-            let root = <[u8; 32]>::try_from(bytes).ok().map(hex::encode)?;
-            Some([
-                format!("{suite}-{root}-{length}.vot-catalog"),
-                format!("{suite}-{root}-{length}.leaves"),
-            ])
-        })
-        .flatten()
-        .collect()
+static UNPARSEABLE_GRANT_WARN: OnceLock<Mutex<crate::api::outbound::ErrorDeduper>> =
+    OnceLock::new();
+
+/// Catalog and leaf names for every active outbound object, plus the grants
+/// whose suite or root does not parse. An unparseable grant cannot name its
+/// files, so its catalogs are missing from the returned keep set; the caller
+/// must keep every catalog instead of pruning against a partial set.
+fn active_catalog_names(
+    keys: Vec<(String, String, String, u64)>,
+) -> (HashSet<String>, Vec<(String, String)>) {
+    let mut names = HashSet::new();
+    let mut unparseable = Vec::new();
+    for (grant_id, suite, root, length) in keys {
+        let suite = match suite.as_str() {
+            "blake3" => 1,
+            "sha256" => 2,
+            other => {
+                unparseable.push((grant_id, format!("unknown suite {other}")));
+                continue;
+            }
+        };
+        let root = match hex::decode(&root)
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+            .map(hex::encode)
+        {
+            Some(root) => root,
+            None => {
+                unparseable.push((grant_id, "root is not a 32-byte hex digest".to_owned()));
+                continue;
+            }
+        };
+        names.insert(format!("{suite}-{root}-{length}.vot-catalog"));
+        names.insert(format!("{suite}-{root}-{length}.leaves"));
+    }
+    (names, unparseable)
 }
 
 fn canonical_proof_name(name: &str) -> bool {
@@ -2091,14 +2175,38 @@ fn clean_outbound_proofs(data_dir: &std::path::Path, store: &Store, now: u64) {
     if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
         return;
     }
-    let keys = match store.active_outbound_object_keys(now) {
+    let (names, unparseable) = match store.active_outbound_object_keys(now) {
         Ok(keys) => active_catalog_names(keys),
         Err(error) => {
             tracing::error!(%error, "outbound catalog references unavailable; skipping prune");
             return;
         }
     };
-    prune_outbound_proofs(&root, &keys);
+    // A grant that does not parse cannot contribute its catalogs, so the keep
+    // set is incomplete and pruning would delete a live delivery's catalog:
+    // keep every file this pass instead.
+    for (grant_id, reason) in &unparseable {
+        let due = UNPARSEABLE_GRANT_WARN
+            .get_or_init(|| {
+                Mutex::new(crate::api::outbound::ErrorDeduper::new(
+                    "unparseable outbound grant",
+                ))
+            })
+            .lock()
+            .expect("unparseable outbound grant warn pacer poisoned")
+            .observe(&format!("{grant_id}: {reason}"), std::time::Instant::now());
+        if due {
+            tracing::warn!(
+                grant_id = %grant_id,
+                reason = %reason,
+                "outbound grant does not parse; keeping every catalog this pass"
+            );
+        }
+    }
+    if !unparseable.is_empty() {
+        return;
+    }
+    prune_outbound_proofs(&root, &names);
 }
 
 fn prune_outbound_proofs(root: &std::path::Path, keys: &HashSet<String>) {
@@ -2167,7 +2275,13 @@ mod outbound_stage_tests {
             )
             .unwrap();
         }
-        let keys = active_catalog_names(vec![("blake3".to_owned(), active_root, 10)]);
+        let (keys, unparseable) = active_catalog_names(vec![(
+            "grant-1".to_owned(),
+            "blake3".to_owned(),
+            active_root,
+            10,
+        )]);
+        assert!(unparseable.is_empty());
 
         prune_outbound_proofs(&root, &keys);
 
@@ -2227,6 +2341,118 @@ mod outbound_stage_tests {
 
         let _app = crate::api::testing::build(directory.path());
         assert_eq!(std::fs::read(&stage).unwrap(), b"staged");
+    }
+
+    /// Audit finding 222: without write access both sweeps fail their
+    /// removals, and each warn must name the item it could not remove.
+    #[test]
+    fn startup_cleanup_warns_with_entry_names_when_removals_fail() {
+        let directory = tempfile::tempdir().unwrap();
+        let stage = directory.path().join("outbound.stage");
+        let owned = stage.join(".vot-outbound-dead");
+        std::fs::create_dir_all(&owned).unwrap();
+        std::fs::write(owned.join("part"), b"staged").unwrap();
+        let backups = directory.path().join("backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        let snapshot = backups.join("votport-1-aaaaaaaa.db");
+        std::fs::write(&snapshot, b"snapshot").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::set_permissions(&backups, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let writer = log.reopen().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.try_clone().unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            clean_outbound_stage(directory.path());
+            // A future cutoff makes the fresh snapshot count as expired.
+            prune_legacy_snapshots(
+                &backups,
+                std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+            );
+        });
+        std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&backups, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        let stage_warn = text
+            .lines()
+            .find(|line| line.contains("outbound stage cleanup failed"))
+            .expect("the stage removal warns");
+        assert!(stage_warn.contains(".vot-outbound-dead"), "{stage_warn}");
+        let snapshot_warn = text
+            .lines()
+            .find(|line| line.contains("legacy snapshot removal failed"))
+            .expect("the snapshot removal warns");
+        assert!(
+            snapshot_warn.contains("votport-1-aaaaaaaa.db"),
+            "{snapshot_warn}"
+        );
+    }
+
+    /// Audit finding 223: a grant whose suite does not parse cannot name its
+    /// catalogs, so the prune must keep every catalog and warn with the
+    /// grant's identity instead of pruning against a partial keep set.
+    #[test]
+    fn unparseable_grant_keeps_its_catalog_and_warns_with_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let now = crate::store::now_unix();
+        app.store
+            .with(|connection| {
+                connection.execute(
+                    "INSERT INTO outbound_grants(id, token_hash, tenant, link_id, upload_id,
+                        package_root, name, suite, root, file_index, bytes_hi, bytes_lo,
+                        label, created_at, expires_at, downloads)
+                     VALUES ('grant-unparseable', 'hash', 'team', 'link', 'upload',
+                        'root', 'file.txt', 'md5', 'root', 0, 0, 8,
+                        'Delivery', 0, ?1, 0)",
+                    rusqlite::params![i64::try_from(now + 3600).unwrap()],
+                )
+            })
+            .unwrap();
+        UNPARSEABLE_GRANT_WARN
+            .get_or_init(|| {
+                Mutex::new(crate::api::outbound::ErrorDeduper::new(
+                    "unparseable outbound grant",
+                ))
+            })
+            .lock()
+            .unwrap()
+            .reset();
+        let root = app.config.data_dir.join("outbound.proofs");
+        std::fs::create_dir_all(&root).unwrap();
+        let stale = format!("2-{}-11.vot-catalog", "11".repeat(32));
+        std::fs::write(root.join(&stale), b"stale").unwrap();
+
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let writer = log.reopen().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.try_clone().unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            clean_outbound_proofs(&app.config.data_dir, &app.store, now);
+        });
+
+        assert!(
+            root.join(&stale).exists(),
+            "conservative retention keeps every catalog when a grant does not parse"
+        );
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        let warn = text
+            .lines()
+            .find(|line| line.contains("outbound grant does not parse"))
+            .expect("the unparseable grant warns");
+        assert!(warn.contains("grant-unparseable"), "{warn}");
+        assert!(warn.contains("unknown suite md5"), "{warn}");
     }
 }
 
@@ -7058,22 +7284,42 @@ async fn sweep_daily_at(app: &Arc<App>, retention: RetentionObservation) {
     }
 }
 
+/// One pass per daily sweep over a bounded directory: every failure warns
+/// with the snapshot's name instead of vanishing. A missing backup directory
+/// is the normal no-snapshots state and stays silent.
 fn prune_legacy_snapshots(backup_dir: &std::path::Path, cutoff: std::time::SystemTime) {
-    let Ok(entries) = std::fs::read_dir(backup_dir) else {
-        return;
+    let entries = match std::fs::read_dir(backup_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            tracing::warn!(%error, path = %backup_dir.display(), "legacy snapshot scan failed");
+            return;
+        }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(%error, "legacy snapshot entry could not be inspected");
+                continue;
+            }
+        };
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         if !crate::backup::owned_legacy_snapshot(name) {
             continue;
         }
-        let expired = entry
-            .metadata()
-            .and_then(|meta| meta.modified())
-            .is_ok_and(|modified| modified < cutoff);
+        let expired = match entry.metadata().and_then(|meta| meta.modified()) {
+            Ok(modified) => modified < cutoff,
+            Err(error) => {
+                tracing::warn!(%error, snapshot = %name, "legacy snapshot expiry unknown; keeping");
+                false
+            }
+        };
         if expired {
-            let _ = std::fs::remove_file(entry.path());
+            if let Err(error) = std::fs::remove_file(entry.path()) {
+                tracing::warn!(%error, snapshot = %name, "legacy snapshot removal failed");
+            }
         }
     }
 }

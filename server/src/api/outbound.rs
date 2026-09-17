@@ -4411,7 +4411,10 @@ async fn record_download(
         Ok::<_, String>((result, reload))
     })
     .await
-    .map_err(|_| ApiError::internal("record download failed"))?;
+    .map_err(|error| {
+        tracing::warn!(grant_id = %grant.id, %error, "record download task failed");
+        ApiError::internal("record download failed")
+    })?;
     match recorded {
         Ok((result, reload)) => {
             match reload {
@@ -4433,7 +4436,10 @@ async fn record_download(
             Ok(result)
         }
         Err(error) if error == OUTBOUND_DOWNLOAD_LIMIT_REACHED => Err(ApiError::not_found()),
-        Err(_) => Err(ApiError::internal("record download failed")),
+        Err(error) => {
+            tracing::warn!(grant_id = %grant.id, %error, "record download failed");
+            Err(ApiError::internal("record download failed"))
+        }
     }
 }
 
@@ -5421,6 +5427,28 @@ mod tests {
         // Recovery is due exactly once, and only after an error.
         assert!(dedupe.recovered());
         assert!(!dedupe.recovered());
+    }
+
+    /// Audit finding 225: a download whose store write fails keeps its 500
+    /// response but now warns with the grant id and store error instead of
+    /// vanishing into the generic message.
+    #[tokio::test]
+    async fn record_download_warns_when_the_store_write_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        app.store
+            .with(|connection| connection.execute_batch("DROP TABLE outbound_grants"))
+            .unwrap();
+        let grant = crate::notify::tests::test_grant(vec![]);
+        let (log, _guard) = crate::logging::captured(crate::logging::stdout_filter(None, false));
+        let error = record_download(&app, &grant, &[0]).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        let warn = text
+            .lines()
+            .find(|line| line.contains("record download failed"))
+            .expect("the failed store write warns");
+        assert!(warn.contains("grant-id"), "{warn}");
     }
 
     #[test]
