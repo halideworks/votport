@@ -20,7 +20,11 @@ fence command that fails because the host is dead is logged and the
 promotion proceeds. Every supplied command runs under `CMD_TIMEOUT` so a
 wedged docker daemon cannot stall the failover; `planned.sh` defaults it to
 600 s because it must exceed the container's `stop_grace_period` (a clean
-stop waits for in-flight downloads), `watch.sh` to 120 s.
+stop waits for in-flight downloads), `watch.sh` to 120 s. The drain wait
+`DRAIN_TIMEOUT` (default 21600 s) must exceed the largest expected in-flight
+upload: a 500 GiB upload over a 1 Gbit/s link takes about 1.5 hours, and a
+slower link takes longer, so the old 30-minute default aborted mid-transfer
+failovers and cleared the drain.
 
 `LIVE_HOST_URL` and `NEW_LIVE_HOST_URL` are where `/healthz` and `/readyz`
 are polled directly from the host running the script, bypassing the proxy (a
@@ -30,9 +34,21 @@ on loopback. `LIVE_URL` and `NEW_LIVE_URL` are the proxied https addresses
 the admin API is used through; the admin cookie is `Secure`, so those must
 be https.
 
+A failed promote after the stop or fence does not leave the site down: both
+scripts restart the previously-live instance (`LIVE_RESTART_CMD` in
+`planned.sh`, which also clears the drain that instance boots with;
+`UNFENCE_CMD` in `watch.sh`), log the rollback loudly, and exit non-zero.
+See [Rolling back a failed promote](#rolling-back-a-failed-promote).
+
+Both scripts need bash, curl, `timeout`, and python3 on the host running
+them; python3 builds the sign-in body and parses `/readyz`, and both scripts
+check for it before changing any state.
+
 Run `scripts/restart-e2e.mjs` in both modes before relying on either script;
 it exercises the same sequence against the real binary. `DRY_RUN=1` on
-either script prints every step and changes nothing (no sign-in, no drain).
+either script prints every step and changes nothing (no sign-in, no drain);
+`watch.sh` prints the whole run immediately instead of waiting for real
+probe misses.
 
 ## Matching the primary
 
@@ -76,6 +92,7 @@ LIVE_HOST_URL=http://10.0.0.5:8103 \
 NEW_LIVE_HOST_URL=http://10.0.0.6:8103 \
 VOTPORT_ADMIN_PASSWORD=... \
 LIVE_STOP_CMD='ssh live "cd /srv/votport && docker compose stop votport"' \
+LIVE_RESTART_CMD='ssh live "cd /srv/votport && docker compose start votport"' \
 PROMOTE_CMD='ssh standby "cd /srv/votport && docker compose --profile standby stop && docker compose --profile live up -d"' \
 REPOINT_CMD='ssh proxy "sed -i s/10.0.0.5/10.0.0.6/ /etc/caddy/Caddyfile && caddy reload --config /etc/caddy/Caddyfile"' \
 ops/failover/planned.sh
@@ -97,6 +114,7 @@ override, which is what the System page's toggle does too.
 LIVE_HOST_URL=http://10.0.0.5:8103 \
 NEW_LIVE_HOST_URL=http://10.0.0.6:8103 \
 FENCE_CMD='ssh -o ConnectTimeout=5 live "cd /srv/votport && docker compose stop votport"' \
+UNFENCE_CMD='ssh -o ConnectTimeout=5 live "cd /srv/votport && docker compose start votport"' \
 PROMOTE_CMD='ssh standby "cd /srv/votport && docker compose --profile standby stop && docker compose --profile live up -d"' \
 REPOINT_CMD='ssh proxy "sed -i s/10.0.0.5/10.0.0.6/ /etc/caddy/Caddyfile && caddy reload --config /etc/caddy/Caddyfile"' \
 INTERVAL=10 FAILURES=10 \
@@ -112,3 +130,24 @@ Run the watcher somewhere that is not the live host, and run one watcher only.
 After a promotion, clear
 Drain for restart on the new live if it was on, and re-arm the watcher
 against the new pair.
+
+## Rolling back a failed promote
+
+If the promote fails after the stop or fence, the scripts put the old live
+back themselves: they run the inverse of the stop or fence command
+(`LIVE_RESTART_CMD`, `UNFENCE_CMD`), `planned.sh` also clears the drain the
+restarted instance boots with, the rollback is logged loudly, and the script
+exits non-zero. The proxy was not repointed yet at that stage, so service
+resumes through it.
+
+Undoing a repoint by hand is the same sed with the two addresses swapped.
+For the examples above, the reverse of
+`sed -i s/10.0.0.5/10.0.0.6/ /etc/caddy/Caddyfile` is:
+
+```sh
+ssh proxy "sed -i s/10.0.0.6/10.0.0.5/ /etc/caddy/Caddyfile && caddy reload --config /etc/caddy/Caddyfile"
+```
+
+Use the same swap on any orchestrator or load balancer the `REPOINT_CMD`
+drives. Run the reverse repoint only while the old live holds the lease and
+answers on `/readyz`.

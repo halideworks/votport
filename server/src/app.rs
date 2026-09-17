@@ -319,6 +319,10 @@ pub struct App {
     /// Set with the `mount_disqualified` audit row when the storage was
     /// remounted instead of taken over; /readyz reports it alongside lease.
     pub mount_disqualified: AtomicBool,
+    /// Paces the non-NotFound staging-lock warn in `sweep_push_staging`.
+    /// Per-instance instead of a process-global static so a rebuilt App
+    /// (tests) starts unpaced.
+    push_staging_warn: Mutex<crate::api::outbound::ErrorDeduper>,
     health: HealthCache,
 }
 
@@ -1157,6 +1161,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         lease_lost: AtomicBool::new(false),
         lease_lost_total: AtomicU64::new(0),
         mount_disqualified: AtomicBool::new(false),
+        push_staging_warn: Mutex::new(crate::api::outbound::ErrorDeduper::new("push staging lock")),
         health: HealthCache::default(),
         config,
     }))
@@ -5999,16 +6004,6 @@ mod push_tests {
             .join(format!(".vot-push-{key}"));
         std::fs::create_dir_all(&staging).unwrap();
         std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o555)).unwrap();
-        // Other tests sweep staging while a live worker holds its lock, which
-        // primes the shared static pacer; clear it so this test starts due.
-        PUSH_STAGING_LOCK_WARN
-            .get_or_init(|| {
-                Mutex::new(crate::api::outbound::ErrorDeduper::new("push staging lock"))
-            })
-            .lock()
-            .unwrap()
-            .reset();
-
         let log = tempfile::NamedTempFile::new().unwrap();
         let writer = log.reopen().unwrap();
         let subscriber = tracing_subscriber::fmt()
@@ -7312,9 +7307,6 @@ fn sweep_push_tickets(app: &App) {
     }
 }
 
-static PUSH_STAGING_LOCK_WARN: OnceLock<Mutex<crate::api::outbound::ErrorDeduper>> =
-    OnceLock::new();
-
 /// Fixed dedupe key for the staging-lock warn: any non-NotFound locking
 /// failure warns once per interval, paced, instead of skipping silently.
 const PUSH_STAGING_LOCK_ERROR: &str = "lock failed";
@@ -7352,12 +7344,8 @@ fn sweep_push_staging(app: &App) {
                 continue;
             }
             Err(_) => {
-                // ponytail: static pacer because the sweep owns no state between
-                // passes; replace with a per-app pacer if sweeps ever share one.
-                let due = PUSH_STAGING_LOCK_WARN
-                    .get_or_init(|| {
-                        Mutex::new(crate::api::outbound::ErrorDeduper::new("push staging lock"))
-                    })
+                let due = app
+                    .push_staging_warn
                     .lock()
                     .expect("push staging warn pacer poisoned")
                     .observe(PUSH_STAGING_LOCK_ERROR, std::time::Instant::now());

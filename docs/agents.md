@@ -33,6 +33,10 @@ upload or delete library files, or issue receive requests. Those remain operator
 workflows. Requests that omit permissions default to `deliveries:create`.
 
 Tokens expire after 1 to 365 days and can be revoked from any operator UI.
+The Automation page shows which operator minted each token, and deactivating
+that principal (revoke on `/tenants`) revokes every token they minted;
+tokens minted before creator tracking kept no minter and are listed as
+`creator unknown`.
 Revoking a token stops its API access; already-issued delivery links keep their
 own expiry and revocation state. Operators can manage those links in Deliver.
 The database stores agent token hashes, permissions, and operation records.

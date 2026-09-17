@@ -594,7 +594,7 @@ Use a matching binary for older archives, take fresh backups after conversion,
 and upgrade replicas together.
 
 The explicit `votport convert-schema35` command converts a disposable schema-35
-copy to schema 44 without starting the application. Follow the
+copy to schema 46 without starting the application. Follow the
 [offline conversion procedure](schema35-conversion.md); startup never runs it.
 
 Schemas 41, 42, and 43 upgrade to 44 during startup under the data-directory

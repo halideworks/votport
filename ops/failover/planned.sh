@@ -13,6 +13,7 @@
 #   NEW_LIVE_HOST_URL=http://10.0.0.6:8103 \
 #   VOTPORT_ADMIN_PASSWORD=... \
 #   LIVE_STOP_CMD='ssh live "cd /srv/votport && docker compose stop votport"' \
+#   LIVE_RESTART_CMD='ssh live "cd /srv/votport && docker compose start votport"' \
 #   PROMOTE_CMD='ssh standby "cd /srv/votport && docker compose --profile standby stop && docker compose --profile live up -d"' \
 #   REPOINT_CMD='ssh proxy "sed -i s/10.0.0.5/10.0.0.6/ /etc/caddy/Caddyfile && caddy reload --config /etc/caddy/Caddyfile"' \
 #   ops/failover/planned.sh
@@ -28,23 +29,39 @@
 # LIVE_HOST_URL and NEW_LIVE_HOST_URL are where /readyz is polled directly,
 # bypassing the proxy (a drained instance answers 503 there on purpose).
 # Optional: DRAIN_TIMEOUT (seconds to wait for sessions_active 0, default
-# 1800), READY_TIMEOUT (seconds to wait for the new live to hold the lease,
-# default 300), CMD_TIMEOUT (seconds each supplied command may take, default
-# 600: it must exceed the container's stop_grace_period, since a clean stop
-# waits for in-flight downloads), DRY_RUN=1 to print every step without
-# signing in, draining, or running anything.
+# 21600: it must exceed the largest expected in-flight upload, see the
+# comment at the default), READY_TIMEOUT (seconds to wait for the new live
+# to hold the lease, default 300), CMD_TIMEOUT (seconds each supplied
+# command may take, default 600: it must exceed the container's
+# stop_grace_period, since a clean stop waits for in-flight downloads),
+# DRY_RUN=1 to print every step without signing in, draining, or running
+# anything.
 #
 # If the script aborts with the drain on, the EXIT trap clears it on the old
 # live while that instance is still running; after the stop, a failed clear
-# on the new live is reported and left for the operator.
+# on the new live is reported and left for the operator. A failed promote
+# after the stop is rolled back: LIVE_RESTART_CMD (the inverse of
+# LIVE_STOP_CMD) restarts the old live, the drain it boots with is cleared,
+# and the script exits non-zero. See README.md for the reverse repoint.
 set -euo pipefail
+
+# python3 builds the login body and reads the /readyz JSON.
+command -v python3 >/dev/null 2>&1 || {
+  echo "python3 is required on the host running this script" >&2
+  exit 1
+}
 
 : "${LIVE_URL:?LIVE_URL is required}"
 : "${NEW_LIVE_URL:?NEW_LIVE_URL is required}"
 : "${LIVE_STOP_CMD:?LIVE_STOP_CMD is required}"
+: "${LIVE_RESTART_CMD:?LIVE_RESTART_CMD is required: the inverse of LIVE_STOP_CMD, run to restart the old live when a promote fails}"
 : "${PROMOTE_CMD:?PROMOTE_CMD is required}"
 REPOINT_CMD="${REPOINT_CMD:-}"
-DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-1800}"
+# The drain must outlast the largest in-flight upload, not just a fast
+# transfer: a 500 GiB upload over a 1 Gbit/s link takes about 1.5 hours, and
+# a slower link takes longer. Abort early and clear the drain rather than
+# kill a mid-transfer session.
+DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-21600}"
 READY_TIMEOUT="${READY_TIMEOUT:-300}"
 CMD_TIMEOUT="${CMD_TIMEOUT:-600}"
 LIVE_HOST_URL="${LIVE_HOST_URL:-$LIVE_URL}"
@@ -73,6 +90,7 @@ if [ "$DRY_RUN" = 1 ]; then
   log "dry run: would poll $LIVE_HOST_URL/readyz until sessions_active is 0 (up to ${DRAIN_TIMEOUT}s)"
   run "$LIVE_STOP_CMD"
   run "$PROMOTE_CMD"
+  log "dry run: a failed promote would run LIVE_RESTART_CMD to restart the old live, clear its drain, and exit non-zero"
   log "dry run: would wait for $NEW_LIVE_HOST_URL/readyz to report lease.mine true (up to ${READY_TIMEOUT}s)"
   run "$REPOINT_CMD"
   log "dry run: would sign in to $NEW_LIVE_URL and clear draining"
@@ -150,7 +168,18 @@ run "$LIVE_STOP_CMD"
 # live boots from and is cleared there below.
 drained=0
 log "promoting the standby"
-run "$PROMOTE_CMD"
+if ! run "$PROMOTE_CMD"; then
+  log "PROMOTE FAILED; rolling back: restarting the stopped live instance with LIVE_RESTART_CMD"
+  if ! run "$LIVE_RESTART_CMD"; then
+    log "the rollback restart failed as well; the site is down: run the inverse of LIVE_STOP_CMD by hand, then inspect $LIVE_HOST_URL/readyz and the receive root's .votport-lease"
+  fi
+  # The old live boots with the drain still on, since the copy the new live
+  # would have booted never started; clear it so the rollback restores service.
+  log "clearing the drain the restarted live booted with"
+  set_drain "$LIVE_URL" false || log "could not clear the drain on $LIVE_URL; turn Drain for restart off by hand on its System page"
+  log "the proxy was not repointed before the failed promote; if anything pointed it at the standby anyway, reverse that by hand: the inverse sed swaps the two addresses in REPOINT_CMD and reloads; see ops/failover/README.md"
+  exit 1
+fi
 
 log "waiting up to ${READY_TIMEOUT}s for $NEW_LIVE_HOST_URL to hold the lease"
 deadline=$((SECONDS + READY_TIMEOUT))

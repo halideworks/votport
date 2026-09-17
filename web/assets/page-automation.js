@@ -52,6 +52,7 @@ function renderAutomationTokens(tokens) {
       Number.isFinite(token.last_used_at)
         ? `last used ${formatWhen(token.last_used_at)}`
         : 'never used',
+      token.created_by ? `created by ${token.created_by}` : 'creator unknown',
       token.directory ? `folder ${token.directory}` : 'any folder',
       token.permissions.map((permission) => permissionLabels[permission] || permission).join(', '),
     ];

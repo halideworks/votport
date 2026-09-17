@@ -2311,6 +2311,7 @@ mod tests {
                 label: "events".into(),
                 directory: None,
                 permissions: vec!["jobs:read".into()],
+                created_by: String::new(),
                 created_at: now_unix(),
                 expires_at: now_unix() + 3600,
                 revoked_at: None,
