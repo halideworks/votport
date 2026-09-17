@@ -635,17 +635,7 @@ pub async fn worker(app: Arc<App>) {
                         }
                         record_dedupe.recovered();
                     }
-                    if let Ok(Some(current)) = app.store.delivery_job(&job.id) {
-                        if current.state == "failed"
-                            || (current.state == "retrying"
-                                && job.checks["first_failure_at"].is_null())
-                        {
-                            let notify_app = Arc::clone(&app);
-                            tokio::spawn(async move {
-                                crate::notify::workflow_failed(notify_app, current).await;
-                            });
-                        }
-                    }
+                    notify_delivery_attention(&app, &job);
                     drop(operation);
                     continue;
                 }
@@ -670,6 +660,45 @@ pub async fn worker(app: Arc<App>) {
             }
         }
         tokio::select! { _ = app.wait_for_shutdown() => return, _ = app.workflow_ready.notified() => {}, _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {} }
+    }
+}
+
+static DELIVERY_ATTENTION_WARN: std::sync::OnceLock<Mutex<crate::api::outbound::ErrorDeduper>> =
+    std::sync::OnceLock::new();
+
+/// Reloads the just-failed job and spawns the attention notification. A store
+/// error here would silently drop the "needs attention" alert, so it warns
+/// with the job id and error class, paced per job.
+fn notify_delivery_attention(app: &Arc<App>, job: &Job) {
+    match app.store.delivery_job(&job.id) {
+        Ok(Some(current))
+            if current.state == "failed"
+                || (current.state == "retrying" && job.checks["first_failure_at"].is_null()) =>
+        {
+            let notify_app = Arc::clone(app);
+            tokio::spawn(async move {
+                crate::notify::workflow_failed(notify_app, current).await;
+            });
+        }
+        Ok(_) => {}
+        Err(error) => {
+            let due = DELIVERY_ATTENTION_WARN
+                .get_or_init(|| {
+                    Mutex::new(crate::api::outbound::ErrorDeduper::new(
+                        "delivery attention reload",
+                    ))
+                })
+                .lock()
+                .expect("delivery attention warn pacer poisoned")
+                .observe(&format!("{}: {error}", job.id), std::time::Instant::now());
+            if due {
+                tracing::warn!(
+                    job_id = %job.id,
+                    %error,
+                    "delivery attention reload failed; the alert is suppressed"
+                );
+            }
+        }
     }
 }
 
@@ -1652,6 +1681,56 @@ mod tests {
     use axum::http::{Method, Request};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    /// Audit finding 226: when the just-failed job cannot be reloaded, the
+    /// worker's "needs attention" alert is suppressed, so the reload error
+    /// must warn with the job id instead of vanishing.
+    #[test]
+    fn delivery_attention_reload_warns_when_the_store_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = testing::build(directory.path());
+        app.store
+            .with(|connection| connection.execute_batch("DROP TABLE delivery_jobs"))
+            .unwrap();
+        DELIVERY_ATTENTION_WARN
+            .get_or_init(|| {
+                Mutex::new(crate::api::outbound::ErrorDeduper::new(
+                    "delivery attention reload",
+                ))
+            })
+            .lock()
+            .unwrap()
+            .reset();
+        let job = crate::workflow::Job {
+            id: "job-attention-1".to_owned(),
+            tenant: String::new(),
+            token_generation: 0,
+            actor: "sender".to_owned(),
+            credential_version: 0,
+            automation_token_id: None,
+            request: crate::workflow::tests::request(),
+            project: crate::workflow::tests::project(),
+            state: "failed".to_owned(),
+            manifest: None,
+            approved_by: None,
+            attempts: 1,
+            created_at: 1,
+            updated_at: 2,
+            error: Some("A destination did not complete".to_owned()),
+            checks: serde_json::json!({}),
+            received: None,
+            reprocessed_from: None,
+            reprocessed_as: None,
+        };
+        let (log, _guard) = crate::logging::captured(crate::logging::stdout_filter(None, false));
+        notify_delivery_attention(&app, &job);
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        let warn = text
+            .lines()
+            .find(|line| line.contains("delivery attention reload failed"))
+            .expect("the suppressed alert warns");
+        assert!(warn.contains("job-attention-1"), "{warn}");
+    }
 
     async fn call(
         app: &Arc<App>,

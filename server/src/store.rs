@@ -4121,8 +4121,18 @@ impl Store {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
             let total_bytes = match combine_byte_sums(bytes_hi, bytes_lo) {
-                0 => grant.bytes,
-                total => total,
+                Ok(0) => grant.bytes,
+                Ok(total) => total,
+                // A corrupt sum is skipped, not clamped: the grant's own
+                // recorded size stays the page total.
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        grant_id = %grant.id,
+                        "grant file byte sum is corrupt; using the recorded grant size"
+                    );
+                    grant.bytes
+                }
             };
             Ok(Some(OutboundGrantFilesPage {
                 grant,
@@ -4582,18 +4592,19 @@ impl Store {
     }
 
     /// Returns globally referenced object keys for non-expired, non-revoked
-    /// outbound grants. Catalogs are content-addressed, so tenant is omitted.
+    /// outbound grants, each with its owning grant id. Catalogs are
+    /// content-addressed, so tenant is omitted.
     pub fn active_outbound_object_keys(
         &self,
         now: u64,
-    ) -> Result<Vec<(String, String, u64)>, String> {
+    ) -> Result<Vec<(String, String, String, u64)>, String> {
         self.with(|connection| {
             let mut statement = connection.prepare(
-                "SELECT suite, root, bytes_hi, bytes_lo
-                 FROM outbound_grants
-                 WHERE revoked_at IS NULL AND expires_at > ?1
+                "SELECT grants.id, grants.suite, grants.root, grants.bytes_hi, grants.bytes_lo
+                 FROM outbound_grants AS grants
+                 WHERE grants.revoked_at IS NULL AND grants.expires_at > ?1
                  UNION
-                 SELECT files.suite, files.root, files.bytes_hi, files.bytes_lo
+                 SELECT files.grant_id, files.suite, files.root, files.bytes_hi, files.bytes_lo
                  FROM outbound_grant_files AS files
                  JOIN outbound_grants AS grants ON grants.id = files.grant_id
                  WHERE grants.revoked_at IS NULL AND grants.expires_at > ?1
@@ -4603,7 +4614,8 @@ impl Store {
                 Ok((
                     row.get(0)?,
                     row.get(1)?,
-                    combine_byte_sums(row.get(2)?, row.get(3)?),
+                    row.get(2)?,
+                    combine_byte_sums(row.get(3)?, row.get(4)?).map_err(corrupt_byte_limbs)?,
                 ))
             })?;
             rows.collect::<Result<Vec<_>, _>>()
@@ -4862,12 +4874,22 @@ fn split_bytes(bytes: u64) -> (i64, i64) {
     ((bytes >> 32) as i64, (bytes & 0xffff_ffff) as i64)
 }
 
-fn combine_byte_sums(hi: i64, lo: i64) -> u64 {
+fn combine_byte_sums(hi: i64, lo: i64) -> Result<u64, String> {
     u64::try_from(hi)
         .ok()
         .and_then(|hi| hi.checked_mul(1 << 32))
         .and_then(|bytes| u64::try_from(lo).ok().and_then(|lo| bytes.checked_add(lo)))
-        .unwrap_or(u64::MAX)
+        .ok_or_else(|| format!("byte limbs {hi}/{lo} are not a representable byte total"))
+}
+
+/// The row-level refusal for corrupt byte limbs: readers return it instead of
+/// reporting a fabricated total for data that was damaged out of band.
+fn corrupt_byte_limbs(error: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Integer,
+        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+    )
 }
 
 struct QuotaIdentity {
@@ -5363,7 +5385,8 @@ fn map_outbound_grant_base(row: &rusqlite::Row<'_>) -> rusqlite::Result<Outbound
         suite: row.get("suite")?,
         root: row.get("root")?,
         file_index: usize::try_from(row.get::<_, i64>("file_index")?.max(0)).unwrap_or(usize::MAX),
-        bytes: combine_byte_sums(row.get("bytes_hi")?, row.get("bytes_lo")?),
+        bytes: combine_byte_sums(row.get("bytes_hi")?, row.get("bytes_lo")?)
+            .map_err(corrupt_byte_limbs)?,
         label: row.get("label")?,
         created_at: row.get::<_, i64>("created_at")?.max(0) as u64,
         expires_at: row.get::<_, i64>("expires_at")?.max(0) as u64,
@@ -5396,7 +5419,8 @@ fn map_outbound_grant_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<Outbound
         name: row.get("name")?,
         suite: row.get("suite")?,
         root: row.get("root")?,
-        bytes: combine_byte_sums(row.get("bytes_hi")?, row.get("bytes_lo")?),
+        bytes: combine_byte_sums(row.get("bytes_hi")?, row.get("bytes_lo")?)
+            .map_err(corrupt_byte_limbs)?,
         receipt_b64: row.get("receipt_b64")?,
         downloads: row.get::<_, i64>("downloads")?.max(0) as u64,
         first_download_at: row

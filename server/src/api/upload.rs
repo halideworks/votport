@@ -601,7 +601,14 @@ async fn register_session(
         )
     })
     .await
-    .map_err(|error| ApiError::internal(error.to_string()))?
+    .map_err(|error| {
+        tracing::warn!(
+            link = %prepared.link.id,
+            %error,
+            "upload session admission task failed"
+        );
+        ApiError::internal(error.to_string())
+    })?
     .map_err(|error| session_insert_error(app, &prepared.link.tenant, error))?;
     match app.store.upload_link(&prepared.link.id) {
         Ok(Some(current)) if current.tenant == prepared.link.tenant && current.usable_now() => {

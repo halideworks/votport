@@ -4338,11 +4338,31 @@ mod phase4_review_tests {
         revoked.files = vec![object("blake3", "revoked-child", 6)];
         store.insert_outbound_grant(revoked).unwrap();
 
+        // The grant id rides along so callers can name unparseable grants.
+        // Identical tuples still deduplicate (the active grant's own row
+        // appears in both UNION halves); rows that differ only by owner now
+        // each appear, which only widens the keep set the prune reads.
         assert_eq!(
             store.active_outbound_object_keys(19).unwrap(),
             vec![
-                ("blake3".to_owned(), "parent".to_owned(), 3),
-                ("sha256".to_owned(), "child".to_owned(), 4),
+                (
+                    "active".to_owned(),
+                    "blake3".to_owned(),
+                    "parent".to_owned(),
+                    3
+                ),
+                (
+                    "legacy".to_owned(),
+                    "blake3".to_owned(),
+                    "parent".to_owned(),
+                    3
+                ),
+                (
+                    "active".to_owned(),
+                    "sha256".to_owned(),
+                    "child".to_owned(),
+                    4
+                ),
             ]
         );
     }
@@ -5764,4 +5784,45 @@ fn store_outage_logs_use_the_reduced_subject_form() {
     let text = std::fs::read_to_string(log.path()).unwrap();
     assert!(text.contains("ja..om (16)"), "{text}");
     assert!(!text.contains("jane@example.com"), "{text}");
+}
+
+/// Audit finding 224: corrupt byte limbs are refused, never saturated to a
+/// fabricated total. The pure limb decision rejects negatives and overflow,
+/// and a damaged file row makes the page read fail instead of reporting a
+/// bogus size.
+#[test]
+fn corrupt_grant_byte_limbs_are_refused_not_saturated() {
+    // The old saturation inputs now refuse: negative limbs and a hi limb
+    // whose shift overflows 64 bits.
+    assert!(combine_byte_sums(-1, 0).is_err());
+    assert!(combine_byte_sums(0, -5).is_err());
+    assert!(combine_byte_sums(1 << 32, 0).is_err());
+    assert_eq!(combine_byte_sums(1, 0).unwrap(), 1 << 32);
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    store
+        .with(|connection| {
+            connection.execute(
+                "INSERT INTO outbound_grants(id, token_hash, tenant, link_id, upload_id,
+                    package_root, name, suite, root, file_index, bytes_hi, bytes_lo,
+                    label, created_at, expires_at, downloads)
+                 VALUES ('grant-corrupt', 'hash-corrupt', 'team', 'link', 'upload',
+                    'root', 'file.txt', 'blake3', 'root', 0, 0, 8,
+                    'Delivery', 0, 0, 0)",
+                [],
+            )?;
+            connection.execute(
+                "INSERT INTO outbound_grant_files(grant_id, file_index, source, name, suite,
+                    root, bytes_hi, bytes_lo, receipt_b64)
+                 VALUES ('grant-corrupt', 0, 'src', 'file.txt', 'blake3', 'root', -1, 0, '')",
+                [],
+            )
+        })
+        .unwrap();
+    let page = store.outbound_grant_files_page_by_token_hash("hash-corrupt", 0, 50);
+    assert!(
+        page.is_err(),
+        "corrupt limbs refuse the row instead of fabricating a total"
+    );
 }
