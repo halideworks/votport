@@ -847,6 +847,7 @@ const RECEIVING_CHECK_CONCURRENCY: usize = 8;
 /// Process-local OIDC client. Success is sticky; failure cools down 30s.
 pub struct SsoSlot<T = crate::api::sso::SsoClient> {
     inner: Mutex<SsoSlotState<T>>,
+    cooldown: std::time::Duration,
 }
 
 enum SsoSlotState<T> {
@@ -883,6 +884,17 @@ impl<T> SsoSlot<T> {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(SsoSlotState::Empty),
+            cooldown: SSO_COOLDOWN,
+        }
+    }
+
+    /// Shortened cooldown for integration tests that exercise re-discovery
+    /// without waiting out the production 30 seconds.
+    #[cfg(test)]
+    pub(crate) fn with_cooldown(cooldown: std::time::Duration) -> Self {
+        Self {
+            inner: Mutex::new(SsoSlotState::Empty),
+            cooldown,
         }
     }
 
@@ -892,6 +904,22 @@ impl<T> SsoSlot<T> {
             .try_lock()
             .map(|guard| matches!(*guard, SsoSlotState::Ready(_)))
             .unwrap_or(false)
+    }
+
+    /// Drops a Ready client after an id-token verification failure: the usual
+    /// cause is the IdP rolling its signing key, which leaves discovery's
+    /// cached JWKS unable to verify any new token. The slot re-enters the
+    /// same Failed state a failed discovery uses, so the next sign-in after
+    /// the cooldown re-discovers. Only a Ready slot flips and an already
+    /// Failed slot keeps its timestamp, so the flip is bounded to once per
+    /// cooldown and bad tokens cannot force discovery storms.
+    pub fn invalidate_ready(&self) {
+        let mut guard = self.inner.lock().expect("sso slot poisoned");
+        if let SsoSlotState::Ready(_) = &*guard {
+            *guard = SsoSlotState::Failed {
+                at: std::time::Instant::now(),
+            };
+        }
     }
 
     /// IdP await must not hold the slot lock.
@@ -904,7 +932,7 @@ impl<T> SsoSlot<T> {
             let mut guard = self.inner.lock().expect("sso slot poisoned");
             match &*guard {
                 SsoSlotState::Ready(client) => return Ok(Arc::clone(client)),
-                SsoSlotState::Failed { at } if at.elapsed() < SSO_COOLDOWN => return Err(()),
+                SsoSlotState::Failed { at } if at.elapsed() < self.cooldown => return Err(()),
                 SsoSlotState::Discovering => return Err(()),
                 SsoSlotState::Empty | SsoSlotState::Failed { .. } => {
                     *guard = SsoSlotState::Discovering;
@@ -8828,6 +8856,55 @@ mod sso_slot_tests {
             .await
             .expect("retry after cancelled claim");
         assert_eq!(*third, 3);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(slot.health_peek());
+    }
+
+    #[tokio::test]
+    async fn invalidate_ready_sends_the_slot_through_the_failure_cooldown() {
+        let slot = SsoSlot::<u8>::new();
+        let hits = Arc::new(AtomicU32::new(0));
+        let discover = {
+            let hits = Arc::clone(&hits);
+            move || {
+                let hits = Arc::clone(&hits);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Ok(1u8)
+                }
+            }
+        };
+
+        // Empty stays Empty: there is nothing to expire.
+        slot.invalidate_ready();
+        assert!(!slot.health_peek());
+        slot.get_or_discover_with(discover.clone())
+            .await
+            .expect("empty slot still discovers");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(slot.health_peek());
+
+        // One verification failure flips Ready into the Failed cooldown.
+        slot.invalidate_ready();
+        assert!(!slot.health_peek());
+        assert_eq!(slot.get_or_discover_with(discover.clone()).await, Err(()));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the cooldown refuses re-discovery"
+        );
+
+        // Repeated failures do not extend the cooldown: the timestamp of the
+        // Failed slot survives invalidate_ready, so once it elapses the next
+        // caller re-discovers.
+        let Some(at) = past_cooldown() else {
+            return;
+        };
+        force_failed_at(&slot, at);
+        slot.invalidate_ready();
+        slot.get_or_discover_with(discover)
+            .await
+            .expect("an expired cooldown is not prolonged by a repeated failure");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         assert!(slot.health_peek());
     }

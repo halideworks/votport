@@ -205,13 +205,20 @@ fn authorize(app: &App, headers: &HeaderMap, ip: &str) -> ScimResult<()> {
 }
 
 /// A userName usable as a principal subject. Refuses the break-glass
-/// subject, which never comes from an identity provider.
+/// subject, which never comes from an identity provider. The subject folds
+/// to lowercase before storage: this is the row an SSO sign-in (folded the
+/// same way in select_subject) looks up, so both sources must spell it
+/// alike. There is no separate display column, so the folded form is what
+/// SCIM responses and the admin listing show; rows stored with mixed case
+/// by earlier versions still resolve by any case because the store's
+/// subject lookups match case-insensitively.
 fn admit_subject(value: Option<&Value>) -> ScimResult<String> {
     let subject = value
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .ok_or_else(|| ScimError::invalid_value("userName is required"))?;
+        .ok_or_else(|| ScimError::invalid_value("userName is required"))?
+        .to_lowercase();
     // Interior whitespace means a display name was mapped, not a subject.
     if subject.len() > MAX_SUBJECT_BYTES
         || subject
@@ -225,7 +232,7 @@ fn admit_subject(value: Option<&Value>) -> ScimResult<String> {
             "the local administrator is not provisionable",
         ));
     }
-    Ok(subject.to_owned())
+    Ok(subject)
 }
 
 /// SCIM `active` arrives as a bool from most clients and as the strings
@@ -399,8 +406,8 @@ fn user_schema(app: &App) -> Value {
         "name": "User",
         "description": "User account",
         "attributes": [
-            attribute("userName", "string", "immutable", "server", true,
-                "The principal subject; must equal the identity provider's configured subject claim"),
+            attribute("userName", "string", "immutable", "server", false,
+                "The principal subject; must equal the identity provider's configured subject claim, matched case-insensitively and stored lowercase"),
             attribute("externalId", "string", "readWrite", "none", false,
                 "The provisioning system's identifier for the user"),
             attribute("active", "boolean", "readWrite", "none", false,
@@ -472,7 +479,7 @@ fn group_schema(app: &App) -> Value {
                     "multiValued": false,
                     "description": "The member user's id",
                     "required": true,
-                    "caseExact": true,
+                    "caseExact": false,
                     "mutability": "immutable",
                     "returned": "default",
                     "uniqueness": "none",
@@ -830,7 +837,9 @@ fn admit_display_name(value: Option<&Value>) -> ScimResult<String> {
     Ok(name.to_owned())
 }
 
-/// Member entries are `{"value": "<user id>"}`; the id is the subject.
+/// Member entries are `{"value": "<user id>"}`; the id is the subject and
+/// folds like admit_subject, so stored memberships join the sign-in
+/// subject whatever case the provisioning client sent.
 fn admit_members(value: Option<&Value>) -> ScimResult<Vec<String>> {
     let Some(value) = value else {
         return Ok(Vec::new());
@@ -845,11 +854,12 @@ fn admit_members(value: Option<&Value>) -> ScimResult<Vec<String>> {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|subject| !subject.is_empty())
-            .ok_or_else(|| ScimError::invalid_value("each member needs a value"))?;
+            .ok_or_else(|| ScimError::invalid_value("each member needs a value"))?
+            .to_lowercase();
         if subject.len() > MAX_SUBJECT_BYTES || subject.chars().any(char::is_control) {
             return Err(ScimError::invalid_value("member value is not acceptable"));
         }
-        members.push(subject.to_owned());
+        members.push(subject);
     }
     Ok(members)
 }
@@ -2536,5 +2546,91 @@ mod tests {
         assert!(text.contains("principal_revoked"), "{text}");
         assert!(text.contains("ja..om (16)"), "{text}");
         assert!(!text.contains("jane@example.com"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn subject_lookups_and_delete_match_any_case() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = build(directory.path());
+        // Provisioned with mixed case; the folded form is stored and shown.
+        let (status, json) = scim(
+            &application,
+            "POST",
+            "/scim/v2/Users",
+            Some(r#"{"schemas":["urn:ietf:params:scim:schemas:core:2.0:User"],"userName":"Alice@Example.com","active":true}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{json}");
+        assert_eq!(json["userName"], "alice@example.com");
+        // A row stored with mixed case by an earlier version.
+        assert!(application
+            .store
+            .provision_principal("Bob@Example.com", None)
+            .unwrap());
+
+        // Filters match case-insensitively in both directions.
+        for spelling in [
+            "ALICE%40EXAMPLE.COM",
+            "alice%40example.com",
+            "Alice%40Example.com",
+        ] {
+            let (status, json) = scim(
+                &application,
+                "GET",
+                &format!("/scim/v2/Users?filter=userName%20eq%20%22{spelling}%22"),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{spelling}");
+            assert_eq!(json["totalResults"], 1, "{spelling} {json}");
+            assert_eq!(json["Resources"][0]["id"], "alice@example.com");
+        }
+
+        // A GET by any spelling resolves the same row.
+        let (status, json) = scim(
+            &application,
+            "GET",
+            "/scim/v2/Users/Alice@Example.com",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["id"], "alice@example.com");
+
+        // DELETE reaches the row regardless of stored case: the folded
+        // spelling revokes the mixed-case row an earlier version stored.
+        let (status, _) = scim(
+            &application,
+            "DELETE",
+            "/scim/v2/Users/bob@example.com",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let row = application
+            .store
+            .principal("BOB@example.com")
+            .unwrap()
+            .unwrap();
+        assert!(row.blocked);
+        assert_eq!(row.credential_version, 2);
+
+        // And a mixed-case path reaches the folded stored row.
+        let (status, json) = scim(
+            &application,
+            "DELETE",
+            "/scim/v2/Users/Alice@Example.com",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
+        assert!(
+            application
+                .store
+                .principal("alice@example.com")
+                .unwrap()
+                .unwrap()
+                .blocked
+        );
     }
 }

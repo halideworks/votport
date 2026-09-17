@@ -2673,13 +2673,21 @@ impl Store {
 
     // ----------------------------------------------------------- principals
 
+    /// Subject lookups match case-insensitively (SQLite lower() folds ASCII)
+    /// so rows stored with mixed case by earlier versions resolve for a
+    /// folded lookup. New rows are folded lowercase at the API boundary
+    /// (admit_subject, select_subject); two rows differing only by case can
+    /// coexist from old data and converge when each is next written.
+    // ponytail: lower(subject) defeats the primary-key index; fine at admin
+    // principal counts, move folding into the schema if this table grows.
     pub fn principal(&self, subject: &str) -> Result<Option<Principal>, String> {
         self.with(|connection| {
             connection
                 .query_row(
                     "SELECT subject, credential_version, blocked, last_login_at,
                             last_groups, last_grants, source, external_id, created_at
-                     FROM principals WHERE subject = ?1",
+                     FROM principals WHERE lower(subject) = lower(?1)
+                     ORDER BY subject LIMIT 1",
                     [subject],
                     map_principal,
                 )
@@ -2981,9 +2989,12 @@ impl Store {
         }
         write_scim_members(&transaction, id, add).map_err(|error| error.to_string())?;
         for subject in remove {
+            // Fold-to-match so a removal reaches memberships stored with
+            // mixed case by earlier versions.
             transaction
                 .execute(
-                    "DELETE FROM scim_group_members WHERE group_id = ?1 AND subject = ?2",
+                    "DELETE FROM scim_group_members
+                     WHERE group_id = ?1 AND lower(subject) = lower(?2)",
                     rusqlite::params![id, subject],
                 )
                 .map_err(|error| error.to_string())?;
@@ -3008,13 +3019,14 @@ impl Store {
     }
 
     /// Names of the groups a subject belongs to, for the sign-in role
-    /// mapping.
+    /// mapping. Matches case-insensitively so memberships stored with mixed
+    /// case by earlier versions still join a folded sign-in subject.
     pub fn scim_groups_of(&self, subject: &str) -> Result<Vec<String>, String> {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT g.display_name FROM scim_group_members m
                  JOIN scim_groups g ON g.id = m.group_id
-                 WHERE m.subject = ?1 ORDER BY g.display_name",
+                 WHERE lower(m.subject) = lower(?1) ORDER BY g.display_name",
             )?;
             let rows = statement.query_map([subject], |row| row.get::<_, String>(0))?;
             rows.collect()
@@ -3041,7 +3053,7 @@ impl Store {
         self.with(|connection| {
             let changed = connection.execute(
                 "UPDATE principals SET credential_version = credential_version + 1, blocked = 1
-                 WHERE subject = ?1",
+                 WHERE lower(subject) = lower(?1)",
                 [subject],
             )?;
             Ok(changed > 0)
@@ -3051,7 +3063,7 @@ impl Store {
     pub fn unblock_principal(&self, subject: &str) -> Result<bool, String> {
         self.with(|connection| {
             let exists: i64 = connection.query_row(
-                "SELECT EXISTS (SELECT 1 FROM principals WHERE subject = ?1)",
+                "SELECT EXISTS (SELECT 1 FROM principals WHERE lower(subject) = lower(?1))",
                 [subject],
                 |row| row.get(0),
             )?;
@@ -3059,7 +3071,7 @@ impl Store {
                 return Ok(false);
             }
             connection.execute(
-                "UPDATE principals SET blocked = 0 WHERE subject = ?1",
+                "UPDATE principals SET blocked = 0 WHERE lower(subject) = lower(?1)",
                 [subject],
             )?;
             Ok(true)
