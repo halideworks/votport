@@ -90,7 +90,7 @@ async function refresh() {
       })));
       actions.append(button('Delete', 'ghost', () => guard(async () => {
         if (!await confirmModal('Delete notification destination', `Remove ${destination.label}? Subscriptions to it will stop sending. Other destinations are unaffected.`, 'Delete destination')) return;
-        await api(`/api/notifications/${destination.id}`, { method: 'DELETE', body: JSON.stringify({ revision: destination.revision }) }); await refresh();
+        await api(`/api/notifications/${destination.id}`, { method: 'DELETE', headers: { 'If-Match': String(destination.revision) } }); await refresh();
       })));
       card.append(actions);
     }

@@ -322,6 +322,7 @@ fn a_closed_request_link_refuses_a_send() {
     );
     assert_eq!(refused.status.code(), Some(1));
     let error = last_json_line(&refused.stdout);
-    assert_eq!(error["event"], "error");
+    assert!(error["error"].is_string());
     assert_eq!(error["code"], "command_failed");
+    assert_eq!(error["retryable"], false);
 }

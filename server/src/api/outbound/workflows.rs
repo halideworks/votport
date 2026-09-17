@@ -90,7 +90,37 @@ pub async fn projects(
         .store
         .delivery_projects(&actor.identity.tenant)
         .map_err(crate::api::store_unavailable)?;
-    Ok(([(header::CACHE_CONTROL,"no-store")],Json(json!({"projects": projects.into_iter().filter(|p| actor.allows(p,"viewer")).collect::<Vec<_>>()}))).into_response())
+    // The storage kind beside each destination id lets automation tell an S3
+    // import source from a folder or Votport destination without a storage
+    // listing round-trip.
+    let kinds: std::collections::BTreeMap<String, storage::StorageKind> = app
+        .store
+        .delivery_storages()
+        .map_err(crate::api::store_unavailable)?
+        .into_iter()
+        .map(|config| (config.id, config.kind))
+        .collect();
+    let projects = projects
+        .into_iter()
+        .filter(|p| actor.allows(p, "viewer"))
+        .map(|project| {
+            serde_json::to_value(&project)
+                .map(|mut value| {
+                    value["destination_kinds"] = json!(project
+                        .destinations
+                        .iter()
+                        .filter_map(|id| kinds.get(id).map(|kind| (id, kind)))
+                        .collect::<std::collections::BTreeMap<_, _>>());
+                    value
+                })
+                .map_err(|e| ApiError::internal(e.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({"projects": projects})),
+    )
+        .into_response())
 }
 
 pub async fn put_project(
@@ -155,6 +185,27 @@ pub async fn create(
             StatusCode::FORBIDDEN,
             "project sender permission required",
         ));
+    }
+    // Resolve the import source against the authorized storage set now so a
+    // guessed or non-S3 id fails here with 422 instead of minutes later in
+    // preparation.
+    if let Some(import) = &request.import {
+        let storage = storage::authorized_storage(&app, &actor.identity.tenant, &import.storage_id)
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!(
+                        "import storage {} is not available for this tenant",
+                        import.storage_id
+                    ),
+                )
+            })?;
+        if storage.kind != storage::StorageKind::S3 {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "imports require an S3 connection",
+            ));
+        }
     }
     let _operation = begin_outbound_operation(&app, &actor.identity.tenant)?;
     let job = app
@@ -1865,6 +1916,42 @@ mod tests {
         )
     }
 
+    /// One bearer-authenticated request, for the automation-readable views.
+    async fn bearer_call(
+        app: &Arc<App>,
+        method: Method,
+        path: &str,
+        raw: &str,
+    ) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .extension(ConnectInfo(
+                "127.0.0.1:34567".parse::<std::net::SocketAddr>().unwrap(),
+            ))
+            .header("X-Votport", "1")
+            .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = crate::app::router(Arc::clone(app))
+            .oneshot(request)
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        (
+            status,
+            headers,
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+    }
+
     fn admin_cookie(app: &App) -> String {
         format!(
             "votport_admin={}",
@@ -2255,6 +2342,215 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["code"], "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn create_resolves_the_import_storage_at_create_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let cookie = admin_cookie(&app);
+        app.store
+            .save_delivery_project("", "local", crate::workflow::tests::project())
+            .unwrap();
+        let import_request = |storage_id: &str, operation_id: &str| {
+            let mut request = serde_json::to_value(crate::workflow::tests::request()).unwrap();
+            request["operation_id"] = json!(operation_id);
+            request["import"] = json!({"storage_id": storage_id, "prefix": "folder"});
+            request
+        };
+
+        // A guessed id refuses at create instead of failing minutes later.
+        assert_eq!(
+            call(
+                &app,
+                Method::POST,
+                "/api/workflows/jobs",
+                Some(&cookie),
+                Some(import_request("nowhere", "guessed-operation")),
+            )
+            .await
+            .0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+
+        // A real storage of the wrong kind refuses with the same reason path.
+        let destination = directory.path().join("shared");
+        std::fs::create_dir(&destination).unwrap();
+        let folder: storage::Storage = serde_json::from_value(json!({
+            "id": "shared",
+            "revision": 0,
+            "label": "Shared folder",
+            "kind": "folder",
+            "directory": destination,
+            "tenants": [""],
+            "enabled": true
+        }))
+        .unwrap();
+        app.store
+            .save_delivery_storage("local", folder, None)
+            .unwrap();
+        assert_eq!(
+            call(
+                &app,
+                Method::POST,
+                "/api/workflows/jobs",
+                Some(&cookie),
+                Some(import_request("shared", "folder-operation")),
+            )
+            .await
+            .0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+
+        // An existing S3 storage is accepted and the job is queued.
+        let source: storage::Storage = serde_json::from_value(json!({
+            "id": "source",
+            "revision": 0,
+            "label": "Source bucket",
+            "kind": "s3",
+            "endpoint": "http://127.0.0.1:1",
+            "bucket": "delivery",
+            "region": "us-east-1",
+            "path_style": true,
+            "tenants": [""],
+            "enabled": true
+        }))
+        .unwrap();
+        app.store
+            .save_delivery_storage("local", source, None)
+            .unwrap();
+        assert_eq!(
+            call(
+                &app,
+                Method::POST,
+                "/api/workflows/jobs",
+                Some(&cookie),
+                Some(import_request("source", "s3-operation")),
+            )
+            .await
+            .0,
+            StatusCode::ACCEPTED
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_listing_reads_bearer_tokens_with_job_creation() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let cookie = admin_cookie(&app);
+        let source: storage::Storage = serde_json::from_value(json!({
+            "id": "source",
+            "revision": 0,
+            "label": "Source bucket",
+            "kind": "s3",
+            "endpoint": "http://127.0.0.1:1",
+            "bucket": "delivery",
+            "region": "us-east-1",
+            "path_style": true,
+            "tenants": [""],
+            "enabled": true
+        }))
+        .unwrap();
+        app.store
+            .save_delivery_storage("local", source, None)
+            .unwrap();
+        assert_eq!(
+            call(&app, Method::GET, "/api/workflows/storage", None, None)
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let token_with = |permissions: &[&str]| {
+            let raw = auth::random_token();
+            app.store
+                .insert_automation_token(AutomationToken {
+                    id: auth::random_token(),
+                    token_hash: hash_token(&raw),
+                    tenant: String::new(),
+                    label: "jobs".into(),
+                    directory: None,
+                    permissions: permissions.iter().map(|p| (*p).to_owned()).collect(),
+                    created_by: String::new(),
+                    created_at: now_unix(),
+                    expires_at: now_unix() + 3600,
+                    revoked_at: None,
+                    last_used_at: None,
+                })
+                .unwrap();
+            raw
+        };
+        let reader = token_with(&["jobs:read"]);
+        assert_eq!(
+            bearer_call(&app, Method::GET, "/api/workflows/storage", &reader)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        let creator = token_with(&["jobs:create"]);
+        let (status, _, body) =
+            bearer_call(&app, Method::GET, "/api/workflows/storage", &creator).await;
+        assert_eq!(status, StatusCode::OK);
+        let listing: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listing["storage"][0]["id"], "source");
+        assert_eq!(listing["storage"][0]["kind"], "s3");
+        // The operator session keeps its listing.
+        assert_eq!(
+            call(
+                &app,
+                Method::GET,
+                "/api/workflows/storage",
+                Some(&cookie),
+                None
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn project_listings_carry_destination_kinds() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let cookie = admin_cookie(&app);
+        let source: storage::Storage = serde_json::from_value(json!({
+            "id": "west",
+            "revision": 0,
+            "label": "West bucket",
+            "kind": "s3",
+            "endpoint": "http://127.0.0.1:1",
+            "bucket": "delivery",
+            "region": "us-east-1",
+            "path_style": true,
+            "tenants": [""],
+            "enabled": true
+        }))
+        .unwrap();
+        app.store
+            .save_delivery_storage("local", source, None)
+            .unwrap();
+        let mut project = crate::workflow::tests::project();
+        project.destinations = vec!["west".into(), "ghost".into()];
+        app.store
+            .save_delivery_project("", "local", project)
+            .unwrap();
+        let (_, _, body) = call(
+            &app,
+            Method::GET,
+            "/api/workflows/projects",
+            Some(&cookie),
+            None,
+        )
+        .await;
+        let listing: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            listing["projects"][0]["destinations"],
+            json!(["west", "ghost"])
+        );
+        assert_eq!(
+            listing["projects"][0]["destination_kinds"],
+            json!({"west": "s3"})
+        );
     }
 
     #[tokio::test]

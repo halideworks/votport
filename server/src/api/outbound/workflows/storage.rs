@@ -264,8 +264,16 @@ impl Storage {
     }
 }
 
-pub async fn list(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Response> {
-    let identity = admin::require_operator(&app, &headers)?;
+pub async fn list(
+    State(app): State<Arc<App>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    // Readable by an operator session or, like the other automation-readable
+    // GETs, by a bearer token; a bearer needs jobs:create because the listing
+    // exists to pick an S3 import source for job creation.
+    let actor = actor(&app, &headers, peer, "jobs:create", false)?;
+    let identity = &actor.identity;
     let platform_admin = identity.tenant.is_empty() && identity.role == "admin";
     let configs = app
         .store
