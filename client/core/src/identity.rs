@@ -198,9 +198,48 @@ pub(crate) fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> 
     Ok(())
 }
 
+/// Removes the whole per-user state directory: the stored port session,
+/// the watch list with its saved passwords, the transfer journal, the
+/// evidence outbox, and the device key. A shell offers this as "Remove
+/// local data" so an uninstall leaves nothing behind. Watch scans and the
+/// evidence retry worker end on their own, each re-reading state that is
+/// now gone.
+///
+/// # Errors
+/// A state directory that cannot be removed.
+pub fn forget_everything() -> Result<()> {
+    match std::fs::remove_dir_all(state_dir()) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other.map_err(crate::Error::from),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An uninstall's "Remove local data" leaves nothing behind: the port
+    /// session, the watch list with its passwords, the journals, the
+    /// evidence outbox, and the device key all live in one directory.
+    #[test]
+    fn forget_everything_removes_every_client_state_file() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        let _scope = test_state_dir(&state);
+        std::fs::create_dir_all(state.join("journal")).unwrap();
+        std::fs::create_dir_all(state.join("evidence/trees")).unwrap();
+        for name in ["port.json", "watches.json", "device.key"] {
+            std::fs::write(state.join(name), b"secret").unwrap();
+        }
+        std::fs::write(state.join("journal/1.json"), b"{}").unwrap();
+        std::fs::write(state.join("evidence/out.json"), b"{}").unwrap();
+
+        forget_everything().unwrap();
+        assert!(!state.exists(), "client state survived Remove local data");
+        // Nothing left to remove is not an error, so a shell can call it
+        // again before quitting.
+        forget_everything().unwrap();
+    }
 
     #[test]
     fn a_device_key_is_stable_across_loads() {

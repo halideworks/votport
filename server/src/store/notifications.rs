@@ -232,6 +232,29 @@ impl Store {
         tx.commit().map_err(|e| e.to_string())
     }
 
+    /// Rules across links, outbound grants, delivery-job overrides and
+    /// tenant defaults that still name `destination_id`, so a delete can
+    /// tell the operator which notifications will silently stop sending.
+    pub fn notification_rules_referencing(
+        &self,
+        tenant: &str,
+        destination_id: &str,
+    ) -> Result<u64, String> {
+        // json_each over a NULL (a policy without rules, or no policy at
+        // all) yields no rows, so absent policies count nothing.
+        let rules_in = |connection: &Connection, sql: &str| -> rusqlite::Result<u64> {
+            connection.query_row(sql, params![tenant, destination_id], |row| {
+                row.get::<_, i64>(0).map(|count| count.max(0) as u64)
+            })
+        };
+        self.with(|connection| {
+            Ok(rules_in(connection, "SELECT COUNT(*) FROM links, json_each(json_extract(links.notifications_json,'$.rules')) WHERE links.tenant=?1 AND json_extract(json_each.value,'$.destination_id')=?2")?
+                + rules_in(connection, "SELECT COUNT(*) FROM outbound_grants, json_each(json_extract(outbound_grants.notifications_json,'$.rules')) WHERE outbound_grants.tenant=?1 AND json_extract(json_each.value,'$.destination_id')=?2")?
+                + rules_in(connection, "SELECT COUNT(*) FROM notification_job_overrides n JOIN delivery_jobs j ON j.id=n.job_id, json_each(json_extract(n.document,'$.rules')) WHERE j.tenant=?1 AND json_extract(json_each.value,'$.destination_id')=?2")?
+                + rules_in(connection, "SELECT COUNT(*) FROM notification_defaults, json_each(json_extract(notification_defaults.document,'$.rules')) WHERE notification_defaults.tenant=?1 AND json_extract(json_each.value,'$.destination_id')=?2")?)
+        })
+    }
+
     pub fn notification_outcomes(&self, tenant: &str) -> Result<serde_json::Value, String> {
         self.with(|connection| {
             let mut query = connection.prepare("SELECT id,last_at,last_delivered,json_extract(document,'$.last_reason') FROM notification_destinations WHERE tenant=?1 AND last_at IS NOT NULL")?;

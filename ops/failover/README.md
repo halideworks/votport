@@ -157,3 +157,24 @@ ssh proxy "sed -i s/10.0.0.6/10.0.0.5/ /etc/caddy/Caddyfile && caddy reload --co
 Use the same swap on any orchestrator or load balancer the `REPOINT_CMD`
 drives. Run the reverse repoint only while the old live holds the lease and
 answers on `/readyz`.
+
+## Erasing and decommissioning a replica-mode standby
+
+A replica-mode standby's data directory holds more than its status file:
+between pulls it stages the last pulled archive extracted in place, so
+`.votport-restore-stage-<random>/` contains the primary's full database
+snapshot plus its receipt and push identity keys, and
+`.votport-restore-pending.json` marks that stage for the promotion boot to
+apply. A standby that has been stopped keeps that copy indefinitely, so
+rows the primary deleted since stay in it, and a replica pull never reaches
+the files the receive volume holds.
+
+Erasure requests and decommissioning therefore cover the standby's data
+volume too, not only the primary's: wipe the standby's `data/` directory
+(`.votport-restore-stage-*`, `.votport-restore-pending.json`,
+`.votport-standby-status.json`, `data/lock`) under the same rules as the
+primary's. A restarted standby does its part: it clears a stage left by a
+previous run and re-pulls a fresh copy within one interval. Before
+promotion, remember the staged copy is the promoted instance's opening
+database, keys and all: once promoted, its credentials behave like the
+primary's and belong in the erasure plan as well.

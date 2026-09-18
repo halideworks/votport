@@ -1312,6 +1312,32 @@ fn persist_pending_restore(data_dir: &Path, marker: &PendingRestore) -> Result<(
     atomic_write_private(&data_dir.join(PENDING_FILE), &bytes)
 }
 
+/// Removes a replica a previous run staged and its marker, so a standby
+/// (or a stopped historical restore) does not hold extracted rows and
+/// identity keys the source has since deleted until someone promotes it.
+/// A restore that was being applied is never touched: its marker and
+/// rollback state are the evidence the next boot finishes from.
+pub(crate) fn discard_staged_replica(data_dir: &Path) -> Result<bool, String> {
+    let Some(marker) = read_pending_restore(data_dir)? else {
+        return Ok(false);
+    };
+    if marker.phase != RestorePhase::Prepared || marker.rollback.is_some() {
+        return Ok(false);
+    }
+    let stage = data_dir.join(&marker.stage);
+    if let Err(error) = fs::remove_dir_all(&stage) {
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error.to_string());
+        }
+    }
+    match fs::remove_file(data_dir.join(PENDING_FILE)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    Ok(true)
+}
+
 pub fn apply_pending_restore(data_dir: &Path, schema_version: u64) -> Result<(), String> {
     let marker_path = data_dir.join(PENDING_FILE);
     let Some(mut marker) = read_pending_restore(data_dir)? else {
@@ -3180,6 +3206,52 @@ mod tests {
                 "unpublished rejected candidate is cleaned up"
             );
         }
+    }
+
+    #[test]
+    fn a_staged_replica_from_a_stopped_standby_is_discarded_but_a_running_restore_is_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest = Manifest {
+            version: VERSION,
+            created_at: 1,
+            schema_version: crate::store::SCHEMA_VERSION,
+            entries: Vec::new(),
+        };
+
+        // A clean stage awaiting promotion goes, marker and all, so a
+        // stopped standby stops holding rows the primary deleted.
+        let stale = root.path().join(".votport-restore-stage-stale");
+        fs::create_dir(&stale).unwrap();
+        write_pending_restore(
+            root.path(),
+            CleanupPath::directory(stale.clone()),
+            manifest.clone(),
+            RestoreMode::Replica,
+        )
+        .unwrap();
+        assert!(discard_staged_replica(root.path()).unwrap());
+        assert!(!stale.exists());
+        assert!(!root.path().join(PENDING_FILE).exists());
+        assert!(!discard_staged_replica(root.path()).unwrap());
+
+        // A restore that was being applied is evidence for its next boot.
+        let applying = root.path().join(".votport-restore-stage-applying");
+        fs::create_dir(&applying).unwrap();
+        persist_pending_restore(
+            root.path(),
+            &PendingRestore {
+                stage: ".votport-restore-stage-applying".into(),
+                version: VERSION,
+                manifest,
+                mode: RestoreMode::Replica,
+                phase: RestorePhase::OldMoved,
+                rollback: Some(".votport-restore-rollback-keep".into()),
+            },
+        )
+        .unwrap();
+        assert!(!discard_staged_replica(root.path()).unwrap());
+        assert!(applying.is_dir());
+        assert!(root.path().join(PENDING_FILE).exists());
     }
 
     #[test]

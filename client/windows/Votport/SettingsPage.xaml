@@ -127,6 +127,11 @@
       <ToggleSwitch x:Name="NotifySwitch" Header="Notify when a transfer ends" Toggled="Notify_Toggled" />
       <ToggleSwitch x:Name="TraySwitch" Header="Keep running in the tray when the window is closed" Toggled="Tray_Toggled" />
       <ToggleSwitch x:Name="StartSwitch" Header="Start with Windows, minimized to the tray" Toggled="Start_Toggled" />
+      <StackPanel Spacing="4">
+        <Button x:Name="RemoveDataButton" Content="Remove local data" Click="RemoveLocalData_Click" />
+        <TextBlock Text="Removes the signed-in session, watch folders and their passwords, unfinished transfers, pending verification evidence, and this PC's device key."
+            FontSize="12" Foreground="{ThemeResource VotMutedBrush}" TextWrapping="Wrap" />
+      </StackPanel>
       <TextBlock x:Name="CoreText" Foreground="{ThemeResource VotMutedBrush}" />
     </StackPanel>
   </ScrollViewer>

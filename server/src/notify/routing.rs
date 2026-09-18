@@ -50,10 +50,17 @@ pub(super) async fn send_policy(
             if !rule.events.iter().any(|e| e == event) {
                 continue;
             }
-            if let Some(destination) =
-                destination(app, route.tenant, &rule.destination_id)?.filter(|d| d.enabled)
-            {
-                selected.push(destination);
+            match destination(app, route.tenant, &rule.destination_id)? {
+                // A destination the operator disabled on purpose is quiet
+                // by choice; one that was deleted is a rule left behind by
+                // the delete, so say so instead of skipping in silence.
+                Some(destination) if destination.enabled => selected.push(destination),
+                Some(_) => {}
+                None => tracing::warn!(
+                    event,
+                    destination = %rule.destination_id,
+                    "notification rule names a deleted destination; its events send nothing"
+                ),
             }
         }
         Ok(selected)
