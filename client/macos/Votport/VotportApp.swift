@@ -24,7 +24,8 @@ struct VotportApp: App {
             MenuPanel()
                 .environmentObject(store)
         } label: {
-            Image(systemName: store.active.isEmpty ? "sailboat" : "sailboat.fill")
+            // The glyph carries the last outcome; the menu bar has no tooltip.
+            Image(systemName: store.menuBarSymbol)
         }
         .menuBarExtraStyle(.menu)
     }

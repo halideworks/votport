@@ -166,6 +166,12 @@ public sealed partial class SettingsPage : Page
         if (await confirm.ShowAsync() == ContentDialogResult.Primary) PortStore.Shared.RemoveLocalData();
     }
 
+    private async void Uninstall_Click(object sender, RoutedEventArgs e)
+    {
+        var confirm = new ContentDialog { XamlRoot = XamlRoot, Title = "Uninstall", Content = "This removes the votport: protocol, the start-with-Windows entry, and the toast registration from this PC. Launching the app again writes them anew; delete the app folder to finish.", PrimaryButtonText = "Uninstall", CloseButtonText = "Cancel" };
+        if (await confirm.ShowAsync() == ContentDialogResult.Primary) Protocol.UnregisterIfUnpackaged();
+    }
+
     private async void ChooseWatch_Click(object sender, RoutedEventArgs e)
     {
         var picked = await PickFolder(PickerLocationId.DocumentsLibrary);

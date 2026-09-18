@@ -48,7 +48,12 @@ try {
     if (summary) summary.hidden = false;
     const sso = $('login-sso');
     sso.hidden = false;
-    if (sso_healthy === false) sso.textContent = 'SSO is not reachable';
+    if (sso_healthy === false) {
+      // The label stays and the button stops navigating; the status sentence
+      // moves to the error paragraph, with the password way in.
+      sso.disabled = true;
+      loginError.show('SSO is not reachable. Sign in with the administrator password.');
+    }
   }
 } catch {
   /* password sign-in still works */

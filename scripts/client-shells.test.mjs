@@ -106,3 +106,47 @@ test('the macOS core ships both Apple architectures and Windows knows its ARM64 
   assert.match(doc, /build-core\.ps1 -Arch arm64/);
   assert.match(doc, /win-arm64/);
 });
+
+test('the unpackaged uninstall removes the protocol command, the Run entry and the toast AUMID', async () => {
+  const protocol = await read('client/windows/Votport/Protocol.cs');
+  const unregister = protocol.match(/public static void UnregisterIfUnpackaged\(\)[\s\S]*?\n    \}/)[0];
+  assert.ok(unregister, 'the uninstall entry point exists');
+  assert.match(unregister, /DeleteValue\("Votport", throwOnMissingValue: false\)/);
+  assert.match(unregister, /UnregisterForProtocolActivation\("votport"/);
+  assert.match(unregister, /DeleteSubKeyTree\(\@"Software\\Classes\\votport"/);
+  assert.match(unregister, /DeleteSubKeyTree\(\$\@"Software\\Classes\\AppUserModelId\\/);
+  // Wired as a destructive control with a confirm, beside Remove local data.
+  const page = await read('client/windows/Votport/SettingsPage.xaml.cs');
+  assert.match(page, /Uninstall_Click[\s\S]*?ContentDialog \{[\s\S]*?CloseButtonText = "Cancel"/);
+  assert.match(page, /ContentDialogResult\.Primary\) Protocol\.UnregisterIfUnpackaged\(\)/);
+  assert.match(await read('client/windows/Votport/SettingsPage.xaml'), /x:Name="UninstallButton"/);
+});
+
+test('the tray indicators separate failure from idle and show moved over total', async () => {
+  // macOS: the menu bar glyph carries the last outcome and the Dock the fraction.
+  const macStore = await read('client/macos/Votport/TransferStore.swift');
+  const symbol = macStore.match(/var menuBarSymbol: String \{[\s\S]*?\n    \}/)[0];
+  assert.ok(symbol, 'menuBarSymbol exists');
+  assert.match(symbol, /active\.isEmpty \{ return "sailboat\.fill"/);
+  assert.match(symbol, /last\.interrupted \|\| last\.view\?\.phase == \.failed \? "exclamationmark\.triangle" : "sailboat"/);
+  const dock = macStore.match(/private func updateDockTile\(\)[\s\S]*?\n    \}/)[0];
+  assert.ok(dock, 'the Dock progress update exists');
+  assert.match(dock, /moved \+= item\.view\?\.movedBytes \?\? 0/);
+  assert.match(dock, /total \+= item\.view\?\.totalBytes \?\? 0/);
+  assert.match(dock, /NSApp\.dockTile\.progress = total > 0 \? Double\(moved\) \/ Double\(total\) : 0/);
+  assert.match(macStore, /items\[index\]\.view = view\n        updateDockTile\(\)/);
+  assert.match(macStore, /handles\[id\] = nil\n        updateDockTile\(\)/);
+  const app = await read('client/macos/Votport/VotportApp.swift');
+  assert.match(app, /Image\(systemName: store\.menuBarSymbol\)/);
+  assert.doesNotMatch(app, /store\.active\.isEmpty \? "sailboat" : "sailboat\.fill"/);
+  // Windows: the tray tip carries the last outcome, the taskbar bar the fraction.
+  const win = await read('client/windows/Votport/MainWindow.xaml.cs');
+  const indicate = win.match(/private void Indicate\(\)[\s\S]*?\n    \}/)[0];
+  assert.ok(indicate, 'the tray and taskbar update exists');
+  assert.match(indicate, /FirstOrDefault\(item => !item\.Running\)/);
+  assert.match(indicate, /Format\.StatusLine\(last\)/);
+  assert.match(indicate, /moved \+= item\.View\?\.MovedBytes \?\? 0/);
+  assert.match(indicate, /total \+= item\.View\?\.TotalBytes \?\? 0/);
+  assert.match(indicate, /Taskbar\.SetProgressValue\(hwnd, moved, total\)/);
+  assert.match(indicate, /TaskbarState\.NoProgress/);
+});

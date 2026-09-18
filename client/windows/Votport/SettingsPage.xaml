@@ -132,6 +132,11 @@
         <TextBlock Text="Removes the signed-in session, watch folders and their passwords, unfinished transfers, pending verification evidence, and this PC's device key."
             FontSize="12" Foreground="{ThemeResource VotMutedBrush}" TextWrapping="Wrap" />
       </StackPanel>
+      <StackPanel Spacing="4">
+        <Button x:Name="UninstallButton" Content="Uninstall" Click="Uninstall_Click" />
+        <TextBlock Text="Removes the votport: protocol, the start-with-Windows entry, and the toast registration from this PC. Launching the app again writes them anew; delete the app folder to finish."
+            FontSize="12" Foreground="{ThemeResource VotMutedBrush}" TextWrapping="Wrap" />
+      </StackPanel>
       <TextBlock x:Name="CoreText" Foreground="{ThemeResource VotMutedBrush}" />
     </StackPanel>
   </ScrollViewer>
