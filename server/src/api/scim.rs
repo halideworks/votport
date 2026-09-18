@@ -81,7 +81,12 @@ impl ScimError {
 
     fn store(error: String) -> Self {
         tracing::error!(target: "audit", event = "scim_store_failed", %error, "scim store call failed");
-        Self::new(StatusCode::SERVICE_UNAVAILABLE, "store unavailable")
+        // Audit 437: the same store-outage sentence every other refusal
+        // uses, carried by the SCIM error type.
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            super::store_unavailable_message(),
+        )
     }
 }
 
@@ -1192,6 +1197,15 @@ pub async fn delete_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit 437: a SCIM store outage carries the shared store-unavailable
+    /// sentence rather than SCIM's own wording.
+    #[test]
+    fn store_outage_shares_the_store_unavailable_sentence() {
+        let error = ScimError::store("rusqlite detail".into());
+        assert_eq!(error.detail, crate::api::store_unavailable_message());
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
 
     use axum::body::Body;
     use axum::http::Request;

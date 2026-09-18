@@ -249,7 +249,11 @@ pub(super) async fn export(app: &Arc<App>, job: &Job, config: &storage::Storage)
             serde_json::from_value::<crate::route_protocol::RoutePermission>(
                 job.checks["trade_routes"][&config.id]["permission"].clone(),
             )
-            .map_err(|_| conflict("route permission snapshot missing; submit a new job".into()))?,
+            .map_err(|_| {
+                conflict(
+                    "this job's saved route permissions are missing; submit a new delivery".into(),
+                )
+            })?,
         )
     } else {
         None
@@ -285,7 +289,12 @@ pub(super) async fn export(app: &Arc<App>, job: &Job, config: &storage::Storage)
     if trade.is_some() {
         let allowed: Vec<String> =
             serde_json::from_value(job.checks["trade_routes"][&config.id]["metadata_keys"].clone())
-                .map_err(|_| conflict("metadata policy snapshot missing".into()))?;
+                .map_err(|_| {
+                    conflict(
+                        "this job's saved metadata allowlist is missing; submit a new delivery"
+                            .into(),
+                    )
+                })?;
         if ancestry.iter().any(|receipt| {
             receipt
                 .document
@@ -302,10 +311,9 @@ pub(super) async fn export(app: &Arc<App>, job: &Job, config: &storage::Storage)
     let source = app.signer.sign_route(crate::route_protocol::RouteDocument {
         issuer: app.signer.public_hex.clone(),
         operation_id: job.id.clone(),
-        manifest: job
-            .manifest
-            .clone()
-            .ok_or_else(|| conflict("frozen manifest missing".into()))?,
+        manifest: job.manifest.clone().ok_or_else(|| {
+            conflict("this job's approved file list is missing; submit a new delivery".into())
+        })?,
         label: job.request.label.clone(),
         metadata,
         parent_receipt: parent.as_ref().map(|receipt| receipt.digest()),
@@ -428,7 +436,12 @@ pub(super) async fn export(app: &Arc<App>, job: &Job, config: &storage::Storage)
     if let Some(route) = trade {
         let policy =
             serde_json::from_value(job.checks["trade_routes"][&config.id]["notifications"].clone())
-                .map_err(|_| conflict("route notification snapshot missing".into()))?;
+                .map_err(|_| {
+                    conflict(
+                "this job's saved route notification settings are missing; submit a new delivery"
+                    .into(),
+            )
+                })?;
         let detail = format!("receipt:{}", receipt.digest());
         crate::notify::trade_event(app, &route, &policy, "route_received", Some(&detail)).await;
         let _ = crate::api::trade::refresh_route(app, &route).await;

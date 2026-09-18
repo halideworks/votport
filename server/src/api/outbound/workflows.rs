@@ -182,7 +182,7 @@ pub async fn create(
     if !actor.allows(&project, "sender") {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
-            "project sender permission required",
+            crate::workflow::permission_refusal("sender"),
         ));
     }
     // Resolve the import source against the authorized storage set now so a
@@ -454,7 +454,7 @@ pub async fn reprocess(
     ) {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
-            "project sender permission required",
+            crate::workflow::permission_refusal("sender"),
         ));
     }
     let job = app
@@ -522,7 +522,11 @@ pub async fn change(
     ) {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
-            "project permission required",
+            crate::workflow::permission_refusal(if action.action == "approve" {
+                "approver"
+            } else {
+                "sender"
+            }),
         ));
     }
     let job = app
@@ -965,7 +969,7 @@ pub(super) async fn received_files(
             .collect();
         if files.len() != count {
             return Err(conflict(
-                "incoming inventory contains duplicate filenames".into(),
+                "the incoming delivery has duplicate filenames; ask the sender to correct them, then retry".into(),
             ));
         }
         Ok(files)
@@ -1010,9 +1014,9 @@ async fn freeze_files(app: &Arc<App>, job: &Job) -> ApiResult<Vec<String>> {
         if let Ok(file) = std::fs::File::open(&inventory) {
             let paths: Vec<String> =
                 serde_json::from_reader(std::io::Read::take(file, 64 * 1024 * 1024))
-                    .map_err(|_| conflict("frozen inventory is corrupt".into()))?;
+                    .map_err(|_| conflict("this delivery's saved file list could not be read; submit a new delivery".into()))?;
             if paths.is_empty() || paths.len() > MAX_LIBRARY_PROJECT_FILES {
-                return Err(conflict("invalid frozen inventory".into()));
+                return Err(conflict("this delivery's saved file list is unusable; submit a new delivery".into()));
             }
             for path in &paths {
                 payload_path(&app, &job.tenant, &job.id, path)?;
@@ -1058,7 +1062,7 @@ async fn freeze_files(app: &Arc<App>, job: &Job) -> ApiResult<Vec<String>> {
             .map_err(conflict)?;
         if root.exists() {
             std::fs::remove_dir_all(&root)
-                .map_err(|_| conflict("remove incomplete job snapshot failed".into()))?;
+                .map_err(|_| conflict("the server could not prepare this delivery's files; check free space on the server, then retry the delivery".into()))?;
         }
         create_library_dirs(&root)?;
         crate::paths::tighten_private_dir(parent).map_err(ApiError::internal)?;
@@ -1080,22 +1084,22 @@ async fn freeze_files(app: &Arc<App>, job: &Job) -> ApiResult<Vec<String>> {
             create_library_dirs(destination.parent().ok_or_else(ApiError::not_found)?)?;
             let source = std::fs::File::open(&path).map_err(|_| ApiError::not_found())?;
             let mut destination_file = std::fs::File::create(&destination)
-                .map_err(|_| conflict("create delivery snapshot failed".into()))?;
+                .map_err(|_| conflict("the server could not stage this delivery's files; check free space on the server, then retry the delivery".into()))?;
             let copied = copy_snapshot(&source, &mut destination_file, before.len())
-                .map_err(|_| conflict("copy delivery snapshot failed; check free space".into()))?;
+                .map_err(|_| conflict("the server could not stage this delivery's files; check free space on the server, then retry the delivery".into()))?;
             if copied != before.len() {
-                return Err(conflict("source size changed during snapshot".into()));
+                return Err(conflict("a source file changed while the delivery was being staged; retry the delivery".into()));
             }
             let after = std::fs::symlink_metadata(&path).map_err(|_| ApiError::not_found())?;
             if !after.file_type().is_file()
                 || before.len() != after.len()
                 || before.modified().ok() != after.modified().ok()
             {
-                return Err(conflict("source changed during delivery snapshot".into()));
+                return Err(conflict("a source file changed while the delivery was being staged; retry the delivery".into()));
             }
             destination_file
                 .sync_all()
-                .map_err(|_| conflict("sync delivery snapshot failed".into()))?;
+                .map_err(|_| conflict("the server could not save this delivery's files; check free space on the server, then retry the delivery".into()))?;
             paths.push(name);
         }
         storage::publish_inventory(&app, &job.tenant, &job.id, &paths)?;
@@ -1173,6 +1177,8 @@ async fn check_media(app: &Arc<App>, job: &Job, names: &[String]) -> ApiResult<(
                     "json",
                 ],
                 &path,
+                "video format check",
+                name,
                 remaining().min(SINGLE_CHECK_TIMEOUT),
             )
             .await?;
@@ -1210,6 +1216,8 @@ async fn check_media(app: &Arc<App>, job: &Job, names: &[String]) -> ApiResult<(
                 binary,
                 &["--no-summary", "--fdpass", "--"],
                 &path,
+                "malware scan",
+                name,
                 remaining().min(SINGLE_CHECK_TIMEOUT),
             )
             .await
@@ -1223,10 +1231,14 @@ async fn check_media(app: &Arc<App>, job: &Job, names: &[String]) -> ApiResult<(
     Ok(())
 }
 
+/// Audit 435: every checker refusal names the check in the words the
+/// release-checks card uses, the file it ran on, and the remedy.
 async fn run_check(
     binary: std::ffi::OsString,
     args: &[&str],
     path: &Path,
+    check: &str,
+    file: &str,
     timeout: std::time::Duration,
 ) -> ApiResult<Vec<u8>> {
     use tokio::io::AsyncReadExt;
@@ -1238,7 +1250,11 @@ async fn run_check(
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|_| conflict("required media or malware checker is unavailable".into()))?;
+        .map_err(|_| {
+            conflict(format!(
+                "the {check} could not start for {file}; ask an administrator to install it, then retry the delivery"
+            ))
+        })?;
     let stdout = child
         .stdout
         .take()
@@ -1249,22 +1265,26 @@ async fn run_check(
             .take(65537)
             .read_to_end(&mut output)
             .await
-            .map_err(|_| conflict("checker output failed".into()))?;
+            .map_err(|_| conflict(format!("the {check} for {file} returned no readable result; retry the delivery")))?;
         if output.len() > 65536 {
-            return Err(conflict("checker output exceeds limit".into()));
+            return Err(conflict(format!(
+                "the {check} for {file} returned more output than the server accepts; retry the delivery"
+            )));
         }
         if !child
             .wait()
             .await
-            .map_err(|_| conflict("checker failed".into()))?
+            .map_err(|_| conflict(format!("the {check} for {file} stopped before it finished; retry the delivery")))?
             .success()
         {
-            return Err(conflict("checker did not clear the file".into()));
+            return Err(conflict(format!(
+                "the {check} did not clear {file}; fix the file, then retry the delivery"
+            )));
         }
         Ok(output)
     })
     .await
-    .map_err(|_| conflict("required checker timed out".into()))?;
+    .map_err(|_| conflict(format!("the {check} for {file} ran past its time limit; retry the delivery")))?;
     result
 }
 
@@ -1751,7 +1771,7 @@ pub async fn update_notifications(
     if !actor.allows(&project, "sender") {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
-            "Project sender permission required",
+            crate::workflow::permission_refusal("sender"),
         ));
     }
     if let Some(policy) = &policy {
@@ -4759,6 +4779,8 @@ mod tests {
                 "/bin/sh".into(),
                 &["-c", "printf checked"],
                 path,
+                "video format check",
+                "fixture.mp4",
                 SINGLE_CHECK_TIMEOUT
             )
             .await
@@ -4772,6 +4794,8 @@ mod tests {
                     "/bin/sh".into(),
                     &["-c", script],
                     path,
+                    "video format check",
+                    "fixture.mp4",
                     SINGLE_CHECK_TIMEOUT
                 )
             )
@@ -4783,10 +4807,74 @@ mod tests {
             "/nonexistent-votport-checker".into(),
             &[],
             path,
+            "video format check",
+            "fixture.mp4",
             SINGLE_CHECK_TIMEOUT
         )
         .await
         .is_err());
+    }
+
+    /// Audit 435: a checker refusal names the check in the release-checks
+    /// card's words, the file it ran on, and the remedy.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checker_refusals_name_the_check_file_and_remedy() {
+        let path = Path::new("fixture.mp4");
+        let start = run_check(
+            "/nonexistent-votport-checker".into(),
+            &[],
+            path,
+            "video format check",
+            "fixture.mp4",
+            SINGLE_CHECK_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            start.message.contains("video format check")
+                && start.message.contains("fixture.mp4")
+                && start.message.contains("ask an administrator")
+                && start.message.contains("retry the delivery"),
+            "{}",
+            start.message
+        );
+        let cleared = run_check(
+            "/bin/sh".into(),
+            &["-c", "exit 1"],
+            path,
+            "malware scan",
+            "fixture.mp4",
+            SINGLE_CHECK_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            cleared.message.contains("malware scan")
+                && cleared.message.contains("fixture.mp4")
+                && cleared
+                    .message
+                    .contains("fix the file, then retry the delivery"),
+            "{}",
+            cleared.message
+        );
+        let stopped = run_check(
+            "/bin/sh".into(),
+            &["-c", "kill $$"],
+            path,
+            "video format check",
+            "fixture.mp4",
+            SINGLE_CHECK_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            stopped.message.contains("video format check")
+                && stopped.message.contains("fixture.mp4")
+                && stopped.message.ends_with("retry the delivery"),
+            "{}",
+            stopped.message
+        );
     }
 
     #[cfg(unix)]
@@ -4800,6 +4888,8 @@ mod tests {
             "/bin/sh".into(),
             &["-c", "sleep 3"],
             path,
+            "video format check",
+            "fixture.mp4",
             std::time::Duration::from_millis(100)
         )
         .await

@@ -1038,7 +1038,7 @@ pub async fn notification_destinations(
     {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
-            "Delivery or job creation permission required",
+            "Ask an administrator to add the deliveries:create or jobs:create permission to this token.",
         ));
     }
     crate::api::notifications::catalog(&app, &token.tenant, false)
