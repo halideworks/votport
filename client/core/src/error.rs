@@ -170,7 +170,10 @@ impl Error {
             Self::Server {
                 status, what, body, ..
             } => match status {
-                401 | 403 => "The password was not accepted.".to_owned(),
+                401 => "The password was not accepted.".to_owned(),
+                // The server refuses on the session's role, not the password:
+                // a viewer pressing Create is not told their password is wrong.
+                403 => "This account is not allowed to do that.".to_owned(),
                 404 | 410 => not_found_headline(what),
                 409 => "The server is busy with that. Try again in a moment.".to_owned(),
                 413 => "The drop is larger than this link accepts.".to_owned(),
@@ -594,6 +597,20 @@ mod tests {
         assert_eq!(human_seconds(200), "3 min 20 s");
         assert_eq!(human_seconds(3600), "1 h 0 min");
         assert_eq!(human_seconds(3900), "1 h 5 min");
+    }
+
+    #[test]
+    fn a_refused_role_does_not_read_as_a_password_failure() {
+        let refused = |status| Error::Server {
+            status,
+            what: "issue request".into(),
+            body: String::new(),
+        };
+        // A viewer pressing Create is told their account is not allowed, not
+        // that their password was wrong.
+        let forbidden = refused(403).headline();
+        assert_eq!(forbidden, "This account is not allowed to do that.");
+        assert_ne!(forbidden, refused(401).headline());
     }
 
     #[test]

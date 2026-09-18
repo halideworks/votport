@@ -17,10 +17,13 @@ public sealed partial class MainWindow : Window
             menu: () => DispatcherQueue.TryEnqueue(ShowTrayMenu));
         PortStore.Shared.Changed += () =>
         {
-            var signedIn = PortStore.Shared.SignedIn;
-            ShareItem.Visibility = LinksItem.Visibility = signedIn ? Visibility.Visible : Visibility.Collapsed;
-            // Signing out from either operator page lands on Settings.
-            if (!signedIn && Nav.SelectedItem is NavigationViewItem current && ((string)current.Tag == "links" || (string)current.Tag == "share")) Show("settings");
+            // The operator items show only for an admin session: a viewer
+            // or auditor pressing them only earns a 403.
+            var operating = PortStore.Shared.CanOperate;
+            ShareItem.Visibility = LinksItem.Visibility = operating ? Visibility.Visible : Visibility.Collapsed;
+            // Signing out or a folded role from either operator page lands
+            // on Settings.
+            if (!operating && Nav.SelectedItem is NavigationViewItem current && ((string)current.Tag == "links" || (string)current.Tag == "share")) Show("settings");
         };
         TransferStore.Shared.ActiveChanged += count =>
         {

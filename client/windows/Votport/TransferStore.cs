@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using Microsoft.UI.Dispatching;
 using uniffi.votport_client_core;
 
@@ -324,7 +325,7 @@ public sealed class TransferStore
         item.View = null;
         item.Landed = null;
         item.RevealDestinationFolder = false;
-        ActiveChanged?.Invoke(ActiveCount);
+        NotifyActive();
         Run(item, (transfer, listener) =>
         {
             try
@@ -363,7 +364,7 @@ public sealed class TransferStore
     {
         var item = new TransferItem { Kind = kind, Subject = subject, Link = link };
         Items.Insert(0, item);
-        ActiveChanged?.Invoke(ActiveCount);
+        NotifyActive();
         return item;
     }
 
@@ -413,9 +414,17 @@ public sealed class TransferStore
         }
         item.CompactStopped(landed);
         handles.Remove(item.Id);
-        ActiveChanged?.Invoke(ActiveCount);
+        NotifyActive();
         Notifier.TransferEnded(item);
         Snapshot.WriteIfRequested(item.SnapshotPath);
+    }
+
+    /// Every transfer start and end routes through here, so the count and
+    /// the power assertion never drift apart.
+    private void NotifyActive()
+    {
+        ActiveChanged?.Invoke(ActiveCount);
+        Power.Transfer(ActiveCount > 0);
     }
 
     /// The core's callback target for one transfer. Called on the core's
@@ -437,6 +446,46 @@ public sealed class TransferStore
             store.dispatcher.TryEnqueue(() => store.Apply(item, view));
         }
     }
+}
+
+/// Keeps the machine awake while bytes move: SetThreadExecutionState holds
+/// the system out of idle sleep for the first active transfer or library
+/// upload and releases with the last, so an overnight send does not die to
+/// sleep. Called on the UI thread, which lives for the process, as the
+/// setting requires. Linux has no equivalent; the shell only runs here and
+/// on macOS.
+internal static class Power
+{
+    private const uint EsContinuous = 0x80000000;
+    private const uint EsSystemRequired = 0x1;
+    private static bool transfers;
+    private static bool libraryUpload;
+    private static bool held;
+
+    internal static void Transfer(bool active)
+    {
+        transfers = active;
+        Apply();
+    }
+
+    internal static void Upload(bool active)
+    {
+        libraryUpload = active;
+        Apply();
+    }
+
+    private static void Apply()
+    {
+        var wanted = transfers || libraryUpload;
+        if (wanted == held) return;
+        // ES_CONTINUOUS alone clears the requirement: one call both holds
+        // and releases.
+        var previous = SetThreadExecutionState(wanted ? EsContinuous | EsSystemRequired : EsContinuous);
+        if (previous != 0) held = wanted;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint SetThreadExecutionState(uint flags);
 }
 
 /// `votport:` links from web pages prefill a page.

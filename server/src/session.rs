@@ -4337,7 +4337,19 @@ pub struct SessionHandle {
     pub sender: mpsc::Sender<Cmd>,
     pub kind: SessionKind,
     pub started_at: u64,
+    /// When this process began holding the session, on the monotonic clock:
+    /// the upload-duration metric's source, so a backwards wall clock cannot
+    /// report an infinite rate and a resumed session measures only its own
+    /// active time.
+    started: Instant,
     activity: Arc<SessionActivity>,
+}
+
+impl SessionHandle {
+    /// Seconds the session has been live in this process.
+    pub(crate) fn active_seconds(&self) -> u64 {
+        self.started.elapsed().as_secs()
+    }
 }
 
 struct SessionActivity {
@@ -4834,6 +4846,7 @@ impl Sessions {
                 sender,
                 kind,
                 started_at: now_unix(),
+                started: Instant::now(),
                 activity: Arc::new(SessionActivity {
                     in_flight: AtomicUsize::new(0),
                     last_active: Mutex::new(Instant::now()),
@@ -5109,7 +5122,10 @@ impl Sessions {
     }
 
     /// A re-attached session keeps its original start and the bytes it had
-    /// covered before the restart.
+    /// covered before the restart, for the admin's live view. The monotonic
+    /// start is deliberately not rewound: the upload-duration metric then
+    /// charges a resumed session only its own active time, never the server's
+    /// downtime.
     pub fn seed_resumed(&self, id: &str, started_at: u64, received: u64) {
         if let Some(handle) = self
             .inner
@@ -5245,6 +5261,27 @@ mod pin_tests {
             )
             .unwrap();
         assert_eq!(sessions.total(), 1);
+    }
+
+    #[test]
+    fn resumed_sessions_measure_their_own_active_time() {
+        let sessions = Sessions::new();
+        sessions
+            .insert(
+                "s1".to_owned(),
+                "link".to_owned(),
+                "acme".to_owned(),
+                dummy_sender(),
+            )
+            .unwrap();
+        // The server was down for an hour when the sender re-attached: the
+        // live view keeps the session's original wall-clock start, while the
+        // monotonic start stays at the re-attach, so the upload-duration
+        // metric charges only the resumed session's own active time.
+        sessions.seed_resumed("s1", now_unix() - 3600, 1024);
+        let handle = sessions.remove("s1").unwrap();
+        assert_eq!(handle.started_at, now_unix() - 3600);
+        assert!(handle.active_seconds() < 5, "monotonic start was rewound");
     }
 
     #[test]

@@ -158,7 +158,7 @@ static void RunPortStoreSessionEpochRegression()
     Check(Generation(store) == generation + 1 && !store.SignedIn,
         "signed-out failure did not invalidate the session");
 
-    Set(store, "Port", new Port("https://replacement", "tenant"));
+    Set(store, "Port", new Port("https://replacement", "tenant", "admin"));
     var workerEntered = new ManualResetEventSlim();
     var releaseWorker = new ManualResetEventSlim();
     var workerFinished = new ManualResetEventSlim();

@@ -30,7 +30,7 @@ struct VotportApp: App {
     }
 }
 
-/// Sharing and link management appear once the operator signs in to a port.
+/// Sharing and link management appear once an admin signs in to a port.
 enum Screen: String, CaseIterable, Identifiable {
     case send = "Send"
     case receive = "Receive"
@@ -58,7 +58,7 @@ enum Screen: String, CaseIterable, Identifiable {
         }
     }
 
-    /// Whether the screen needs a signed-in port.
+    /// Whether the screen needs an admin session on a port.
     var operator_: Bool {
         self == .share || self == .links
     }
@@ -71,7 +71,7 @@ struct MainWindow: View {
     @State private var urlChoseSection = false
 
     private var screens: [Screen] {
-        Screen.allCases.filter { port.signedIn || !$0.operator_ }
+        Screen.allCases.filter { port.operating || !$0.operator_ }
     }
 
     var body: some View {
@@ -134,11 +134,11 @@ struct MainWindow: View {
             if interrupted && !urlChoseSection { section = .transfers }
         }
         // Signing out while on an operator screen lands on Settings.
-        .onChange(of: port.signedIn) { _, signedIn in
+        .onChange(of: port.operating) { _, operating in
             // The list loses its operator rows in the same update, which can
             // clear the selection before this runs; either way land on
             // Settings.
-            if !signedIn && (section == nil || section?.operator_ == true) { section = .settings }
+            if !operating && (section == nil || section?.operator_ == true) { section = .settings }
         }
         .onOpenURL { url in
             if url.scheme == "votport", url.host == "signin" {

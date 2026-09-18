@@ -15,6 +15,9 @@ public sealed class PortStore
 
     internal Port? Port { get; private set; }
     public bool SignedIn => Port is not null;
+    /// The session's role on the port: only an admin may operate, so the
+    /// operator pages fold for a viewer or auditor session.
+    public bool CanOperate => Port?.Role == "admin";
     public ObservableCollection<RequestItem> Requests { get; } = new();
     public ObservableCollection<DeliveryItem> Deliveries { get; } = new();
     public ObservableCollection<WatchItem> Watches { get; } = new();
@@ -217,6 +220,8 @@ public sealed class PortStore
         LibraryUploadView = null;
         LibraryUploadOutcome = null;
         LibraryUploadActive = true;
+        // The upload moves bytes like any transfer: hold the machine awake.
+        Power.Upload(true);
         Changed?.Invoke();
         Run(
             Scope.Deliver,
@@ -247,6 +252,7 @@ public sealed class PortStore
         if (libraryUploadWorkerId != id) return;
         libraryUploadWorkerId = null;
         LibraryUploadActive = false;
+        Power.Upload(false);
         LibraryUpload = null;
         if (LibraryUploadId != id)
         {
@@ -262,7 +268,11 @@ public sealed class PortStore
     private void ResetLibraryUploadForSession()
     {
         sessionGeneration++;
-        if (LibraryUploadActive) LibraryUpload?.Cancel();
+        if (LibraryUploadActive)
+        {
+            LibraryUpload?.Cancel();
+            Power.Upload(false);
+        }
         LibraryUploadId = null;
         LibraryUploadView = null;
         LibraryUploadOutcome = null;
@@ -272,6 +282,18 @@ public sealed class PortStore
             LibraryUpload = null;
         }
         Changed?.Invoke();
+    }
+
+    /// Folds the signed-in state when the server ended the session. Also
+    /// called by pages that run core calls on their own (Workflows), whose
+    /// 401 would otherwise only print.
+    internal void SessionEnded()
+    {
+        ResetLibraryUploadForSession();
+        Port = null;
+        AutomationTokens = Array.Empty<AutomationToken>();
+        Requests.Clear();
+        Deliveries.Clear();
     }
 
     private sealed class LibraryUploadListener : UploadListener
@@ -370,14 +392,7 @@ public sealed class PortStore
                         Problem = problem;
                         ProblemScope = scope;
                     }
-                    if (signedOut && sameSession)
-                    {
-                        ResetLibraryUploadForSession();
-                        Port = null;
-                        AutomationTokens = Array.Empty<AutomationToken>();
-                        Requests.Clear();
-                        Deliveries.Clear();
-                    }
+                    if (signedOut && sameSession) SessionEnded();
                     failed?.Invoke();
                 }
                 Changed?.Invoke();
