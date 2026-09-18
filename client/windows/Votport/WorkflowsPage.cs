@@ -8,6 +8,11 @@ namespace Votport;
 public sealed partial class WorkflowsPage : Page
 {
     private readonly StackPanel body = new() { Spacing = 16, Padding = new Thickness(24) };
+    /// The signed-in half: built the first time a session appears, so a 401
+    /// handled after the session ended folds the panel instead of keeping
+    /// dead fields on the page.
+    private readonly StackPanel signedIn = new() { Spacing = 16 };
+    private bool signedInBuilt;
     private readonly StackPanel jobs = new() { Spacing = 14 };
     private readonly StackPanel evidence = new() { Spacing = 14 };
     private readonly StackPanel metadata = new() { Spacing = 8 };
@@ -28,28 +33,39 @@ public sealed partial class WorkflowsPage : Page
         body.Children.Add(Text("Delivery workflows", 24));
         body.Children.Add(problem);
         body.Children.Add(Action("Refresh", () => Refresh()));
-        if (PortStore.Shared.SignedIn)
-        {
-            body.Children.Add(Action("Projects, reception routes, storage and events", () =>
-            {
-                var address = PortStore.Shared.Port!.Base.TrimEnd('/') + "/workflows";
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(address) { UseShellExecute = true });
-                return Task.CompletedTask;
-            }));
-            body.Children.Add(project); body.Children.Add(label); body.Children.Add(days);
-            body.Children.Add(metadata); body.Children.Add(recipients);
-            body.Children.Add(Action("Queue delivery", Create));
-            body.Children.Add(Action("Start a separate delivery", () => { operation = Guid.NewGuid().ToString(); problem.Text = "Ready to create a separate delivery."; return Task.CompletedTask; }));
-            body.Children.Add(Text("Jobs", 20)); body.Children.Add(jobs);
-            body.Children.Add(Action("Load more jobs", () => LoadJobs(true)));
-        }
+        body.Children.Add(signedIn);
         body.Children.Add(Text("Recipient verification and acceptance", 20));
         body.Children.Add(Text("Accept a delivery only after reviewing the verified files. Acceptance signs the exact manifest shown here."));
         body.Children.Add(Action("Copy this device's public key", async () => Copy(await Task.Run(VotportClientCoreMethods.RecipientDeviceKey))));
         body.Children.Add(Action("Retry pending reports", async () => { await Task.Run(VotportClientCoreMethods.RetryEvidence); await LoadEvidence(); }));
         body.Children.Add(evidence);
         project.SelectionChanged += (_, _) => ProjectFields();
+        // A 401 on any page ends the session in the store; this page rebuilds
+        // its signed-in half so the fields do not outlive it.
+        PortStore.Shared.Changed += RebuildForSession;
+        Unloaded += (_, _) => PortStore.Shared.Changed -= RebuildForSession;
+        RebuildForSession();
         Loaded += async (_, _) => await Run(Refresh);
+    }
+
+    private void RebuildForSession()
+    {
+        var signedInNow = PortStore.Shared.SignedIn;
+        signedIn.Visibility = signedInNow ? Visibility.Visible : Visibility.Collapsed;
+        if (!signedInNow || signedInBuilt) return;
+        signedInBuilt = true;
+        signedIn.Children.Add(Action("Projects, reception routes, storage and events", () =>
+        {
+            var address = PortStore.Shared.Port!.Base.TrimEnd('/') + "/workflows";
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(address) { UseShellExecute = true });
+            return Task.CompletedTask;
+        }));
+        signedIn.Children.Add(project); signedIn.Children.Add(label); signedIn.Children.Add(days);
+        signedIn.Children.Add(metadata); signedIn.Children.Add(recipients);
+        signedIn.Children.Add(Action("Queue delivery", Create));
+        signedIn.Children.Add(Action("Start a separate delivery", () => { operation = Guid.NewGuid().ToString(); problem.Text = "Ready to create a separate delivery."; return Task.CompletedTask; }));
+        signedIn.Children.Add(Text("Jobs", 20)); signedIn.Children.Add(jobs);
+        signedIn.Children.Add(Action("Load more jobs", () => LoadJobs(true)));
     }
 
     private static TextBlock Text(string value, double size = 14) => new() { Text = value, FontSize = size, TextWrapping = TextWrapping.Wrap, IsTextSelectionEnabled = true };
@@ -64,6 +80,12 @@ public sealed partial class WorkflowsPage : Page
         if (busy) return;
         busy = true; problem.Text = "";
         try { await action(); }
+        catch (PortException.Failed error)
+        {
+            problem.Text = error.headline;
+            // The call ran outside the store, so its signed-out fold is ours.
+            if (error.signedOut) PortStore.Shared.SessionEnded();
+        }
         catch (Exception error) { problem.Text = error.Message; }
         finally { busy = false; }
     }

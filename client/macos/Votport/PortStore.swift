@@ -49,6 +49,10 @@ final class PortStore: ObservableObject {
 
     var signedIn: Bool { port != nil }
 
+    /// The session's role on the port: only an admin may operate, so the
+    /// screens that change the port fold for a viewer or auditor session.
+    var operating: Bool { port?.role == "admin" }
+
     /// Reads the stored port without a round trip, then asks the server
     /// whether the session still holds. Called once at launch.
     func load() {
@@ -275,6 +279,8 @@ final class PortStore: ObservableObject {
         libraryUploadView = nil
         libraryUploadOutcome = nil
         libraryUploadActive = true
+        // The upload moves bytes like any transfer: hold the machine awake.
+        Power.libraryUpload(true)
         let listener = LibraryUploadListener(id: id)
         run(.deliver) {
             try VotportCore.upload(paths: paths, into: into, transfer: transfer, listener: listener)
@@ -302,6 +308,7 @@ final class PortStore: ObservableObject {
         libraryUploadWorkerID = nil
         libraryUploadActive = false
         libraryUploadTransfer = nil
+        Power.libraryUpload(false)
         guard libraryUploadID == id else { return }
         if case .failure(let error) = result {
             let outcome: String
@@ -319,7 +326,10 @@ final class PortStore: ObservableObject {
     /// Drops upload state when the signed-in account changes. A running core
     /// worker remains the active guard until its completion callback settles.
     private func resetLibraryUploadForSession() {
-        if libraryUploadActive { libraryUploadTransfer?.cancel() }
+        if libraryUploadActive {
+            libraryUploadTransfer?.cancel()
+            Power.libraryUpload(false)
+        }
         libraryUploadID = nil
         libraryUploadView = nil
         libraryUploadOutcome = nil
@@ -406,14 +416,19 @@ final class PortStore: ObservableObject {
         guard case let .Failed(headline, detail, signedOut) = error else { return }
         problem = headline
         problemScope = scope
-        if signedOut {
-            resetLibraryUploadForSession()
-            port = nil
-            requests = []
-            deliveries = []
-            automationTokens = []
-        }
+        if signedOut { sessionEnded() }
         log.notice("port call failed: \(detail, privacy: .private)")
+    }
+
+    /// Folds the signed-in state when the server ended the session. Also
+    /// called by screens that run core calls on their own (Workflows),
+    /// whose 401 would otherwise only print.
+    func sessionEnded() {
+        resetLibraryUploadForSession()
+        port = nil
+        requests = []
+        deliveries = []
+        automationTokens = []
     }
 
     /// Runs `work` on its own thread (a core call blocks for its round trips

@@ -797,13 +797,16 @@ pub(crate) fn upload_completed(
             tracing::warn!(upload = %report.upload_id, link = %link.id, "completed upload timestamp missing for notification");
         }
     }
-    let started_at = app
+    // The duration is the session's own monotonic time in this process, not
+    // a wall-clock difference: a resumed session does not charge the server's
+    // downtime, and a backwards clock step cannot report an infinite rate.
+    let seconds = app
         .sessions
         .remove(session_id)
-        .map_or(now_unix(), |handle| handle.started_at);
+        .map_or(0, |handle| handle.active_seconds());
     TRANSFERS.published(
         report.files.iter().map(|file| file.bytes).sum::<u64>(),
-        now_unix().saturating_sub(started_at),
+        seconds,
     );
     remove_push_ticket(app, session_id);
 }

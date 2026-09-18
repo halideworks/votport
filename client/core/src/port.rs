@@ -73,6 +73,11 @@ pub struct Port {
     pub base: String,
     /// The tenant the session belongs to; empty for the default tenant.
     pub tenant: String,
+    /// The session's role on this port: `admin`, `auditor`, or `viewer`. A
+    /// shell shows its operator screens only to an admin; a session stored
+    /// by an earlier build reads as empty until its next check fills the
+    /// role in.
+    pub role: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -80,6 +85,8 @@ struct Stored {
     base: String,
     cookie: String,
     tenant: String,
+    #[serde(default)]
+    role: String,
 }
 
 fn path() -> PathBuf {
@@ -125,6 +132,8 @@ pub(crate) fn origin(base: &str) -> Result<String> {
 struct SessionInfo {
     #[serde(default)]
     tenant: String,
+    #[serde(default)]
+    role: String,
 }
 
 /// One browser sign-in started by this process, bound to its original port.
@@ -227,11 +236,13 @@ impl SsoLogin {
             base: self.base.clone(),
             cookie: exchange.cookie,
             tenant: session.tenant.clone(),
+            role: session.role.clone(),
         })?;
         *active = false;
         Ok(Port {
             base: self.base.clone(),
             tenant: session.tenant,
+            role: session.role,
         })
     }
 }
@@ -264,19 +275,22 @@ pub fn sign_in(base: &str, password: &str) -> Result<Port> {
     let cookie = client.admin_login(password)?;
     // Stored before the session read: every login spends a throttle slot,
     // so a cookie the server issued is never dropped on a lost reply. The
-    // next check fills the tenant in.
+    // next check fills the tenant and role in.
     let mut stored = Stored {
         base: base.clone(),
         cookie,
         tenant: String::new(),
+        role: String::new(),
     };
     store(&stored)?;
     let session: SessionInfo = client.admin_get("/api/admin/session", &stored.cookie)?;
     stored.tenant = session.tenant.clone();
+    stored.role = session.role.clone();
     store(&stored)?;
     Ok(Port {
         base,
         tenant: session.tenant,
+        role: session.role,
     })
 }
 
@@ -287,6 +301,7 @@ pub fn current() -> Option<Port> {
     load().map(|stored| Port {
         base: stored.base,
         tenant: stored.tenant,
+        role: stored.role,
     })
 }
 
@@ -303,15 +318,17 @@ pub fn check() -> Result<Option<Port>> {
     let client = Client::new(&stored.base)?;
     match client.admin_get::<SessionInfo>("/api/admin/session", &stored.cookie) {
         Ok(session) => {
-            if session.tenant != stored.tenant {
+            if session.tenant != stored.tenant || session.role != stored.role {
                 let _ = store(&Stored {
                     tenant: session.tenant.clone(),
+                    role: session.role.clone(),
                     ..stored.clone()
                 });
             }
             Ok(Some(Port {
                 base: stored.base,
                 tenant: session.tenant,
+                role: session.role,
             }))
         }
         Err(Error::NotSignedIn) => {
@@ -1311,6 +1328,38 @@ mod tests {
         assert_eq!(
             (link.drops, link.receiving, link.max_bytes),
             (2, 1, Some(5))
+        );
+    }
+
+    #[test]
+    fn the_session_role_reaches_the_stored_port() {
+        // The session view's role is no longer dropped: an SSO viewer must
+        // reach the shell as a viewer so its operator screens can fold.
+        let session: SessionInfo =
+            serde_json::from_value(serde_json::json!({ "tenant": "acme", "role": "viewer" }))
+                .unwrap();
+        assert_eq!(
+            (session.tenant.as_str(), session.role.as_str()),
+            ("acme", "viewer")
+        );
+        // A session stored by an earlier build carries no role; it reads as
+        // empty and the next check fills it in.
+        let legacy: Stored =
+            serde_json::from_str(r#"{"base":"https://drop.example","cookie":"c","tenant":""}"#)
+                .unwrap();
+        assert_eq!(legacy.role, "");
+        assert_eq!(
+            serde_json::to_value(&Stored {
+                base: "https://drop.example".to_owned(),
+                cookie: "c".to_owned(),
+                tenant: "acme".to_owned(),
+                role: "admin".to_owned(),
+            })
+            .unwrap(),
+            serde_json::json!({
+                "base": "https://drop.example", "cookie": "c",
+                "tenant": "acme", "role": "admin"
+            })
         );
     }
 }

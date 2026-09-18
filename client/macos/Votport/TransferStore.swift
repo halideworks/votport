@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import IOKit
 import OSLog
 import VotportCore
 
@@ -223,6 +224,9 @@ final class TransferStore: ObservableObject {
     ) {
         let transfer = Transfer()
         handles[id] = transfer
+        // Bytes are moving: hold the machine awake until the last transfer
+        // and library upload end.
+        Power.transfer(true)
         let listener = Listener(store: self, id: id)
         let thread = Thread {
             let landed = work(transfer, listener)
@@ -252,6 +256,7 @@ final class TransferStore: ObservableObject {
     func finished(_ id: UUID, landed: [String]) {
         guard let index = items.firstIndex(where: { $0.id == id }) else { return }
         items[index].running = false
+        Power.transfer(false)
         if let handle = handles[id] {
             items[index].journalId = handle.journalId()
             // The core keeps the entry only for a failure worth trying again,
@@ -341,6 +346,48 @@ enum Snapshot {
             } catch {
                 log.error("snapshot failed: \(String(describing: error), privacy: .public)")
             }
+        }
+    }
+}
+
+/// Keeps the machine awake while bytes move: the first active transfer or
+/// library upload takes one IOKit assertion (PreventUserIdleSystemSleep: the
+/// display may still sleep) and the last releases it, so an overnight send
+/// does not die to idle sleep. Linux has no equivalent; the shell only runs
+/// here and on Windows.
+@MainActor
+enum Power {
+    private static var transfers = false
+    private static var libraryUpload = false
+    private static var assertion: IOPMAssertionID = 0
+
+    static func transfer(_ active: Bool) {
+        transfers = active
+        apply()
+    }
+
+    static func libraryUpload(_ active: Bool) {
+        libraryUpload = active
+        apply()
+    }
+
+    private static func apply() {
+        let wanted = transfers || libraryUpload
+        guard wanted != (assertion != 0) else { return }
+        if wanted {
+            var id: IOPMAssertionID = 0
+            let status = IOPMAssertionCreateWithName(
+                kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
+                IOPMAssertionLevel(IOPMAssertionLevel.IOPMAssertionLevelOn.rawValue),
+                "votport is transferring files" as CFString,
+                &id)
+            assertion = status == kIOReturnSuccess ? id : 0
+            if status != kIOReturnSuccess {
+                log.error("power assertion refused: \(status, privacy: .public)")
+            }
+        } else {
+            IOPMAssertionRelease(assertion)
+            assertion = 0
         }
     }
 }

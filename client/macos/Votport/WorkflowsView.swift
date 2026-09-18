@@ -132,8 +132,12 @@ struct WorkflowsView: View {
                 switch result {
                 case .success(let value): then(value)
                 case .failure(let error):
-                    if let error = error as? PortError, case let .Failed(headline, _, _) = error { problem = headline }
-                    else { problem = "Could not complete the workflow request." }
+                    if let error = error as? PortError, case let .Failed(headline, _, signedOut) = error {
+                        problem = headline
+                        // The call ran outside the store, so its signed-out
+                        // fold is ours.
+                        if signedOut { port.sessionEnded() }
+                    } else { problem = "Could not complete the workflow request." }
                 }
             }
         }.start()
