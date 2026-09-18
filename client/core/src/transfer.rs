@@ -634,6 +634,10 @@ mod tests {
     /// Sends one small file through the real decision in [`send_with_session`].
     fn send_one_file(base: &str) -> Result<Sent> {
         let device_dir = tempfile::tempdir().unwrap();
+        // Staging lives under the state directory; pin a per-test one so a
+        // concurrent test's state-dir teardown cannot sweep this send's
+        // manifest out from under it.
+        let _state = crate::identity::test_state_dir(device_dir.path());
         let device = Device::load_or_create_in(device_dir.path()).unwrap();
         let source = tempfile::tempdir().unwrap();
         let file = source.path().join("note.txt");

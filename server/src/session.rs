@@ -1781,14 +1781,23 @@ struct Delivered {
     receipt: bool,
 }
 
-/// A file with this object root already delivered on this link and still on
-/// disk at its recorded name: the transfer is skipped and the existing copy
-/// reported, instead of publishing a suffixed duplicate.
+/// A file with this object root already delivered on this link under the
+/// announced name and still on disk: the transfer is skipped and the
+/// existing copy reported, instead of publishing a suffixed duplicate.
 fn find_delivered(
     setup: &WorkerSetup,
     object: &ObjectId,
+    announced: &[String],
     active: impl Fn() -> bool,
 ) -> Result<Option<Delivered>, SessionError> {
+    // The reuse must sit at the announced name: a renamed re-announce of
+    // delivered bytes transfers for real, so no record is synthesized for
+    // a name under which nothing was received.
+    let expected = if setup.dest_rel.is_empty() {
+        announced.join("/")
+    } else {
+        format!("{}/{}", setup.dest_rel, announced.join("/"))
+    };
     let mut after = String::new();
     loop {
         if !active() {
@@ -1803,34 +1812,29 @@ fn find_delivered(
             if stored_as == after {
                 continue;
             }
-            after = stored_as;
+            after = stored_as.clone();
             if !active() {
                 return Err(SessionError::conflict("receive preparation cancelled"));
             }
-            // stored_as is relative to the tenant's subtree: it carries the link
-            // dest but not the tenant prefix, which is why dest_rel is stripped
-            // before joining under dest_dir. A record made under a
-            // different link dest no longer lives beneath dest_dir; skip it.
-            let rel = if setup.dest_rel.is_empty() {
-                after.as_str()
-            } else {
-                match after.strip_prefix(&format!("{}/", setup.dest_rel)) {
-                    Some(rest) => rest,
-                    None => continue,
-                }
-            };
-            if rel.split('/').any(crate::protocol_paths::is_receipt_name) {
+            if stored_as != expected {
+                continue;
+            }
+            // Names reserved for signed receipts never dedupe, even when a
+            // record of one exists.
+            if announced
+                .iter()
+                .any(|part| crate::protocol_paths::is_receipt_name(part))
+            {
                 continue;
             }
             if crate::protocol_paths::check_payload_name_length(
-                rel.rsplit('/').next().unwrap_or_default(),
+                announced.last().map_or("", String::as_str),
             )
             .is_err()
             {
                 continue;
             }
-            let components: Vec<String> = rel.split('/').map(str::to_owned).collect();
-            let Ok(path) = paths::join_under(&setup.dest_dir, &components) else {
+            let Ok(path) = paths::join_under(&setup.dest_dir, announced) else {
                 continue;
             };
             match fs::metadata(&path) {
@@ -1840,7 +1844,7 @@ fn find_delivered(
                         && staged_object_valid(&path, object, &active).unwrap_or(false) =>
                 {
                     return Ok(Some(Delivered {
-                        stored_components: components,
+                        stored_components: announced.to_vec(),
                         receipt,
                     }));
                 }
@@ -1913,8 +1917,8 @@ fn prepare_files<'a>(
             "receiving destination uses a name reserved for signed receipts",
         ));
     }
-    let existing = prepare_parallel(entries, |_, (_, object)| {
-        find_delivered(setup, object, &active)
+    let existing = prepare_parallel(entries, |_, (components, object)| {
+        find_delivered(setup, object, components, &active)
     })?;
     // ponytail: large NAS manifests serialize metadata allocation; temporary claims can narrow it.
     let allocation = setup
@@ -6605,21 +6609,68 @@ mod push_tests {
     }
 
     #[test]
+    fn dedupe_reuses_delivered_bytes_only_under_the_announced_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let expected = object(Suite::Blake3Bao64, b"original");
+        let setup = setup(directory.path(), expected.clone());
+        fs::write(setup.dest_dir.join("existing.bin"), b"original").unwrap();
+        record_delivered_files(
+            &setup,
+            vec![FileRecord {
+                path: "existing.bin".into(),
+                stored_as: "existing.bin".into(),
+                bytes: 8,
+                suite: suite_name(expected.suite),
+                root: hex::encode(expected.root),
+                receipt: true,
+                deleted: false,
+            }],
+        );
+        // Re-announcing under the recorded name still reuses the delivered
+        // copy, receipt flag included: the custody claim is unchanged.
+        let (files, allocation) = prepare_files(
+            &setup,
+            &[(vec!["existing.bin".into()], expected.clone())],
+            || true,
+        )
+        .unwrap();
+        drop(allocation);
+        assert_eq!(files[0].stored_components, "existing.bin");
+        assert!(files[0].published);
+        assert!(files[0].receipt);
+        // The same root announced under a new name is not a reuse: the file
+        // transfers for real, so no record is synthesized for a name under
+        // which nothing was received.
+        let (files, allocation) =
+            prepare_files(&setup, &[(vec!["renamed.bin".into()], expected)], || true).unwrap();
+        drop(allocation);
+        assert_eq!(files[0].stored_components, "renamed.bin");
+        assert!(!files[0].published);
+        assert!(!files[0].receipt);
+    }
+
+    #[test]
     fn pending_parent_does_not_block_verified_deduplication() {
         let directory = tempfile::tempdir().unwrap();
         let expected = object(Suite::Blake3Bao64, b"original");
         let first = setup(directory.path(), expected.clone());
-        let (pending, allocation) =
-            prepare_files(&first, &[(vec!["folder".into()], expected.clone())], || {
-                true
-            })
-            .unwrap();
+        let (pending, allocation) = prepare_files(
+            &first,
+            &[(vec!["folder".into(), "other.bin".into()], expected.clone())],
+            || true,
+        )
+        .unwrap();
         persist_session(&first, &pending).unwrap();
         drop(allocation);
-        fs::write(first.dest_dir.join("existing.bin"), b"original").unwrap();
+        fs::create_dir_all(first.dest_dir.join("folder")).unwrap();
+        fs::write(
+            first.dest_dir.join("folder").join("existing.bin"),
+            b"original",
+        )
+        .unwrap();
         let record = FileRecord {
             path: "existing.bin".into(),
-            stored_as: "existing.bin".into(),
+            stored_as: "folder/existing.bin".into(),
             bytes: 8,
             suite: suite_name(expected.suite),
             root: hex::encode(expected.root),
@@ -6629,15 +6680,20 @@ mod push_tests {
         record_delivered_files(&first, vec![record]);
         let (files, allocation) = prepare_files(
             &first,
-            &[(vec!["folder".into(), "copy.bin".into()], expected)],
+            &[(vec!["folder".into(), "existing.bin".into()], expected)],
             || true,
         )
         .unwrap();
         drop(allocation);
-        assert_eq!(files[0].stored_components, "existing.bin");
+        assert_eq!(files[0].stored_components, "folder\0existing.bin");
         assert!(files[0].published);
         assert!(files[0].native.is_none());
-        assert!(!first.dest_dir.join("folder").exists());
+        assert!(first
+            .dest_dir
+            .join("folder")
+            .join("other.bin")
+            .metadata()
+            .is_err());
     }
 
     #[test]
@@ -8581,7 +8637,8 @@ mod push_tests {
                     fs::write(setup.dest_dir.join(name), &bytes).unwrap();
                 }
                 let checks = AtomicUsize::new(0);
-                let found = find_delivered(&setup, &expected, || {
+                let announced = ["z-valid".to_owned()];
+                let found = find_delivered(&setup, &expected, &announced, || {
                     let n = checks.fetch_add(1, Ordering::Relaxed);
                     assert!(
                         n < page + 40,
@@ -8592,11 +8649,11 @@ mod push_tests {
                 .unwrap()
                 .unwrap();
                 assert_eq!(found.stored_components, ["z-valid"]);
-                assert_eq!(found.receipt, suite == Suite::Blake3Bao64);
                 let checks = AtomicUsize::new(0);
                 assert_eq!(
-                    find_delivered(&setup, &expected, || checks.fetch_add(1, Ordering::Relaxed)
-                        < 2)
+                    find_delivered(&setup, &expected, &announced, || {
+                        checks.fetch_add(1, Ordering::Relaxed) < 2
+                    })
                     .err()
                     .unwrap()
                     .status,
@@ -8637,10 +8694,11 @@ mod push_tests {
                 deleted: false,
             };
             record_delivered_files(&setup, vec![record.clone()]);
-            assert!(find_delivered(&setup, &expected, || true)
+            let announced = ["frame.bin".to_owned()];
+            assert!(find_delivered(&setup, &expected, &announced, || true)
                 .unwrap()
                 .is_some());
-            assert!(find_delivered(&setup, &expected, || false).is_err());
+            assert!(find_delivered(&setup, &expected, &announced, || false).is_err());
             for name in [
                 "old.vot-receipt".into(),
                 "old.vot-receI\u{307}pt/frame".into(),
@@ -8669,7 +8727,7 @@ mod push_tests {
                 .with(|c| c.execute("UPDATE files SET stored_as=?1", [&record.stored_as]))
                 .unwrap();
             fs::write(&path, b"changed!").unwrap();
-            assert!(find_delivered(&setup, &expected, || true)
+            assert!(find_delivered(&setup, &expected, &announced, || true)
                 .unwrap()
                 .is_none());
             let file = FileState {

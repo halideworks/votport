@@ -152,20 +152,23 @@ impl Drop for SessionHold {
     }
 }
 
-/// The servers assembled this process by package root and the slots fetches
-/// hold.
+/// One server per (tenant, manifest root): byte-identical packages can be
+/// granted in two tenants, and a server's sources name one tenant's storage.
+type TenantServers = HashMap<(String, [u8; 32]), Arc<vot_cli::BundleServer>>;
+
+/// The servers assembled this process and the slots fetches hold.
 #[derive(Default)]
 pub(crate) struct ServeRegistry {
-    servers: Mutex<HashMap<[u8; 32], Arc<vot_cli::BundleServer>>>,
+    servers: Mutex<TenantServers>,
     slots: Mutex<HashMap<[u8; 16], FetchSlot>>,
 }
 
 impl ServeRegistry {
-    fn server(&self, root: [u8; 32]) -> Option<Arc<vot_cli::BundleServer>> {
+    fn server(&self, tenant: &str, root: [u8; 32]) -> Option<Arc<vot_cli::BundleServer>> {
         self.servers
             .lock()
             .expect("serve registry poisoned")
-            .get(&root)
+            .get(&(tenant.to_owned(), root))
             .cloned()
     }
 
@@ -214,13 +217,13 @@ impl ServeRegistry {
             .sum()
     }
 
-    /// Keeps servers for `roots`. Slots are released by their sessions, never
-    /// here.
-    fn retain(&self, roots: &HashSet<[u8; 32]>) {
+    /// Keeps servers for `roots` as (tenant, root) pairs. Slots are released
+    /// by their sessions, never here.
+    fn retain(&self, roots: &HashSet<(String, [u8; 32])>) {
         self.servers
             .lock()
             .expect("serve registry poisoned")
-            .retain(|root, _| roots.contains(root));
+            .retain(|key, _| roots.contains(key));
     }
 }
 
@@ -692,7 +695,7 @@ pub(crate) fn ensure_server(
     let entries = grant_entries(app, grant)?;
     let directory = manifest_directory(app, &grant.id);
     let root = ensure_manifest(app, grant, &entries)?;
-    if let Some(server) = serve.registry.server(root) {
+    if let Some(server) = serve.registry.server(&grant.tenant, root) {
         return Ok((root, server));
     }
     let proofs = proof_root(app);
@@ -727,7 +730,7 @@ pub(crate) fn ensure_server(
         .servers
         .lock()
         .expect("serve registry poisoned")
-        .insert(root, Arc::clone(&server));
+        .insert((grant.tenant.clone(), root), Arc::clone(&server));
     Ok((root, server))
 }
 
@@ -779,9 +782,9 @@ pub(crate) fn prune(app: &App) {
             return;
         }
     };
-    let roots: HashSet<[u8; 32]> = servable
-        .iter()
-        .filter_map(|root| decode_root(root))
+    let roots: HashSet<(String, [u8; 32])> = servable
+        .into_iter()
+        .filter_map(|(tenant, root)| decode_root(&root).map(|root| (tenant, root)))
         .collect();
     serve.registry.retain(&roots);
     if let Err(error) = app
@@ -1060,7 +1063,7 @@ pub(crate) fn admit_fetch(
     if !grant_open(&grant, presentation.now) {
         return refuse_closed_fetch(app, runtime, token, peer);
     }
-    let Some(server) = serve.registry.server(root) else {
+    let Some(server) = serve.registry.server(&grant.tenant, root) else {
         // Built at mint and warmed off-thread after a restart, so a server
         // can be briefly absent for a valid ticket while warming, or absent
         // because a build failed; both refuse unknown, both are in the log.
@@ -1835,6 +1838,73 @@ mod tests {
         assert_eq!(registry.active_sessions(), 1);
         registry.release_slot([2; 16]);
         assert_eq!(registry.active_sessions(), 0);
+    }
+
+    #[test]
+    fn a_server_is_kept_per_tenant_over_a_shared_manifest_root() {
+        // Byte-identical packages granted in two tenants share one manifest
+        // root; each tenant must get its own server so a fetch reads the
+        // fetching tenant's storage, never whichever tenant registered first.
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::api::testing::config(directory.path());
+        config.serve_bind = Some("127.0.0.1:0".parse().unwrap());
+        let app = crate::app::build(config).unwrap();
+        let bytes = b"shared package";
+        let now = now_unix();
+        let serve = app.serve.as_ref().unwrap();
+        let mut servers = Vec::new();
+        let mut shared_root = None;
+        for (id, tenant) in [("shared-a", "acme"), ("shared-b", "other")] {
+            let library = if tenant.is_empty() {
+                app.config.outbound_dir.clone()
+            } else {
+                app.config
+                    .outbound_dir
+                    .join(crate::paths::TENANT_STORAGE_DIR)
+                    .join(tenant)
+            };
+            std::fs::create_dir_all(&library).unwrap();
+            std::fs::write(library.join("file.bin"), bytes).unwrap();
+            let mut grant = crate::store::tests::test_outbound_grant(id, tenant, 0);
+            let mut builder = vot_sdk::object::InMemoryObjectBuilder::new(
+                Suite::Blake3Bao64,
+                Some(bytes.len() as u64),
+                bytes.len() as u64,
+            )
+            .unwrap();
+            builder.update(bytes).unwrap();
+            let object = builder.finish().unwrap().object_id().clone();
+            grant.package_root = hex::encode(object.root);
+            grant.root = hex::encode(object.root);
+            grant.bytes = bytes.len() as u64;
+            grant.expires_at = now + 600;
+            grant.files = vec![crate::store::OutboundGrantFile {
+                source: "file.bin".into(),
+                name: "file.bin".into(),
+                suite: "blake3".into(),
+                root: hex::encode(object.root),
+                bytes: bytes.len() as u64,
+                receipt_b64: String::new(),
+                downloads: 0,
+                first_download_at: None,
+                last_download_at: None,
+            }];
+            app.store.insert_outbound_grant(grant.clone()).unwrap();
+            let (manifest, server) = ensure_server(&app, serve, &grant).unwrap();
+            if let Some(previous) = shared_root {
+                assert_eq!(manifest, previous, "identical packages share one root");
+            }
+            shared_root = Some(manifest);
+            servers.push(server);
+        }
+        assert!(
+            !Arc::ptr_eq(&servers[0], &servers[1]),
+            "each tenant keeps its own server"
+        );
+        assert!(serve
+            .registry
+            .server("unrelated", shared_root.unwrap())
+            .is_none());
     }
 
     /// The admission tests' shared fixture: the app keeps the temporary

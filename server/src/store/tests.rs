@@ -1414,7 +1414,7 @@ fn serve_prune_queries_preserve_expiry_revoke_and_ticket_retention() {
 
     assert_eq!(
         store.servable_manifest_roots(20).unwrap(),
-        vec!["root-open".to_owned()]
+        vec![("acme".to_owned(), "root-open".to_owned())]
     );
     assert_eq!(store.prune_fetch_tickets(20).unwrap(), 1);
     let remaining: Vec<String> = store

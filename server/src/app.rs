@@ -9291,7 +9291,7 @@ mod legal_hold_marker_tests {
         assert!(app.link_hold_pinned("held"));
 
         // The retention sweep skips the link and keeps its bytes.
-        let cutoff = now_unix() + 1;
+        let cutoff = now_unix() + 60;
         let candidate = app.store.link("", "held").unwrap().unwrap();
         expire_link_uploads(&app, candidate, cutoff, cutoff)
             .await

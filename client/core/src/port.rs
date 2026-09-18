@@ -10,8 +10,8 @@
 //! drops the stored session so the next launch asks again.
 //!
 //! ponytail: a JSON file beside the device key, owner-only on Unix and a
-//! plain file under the user's profile on Windows (`write_private` sets no
-//! ACL there); the platform keychain is the upgrade when the apps are
+//! user-only DACL under the local profile on Windows (`write_private`
+//! restricts both); the platform keychain is the upgrade when the apps are
 //! signed.
 
 use std::io::{Read, Seek, SeekFrom};
