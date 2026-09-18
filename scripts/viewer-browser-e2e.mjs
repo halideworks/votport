@@ -107,7 +107,7 @@ try {
   await adminPage.goto(`${base}/receive`);
   const adminCard = adminPage.locator(`#link-${link.id}`);
   await adminCard.waitFor();
-  for (const name of [/^Deactivate receive link: /, /^Legal hold: /, /^Delete receive link: /]) {
+  for (const name of [/^Deactivate request link: /, /^Legal hold: /, /^Delete request link: /]) {
     assert.equal(await adminCard.getByRole('button', { name }).count(), 1, `admin receive action is named ${name}`);
   }
   assert.ok(await adminPage.locator('#create-form').isVisible());
@@ -152,10 +152,10 @@ try {
   assert.deepEqual(await viewerPage.locator('#admin-session').evaluate((node) => JSON.parse(node.textContent)), expectedSession);
   assert.ok(await viewerPage.locator('#create-form').isHidden());
   const receiveCard = viewerPage.locator(`#link-${link.id}`);
-  for (const name of [/^Deactivate receive link: /, /^Reactivate receive link: /, /^Legal hold: /, /^Release hold: /, /^Delete receive link: /]) {
+  for (const name of [/^Deactivate request link: /, /^Reactivate request link: /, /^Legal hold: /, /^Release hold: /, /^Delete request link: /]) {
     assert.equal(await receiveCard.getByRole('button', { name }).count(), 0, `viewer receive exposes ${name}`);
   }
-  assert.equal(await receiveCard.getByRole('button', { name: /^Copy receive link: / }).count(), 1);
+  assert.equal(await receiveCard.getByRole('button', { name: /^Copy request link: / }).count(), 1);
   await receiveCard.getByRole('button', { name: /^Show QR code: / }).click();
   await receiveCard.locator('img[alt^="QR code"]').waitFor();
   await receiveCard.locator('.upload-history > summary').click();

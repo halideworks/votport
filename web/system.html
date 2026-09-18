@@ -42,7 +42,7 @@
       <div class="bar">
         <nav id="nav" class="nav"></nav>
         <form id="global-search" class="global-search" role="search" autocomplete="off">
-          <input id="global-search-input" type="search" placeholder="Search requests, downloads, files" aria-label="Search" maxlength="200" />
+          <input id="global-search-input" type="search" placeholder="Search requests, deliveries, files" aria-label="Search" maxlength="200" />
           <div id="global-search-results" class="search-results" hidden></div>
         </form>
       </div>
@@ -225,7 +225,7 @@
           </section>
 
           <section class="settings-group" id="email" data-group="email">
-            <div class="section-heading"><h2>Email</h2><button type="button" class="hint-button" aria-label="Help about email delivery" data-hint="These settings connect the server to an SMTP relay. Choose recipients and events in Notifications, then select those destinations on requests or workflows.">?</button></div>
+            <div class="section-heading"><h2>Email</h2><button type="button" class="hint-button" aria-label="Help about email delivery" data-hint="These settings connect the server to an SMTP relay. Choose recipients and events in Notifications, then select those destinations on requests or deliveries.">?</button></div>
             <form inert data-unsaved id="smtp-form" class="card">
               <p class="muted">
                 Configure the shared email relay here. Choose recipients on each named destination in Notifications. Port
@@ -369,7 +369,7 @@
           </section>
 
           <section class="settings-group" id="default-tenant-quotas" data-group="default-tenant-quotas">
-            <div class="section-heading"><h2>Default tenant quotas</h2><button type="button" class="hint-button" aria-label="Help about tenant quotas" data-hint="These are the default limits for storage, receive requests and active upload sessions. Individual tenants can have their own limits.">?</button></div>
+            <div class="section-heading"><h2>Default tenant quotas</h2><button type="button" class="hint-button" aria-label="Help about tenant quotas" data-hint="These are the default limits for storage, requests and active upload sessions. Individual tenants can have their own limits.">?</button></div>
             <form inert data-unsaved id="quotas-form" class="card">
               <p class="muted">Applied to tenants without their own limits. Blank means no limit.</p>
               <div class="grid">

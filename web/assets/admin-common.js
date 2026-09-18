@@ -176,7 +176,7 @@ function mountSearch(session) {
       }));
     }
     if (pages.includes('deliver')) {
-      group('Downloads', hit.downloads, (row) => ({
+      group('Deliveries', hit.downloads, (row) => ({
         href: `/deliver#grant-${row.id}`,
         primary: row.label || row.name,
         secondary: `${row.name} · ${row.revoked ? 'revoked' : 'issued'} ${formatWhen(row.created_at)}`,
@@ -282,8 +282,8 @@ mountThemeToggle();
 
 const NAV_ITEMS = [
   ['receive', '/receive', 'Receive', 'Invite someone to ship files to this port.'],
-  ['deliver', '/deliver', 'Deliver', 'Share files with a private download link.'],
-  ['workflows', '/workflows', 'Workflows', 'Prepare deliveries with reusable checks, approvals and destinations.'],
+  ['deliver', '/deliver', 'Deliver', 'Share files with a private delivery link.'],
+  ['workflows', '/workflows', 'Deliveries', 'Prepare deliveries with reusable checks, approvals and storage connections.'],
   ['trade-routes', '/trade-routes', 'Trade routes', 'Connect ports to move files between your sites and partners.'],
   ['storage', '/storage', 'Storage', 'Manage receiving storage, S3 buckets and shared folders.'],
   ['automation', '/automation', 'Automation', 'Connect agents and scripts with limited access.'],
@@ -507,8 +507,8 @@ export function showGrantResult(url, protectedGrant = false, focusResult = false
   output.value = url;
   output.onclick = () => output.select();
   document.getElementById('outbound-note').textContent =
-    `You can copy this link again from Download links on the Deliver page.`
-    + (protectedGrant ? ' This download is password-protected. Send the password by a separate channel.' : '');
+    `You can copy this link again from Delivery links on the Deliver page.`
+    + (protectedGrant ? ' This delivery is password-protected. Send the password by a separate channel.' : '');
   const copy = document.getElementById('outbound-copy');
   const status = document.querySelector('#outbound-grants-status, #links-action-status');
   const report = (text) => { if (status) announce(status.id, text); };
@@ -516,12 +516,12 @@ export function showGrantResult(url, protectedGrant = false, focusResult = false
   copy.onclick = async () => {
     try {
       await copyToClipboard(copy, url);
-      report('Download link copied.');
+      report('Delivery link copied.');
     } catch {
       if (copy === document.activeElement || output === document.activeElement || document.activeElement === document.body) {
         selectText(output);
-        report('Your download address is selected below. Copy it to share.');
-      } else report('Could not copy the download address. Use Copy address below to retry.');
+        report('Your delivery link is selected below. Copy it to share.');
+      } else report('Could not copy the delivery link. Use Copy link below to retry.');
     }
   };
 }

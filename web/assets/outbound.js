@@ -348,17 +348,17 @@ async function fetchMetadataPage(offset, limit = METADATA_PAGE_SIZE) {
   metadataHasPassword = Boolean(body?.needs_password || body?.has_password);
   if (metadataHasPassword && !body.authorized) {
     if (offset === 0) showPasswordGate();
-    throw new Error('outbound grant password required');
+    throw new Error('delivery password required');
   }
   if (!response.ok) {
     throw new Error(
       response.status === 404
-        ? 'This download link was not found or has expired.'
+        ? 'This delivery link was not found or has expired.'
         : body?.error || `The download could not be loaded (${response.status}).`,
     );
   }
   if (body?.expires_at && body.expires_at <= Math.floor(Date.now() / 1000)) {
-    throw new Error('This download link has expired.');
+    throw new Error('This delivery link has expired.');
   }
   const files = Array.isArray(body?.files) && body.files.length
     ? body.files
@@ -500,7 +500,7 @@ async function loadMetadata() {
   try {
     body = await fetchMetadataPage(0);
   } catch (error) {
-    if (error.message === 'outbound grant password required') return;
+    if (error.message === 'delivery password required') return;
     showError(error.message);
     return;
   }

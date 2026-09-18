@@ -100,7 +100,7 @@ test('list actions announce their outcome and copy buttons confirm', () => {
   assert.match(deliver, /id="outbound-grants-status"[^>]+role="status"/);
   assert.match(receiveScript, /announce\('links-action-status'/);
   assert.match(deliverScript, /announce\('outbound-grants-status'/);
-  assert.match(deliverScript, /confirmModal\('Extend download'/);
+  assert.match(deliverScript, /confirmModal\('Extend delivery'/);
   // Every clipboard write goes through copyToClipboard so the button flips to Copied.
   assert.doesNotMatch(receiveScript, /navigator\.clipboard/);
   assert.doesNotMatch(deliverScript, /navigator\.clipboard/);
@@ -116,13 +116,13 @@ test('repeated actions and help controls carry their context', () => {
       assert.doesNotMatch(heading[0], /class="hint-button"/, `${name}: help control remains inside ${heading[1]}`);
     }
   }
-  assert.match(receiveScript, /copy\.setAttribute\('aria-label', `Copy receive link: \$\{link\.label\}`\)/);
+  assert.match(receiveScript, /copy\.setAttribute\('aria-label', `Copy request link: \$\{link\.label\}`\)/);
   assert.match(receiveScript, /qrButton\.setAttribute\('aria-label', `Show QR code: \$\{link\.label\}`\)/);
   assert.match(receiveScript, /qrButton\.setAttribute\('aria-label', `\$\{qr\.hidden \? 'Show' : 'Hide'\} QR code: \$\{link\.label\}`\)/);
-  assert.match(receiveScript, /activeButton\.setAttribute\('aria-label', `\$\{link\.active \? 'Deactivate' : 'Reactivate'\} receive link: \$\{link\.label\}`\)/);
+  assert.match(receiveScript, /activeButton\.setAttribute\('aria-label', `\$\{link\.active \? 'Deactivate' : 'Reactivate'\} request link: \$\{link\.label\}`\)/);
   assert.match(receiveScript, /holdButton\.setAttribute\('aria-label', `\$\{link\.legal_hold \? 'Release hold' : 'Legal hold'\}: \$\{link\.label\}`\)/);
   assert.match(receiveScript, /\$\('create-notification-options'\)\.closest\('\.form-advanced-with-hint'\)\.hidden = true/);
-  assert.match(deliverScript, /newAddress\.setAttribute\('aria-label', `New address: \$\{grant\.label \|\| grant\.name\}`\)/);
+  assert.match(deliverScript, /newAddress\.setAttribute\('aria-label', `Replace link: \$\{grant\.label \|\| grant\.name\}`\)/);
   assert.match(deliverScript, /extend\.setAttribute\('aria-label', `Extend 7 days: \$\{grant\.label \|\| grant\.name\}`\)/);
   assert.match(deliverScript, /revoke\.setAttribute\('aria-label', `Revoke: \$\{grant\.label \|\| grant\.name\}`\)/);
   assert.equal((system.match(/<button[^>]*aria-label="Save [^"]+"[^>]*>Save<\/button>/g) || []).length, 7);

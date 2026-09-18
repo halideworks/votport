@@ -69,7 +69,7 @@ try {
   }
   assert.ok(ready.url, JSON.stringify(ready));
   await page.click('#workflow-refresh');
-  await page.locator('#workflow-jobs article').filter({ hasText: ready.job.manifest }).getByRole('button', { name: 'Copy download link', exact: true }).click();
+  await page.locator('#workflow-jobs article').filter({ hasText: ready.job.manifest }).getByRole('button', { name: 'Copy delivery link', exact: true }).click();
   await page.waitForFunction((url) => window.copiedText === url, ready.url);
   await page.waitForTimeout(250);
   assert.equal(await page.locator('dialog[open]').count(), 0);
@@ -175,18 +175,18 @@ try {
   }, { times: 1 });
   await grantCard.getByRole('button', { name: /^Extend 7 days: / }).focus();
   await page.keyboard.press('Enter'); await page.locator('#confirm-ok').press('Enter');
-  await page.waitForFunction(() => document.querySelector('#outbound-grants-status').textContent.startsWith('Download extended until'));
+  await page.waitForFunction(() => document.querySelector('#outbound-grants-status').textContent.startsWith('Delivery extended until'));
   assert.ok(await page.locator('#global-search-input').evaluate((node) => node === document.activeElement), 'A delayed grant refresh preserves newly moved focus');
-  for (const [action, name, message] of [['New address', /^New address: /, 'Download address rotated.'], ['Extend 7 days', /^Extend 7 days: /, 'Download extended until'], ['Revoke', /^Revoke: /, 'Download revoked.']]) {
+  for (const [action, name, message] of [['Replace link', /^Replace link: /, 'Delivery link replaced.'], ['Extend 7 days', /^Extend 7 days: /, 'Delivery extended until'], ['Revoke', /^Revoke: /, 'Delivery revoked.']]) {
     if (action === 'Revoke') await page.route('**/api/admin/outbound-grants?*', (route) => route.fulfill({ status: 503 }), { times: 1 });
     await grantCard.getByRole('button', { name }).focus();
     await page.keyboard.press('Enter'); await page.locator('#confirm-ok').press('Enter');
     await page.waitForFunction((text) => document.querySelector('#outbound-grants-status').textContent.startsWith(text), message);
-    const resultFocus = action === 'New address' ? '#outbound-url' : '#outbound-grants-status';
+    const resultFocus = action === 'Replace link' ? '#outbound-url' : '#outbound-grants-status';
     assert.ok(await page.locator(resultFocus).evaluate((node) => node === document.activeElement), `${action} focuses its result`);
-    if (action === 'New address') assert.match(await page.inputValue('#outbound-url'), /^https?:\/\//);
+    if (action === 'Replace link') assert.match(await page.inputValue('#outbound-url'), /^https?:\/\//);
   }
-  await page.getByText('Issued downloads could not be loaded.', { exact: true }).waitFor();
+  await page.getByText('Deliveries could not be loaded.', { exact: true }).waitFor();
   assert.deepEqual(errors, []);
   console.log('Project UI, recipient-key admission, copy/open actions, saved-file verification, revoked-link recovery and queued acceptance: passed');
 } finally {

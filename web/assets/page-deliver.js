@@ -2,7 +2,7 @@ import { isFormDirty, markFormChanged, markFormSaved } from '/assets/form-drafts
 import { notificationEditor, notificationDetails, downloadEvents } from '/assets/notifications.js';
 if (window.location.hash === '#workflows') window.location.replace('/workflows');
 
-// votport deliver page: build outbound downloads and manage issued links.
+// votport deliver page: build outbound deliveries and manage delivery links.
 // VOTPORT PROPRIETARY LICENSE.
 
 import {
@@ -55,13 +55,13 @@ function renderGrants() {
   const retainedEditors = new Set(editingNotifications.values());
   for (const editor of container.querySelectorAll('.notification-details')) if (!retainedEditors.has(editor)) editor.destroy?.();
   if (container.contains(document.activeElement)) {
-    announce('outbound-grants-status', 'Issued downloads updated.');
+    announce('outbound-grants-status', 'Deliveries updated.');
     $('outbound-grants-status').focus({ preventScroll: true });
   }
   container.replaceChildren();
   $('outbound-grants-count').textContent = grantTotal
-    ? `Showing ${grants.length} of ${grantTotal} issued downloads.`
-    : '0 issued downloads.';
+    ? `Showing ${grants.length} of ${grantTotal} deliveries.`
+    : '0 deliveries.';
   $('outbound-grants-load-more').hidden = !grantHasMore;
   if (!grants.length) {
     const empty = document.createElement('div');
@@ -71,7 +71,7 @@ function renderGrants() {
     const steps = document.createElement('ol');
     for (const text of [
       'Add files to the library, or pick ones that already arrived.',
-      'Issue a download link, with a password or expiry if you like.',
+      'Issue a delivery link, with a password or expiry if you like.',
       'Recipients request verified files; each file request is recorded here.',
     ]) {
       const item = document.createElement('li');
@@ -89,7 +89,7 @@ function renderGrants() {
     const head = document.createElement('div');
     head.className = 'head';
     const title = document.createElement('h3');
-    title.textContent = grant.label || 'Outbound download';
+    title.textContent = grant.label || 'Delivery';
     const status = grantStatus(grant);
     const badge = document.createElement('span');
     badge.className = `badge ${status === 'active' ? 'on' : 'off'}`;
@@ -176,15 +176,15 @@ function renderGrants() {
             showGrantResult(url, grant.has_password, focusResult);
             try {
               await copyToClipboard(control, url);
-              announce('outbound-grants-status', 'Download link copied.');
+              announce('outbound-grants-status', 'Delivery link copied.');
             } catch {
               const ownsResultFocus = control === document.activeElement
                 || $('outbound-url') === document.activeElement
                 || document.activeElement === document.body;
               if (ownsResultFocus) {
                 selectText($('outbound-url'));
-                announce('outbound-grants-status', 'Your download address is selected below. Copy it to share.');
-              } else announce('outbound-grants-status', 'Could not copy the download address. Use Copy address below to retry.');
+                announce('outbound-grants-status', 'Your delivery link is selected below. Copy it to share.');
+              } else announce('outbound-grants-status', 'Could not copy the delivery link. Use Copy link below to retry.');
             }
           } finally {
             control.disabled = false;
@@ -192,12 +192,12 @@ function renderGrants() {
         });
         actions.append(copyLink);
         if (deliverAdministrator) {
-          const newAddress = button('New address', 'tiny', async (control) => {
+          const newAddress = button('Replace link', 'tiny', async (control) => {
             if (
               !(await confirmModal(
-                'Rotate download address',
-                'Create a new address? The old address will stop working immediately.',
-                'Create',
+                'Replace delivery link',
+                'Create a new link? The old link will stop working immediately.',
+                'Replace',
               ))
             )
               return;
@@ -209,9 +209,9 @@ function renderGrants() {
             const focusResult = control === document.activeElement || document.activeElement === document.body;
             showGrantResult(response.url, grant.has_password, focusResult);
             await refreshGrants();
-            announce('outbound-grants-status', 'Download address rotated.');
+            announce('outbound-grants-status', 'Delivery link replaced.');
           });
-          newAddress.setAttribute('aria-label', `New address: ${grant.label || grant.name}`);
+          newAddress.setAttribute('aria-label', `Replace link: ${grant.label || grant.name}`);
           actions.append(newAddress);
         }
       }
@@ -220,28 +220,28 @@ function renderGrants() {
           // Same base as the server: seven days past the later of now and the current expiry.
           const base = Math.max(grant.expires_at, Math.floor(Date.now() / 1000));
           const until = formatWhen(base + 7 * 86_400);
-          if (!(await confirmModal('Extend download', `Extend this download until ${until}?`, 'Extend')))
+          if (!(await confirmModal('Extend delivery', `Extend this delivery until ${until}?`, 'Extend')))
             return;
           const { expires_at } = await api(`/api/admin/outbound-grants/${grant.id}`, {
             method: 'PATCH',
             body: JSON.stringify({ extend_days: 7 }),
           });
           await refreshGrants();
-          announce('outbound-grants-status', `Download extended until ${formatWhen(expires_at)}.`);
+          announce('outbound-grants-status', `Delivery extended until ${formatWhen(expires_at)}.`);
         });
         extend.setAttribute('aria-label', `Extend 7 days: ${grant.label || grant.name}`);
         const revoke = button('Revoke', 'tiny danger', async () => {
           if (
             !(await confirmModal(
-              'Revoke download',
-              'Revoke this download link? Anyone with it will lose access.',
+              'Revoke delivery',
+              'Revoke this delivery link? Anyone with it will lose access.',
               'Revoke',
             ))
           )
             return;
           await api(`/api/admin/outbound-grants/${grant.id}`, { method: 'DELETE' });
           await refreshGrants();
-          announce('outbound-grants-status', 'Download revoked.');
+          announce('outbound-grants-status', 'Delivery revoked.');
         });
         revoke.setAttribute('aria-label', `Revoke: ${grant.label || grant.name}`);
         actions.append(extend, revoke);
@@ -269,7 +269,7 @@ async function refreshGrants(reset = true) {
     if (reset || !grantRows.length) {
       const message = document.createElement('p');
       message.className = 'muted';
-      message.textContent = 'Issued downloads could not be loaded.';
+      message.textContent = 'Deliveries could not be loaded.';
       if ($('outbound-grants').contains(document.activeElement)) {
         announce('outbound-grants-status', message.textContent);
         $('outbound-grants-status').focus({ preventScroll: true });
@@ -530,7 +530,7 @@ function renderLibraryFile(file, container, showPath = false) {
   const remove = button('Delete', 'tiny danger', async () => {
     if (!(await confirmModal(
       'Delete outbound file',
-      `Delete "${file.path}"? Active download grants will block this if they still reference it.`,
+      `Delete "${file.path}"? Active deliveries will block this if they still reference it.`,
       'Delete',
     ))) return;
     remove.disabled = true;
@@ -827,7 +827,7 @@ async function submitDeliverGrant() {
   $('deliver-fields').disabled = true;
   $('library-files').disabled = true;
   submit.textContent = 'Preparing link…';
-  progress.textContent = 'Verifying selected files and preparing your download link. Large files can take a few minutes. Keep this page open.';
+  progress.textContent = 'Verifying selected files and preparing your delivery link. Large files can take a few minutes. Keep this page open.';
   progress.hidden = false;
   progress.focus({ preventScroll: true });
   $('outbound-result').hidden = true;
@@ -842,7 +842,7 @@ async function submitDeliverGrant() {
       || document.activeElement === progress
       || document.activeElement === document.body;
     showGrantResult(response.url, response.grant?.has_password, focusResult);
-    announce('outbound-grants-status', 'Download link ready.');
+    announce('outbound-grants-status', 'Delivery link ready.');
     $('deliver-password').value = '';
     refreshGrants();
   } catch (requestError) {
@@ -853,7 +853,7 @@ async function submitDeliverGrant() {
     form.removeAttribute('aria-busy');
     $('deliver-fields').disabled = false;
     $('library-files').disabled = false;
-    submit.textContent = 'Create download link';
+    submit.textContent = 'Create delivery link';
     progress.hidden = true;
     if (focusError) error.focus();
   }
@@ -867,7 +867,7 @@ $('deliver-form').addEventListener('submit', async (event) => {
 
 // A search result may name a grant past the first page: page forward until
 // it is on the page. ponytail: bounded at ten pages; a grant lookup by id
-// is the upgrade if issued downloads ever run to thousands.
+// is the upgrade if active deliveries ever run to thousands.
 async function revealGrant() {
   if (!window.location.hash.startsWith('#grant-')) return;
   for (let pages = 0; !revealHash() && grantHasMore && pages < 10; pages += 1) {

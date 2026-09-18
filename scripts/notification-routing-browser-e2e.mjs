@@ -123,7 +123,7 @@ try {
     await lifecycleReload.dispatchEvent('click');
     const discardedStatusBefore = await discardedStatusHandle.textContent();
     await page.locator('#create-label').fill(`Discarded stale ${id}`);
-    await page.getByRole('button', { name: 'Create receive link', exact: true }).click();
+    await page.getByRole('button', { name: 'Create request link', exact: true }).click();
     await page.locator('#new-link').waitFor({ state: 'visible' });
     releaseDestroyed();
     await page.waitForTimeout(100);
@@ -151,7 +151,7 @@ try {
   await page.locator('#create-notifications .notification-add option').filter({ hasText: 'Added during setup' }).waitFor({ state: 'attached' });
   assert.ok(await page.locator('#create-notifications').getByRole('group', { name: 'Incoming', exact: true }).getByLabel('Upload completed', { exact: true }).isChecked());
 
-  await page.getByRole('button', { name: 'Create receive link', exact: true }).click();
+  await page.getByRole('button', { name: 'Create request link', exact: true }).click();
   await page.locator('#new-link').waitFor({ state: 'visible' });
   let link = (await api('admin/links')).links.find((link) => link.label === uploadLabel);
   assert.deepEqual(link.notifications.rules, [{ destination_id: incoming.id, events: ['upload_complete'] }]);
@@ -181,7 +181,7 @@ try {
   await page.locator('#library-files input[type=checkbox][value="notification-clip.txt"]').check();
   await page.locator('#deliver-label').fill(downloadLabel);
   await choose(page.locator('#deliver-notifications'), 'Incoming', 'First file requested');
-  await page.getByRole('button', { name: 'Create download link', exact: true }).click();
+  await page.getByRole('button', { name: 'Create delivery link', exact: true }).click();
   await page.getByRole('heading', { name: downloadLabel, exact: true }).waitFor();
   const grants = await api('admin/outbound-grants'); const grant = grants.grants.find((grant) => grant.label === downloadLabel);
   assert.deepEqual(grant.notifications.rules, [{ destination_id: incoming.id, events: ['outbound_download_started'] }]);
@@ -274,7 +274,7 @@ try {
   await page.locator('#create-notifications').getByText('Notifications are off for this item.', { exact: false }).waitFor();
   const offUploadLabel = `${uploadLabel} explicit off`;
   await page.locator('#create-label').fill(offUploadLabel);
-  await page.getByRole('button', { name: 'Create receive link', exact: true }).click();
+  await page.getByRole('button', { name: 'Create request link', exact: true }).click();
   await page.locator('#new-link').waitFor({ state: 'visible' });
   const offLink = (await api('admin/links')).links.find((link) => link.label === offUploadLabel);
   assert.equal(offLink.notifications.mode, 'off');

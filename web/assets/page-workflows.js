@@ -60,7 +60,7 @@ function reprocessAction(job, project, canSend) {
     await refreshProjects();
     const current = projects.find((item) => item.id === job.project.id);
     if (!current) throw new Error('Project unavailable. Reload before reprocessing.');
-    if (!await confirmModal('Reprocess with current rules', `Create a new delivery under “${current.label}” revision ${current.revision}, using the saved Receive workflow settings? The old link will stop working and connected ports will be asked to revoke its delivery. Existing copies remain; new checks, approval and exports run again and may create new copies.`, 'Create new delivery')) return;
+    if (!await confirmModal('Reprocess with current rules', `Create a new delivery under “${current.label}” revision ${current.revision}, using the saved reception project settings? The old link will stop working and connected ports will be asked to revoke its delivery. Existing copies remain; new checks, approval and exports run again and may create new copies.`, 'Create new delivery')) return;
     const issued = await api(`/api/workflows/jobs/${job.id}/reprocess`, { method: 'POST', body: JSON.stringify({ manifest: job.manifest, project_revision: current.revision }) });
     notice('New delivery created from the same received files. The previous delivery retains its evidence.');
     window.location.hash = `#job-${issued.job.id}`;
@@ -95,7 +95,7 @@ function projectFields() {
     const label = node('label', '', 'check'), input = document.createElement('input'); input.type = 'checkbox'; input.value = recipient.holder;
     label.append(input, document.createTextNode(recipient.email)); recipients.append(label);
   }
-  if (!project?.recipients?.length) recipients.append(node('p', 'Anyone with the download link can receive this delivery.', 'field-help'));
+  if (!project?.recipients?.length) recipients.append(node('p', 'Anyone with the delivery link can receive this delivery.', 'field-help'));
 }
 async function refreshProjects() {
   const [projectResponse, storageResponse] = await Promise.all([api('/api/workflows/projects'), api('/api/workflows/storage')]);
@@ -279,11 +279,11 @@ async function refreshJobs(more = false, background = false, discardEdits = fals
     }));
     if (job.request.not_before) card.append(node('p', `Scheduled ${formatWhen(job.request.not_before)}`, 'muted'));
     if (job.request.deadline) card.append(node('p', `Acceptance due ${formatWhen(job.request.deadline)}`, 'muted'));
-    if (url && job.state !== 'ready') card.append(node('p', 'Local download link is released. Destination copies are still pending.', 'info-banner'));
+    if (url && job.state !== 'ready') card.append(node('p', 'Local delivery link is released. Destination copies are still pending.', 'info-banner'));
     if (job.received) {
       const source = node('a', 'View incoming request →', 'text-link'); source.href = `/receive?search=${encodeURIComponent(job.received.link_id)}#link-${job.received.link_id}`; card.append(source);
       if (!['retired', 'suspended'].includes(job.state)) card.append(node('p', 'This delivery uses the original received files. Keep them unchanged until the delivery is archived. Automatic archival occurs seven days after cancellation, failure, or link expiry or revocation.', 'field-help'));
-      if (canReprocess(job, currentProject)) card.append(node('p', 'Project rules changed. This prepared delivery remains held under its recorded rules. Reprocessing requires a new delivery and valid Receive workflow settings.', 'info-banner'));
+      if (canReprocess(job, currentProject)) card.append(node('p', 'Project rules changed. This prepared delivery remains held under its recorded rules. Reprocessing requires a new delivery and valid reception project settings.', 'info-banner'));
       for (const [label, id] of [['Previous delivery', job.reprocessed_from], ['Replacement delivery', job.reprocessed_as]]) {
         if (id) { const link = node('a', label, 'text-link'); link.href = `/workflows#job-${encodeURIComponent(id)}`; card.append(link); }
       }
@@ -303,7 +303,7 @@ async function refreshJobs(more = false, background = false, discardEdits = fals
       card.append(leg);
     }
     if (job.state === 'retrying') card.append(node('p', `Next attempt ${formatWhen(job.checks.retry_at)}`, 'muted'));
-    const nextStep = { awaiting_approval: 'Waiting for an authorized approver who did not create this delivery.', failed: 'Delivery stopped. Review the error below, correct the cause, then retry.', retrying: 'Another attempt is scheduled. Review the error below if this keeps happening.', preparing: 'Checking and preparing files before release.', exporting: 'Sending copies to the selected destinations. Each destination reports its progress below.', ready: url ? 'Ready to share. Copy the download link below.' : policyChanged ? 'The project rules changed before this delivery could be shared. Create a new delivery to get a current download link.' : 'The delivery is ready, but its download link is unavailable. Refresh and check the delivery details before creating a new delivery.' }[job.state];
+    const nextStep = { awaiting_approval: 'Waiting for an authorized approver who did not create this delivery.', failed: 'Delivery stopped. Review the error below, correct the cause, then retry.', retrying: 'Another attempt is scheduled. Review the error below if this keeps happening.', preparing: 'Checking and preparing files before release.', exporting: 'Sending copies to the selected connections. Each connection reports its progress below.', ready: url ? 'Ready to share. Copy the delivery link below.' : policyChanged ? 'The project rules changed before this delivery could be shared. Create a new delivery to get a current delivery link.' : 'The delivery is ready, but its delivery link is unavailable. Refresh and check the delivery details before creating a new delivery.' }[job.state];
     if (nextStep) card.append(node('p', nextStep, 'workflow-next'));
     if (job.error) card.append(node('p', job.error, 'error'));
     const detail = document.createElement('details'); detail.append(node('summary', 'Package and recipient verification'));
@@ -325,7 +325,7 @@ async function refreshJobs(more = false, background = false, discardEdits = fals
     }));
     detail.append(load, evidence); card.append(detail);
     const actions = node('div', '', 'actions');
-    if (url) actions.append(button('Copy download link', '', (element) => copyToClipboard(element, url)));
+    if (url) actions.append(button('Copy delivery link', '', (element) => copyToClipboard(element, url)));
     if (job.state === 'awaiting_approval' && canApprove) actions.append(button('Approve delivery', '', () => guard(async () => {
       if (await confirmModal('Approve delivery', `Release “${job.request.label}” with manifest ${job.manifest}?`, 'Approve delivery')) {
         await api(`/api/workflows/jobs/${job.id}`, { method: 'POST', body: JSON.stringify({ action: 'approve', manifest: job.manifest }) }); await refreshJobs();

@@ -53,7 +53,7 @@ function showRequests(requests, preferred = '') {
   const select = $('trade-request'), retained = select.selectedOptions[0];
   const chosen = retained?.value || preferred;
   select.replaceChildren();
-  const placeholder = node('option', 'Choose a receive request'); placeholder.value = ''; select.append(placeholder);
+  const placeholder = node('option', 'Choose a request'); placeholder.value = ''; select.append(placeholder);
   for (const request of requests.links) {
     const option = node('option', request.label + ' · ' + (request.dest || 'Receive root'));
     option.value = request.id; option.dataset.label = request.label; select.append(option);
@@ -63,7 +63,7 @@ function showRequests(requests, preferred = '') {
   requestCursor = requests.next_cursor;
   $('trade-request-more').hidden = !requestCursor;
   $('trade-request-help').textContent = requests.links.length
-    ? 'Only active requests with no password or previous uploads can be used. Search by name or destination to find another request.'
+    ? 'Only active requests with no password or previous uploads can be used. Search by name or folder to find another request.'
     : 'No eligible requests match. Try another search or create a request below.';
   requestSelected();
 }
@@ -121,7 +121,7 @@ async function refresh() {
   $('trade-endpoints-section').hidden = !catalog.endpoints.length && setup !== 'receive';
   for (const endpoint of catalog.endpoints) {
     const row = node('div', '', 'card'); row.id = `endpoint-${endpoint.id}`; row.tabIndex = -1;
-    row.append(node('h3', endpoint.name), node('p', `${endpoint.category === 'internal' ? 'Internal site' : 'External partner'} · ${endpoint.forwarding ? 'Forwarding allowed' : 'Forwarding prohibited'}`, 'field-help'), link('Receiving folder, limits and workflow →', `/receive?search=${endpoint.id}#link-${endpoint.id}`));
+    row.append(node('h3', endpoint.name), node('p', `${endpoint.category === 'internal' ? 'Internal site' : 'External partner'} · ${endpoint.forwarding ? 'Forwarding allowed' : 'Forwarding prohibited'}`, 'field-help'), link('Receiving folder, limits and project →', `/receive?search=${endpoint.id}#link-${endpoint.id}`));
     if (admin) {
       const form = node('form'), key = input('text'); form.setAttribute('data-unsaved', ''); key.maxLength = 64; key.placeholder = 'Optional: exact sending port fingerprint';
       const expiry = select([['3600', '1 hour'], ['86400', '24 hours'], ['604800', '7 days']], '86400');
@@ -170,7 +170,7 @@ function routeCard(route, savedEditor) {
   card.append(node('p', `Receiving endpoint: ${route.endpoint_name}`), node('p', `Managed forwarding: ${route.forwarding ? 'allowed' : 'prohibited'}`, 'field-help'));
   const next = {
     pending_approval: route.direction === 'incoming' ? (admin ? 'Your approval is needed. Check the sending port’s fingerprint above, then approve this route.' : 'A port administrator needs to approve this sender.') : 'Waiting for the receiving team. Ask them to approve your route on their Trade routes page, then check the connection.',
-    active: route.direction === 'incoming' ? 'Ready to receive. New files follow this endpoint’s receiving settings.' : `Ready to send. Choose “${route.name}” in a workflow project’s destinations.`,
+    active: route.direction === 'incoming' ? 'Ready to receive. New files follow this endpoint’s receiving settings.' : `Ready to send. Choose “${route.name}” in a project’s storage connections.`,
     paused: route.state === 'paused' ? 'Paused on this port. Set permission to Active to allow new transfers again.' : 'Paused by the receiving team. Ask them to restore permission.',
     revoked: 'This permission has ended. Ask the receiving team for a new invitation to reconnect.',
     unreachable: 'The other port could not be reached. Check its address and network access, then try Check connection.',
@@ -179,7 +179,7 @@ function routeCard(route, savedEditor) {
   };
   if (next[current]) card.append(node('p', next[current], 'info-banner'));
   if (route.direction === 'outgoing') {
-    if (current === 'active') card.append(link('Choose this route in a workflow →', '/workflows#projects'));
+    if (current === 'active') card.append(link('Choose this route in a project →', '/workflows#projects'));
     const local = node('details', '', 'trade-advanced'); local.append(node('summary', 'Local connection ID for scripts and agents'), node('p', 'This ID selects the saved route on this port. It is not the other port’s address. In the UI, choose the route by name.', 'field-help'), node('code', route.id, 'trade-key'), button('Copy local connection ID', 'ghost tiny', (element) => copyToClipboard(element, route.id))); card.append(local);
   }
   card.append(node('p', route.last_contact ? `Last contact ${formatWhen(route.last_contact)}` : 'No successful contact yet.', 'field-help'));
@@ -195,7 +195,7 @@ function routeCard(route, savedEditor) {
       if (remote.revoked) text += ' · Delivery revoked';
       else if (remote.released) text += ' · Released';
       else if (typeof remote.workflow === 'string' && remote.workflow) text += remote.workflow === 'awaiting_approval' ? ' · Held for approval' : ` · Processing (${remote.workflow.replaceAll('_', ' ')})`;
-      else if (remote.received) text += ' · No workflow release reported';
+      else if (remote.received) text += ' · No project release reported';
       const row = node('p', `${delivery.label || 'Incoming delivery'} · ${text}`, 'field-help'); detail.append(row);
     } card.append(detail);
   }
@@ -230,7 +230,7 @@ function routeCard(route, savedEditor) {
       const save = node('button', 'Save route settings'); save.type = 'submit'; form.append(save);
       form.addEventListener('submit', (event) => { event.preventDefault(); if (form.inert) return;
         guard(async () => {
-          if (state.value === 'revoked' && !await confirmModal('Revoke this route', 'New deliveries will be denied. Restoring permission requires a new invitation. Previously received files remain on the destination.', 'Revoke route')) return;
+          if (state.value === 'revoked' && !await confirmModal('Revoke this route', 'New deliveries will be denied. Restoring permission requires a new invitation. Previously received files remain on the other port.', 'Revoke route')) return;
           form.inert = true;
           try { await api(`/api/trade-routes/${route.id}`, { method: 'PUT', body: JSON.stringify({ revision: revisionOf(route), state: state.value, cancel_active: active.value === 'cancel', notifications: policy.read() }) }); markFormSaved(form); $('trade-notice').textContent = 'Route settings saved.'; await refresh(); $(`route-${route.id}`).focus(); } finally { form.inert = false; }
         });
@@ -264,7 +264,7 @@ $('trade-inspect').onclick = () => guard(async () => {
   let invitation;
   try { invitation = JSON.parse($('trade-invitation').value); } catch { throw new Error(INVITATION_GUIDANCE); }
   const ticket = previewRevision;
-  $('trade-inspect').disabled = true; $('trade-inspect').textContent = 'Checking destination…';
+  $('trade-inspect').disabled = true; $('trade-inspect').textContent = 'Checking the other port…';
   try {
     const result = await api('/api/trade-routes/inspect', { method: 'POST', body: JSON.stringify({ invitation }) });
     if (ticket !== previewRevision) return;
@@ -282,10 +282,10 @@ $('trade-inspect').onclick = () => guard(async () => {
 });
 $('trade-discover').onclick = () => guard(async () => { const result = await api('/api/trade-routes/inspect', { method: 'POST', body: JSON.stringify({ address: $('trade-discovery-address').value }) }); $('trade-discovery-result').textContent = `${result.document.body.name} · ${result.document.issuer}`; });
 $('trade-accept-form').addEventListener('submit', (event) => { event.preventDefault(); const form = event.currentTarget; if (!preview || form.inert) return; form.inert = true;
-  guard(async () => { const route = await api('/api/trade-routes', { method: 'POST', body: JSON.stringify({ invitation: preview, name: $('trade-name').value.trim(), notifications: acceptNotifications.read() }) }); resetForm(form); clearPreview(); showSetup(null); $('trade-notice').textContent = route.state === 'active' ? 'Route active. Choose its name in a workflow’s destinations.' : 'Route saved. Follow the next step on its card below.'; await refresh(); $(`route-${route.id}`).focus(); }).finally(() => { form.inert = false; });
+  guard(async () => { const route = await api('/api/trade-routes', { method: 'POST', body: JSON.stringify({ invitation: preview, name: $('trade-name').value.trim(), notifications: acceptNotifications.read() }) }); resetForm(form); clearPreview(); showSetup(null); $('trade-notice').textContent = route.state === 'active' ? 'Route active. Choose its name in a project’s storage connections.' : 'Route saved. Follow the next step on its card below.'; await refresh(); $(`route-${route.id}`).focus(); }).finally(() => { form.inert = false; });
 });
 $('trade-endpoint-form').addEventListener('submit', (event) => { event.preventDefault(); const form = event.currentTarget; if (form.inert) return;
-  guard(async () => { if (!await confirmModal('Require enrolled routes', 'This receive request will accept uploads only through approved trade routes. Ordinary receive-link uploads will be denied.', 'Create endpoint')) return;
+  guard(async () => { if (!await confirmModal('Require enrolled routes', 'This request will accept uploads only through approved trade routes. Ordinary request-link uploads will be denied.', 'Create endpoint')) return;
     const id = $('trade-request').value;
     form.inert = true; try { await api('/api/trade-routes/endpoints', { method: 'POST', body: JSON.stringify({ id, name: $('trade-endpoint-name').value.trim(), category: $('trade-category').value, forwarding: $('trade-forwarding').checked, metadata_keys: $('trade-metadata').value.split(',').map((v) => v.trim()).filter(Boolean), notifications: endpointNotifications.read() }) }); resetForm(form); $('trade-notice').textContent = 'Receiving endpoint created. Next, create an invitation below and send it to the other team.'; await refresh(); $('trade-endpoints-section').open = true; $(`endpoint-${id}`).focus(); } finally { form.inert = false; }
   });
