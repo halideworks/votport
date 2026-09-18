@@ -570,6 +570,39 @@ function renderLink(link) {
     lock.textContent = 'password';
     head.append(lock);
   }
+  if (receiveAdministrator) {
+    const retention = document.createElement('details');
+    retention.setAttribute('data-unsaved', '');
+    const retentionSummary = document.createElement('summary');
+    retentionSummary.textContent = 'Upload retention';
+    retention.append(retentionSummary);
+    const retentionLabel = document.createElement('label');
+    retentionLabel.textContent = 'Retention days ';
+    const retentionInput = document.createElement('input');
+    retentionInput.type = 'number';
+    retentionInput.min = '1';
+    retentionInput.max = '3650';
+    retentionInput.placeholder = 'platform default';
+    retentionInput.value = link.retention_days ?? '';
+    retentionLabel.append(retentionInput);
+    const retentionNote = document.createElement('p');
+    retentionNote.className = 'muted';
+    retentionNote.setAttribute('role', 'status');
+    const saveRetention = button('Save retention', 'ghost', async () => {
+      saveRetention.disabled = true;
+      try {
+        const days = retentionInput.value.trim() === '' ? null : Number(retentionInput.value);
+        await api(`/api/admin/links/${link.id}`, { method: 'PATCH', body: JSON.stringify({ retention_days: days }) });
+        linksRevision++; link.retention_days = days;
+        markFormSaved(retention); delete retention.dataset.dirty;
+        retentionNote.textContent = 'Saved. Uploads on this link are swept by the narrowest retention scope.';
+      } catch (error) { retentionNote.textContent = error.message; }
+      finally { saveRetention.disabled = false; }
+    });
+    retentionInput.addEventListener('input', () => { retention.dataset.dirty = 'true'; });
+    retention.append(retentionLabel, saveRetention, retentionNote);
+    card.append(retention);
+  }
   if (link.legal_hold) {
     const hold = document.createElement('span');
     hold.className = 'badge';
@@ -591,6 +624,7 @@ function renderLink(link) {
   ];
   if (link.expires_at) parts.push(`expires ${formatWhen(link.expires_at)}`);
   if (link.max_bytes) parts.push(`limit ${formatBytes(link.max_bytes)}`);
+  if (link.retention_days) parts.push(`kept ${link.retention_days}d`);
   meta.textContent = parts.join(' · ');
   card.append(meta);
   if (link.workflow) {
@@ -883,6 +917,7 @@ $('create-form').addEventListener('submit', async (event) => {
   createError.clear();
   const maxGib = parseInt($('create-max').value, 10);
   const expires = parseInt($('create-expires').value, 10);
+  const retention = parseInt($('create-retention').value, 10);
   try {
     const { link } = await api('/api/admin/links', {
       method: 'POST',
@@ -892,6 +927,7 @@ $('create-form').addEventListener('submit', async (event) => {
         password: creatingRoute ? null : $('create-password').value || null,
         expires_days: Number.isFinite(expires) ? expires : null,
         max_bytes: Number.isFinite(maxGib) ? maxGib * 1024 ** 3 : null,
+        retention_days: Number.isFinite(retention) ? retention : null,
         notifications: creatingRoute ? { mode: 'off', rules: [] } : createNotifications.read(),
         workflow: createWorkflow?.read() || null,
       }),

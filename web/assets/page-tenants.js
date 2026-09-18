@@ -34,6 +34,7 @@ function quotaText(tenant) {
   if (tenant.max_total_bytes) parts.push(`storage ${formatBytes(tenant.max_total_bytes)}`);
   if (tenant.max_links) parts.push(`${tenant.max_links} links`);
   if (tenant.max_sessions) parts.push(`${tenant.max_sessions} concurrent uploads`);
+  if (tenant.retention_days) parts.push(`uploads kept ${tenant.retention_days}d`);
   return parts.length ? parts.join(' · ') : 'no quotas';
 }
 
@@ -70,6 +71,7 @@ function editTenantForm(tenant) {
     ['Storage GiB', 'max_total_bytes', tenant.max_total_bytes === null || tenant.max_total_bytes === undefined ? '' : tenant.max_total_bytes / 1024 ** 3, 'number'],
     ['Link limit', 'max_links', tenant.max_links ?? '', 'number'],
     ['Concurrent uploads', 'max_sessions', tenant.max_sessions ?? '', 'number'],
+    ['Retention days', 'retention_days', tenant.retention_days ?? '', 'number'],
   ];
   const grid = document.createElement('div');
   grid.className = 'grid';
@@ -112,6 +114,7 @@ function editTenantForm(tenant) {
           max_total_bytes: storageBytes,
           max_links: nullableNumber(inputs.max_links.value),
           max_sessions: nullableNumber(inputs.max_sessions.value),
+          retention_days: nullableNumber(inputs.retention_days.value),
         }),
       });
       markFormSaved(form); await refreshTenants(true);
@@ -535,6 +538,7 @@ $('tenant-form').addEventListener('submit', async (event) => {
   const maxTotal = parseInt($('tenant-max-total').value, 10);
   const maxLinks = parseInt($('tenant-max-links').value, 10);
   const maxSessions = parseInt($('tenant-max-sessions').value, 10);
+  const retentionDays = parseInt($('tenant-retention-days').value, 10);
   try {
     await api('/api/admin/tenants', {
       method: 'POST',
@@ -545,6 +549,7 @@ $('tenant-form').addEventListener('submit', async (event) => {
         max_total_bytes: Number.isFinite(maxTotal) ? maxTotal * 1024 ** 3 : null,
         max_links: Number.isFinite(maxLinks) ? maxLinks : null,
         max_sessions: Number.isFinite(maxSessions) ? maxSessions : null,
+        retention_days: Number.isFinite(retentionDays) ? retentionDays : null,
       }),
     });
     markFormSaved($('tenant-form')); $('tenant-form').reset();

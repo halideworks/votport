@@ -1182,6 +1182,7 @@ mod status_cache_tests {
         let directory = tempfile::tempdir().unwrap();
         let application = crate::api::testing::build(directory.path());
         let tenant = || crate::store::Tenant {
+            retention_days: None,
             incarnation: String::new(),
             key: "team".to_owned(),
             label: "team".to_owned(),
@@ -1219,6 +1220,7 @@ mod status_cache_tests {
         application
             .store
             .insert_tenant(crate::store::Tenant {
+                retention_days: None,
                 incarnation: String::new(),
                 key: "team".to_owned(),
                 label: "team".to_owned(),
@@ -1313,6 +1315,7 @@ mod status_cache_tests {
         application
             .store
             .insert_tenant(crate::store::Tenant {
+                retention_days: None,
                 incarnation: String::new(),
                 key: "team".to_owned(),
                 label: "team".to_owned(),
@@ -1456,6 +1459,10 @@ pub struct CreateTenantRequest {
     max_links: Option<u64>,
     #[serde(default)]
     max_sessions: Option<u64>,
+    /// Finding 378: tenant-scoped upload retention; 0 is treated as unset at
+    /// creation, matching the quota fields.
+    #[serde(default)]
+    retention_days: Option<u64>,
 }
 
 /// Admits a tenant key for lookup: destination rules plus the reserved names.
@@ -1524,6 +1531,7 @@ pub async fn create_tenant(
             .max_sessions
             .or(defaults.default_max_sessions)
             .filter(|&sessions| sessions > 0),
+        retention_days: request.retention_days.filter(|&days| days > 0),
         created_at: now_unix(),
     };
     let detail = json!({
@@ -1532,6 +1540,7 @@ pub async fn create_tenant(
         "max_total_bytes": tenant.max_total_bytes,
         "max_links": tenant.max_links,
         "max_sessions": tenant.max_sessions,
+        "retention_days": tenant.retention_days,
     });
     app.store
         .insert_tenant(tenant)
@@ -1921,6 +1930,8 @@ pub struct PatchTenantRequest {
     max_links: Option<Option<u64>>,
     #[serde(default, deserialize_with = "double_option")]
     max_sessions: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "double_option")]
+    retention_days: Option<Option<u64>>,
 }
 
 fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
@@ -1971,6 +1982,9 @@ pub async fn update_tenant(
     if let Some(sessions) = request.max_sessions {
         tenant.max_sessions = patch_quota("max_sessions", sessions)?;
     }
+    if let Some(days) = request.retention_days {
+        tenant.retention_days = patch_quota("retention_days", days)?;
+    }
     if !app
         .store
         .update_tenant(&tenant)
@@ -1990,6 +2004,7 @@ pub async fn update_tenant(
             "max_total_bytes": tenant.max_total_bytes,
             "max_links": tenant.max_links,
             "max_sessions": tenant.max_sessions,
+            "retention_days": tenant.retention_days,
         }),
     );
     Ok(Json(json!({ "ok": true })))
@@ -3665,6 +3680,8 @@ struct LinkView {
     legal_hold: bool,
 
     notifications: Option<crate::store::NotificationPolicy>,
+    /// Finding 378: link-scoped upload retention in days, if any.
+    retention_days: Option<u64>,
     usable: bool,
     upload_count: u64,
     upload_bytes: u64,
@@ -3781,6 +3798,7 @@ fn link_view(
         active: link.active,
         legal_hold: link.legal_hold,
         notifications: link.notifications,
+        retention_days: link.retention_days,
         upload_count: totals.0,
         upload_bytes: totals.1,
         events: link.events,
@@ -4109,6 +4127,9 @@ pub struct CreateLinkRequest {
     expires_days: Option<u32>,
     #[serde(default)]
     max_bytes: Option<u64>,
+    /// Finding 378: optional link-scoped upload retention in days.
+    #[serde(default)]
+    retention_days: Option<u64>,
     #[serde(default)]
     notifications: Option<crate::store::NotificationPolicy>,
     workflow: Option<crate::workflow::ReceiveWorkflow>,
@@ -4149,6 +4170,17 @@ pub async fn create_link(
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             format!("expires_days must be between 1 and {MAX_REQUEST_LINK_EXPIRY_DAYS}"),
+        ));
+    }
+    // Finding 378: the retention window shares the expiry cap so no stored
+    // day count can overflow the sweep math.
+    if request
+        .retention_days
+        .is_some_and(|days| !(1..=u64::from(MAX_REQUEST_LINK_EXPIRY_DAYS)).contains(&days))
+    {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("retention_days must be between 1 and {MAX_REQUEST_LINK_EXPIRY_DAYS}"),
         ));
     }
     let password_hash = match request.password.as_deref().filter(|p| !p.is_empty()) {
@@ -4227,6 +4259,7 @@ pub async fn create_link(
         active: true,
         legal_hold: false,
 
+        retention_days: request.retention_days,
         notifications,
         uploads: Vec::new(),
         events: Vec::new(),
@@ -4257,6 +4290,7 @@ pub async fn create_link(
             "has_password": view.has_password,
             "expires_at": view.expires_at,
             "max_bytes": view.max_bytes,
+            "retention_days": view.retention_days,
         }),
     );
     Ok(Json(json!({ "link": view })))
@@ -4268,6 +4302,10 @@ pub struct UpdateLinkRequest {
     active: Option<bool>,
     #[serde(default)]
     legal_hold: Option<bool>,
+    /// Finding 378: null to clear, n to set the link-scoped upload
+    /// retention window in days.
+    #[serde(default, deserialize_with = "double_option")]
+    retention_days: Option<Option<u64>>,
     #[serde(default)]
     notifications: Option<crate::store::NotificationPolicy>,
     workflow: Option<crate::workflow::ReceiveWorkflow>,
@@ -4285,6 +4323,7 @@ pub async fn update_link(
         request.legal_hold.is_some(),
         request.notifications.is_some(),
         request.workflow.is_some(),
+        request.retention_days.is_some(),
     ];
     if fields.iter().filter(|field| **field).count() != 1 {
         return Err(ApiError::new(
@@ -4373,6 +4412,35 @@ pub async fn update_link(
             "link_notifications_changed",
             &id,
             &json!({}),
+        );
+        return Ok(Json(json!({"ok":true})));
+    }
+
+    if let Some(days) = request.retention_days {
+        // Finding 378: the same positive window the create path validates;
+        // a stored value can never be zero or overflow the sweep math.
+        if days.is_some_and(|days| !(1..=u64::from(MAX_REQUEST_LINK_EXPIRY_DAYS)).contains(&days)) {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("retention_days must be between 1 and {MAX_REQUEST_LINK_EXPIRY_DAYS}"),
+            ));
+        }
+        if !app
+            .store
+            .update_link(&identity.tenant, &id, |link| {
+                link.retention_days = days;
+            })
+            .map_err(super::store_unavailable)?
+        {
+            return Err(ApiError::not_found());
+        }
+        tracing::info!(target: "audit", event = "link_retention_changed", id = %id, retention_days = ?days, "request link retention changed");
+        app.store.audit(
+            &identity.tenant,
+            &identity.subject,
+            "link_retention_changed",
+            &id,
+            &json!({"retention_days": days}),
         );
         return Ok(Json(json!({"ok":true})));
     }
@@ -5140,6 +5208,7 @@ mod handler_tests {
         application
             .store
             .insert_link(crate::store::Link {
+                retention_days: None,
                 id: "held".to_owned(),
                 label: "held".to_owned(),
                 tenant: String::new(),
@@ -5186,6 +5255,7 @@ mod handler_tests {
         application
             .store
             .insert_link(crate::store::Link {
+                retention_days: None,
                 id: "link".to_owned(),
                 label: "link".to_owned(),
                 tenant: String::new(),
@@ -5287,6 +5357,7 @@ mod handler_tests {
             application
                 .store
                 .insert_link(crate::store::Link {
+                    retention_days: None,
                     id: id.to_owned(),
                     label: id.to_owned(),
                     tenant: String::new(),
@@ -5942,6 +6013,7 @@ mod handler_tests {
         application
             .store
             .insert_link(crate::store::Link {
+                retention_days: None,
                 id: "link".to_owned(),
                 label: "link".to_owned(),
                 tenant: String::new(),
@@ -6060,6 +6132,7 @@ mod handler_tests {
             );
             app.store
                 .insert_link(crate::store::Link {
+                    retention_days: None,
                     id: "crash-link".to_owned(),
                     tenant: String::new(),
                     label: "crash".to_owned(),
@@ -6524,6 +6597,7 @@ mod tenant_authz_tests {
         application
             .store
             .insert_tenant(crate::store::Tenant {
+                retention_days: None,
                 incarnation: String::new(),
                 key: "acme".to_owned(),
                 label: String::new(),
@@ -6539,6 +6613,7 @@ mod tenant_authz_tests {
             .insert_link(crate::store::Link {
                 tenant: "acme".to_owned(),
                 ..crate::store::Link {
+                    retention_days: None,
                     id: "acme-link".to_owned(),
                     tenant: "acme".to_owned(),
                     label: "acme".to_owned(),
@@ -6752,6 +6827,7 @@ mod branding_tests {
     fn insert_tenant(app: &App, key: &str) {
         app.store
             .insert_tenant(crate::store::Tenant {
+                retention_days: None,
                 incarnation: String::new(),
                 key: key.to_owned(),
                 label: String::new(),
@@ -7307,6 +7383,7 @@ mod tenant_offboard_tests {
 
     fn named_tenant(key: &str) -> Tenant {
         Tenant {
+            retention_days: None,
             incarnation: String::new(),
             key: key.to_owned(),
             label: key.to_owned(),
@@ -7320,6 +7397,7 @@ mod tenant_offboard_tests {
 
     fn default_link(id: &str, dest: &str) -> Link {
         Link {
+            retention_days: None,
             id: id.to_owned(),
             tenant: String::new(),
             label: id.to_owned(),
@@ -8100,6 +8178,7 @@ mod tenant_offboard_tests {
         application
             .store
             .insert_tenant(crate::store::Tenant {
+                retention_days: None,
                 incarnation: String::new(),
                 key: "clients/acme".to_owned(),
                 label: "legacy".to_owned(),
@@ -8131,6 +8210,7 @@ mod tenant_offboard_tests {
         application
             .store
             .insert_tenant(crate::store::Tenant {
+                retention_days: None,
                 incarnation: String::new(),
                 key: "acme".to_owned(),
                 label: "acme".to_owned(),
@@ -9215,6 +9295,7 @@ mod settings_api_tests {
         application
             .store
             .insert_link(crate::store::Link {
+                retention_days: None,
                 id: "resume".into(),
                 tenant: String::new(),
                 label: "resume".into(),
@@ -10071,6 +10152,7 @@ mod settings_api_tests {
         application
             .store
             .insert_tenant(crate::store::Tenant {
+                retention_days: None,
                 incarnation: String::new(),
                 key: "acme".to_owned(),
                 label: String::new(),
@@ -10084,6 +10166,7 @@ mod settings_api_tests {
         application
             .store
             .insert_link(crate::store::Link {
+                retention_days: None,
                 id: "acme-link".to_owned(),
                 tenant: "acme".to_owned(),
                 label: "open".to_owned(),
@@ -10196,6 +10279,7 @@ mod settings_api_tests {
                 "max_total_bytes": 100,
                 "max_links": null,
                 "max_sessions": null,
+                "retention_days": null,
             })
         );
         let (status, _) = send(
@@ -10284,6 +10368,7 @@ mod settings_api_tests {
         application
             .store
             .insert_link(crate::store::Link {
+                retention_days: None,
                 id: "default-link".to_owned(),
                 tenant: String::new(),
                 label: "open".to_owned(),
@@ -10534,6 +10619,7 @@ mod principals_api_tests {
         application
             .store
             .insert_tenant(crate::store::Tenant {
+                retention_days: None,
                 incarnation: String::new(),
                 key: "acme".to_owned(),
                 label: String::new(),

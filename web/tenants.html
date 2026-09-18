@@ -82,6 +82,10 @@
             >Concurrent uploads <span class="muted">optional</span>
             <input id="tenant-max-sessions" type="number" min="1" placeholder="none" />
           </label>
+          <label
+            >Upload retention <span class="muted">days, optional; narrowest scope wins</span>
+            <input id="tenant-retention-days" type="number" min="1" placeholder="platform default" />
+          </label>
         </div>
         <button type="submit">Create tenant</button>
         <p class="error" id="tenant-error" role="alert" hidden></p>

@@ -27,6 +27,15 @@ pub enum WorkflowMutationError {
     Store(String),
 }
 
+/// Outcome of [`Store::delete_delivery_storage`] (finding 381).
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeliveryStorageRemoval {
+    Deleted,
+    Absent,
+    PairedTradeRoute,
+    JobsAttached,
+}
+
 impl WorkflowMutationError {
     pub(super) fn invalid(message: impl Into<String>) -> Self {
         Self::Invalid(message.into())
@@ -656,6 +665,62 @@ impl Store {
         evidence::delivery_event(&tx,&self.event_signer,"","","storage_changed",&serde_json::json!({"actor": actor,"storage_id": storage.id,"revision": storage.revision}),now_unix()).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(storage)
+    }
+
+    /// Finding 381: a delivery storage connection was previously
+    /// undeletable. Remove it, with its stored credentials, unless a trade
+    /// route owns the id or a delivery job that has not retired still
+    /// references it as its import source or a destination.
+    pub fn delete_delivery_storage(&self, id: &str) -> Result<DeliveryStorageRemoval, String> {
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let tx = connection.transaction().map_err(|e| e.to_string())?;
+        let paired: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM trade_routes WHERE id=?1)",
+                [id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if paired {
+            return Ok(DeliveryStorageRemoval::PairedTradeRoute);
+        }
+        let referenced: bool = tx
+            .query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM delivery_jobs
+                     WHERE state <> 'retired'
+                       AND (json_extract(document, '$.request.import.storage_id') = ?1
+                            OR EXISTS (SELECT 1 FROM json_each(document, '$.project.destinations')
+                                       WHERE value = ?1))
+                 )",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if referenced {
+            return Ok(DeliveryStorageRemoval::JobsAttached);
+        }
+        // The credentials row references the storage id, so it goes first.
+        tx.execute("DELETE FROM delivery_storage_credentials WHERE id=?1", [id])
+            .map_err(|e| e.to_string())?;
+        let removed = tx
+            .execute("DELETE FROM delivery_storage WHERE id=?1", [id])
+            .map_err(|e| e.to_string())?;
+        if removed == 0 {
+            return Ok(DeliveryStorageRemoval::Absent);
+        }
+        evidence::delivery_event(
+            &tx,
+            &self.event_signer,
+            "",
+            "",
+            "storage_deleted",
+            &serde_json::json!({"storage_id": id}),
+            now_unix(),
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(DeliveryStorageRemoval::Deleted)
     }
 
     pub fn delivery_storage_has_credentials(&self, id: &str) -> Result<bool, String> {

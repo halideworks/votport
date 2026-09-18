@@ -7109,6 +7109,7 @@ async fn mounted_nas_media_campaign() {
         json!({"phase":"start","receive":server.receive_dir,"control":server.application.config.data_dir})
     );
     let link = votport::store::Link {
+        retention_days: None,
         id: "campaign".into(),
         tenant: String::new(),
         label: "NAS campaign".into(),

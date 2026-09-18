@@ -5829,6 +5829,10 @@ pub fn router(app: Arc<App>) -> Router {
                 .layer(DefaultBodyLimit::max(1024)),
         )
         .route(
+            "/api/workflows/storage/{id}",
+            delete(api::outbound::workflows::storage::remove),
+        )
+        .route(
             "/api/workflows/webhook",
             get(api::outbound::workflows::webhook)
                 .put(api::outbound::workflows::put_webhook)
@@ -5980,6 +5984,7 @@ mod push_tests {
         let app = crate::api::testing::build(directory.path());
         app.store
             .insert_link(crate::store::Link {
+                retention_days: None,
                 id: "resume".to_owned(),
                 tenant: String::new(),
                 label: "resume".to_owned(),
@@ -7595,6 +7600,23 @@ async fn sweep_daily_at(app: &Arc<App>, retention: RetentionObservation) {
         clean_outbound_proofs(&app.config.data_dir, &app.store, now);
     })
     .await;
+    sweep_task(app, "revoked deliveries", move |app| {
+        // Finding 379: a revoked delivery whose expiry has passed keeps its
+        // recorded names, roots and receipts alive until this purge removes
+        // the grant row and its dependents.
+        match app.store.purge_expired_revoked_grants(now) {
+            Ok(count) => {
+                if count > 0 {
+                    tracing::info!(count, "purged expired revoked deliveries");
+                }
+            }
+            Err(error) => {
+                retention_sweep_failure();
+                tracing::warn!(%error, "revoked delivery purge failed")
+            }
+        }
+    })
+    .await;
     if settings.audit_retention_days > 0 {
         let cutoff = now.saturating_sub(settings.audit_retention_days.saturating_mul(86_400));
         sweep_task(app, "audit rows", move |app| {
@@ -7636,8 +7658,23 @@ async fn sweep_daily_at(app: &Arc<App>, retention: RetentionObservation) {
     })
     .await;
 
-    if settings.upload_retention_days > 0 {
-        let cutoff = now.saturating_sub(settings.upload_retention_days.saturating_mul(86_400));
+    // Finding 378: a tenant or link may set its own upload retention even
+    // when the platform-wide setting is off, so scope presence alone starts
+    // the sweep.
+    let scoped_retention = match sweep_task(app, "retention scope", |app| {
+        app.store.scoped_retention_exists()
+    })
+    .await
+    {
+        Some(Ok(scoped)) => scoped,
+        Some(Err(error)) => {
+            retention_sweep_failure();
+            tracing::error!(%error, "retention scope read failed; skipping the retention sweep");
+            return;
+        }
+        None => return,
+    };
+    if settings.upload_retention_days > 0 || scoped_retention {
         let mut after = None;
         loop {
             let page_after = after.clone();
@@ -7659,7 +7696,7 @@ async fn sweep_daily_at(app: &Arc<App>, retention: RetentionObservation) {
                 }
             };
             let page_len = link_ids.len();
-            for (tenant, id) in link_ids {
+            for (tenant, id, tenant_retention) in link_ids {
                 after = Some(id.clone());
                 // ponytail: one link's complete history remains the memory ceiling;
                 // page link_uploads/files if a single link grows beyond memory.
@@ -7680,6 +7717,16 @@ async fn sweep_daily_at(app: &Arc<App>, retention: RetentionObservation) {
                         return;
                     }
                 };
+                // The narrowest of the platform, tenant and link windows
+                // decides; nothing set (0 = off, None = unset) keeps uploads.
+                let Some(days) = narrowest_retention_days(
+                    settings.upload_retention_days,
+                    tenant_retention,
+                    link.retention_days,
+                ) else {
+                    continue;
+                };
+                let cutoff = now.saturating_sub(days.saturating_mul(86_400));
                 match expire_link_uploads(app, link, cutoff, now).await {
                     Some(Ok(())) => {}
                     Some(Err(error)) => {
@@ -7694,6 +7741,40 @@ async fn sweep_daily_at(app: &Arc<App>, retention: RetentionObservation) {
                 break;
             }
         }
+    }
+}
+
+/// Finding 378: each link's upload retention is the narrowest positive
+/// window set at any level. Zero means "off" at that level, and a missing
+/// tenant or link scope does not constrain; when nothing is set the uploads
+/// are kept.
+fn narrowest_retention_days(
+    global_days: u64,
+    tenant_days: Option<u64>,
+    link_days: Option<u64>,
+) -> Option<u64> {
+    [Some(global_days), tenant_days, link_days]
+        .into_iter()
+        .flatten()
+        .filter(|days| *days > 0)
+        .min()
+}
+
+#[cfg(test)]
+mod retention_scope_tests {
+    use super::narrowest_retention_days;
+
+    #[test]
+    fn narrowest_retention_takes_the_smallest_positive_scope() {
+        assert_eq!(narrowest_retention_days(30, None, None), Some(30));
+        assert_eq!(narrowest_retention_days(30, Some(7), None), Some(7));
+        assert_eq!(narrowest_retention_days(30, Some(90), Some(14)), Some(14));
+        // Zero is "off" at that level, never a zero-day wipe.
+        assert_eq!(narrowest_retention_days(0, Some(7), None), Some(7));
+        assert_eq!(narrowest_retention_days(30, Some(0), Some(45)), Some(30));
+        // Nothing set anywhere keeps uploads.
+        assert_eq!(narrowest_retention_days(0, None, None), None);
+        assert_eq!(narrowest_retention_days(0, Some(0), Some(0)), None);
     }
 }
 
@@ -7962,6 +8043,7 @@ mod retention_tests {
                 &app.signer,
             );
             Link {
+                retention_days: None,
                 id: id.to_owned(),
                 tenant: String::new(),
                 label: id.to_owned(),
@@ -8375,6 +8457,7 @@ mod retention_tests {
         std::fs::write(&failed_path, b"failed").unwrap();
 
         let held = Link {
+            retention_days: None,
             id: "held".to_owned(),
             tenant: String::new(),
             label: "held".to_owned(),
@@ -9154,6 +9237,7 @@ mod legal_hold_marker_tests {
         );
         app.store
             .insert_link(Link {
+                retention_days: None,
                 id: "held".to_owned(),
                 tenant: String::new(),
                 label: "held".to_owned(),
