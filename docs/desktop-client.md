@@ -878,8 +878,15 @@ machines on 2026-09-04, `cargo +1.97.1 build -p vot-cli --features wire
   desktop can be self-hosted runners for the shells, as VOT already uses
   a self-hosted storage runner. David's call.
 - Releases: a tag builds the CLI for Linux x86_64 and aarch64, macOS
-  universal, and Windows x86_64; the macOS app as a notarized DMG; the
-  Windows app as a signed MSIX. Versions follow the server's.
+  universal, and Windows x86_64 and ARM64; the macOS app as a notarized
+  DMG from `build-core.sh`'s universal XCFramework (both Apple silicon and
+  Intel in one slice); the Windows app as a signed MSIX per architecture,
+  the ARM64 one after `build-core.ps1 -Arch arm64` fills
+  `Generated\arm64` and a `dotnet publish -r win-arm64` run. The app
+  version is the core's `client/core/Cargo.toml` number, stamped by the
+  build scripts into `project.yml`, `app.manifest`, and
+  `Package.appxmanifest`, so bundle and core never disagree; it follows
+  the server's.
 
 ## Open questions David owns
 

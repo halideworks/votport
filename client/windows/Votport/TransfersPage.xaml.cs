@@ -1,5 +1,6 @@
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Windows.Storage.Pickers;
 
 namespace Votport;
 
@@ -59,7 +60,7 @@ public sealed partial class TransfersPage : Page
         if ((sender as FrameworkElement)?.DataContext is TransferItem item) TransferStore.Shared.Cancel(item);
     }
 
-    private void Resume_Click(object sender, RoutedEventArgs e)
+    private async void Resume_Click(object sender, RoutedEventArgs e)
     {
         if ((sender as FrameworkElement)?.DataContext is not TransferItem item) return;
         // The password box sits beside the button in the same panel.
@@ -67,7 +68,20 @@ public sealed partial class TransfersPage : Page
         var password = box is null || box.Password.Length == 0 ? null : box.Password;
         if (item.NeedsPassword && password is null) return;
         if (box is not null) box.Password = "";
-        TransferStore.Shared.Resume(item, password);
+        // The one thing a journalled receive can be asked again: where it
+        // lands. The tray's resume takes no answer and keeps the journalled
+        // folder.
+        string? destination = null;
+        if (item.Kind == TransferItem.Kinds.Receive)
+        {
+            var picker = new FolderPicker();
+            picker.FileTypeFilter.Add("*");
+            WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(App.Window));
+            var picked = await picker.PickSingleFolderAsync();
+            if (picked is null) return;
+            destination = picked.Path;
+        }
+        TransferStore.Shared.Resume(item, password, destination);
     }
 
     private void Reveal_Click(object sender, RoutedEventArgs e)

@@ -31,7 +31,7 @@
               </Grid.ColumnDefinitions>
               <FontIcon Glyph="{x:Bind Icon}" Foreground="{ThemeResource VotMutedBrush}" VerticalAlignment="Top" />
               <StackPanel Grid.Column="1" Spacing="2">
-                <TextBlock Text="{x:Bind Subject}" TextTrimming="CharacterEllipsis" />
+                <TextBlock Text="{x:Bind Subject, Mode=OneWay}" TextTrimming="CharacterEllipsis" />
                 <TextBlock Text="{x:Bind Status, Mode=OneWay}" FontSize="12" Foreground="{ThemeResource VotMutedBrush}" TextWrapping="Wrap" />
                 <TextBlock Text="{x:Bind StartedLabel, Mode=OneWay}" Visibility="{x:Bind NotRunning, Mode=OneWay}" FontSize="12" Foreground="{ThemeResource VotMutedBrush}" />
               </StackPanel>

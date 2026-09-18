@@ -294,6 +294,7 @@ fn resume(args: &[String]) -> Result<(), String> {
     let report = votport_client_core::ffi::resume(
         id.clone(),
         password,
+        None,
         votport_client_core::ffi::Transfer::new(),
         listener,
     )

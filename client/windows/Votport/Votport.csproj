@@ -11,8 +11,11 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <!-- The ship on the web's navy square, rendered by scripts/app-icon.py. -->
     <ApplicationIcon>Assets\tray.ico</ApplicationIcon>
+    <!-- The development build pins win-x64; a release packages win-arm64
+         too, after build-core.ps1 -Arch arm64 fills Generated\arm64. -->
     <Platforms>x64</Platforms>
-    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
     <UseWinUI>true</UseWinUI>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -31,11 +34,20 @@
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.4188" />
   </ItemGroup>
   <ItemGroup>
-    <Content Include="Generated\votport-cli.exe">
+    <Content Include="Generated\votport-cli.exe" Condition="'$(RuntimeIdentifier)' != 'win-arm64'">
       <Link>votport-cli.exe</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
-    <Content Include="Generated\votport_client_core.dll">
+    <Content Include="Generated\votport_client_core.dll" Condition="'$(RuntimeIdentifier)' != 'win-arm64'">
+      <!-- Beside the executable, where DllImport looks. -->
+      <Link>votport_client_core.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Generated\arm64\votport-cli.exe" Condition="'$(RuntimeIdentifier)' == 'win-arm64'">
+      <Link>votport-cli.exe</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Generated\arm64\votport_client_core.dll" Condition="'$(RuntimeIdentifier)' == 'win-arm64'">
       <!-- Beside the executable, where DllImport looks. -->
       <Link>votport_client_core.dll</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>

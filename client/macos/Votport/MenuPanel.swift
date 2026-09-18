@@ -14,8 +14,10 @@ struct MenuPanel: View {
                     Button("Pause") { store.pause(item.id) }
                     Button("Cancel") { store.cancel(item.id) }
                 } else if item.canResume && !item.needsPassword {
+                    // The menu is the no-questions path; the card re-asks a
+                    // receive for its folder.
                     Button(item.interrupted || item.view?.phase == .paused ? "Resume" : "Retry") {
-                        store.resume(item.id, password: nil)
+                        store.resume(item.id, password: nil, destination: nil)
                     }
                 }
             } label: {

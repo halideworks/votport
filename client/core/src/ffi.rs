@@ -319,9 +319,12 @@ pub enum ResumeReport {
 }
 
 /// Runs a journalled transfer again under the same id: the same link and
-/// paths or destination, with `password` supplied afresh. Whatever an
-/// earlier run landed is kept and resumed where the path allows. Blocks
-/// until done, like [`send`] and [`receive`].
+/// paths, with `password` supplied afresh. A receive's `dest` overrides the
+/// journalled folder for this run and is journalled as its folder, so a
+/// retry can land in an empty one after a refusal like an existing file;
+/// `None` runs where the entry points. Whatever an earlier run landed is
+/// kept and resumed where the path allows. Blocks until done, like [`send`]
+/// and [`receive`].
 ///
 /// # Errors
 /// An id the journal does not hold, or anything [`send`] or [`receive`]
@@ -330,6 +333,7 @@ pub enum ResumeReport {
 pub fn resume(
     id: String,
     password: Option<String>,
+    dest: Option<String>,
     transfer: Arc<Transfer>,
     listener: Arc<dyn TransferListener>,
 ) -> std::result::Result<ResumeReport, Error> {
@@ -350,7 +354,8 @@ pub fn resume(
             run_send(entry, password, transfer, listener, false, None).map(ResumeReport::Sent)
         }
         journal::Kind::Receive => {
-            run_receive(entry, password, transfer, listener, true).map(ResumeReport::Received)
+            let dest = dest.map(|dest| journal::absolute(&dest));
+            run_receive(entry, password, transfer, listener, true, dest).map(ResumeReport::Received)
         }
     }
 }
@@ -941,22 +946,30 @@ pub fn receive(
         Some(dest),
         password.is_some(),
     );
-    run_receive(entry, password, transfer, listener, false)
+    run_receive(entry, password, transfer, listener, false, None)
 }
 
 /// Runs a journalled receive; the entry's fate is as for [`run_send`].
+/// `dest_override` repoints the run at another, already-absolute folder and
+/// journals it, so a retry re-asked for the folder lands there and every
+/// later offer follows.
 fn run_receive(
-    entry: journal::Entry,
+    mut entry: journal::Entry,
     password: Option<String>,
     transfer: Arc<Transfer>,
     listener: Arc<dyn TransferListener>,
     resume: bool,
+    dest_override: Option<String>,
 ) -> std::result::Result<ReceiveReport, Error> {
     transfer.set_journal_id(&entry.id);
     let handle = Arc::clone(&transfer);
     let mut forward = Forward::new(journal::Kind::Receive, transfer, listener);
     let result = (|| {
         let link = split_link_as(&entry.link, LinkKind::Delivery)?;
+        if let Some(dest) = dest_override {
+            journal::set_dest(&entry.id, &dest);
+            entry.dest = Some(dest);
+        }
         let dest = entry
             .dest
             .as_deref()
