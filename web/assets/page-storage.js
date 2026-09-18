@@ -47,20 +47,20 @@ async function refresh() {
   const list = $('storage-list'); list.replaceChildren();
   if (!connections.length) {
     const empty = node('div', '', 'empty-state'); empty.append(node('h3', 'Choose where your files go'), node('p', admin ? 'Connect S3 storage or a shared folder for deliveries and receive projects. To connect another VOTPort, open Trade routes.' : 'Ask your administrator to make a connection available to this tenant.'));
-    if (admin) empty.append(button('Add your first storage', '', () => edit()));
+    if (admin) empty.append(button('Add your first storage connection', '', () => edit()));
     list.append(empty);
   }
   for (const connection of connections) {
     const card = node('article', '', 'card');
     const head = node('div', '', 'section-heading'); head.append(node('h3', connection.label), node('span', connection.enabled ? 'Enabled' : 'Disabled', 'badge'));
-    card.append(head, node('p', connection.kind === 'folder' ? 'Shared folder' : connection.kind === 'votport' ? 'Votport destination' : 'S3 storage', 'connection-meta'));
+    card.append(head, node('p', connection.kind === 'folder' ? 'Shared folder' : connection.kind === 'votport' ? 'Votport connection' : 'S3 storage', 'connection-meta'));
     if (connection.kind === 'folder') card.append(node('p', `${connection.directory}${connection.prefix ? `/${connection.prefix}` : ''}`, 'connection-meta'));
-    else if (connection.kind === 'votport') card.append(node('p', connection.endpoint, 'connection-meta'), node('p', connection.trade_route ? 'Paired trade route · Pinned port identity' : 'Receive-link connection · Verified file transfer', 'connection-meta'));
+    else if (connection.kind === 'votport') card.append(node('p', connection.endpoint, 'connection-meta'), node('p', connection.trade_route ? 'Paired trade route · Pinned port identity' : 'Request-link connection · Verified file transfer', 'connection-meta'));
     else card.append(node('p', `s3://${connection.bucket}/${connection.prefix}`, 'connection-meta'), node('p', connection.endpoint, 'connection-meta'), node('p', `${connection.region} · ${connection.kms_key_id ? 'KMS encryption' : 'Bucket default encryption'} · ${connection.credential_source === 'saved' ? 'Saved access key' : 'Server credentials'}`, 'connection-meta'));
     if (connection.kind === 'votport') { const manage = node('a', connection.trade_route ? 'Manage in Trade routes →' : 'Set up a paired trade route →'); manage.href = '/trade-routes'; card.append(manage); }
     if (admin && connection.kind === 'votport' && !connection.trade_route && connection.enabled) {
-      card.append(node('p', 'Move workflows to a paired trade route, then disable this receive-link destination.', 'field-help'), button('Disable receive-link connection', 'ghost', () => guard(async () => {
-        if (!await confirmModal('Disable receive-link connection', 'New deliveries using this destination will stop. Update project destinations to use a paired trade route first. Files already delivered remain in place.', 'Disable connection')) return;
+      card.append(node('p', 'Move projects to a paired trade route, then disable this request-link connection.', 'field-help'), button('Disable request-link connection', 'ghost', () => guard(async () => {
+        if (!await confirmModal('Disable request-link connection', 'New deliveries using this connection will stop. Update projects to use a paired trade route first. Files already delivered remain in place.', 'Disable connection')) return;
         const storage = { ...connection, enabled: false }; delete storage.credential_source; delete storage.trade_route;
         await api('/api/workflows/storage', { method: 'PUT', body: JSON.stringify({ storage }) }); await refresh();
       })));
@@ -145,7 +145,7 @@ $('workflow-save-storage').addEventListener('submit', (event) => {
     saved.credential_source = credentials ? credentials.mode === 'server' ? 'server' : 'saved' : current?.credential_source || 'server';
     $('workflow-save-storage').inert = false;
     markFormSaved($('workflow-save-storage')); edit(saved);
-    notice(`“${saved.label}” saved. Test the saved connection before using it in a workflow.`);
+    notice(`“${saved.label}” saved. Test the saved connection before using it in a project.`);
     await refresh();
   }).finally(() => { submit.disabled = false; $('workflow-save-storage').inert = false; $('storage-new').disabled = false; });
 });

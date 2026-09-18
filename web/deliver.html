@@ -39,13 +39,13 @@
       <div class="bar">
         <nav id="nav" class="nav"></nav>
         <form id="global-search" class="global-search" role="search" autocomplete="off">
-          <input id="global-search-input" type="search" placeholder="Search requests, downloads, files" aria-label="Search" maxlength="200" />
+          <input id="global-search-input" type="search" placeholder="Search requests, deliveries, files" aria-label="Search" maxlength="200" />
           <div id="global-search-results" class="search-results" hidden></div>
         </form>
       </div>
 
       <main id="main-content" tabindex="-1">
-      <div class="page-heading"><div><p class="eyebrow">File delivery</p><h1>Deliver files</h1><p class="page-lead">Choose files, set access, and share one download link.</p></div><a class="text-link" href="/workflows">Use a project workflow →</a></div>
+      <div class="page-heading"><div><p class="eyebrow">File delivery</p><h1>Deliver files</h1><p class="page-lead">Choose files, set access, and share one delivery link.</p></div><a class="text-link" href="/workflows">Use a project →</a></div>
 
       <dl id="status-strip" class="status-strip" aria-label="Status" hidden>
         <div class="stat">
@@ -111,7 +111,7 @@
         <h2 id="delivery-options-title" class="section-title"><span class="step-number">2</span> Set access and share</h2>
         <p class="muted">Only the files you select will be included.</p>
         <form data-unsaved data-draft id="deliver-form">
-          <fieldset id="deliver-fields" aria-label="Download link settings">
+          <fieldset id="deliver-fields" aria-label="Delivery link settings">
           <div class="grid">
             <label>Name
               <input data-draft-field id="deliver-label" required maxlength="200" placeholder="Project files" aria-describedby="deliver-error" />
@@ -129,7 +129,7 @@
           </div>
           </details><button type="button" class="hint-button" aria-label="Help about download access" data-hint="A password protects the link. A maximum of one request set limits each file to one request. Interrupted file downloads can resume without using another request. Share the password separately from the link.">?</button></div>
           <div class="form-advanced-with-hint"><details class="form-advanced"><summary>Notifications</summary><div id="deliver-notifications"></div></details><button type="button" class="hint-button" aria-label="Help about download notifications" data-hint="First file requested means a recipient began fetching files. Every file requested is a separate event; neither is the recipient’s explicit acceptance.">?</button></div>
-          <button type="submit" id="deliver-submit">Create download link</button>
+          <button type="submit" id="deliver-submit">Create delivery link</button>
           </fieldset>
         </form>
         <p id="deliver-progress" class="muted" role="status" tabindex="-1" hidden></p>
@@ -138,16 +138,16 @@
 
       </div>
       <div id="outbound-result" class="card ok" hidden aria-live="polite">
-        <h2>Download link ready</h2>
-        <label>Private download address
+        <h2>Delivery link ready</h2>
+        <label>Private delivery link
           <input id="outbound-url" class="mono" type="text" readonly aria-describedby="outbound-note" />
         </label>
-        <button id="outbound-copy" type="button">Copy address</button>
-        <p id="outbound-note" class="muted">You can copy this link again from Download links on the Deliver page.</p>
+        <button id="outbound-copy" type="button">Copy link</button>
+        <p id="outbound-note" class="muted">You can copy this link again from Delivery links on the Deliver page.</p>
       </div>
 
-      <h2>Download links</h2>
-      <p id="outbound-grants-count" class="muted" role="status" aria-live="polite">Loading issued downloads…</p>
+      <h2>Delivery links</h2>
+      <p id="outbound-grants-count" class="muted" role="status" aria-live="polite">Loading deliveries…</p>
       <p class="muted">Request sets count each file request. A set is complete when every file has been requested; signed verification evidence is separate.</p>
       <p id="outbound-grants-status" class="muted" role="status" tabindex="-1"></p>
       <div id="outbound-grants"></div>

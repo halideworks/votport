@@ -476,7 +476,7 @@ function sizeLimitMessage(total) {
     return `Selected files total ${formatBytes(total)} exceeds this link's ${formatBytes(maxBytes)} limit. Clear the selection and choose fewer files.`;
   }
   if (picked.size > maxEntries) {
-    return `${picked.size} files selected; a drop holds up to ${maxEntries.toLocaleString()} files. Clear the selection and send it in parts.`;
+    return `${picked.size} files selected; a request holds up to ${maxEntries.toLocaleString()} files. Clear the selection and send it in parts.`;
   }
   return null;
 }
@@ -1412,7 +1412,7 @@ function showResumeNote() {
   }
   $('resume-detail').textContent = saved.path
     ? `${formatBytes(saved.size)} of "${saved.path}" is held on the server.`
-    : `A ${saved.files === 1 ? 'file' : `${saved.files}-file drop`} of ${formatBytes(saved.size)} is held on the server.`;
+    : `A ${saved.files === 1 ? 'file' : `${saved.files}-file request`} of ${formatBytes(saved.size)} is held on the server.`;
   note.hidden = false;
 }
 

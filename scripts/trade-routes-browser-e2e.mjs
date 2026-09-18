@@ -122,7 +122,7 @@ try {
   await receiving.goto(`${peer}/trade-routes?receive=${olderRequest.id}#receive`);
   await receiving.waitForFunction((id) => document.querySelector('#trade-request').value === id, olderRequest.id);
   assert.equal(await receiving.locator('#trade-request').inputValue(), olderRequest.id, 'Returning to an older request uses its exact tenant-scoped ID');
-  await receiving.getByRole('link', { name: 'Create a receive request and return here →', exact: true }).click();
+  await receiving.getByRole('link', { name: 'Create a request and return here →', exact: true }).click();
   await receiving.locator('#trade-return-guide').waitFor();
   assert.ok(await receiving.locator('#trade-return-guide').evaluate((node) => node === document.activeElement), 'Route handoff focuses its setup guide');
   assert.ok(await receiving.locator('#create-password').isHidden());
@@ -289,7 +289,7 @@ try {
   await new Promise((resolve) => setTimeout(resolve, 1100));
   for (let index = 0; index < 50; index++) await destination('admin/links', { label: `${id}-newer-${index}` });
   assert.ok(!(await destination('admin/links')).links.some((request) => request.id === receiveId), 'The endpoint request is outside the first Receive page');
-  await receiving.locator(`#endpoint-${receiveId}`).getByRole('link', { name: 'Receiving folder, limits and workflow →', exact: true }).click();
+  await receiving.locator(`#endpoint-${receiveId}`).getByRole('link', { name: 'Receiving folder, limits and project →', exact: true }).click();
   await receiving.locator(`#link-${receiveId}`).waitFor({ timeout: 5000 });
   assert.equal(new URL(receiving.url()).searchParams.get('search'), receiveId);
   assert.deepEqual(errors, []); console.log('Trade route browser acceptance passed: five clipboard actions, preview, independent keys, approval, rotation, transfer, metadata filtering, downstream hold, revocation, responsive UI.');

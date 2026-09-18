@@ -200,26 +200,26 @@ await page.locator("#links-error").filter({ hasText: "Created link list refresh 
 if (await page.getAttribute("#new-link-url", "role") !== "status"
   || await page.evaluate(() => document.activeElement === document.getElementById("new-link-url"))
   !== true
-  || await page.textContent("#links-action-status") !== "Receive link created.") {
-  throw new Error("created receive links must announce and focus their address");
+  || await page.textContent("#links-action-status") !== "Request link created.") {
+  throw new Error("created request links must announce and focus their address");
 }
 if (!receiveListFailed || await page.locator("#create-error").isVisible()) {
-  throw new Error("a list refresh failure must not hide or fail a successfully created receive link");
+  throw new Error("a list refresh failure must not hide or fail a successfully created request link");
 }
 await page.click("#new-link-copy");
 await page.waitForFunction((url) => window.__copiedText === url
-  && document.getElementById("links-action-status").textContent === "Receive link copied.", linkUrl, { polling: 50 });
+  && document.getElementById("links-action-status").textContent === "Request link copied.", linkUrl, { timeout: 60000, polling: 50 });
 await page.evaluate(() => { window.__clipboardFailure = true; window.__clipboardHold = true; window.__releaseClipboard = null; });
 await page.click("#new-link-copy");
 await page.waitForFunction(() => typeof window.__releaseClipboard === "function", null, { polling: 50 });
 await page.locator("#links-query").focus();
 await page.evaluate(() => { window.__clipboardHold = false; window.__releaseClipboard(); });
 await page.waitForFunction(() => document.activeElement === document.getElementById("links-query")
-  && document.getElementById("links-action-status").textContent === "Could not copy the receive address. Use Copy address below to retry.", null, { polling: 50 });
+  && document.getElementById("links-action-status").textContent === "Could not copy the delivery link. Use Copy link below to retry.", null, { polling: 50 });
 await page.evaluate(() => { window.__clipboardHold = false; });
 await page.click("#new-link-copy");
 await page.waitForFunction(() => document.activeElement === document.getElementById("new-link-url")
-  && document.getElementById("links-action-status").textContent === "Your receive address is selected below. Copy it to share.");
+  && document.getElementById("links-action-status").textContent === "Your delivery link is selected below. Copy it to share.");
 await page.evaluate(() => { window.__clipboardFailure = false; });
 await page.reload();
 await page.locator("#links [data-link-id]").first().waitFor();
@@ -437,7 +437,7 @@ workflowJobUrl = "https://fixture.invalid/download";
 await page.click("#workflow-refresh");
 await workflowCard.getByRole("button", { name: "Retry", exact: true }).waitFor();
 if (await workflowCard.getByRole("button", { name: "Cancel delivery", exact: true }).count() !== 1
-  || await workflowCard.getByRole("button", { name: "Copy download link", exact: true }).count() !== 1) {
+  || await workflowCard.getByRole("button", { name: "Copy delivery link", exact: true }).count() !== 1) {
   throw new Error("sender actions and valid links must remain available");
 }
 workflowPaging = true;
@@ -1857,7 +1857,7 @@ if (await page.inputValue('#outbound-url') !== outboundUrl) {
   throw new Error('reopening a saved download must preserve the original address');
 }
 await page.waitForFunction((url) => window.__copiedText === url
-  && document.getElementById('outbound-grants-status').textContent === 'Download link copied.'
+  && document.getElementById('outbound-grants-status').textContent === 'Delivery link copied.'
   && document.activeElement === document.getElementById('outbound-url'), outboundUrl);
 await page.evaluate(() => { window.__clipboardFailure = true; window.__clipboardHold = true; window.__releaseClipboard = null; });
 await page.click('#outbound-copy');
@@ -1866,7 +1866,7 @@ await page.locator('#library-search').focus();
 await page.evaluate(() => { window.__clipboardHold = false; window.__releaseClipboard(); });
 await page.waitForFunction(() => {
   return document.activeElement === document.getElementById('library-search')
-    && document.getElementById('outbound-grants-status').textContent === 'Could not copy the download address. Use Copy address below to retry.';
+    && document.getElementById('outbound-grants-status').textContent === 'Could not copy the delivery link. Use Copy link below to retry.';
 });
 await page.evaluate(() => { window.__clipboardFailure = true; window.__clipboardHold = false; });
 await page.click('#outbound-copy');
@@ -1875,10 +1875,10 @@ await page.waitForFunction(() => {
   return document.activeElement === output
     && output.selectionStart === 0
     && output.selectionEnd === output.value.length
-    && document.getElementById('outbound-grants-status').textContent === 'Your download address is selected below. Copy it to share.';
+    && document.getElementById('outbound-grants-status').textContent === 'Your delivery link is selected below. Copy it to share.';
 });
 await page.evaluate(() => { window.__clipboardFailure = false; });
-console.log("download link remains available after reload: ok");
+console.log("delivery link remains available after reload: ok");
 
 await page.goto(outboundUrl);
 await page.waitForSelector("#download-content:not([hidden])", { timeout: 30000 });

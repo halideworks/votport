@@ -4416,7 +4416,7 @@ async fn audit_download_request(
                 {
                     return Err(ApiError::new(
                         StatusCode::UNAUTHORIZED,
-                        "outbound grant password required",
+                        "delivery password required",
                     ));
                 }
                 workflows::require_recipient_for_job(
@@ -4573,7 +4573,7 @@ pub(crate) fn require_grant_access(
     } else {
         Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
-            "outbound grant password required",
+            "delivery password required",
         ))
     }
 }
@@ -9038,10 +9038,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-            assert_eq!(
-                body(response).await["error"],
-                "outbound grant password required"
-            );
+            assert_eq!(body(response).await["error"], "delivery password required");
         }
         let response = router(app.clone())
             .oneshot(challenge_request(&grant_cookie))

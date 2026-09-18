@@ -1,6 +1,6 @@
 import { isFormDirty, markFormSaved } from '/assets/form-drafts.js';
 import { notificationEditor, notificationDetails, uploadEvents, workflowEvents } from '/assets/notifications.js';
-// votport receive page: issue transfer requests and manage received files.
+// votport receive page: issue request links and manage received files.
 // VOTPORT PROPRIETARY LICENSE.
 
 import { appendObjectCard, fieldError } from '/assets/object-card.js';
@@ -40,11 +40,11 @@ let receiveProjects = [], receiveAdministrator = false, createWorkflow = null;
 function workflowEditor(current = null) {
   const element = document.createElement('fieldset'), legend = document.createElement('legend'); legend.textContent = 'After files arrive'; element.append(legend);
   const label = document.createElement('label'); label.textContent = 'Reception project';
-  const select = document.createElement('select'); select.add(new window.Option('Keep files here; no workflow', ''));
+  const select = document.createElement('select'); select.add(new window.Option('Keep files here; no project', ''));
   for (const project of receiveProjects) select.add(new window.Option(project.label, project.id));
   if (current?.project_id && !receiveProjects.some((project) => project.id === current.project_id)) select.add(new window.Option(`${current.project_id} (unavailable)`, current.project_id));
   select.value = current?.project_id || ''; label.append(select); element.append(label);
-  const help = document.createElement('p'); help.className = 'field-help'; help.textContent = 'Completed uploads run this project’s checks, approvals and destination copies. Incomplete uploads do not start a workflow.';
+  const help = document.createElement('p'); help.className = 'field-help'; help.textContent = 'Completed uploads run this project’s checks, approvals and destination copies. Incomplete uploads do not start a delivery.';
   const fields = document.createElement('div'); fields.className = 'grid';
   const notificationHost = document.createElement('div'); let workflowNotifications;
   const manage = document.createElement('a'); manage.href = '/workflows#projects'; manage.className = 'text-link'; manage.textContent = 'Manage reception projects →';
@@ -100,7 +100,7 @@ async function issueReceivedGrant(link, upload, fileIndex, file, control) {
   if (!url) throw new Error('server did not return a download URL');
   const focusResult = control && (document.activeElement === control || document.activeElement === document.body);
   showGrantResult(url, response.grant?.has_password, focusResult);
-  announce('links-action-status', 'Download link ready.');
+  announce('links-action-status', 'Delivery link ready.');
 }
 
 // The transfer timeline: summary figures and one line per log event, in
@@ -544,7 +544,7 @@ function renderStatus(status) {
   receivingKey = key;
 }
 
-// The receive-link cap is quoted decimally, like the create form and the
+// The request-link cap is quoted decimally, like the create form and the
 // desktops; formatBytes stays binary for the file sizes beside it.
 function formatLimit(bytes) {
   const gb = bytes / 1000 ** 3;
@@ -640,7 +640,7 @@ function renderLink(link) {
     const jobs = document.createElement('a'); jobs.href = '/workflows#jobs'; jobs.className = 'text-link'; jobs.textContent = 'Follow workflow deliveries →'; card.append(route, jobs);
   }
   if (receiveAdministrator) {
-    const details = document.createElement('details'), summary = document.createElement('summary'); summary.textContent = 'Reception workflow'; details.className = 'reception-workflow'; details.setAttribute('data-unsaved', '');
+    const details = document.createElement('details'), summary = document.createElement('summary'); summary.textContent = 'Reception project'; details.className = 'reception-workflow'; details.setAttribute('data-unsaved', '');
     const editor = workflowEditor(link.workflow), result = document.createElement('p'); result.setAttribute('role', 'status'); result.className = 'muted';
     editor.element.addEventListener('input', () => { details.dataset.dirty = 'true'; });
     const save = button('Save reception workflow', 'ghost', async () => {
@@ -681,7 +681,7 @@ function renderLink(link) {
   const actions = document.createElement('div');
   actions.className = 'actions';
   const copy = button('Copy', 'tiny', () => copyToClipboard(copy, link.url));
-  copy.setAttribute('aria-label', `Copy receive link: ${link.label}`);
+  copy.setAttribute('aria-label', `Copy request link: ${link.label}`);
   const qrButton = button('QR', 'tiny ghost', async () => {
     qr.hidden = !qr.hidden;
     qrButton.setAttribute('aria-label', `${qr.hidden ? 'Show' : 'Hide'} QR code: ${link.label}`);
@@ -713,7 +713,7 @@ function renderLink(link) {
         },
       });
     });
-    activeButton.setAttribute('aria-label', `${link.active ? 'Deactivate' : 'Reactivate'} receive link: ${link.label}`);
+    activeButton.setAttribute('aria-label', `${link.active ? 'Deactivate' : 'Reactivate'} request link: ${link.label}`);
     const holdButton = button(link.legal_hold ? 'Release hold' : 'Legal hold', 'tiny ghost', async (control) => {
       if (pending) return;
       if (!link.legal_hold) {
@@ -759,7 +759,7 @@ function renderLink(link) {
         await refreshLinks();
         announce('links-action-status', `Request "${link.label}" deleted.`);
     });
-    deleteButton.setAttribute('aria-label', `Delete receive link: ${link.label}`);
+    deleteButton.setAttribute('aria-label', `Delete request link: ${link.label}`);
     actions.append(deleteButton);
   }
   // Inside an undo window only Copy stays live; disabled buttons leave the
@@ -899,7 +899,7 @@ async function refreshLinksInner({ append, fromPoll }) {
   // A re-render (the status poll, an action) keeps the deep-linked card open.
   revealHash({ scroll: false });
   if (focus) {
-    if (!focus.isConnected) announce('links-action-status', 'Receive requests updated.');
+    if (!focus.isConnected) announce('links-action-status', 'Requests updated.');
     (focus.isConnected ? focus : $('links-action-status')).focus({ preventScroll: true });
   }
 }
@@ -951,17 +951,17 @@ $('create-form').addEventListener('submit', async (event) => {
       ? 'Send the access password by a separate channel.'
       : '';
     created = true;
-    announce('links-action-status', 'Receive link created.');
+    announce('links-action-status', 'Request link created.');
     $('new-link-copy').onclick = async () => {
       try {
         await copyToClipboard($('new-link-copy'), link.url);
-        announce('links-action-status', 'Receive link copied.');
+        announce('links-action-status', 'Request link copied.');
       } catch {
         const output = $('new-link-url');
         if ($('new-link-copy') === document.activeElement || output === document.activeElement || document.activeElement === document.body) {
           selectText(output);
-          announce('links-action-status', 'Your receive address is selected below. Copy it to share.');
-        } else announce('links-action-status', 'Could not copy the receive address. Use Copy address below to retry.');
+          announce('links-action-status', 'Your delivery link is selected below. Copy it to share.');
+        } else announce('links-action-status', 'Could not copy the delivery link. Use Copy link below to retry.');
       }
     };
     refreshLinksSafe();

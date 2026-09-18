@@ -117,7 +117,7 @@ try {
     await page.goto(`${base}/workflows`); await page.waitForLoadState('networkidle');
     await page.locator('#nav .nav-more > summary').click();
     await page.locator('.nav-panel').evaluate(async (panel) => { await Promise.all(panel.getAnimations().map((animation) => animation.finished)); });
-    assert.ok(await page.getByRole('button', { name: 'Help about workflows', exact: true }).evaluate((hint) => {
+    assert.ok(await page.getByRole('button', { name: 'Help about deliveries', exact: true }).evaluate((hint) => {
       const rect = hint.getBoundingClientRect();
       return !!document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)?.closest('.nav-panel');
     }), `${reducedMotion}: navigation covers the page help button`);
@@ -128,7 +128,7 @@ try {
   const workflowLink = page.locator('#nav a[href="/workflows"]');
   await workflowLink.focus(); await page.getByRole('tooltip').filter({ hasText: 'Prepare deliveries with reusable checks' }).waitFor();
   await page.keyboard.press('Enter'); await page.waitForURL(`${base}/workflows`);
-  await page.getByRole('button', { name: 'Help about workflows', exact: true }).click();
+  await page.getByRole('button', { name: 'Help about deliveries', exact: true }).click();
   await page.getByRole('tooltip').filter({ hasText: 'A project holds reusable rules.' }).waitFor();
   await page.keyboard.press('Escape');
   await page.locator('#nav a[href="/trade-routes"]').hover();
@@ -157,7 +157,7 @@ try {
     await page.keyboard.press('Escape'); assert.equal(await menu.getAttribute('open'), null);
   }
   await page.setViewportSize({ width: 390, height: 1000 });
-  const hint = page.getByRole('button', { name: 'Help about receive links', exact: true });
+  const hint = page.getByRole('button', { name: 'Help about requests', exact: true });
   await hint.focus(); await page.locator('.field-hint:popover-open').waitFor();
   await page.keyboard.press('Escape'); assert.equal(await page.locator('.field-hint:popover-open').count(), 0);
   await hint.click(); await page.locator('.field-hint:popover-open').waitFor(); await page.keyboard.press('Escape');
@@ -174,19 +174,19 @@ try {
   await page.evaluate(() => document.querySelector('#nav a[href="/workflows"]').click()); await leaving;
   assert.ok(page.url().endsWith('/receive')); dismiss = false;
   await page.route('**/api/admin/links', (route) => route.request().method() === 'POST' ? route.fulfill({ status: 422, json: { error: 'Save refused fixture' } }) : route.continue(), { times: 1 });
-  await page.getByRole('button', { name: 'Create receive link', exact: true }).click();
+  await page.getByRole('button', { name: 'Create request link', exact: true }).click();
   await page.getByText('Save refused fixture', { exact: true }).waitFor();
   assert.equal(await page.inputValue('#create-label'), id);
-  await page.getByRole('button', { name: 'Create receive link', exact: true }).click(); await page.locator('#new-link').waitFor();
+  await page.getByRole('button', { name: 'Create request link', exact: true }).click(); await page.locator('#new-link').waitFor();
   const createdLink = (await api('admin/links')).links.find((link) => link.label === id);
   assert.ok(createdLink);
   const createdCard = page.locator(`#link-${createdLink.id}`);
   await createdCard.waitFor();
-  const copyLink = createdCard.getByRole('button', { name: /^Copy receive link: / });
+  const copyLink = createdCard.getByRole('button', { name: /^Copy request link: / });
   assert.equal(await copyLink.count(), 1);
   await copyLink.click();
   await createdCard.getByRole('button', { name: 'Copied', exact: true }).waitFor();
-  await createdCard.getByRole('button', { name: /^Copy receive link: / }).waitFor();
+  await createdCard.getByRole('button', { name: /^Copy request link: / }).waitFor();
   assert.equal(await createdCard.getByRole('button', { name: /^Show QR code: / }).count(), 1);
   const before = dialogs.length; await page.goto(`${base}/workflows`); assert.equal(dialogs.length, before, 'Successful save clears the leave warning');
 
@@ -216,7 +216,7 @@ try {
   await page.fill('#workflow-query', id); await page.getByRole('button', { name: 'Filter deliveries', exact: true }).click(); await requested;
   assert.ok(await page.locator('#workflow-more').isDisabled()); assert.ok(await page.locator('#workflow-jobs').evaluate((node) => node.inert));
   await page.getByRole('link', { name: 'Projects', exact: true }).click();
-  await page.getByRole('link', { name: 'Deliveries', exact: true }).click();
+  await page.getByRole('link', { name: 'Delivery jobs', exact: true }).click();
   await page.locator(`#job-${issued.job.id}`).waitFor(); const late = page.waitForResponse((response) => response.url().includes('/api/workflows/jobs?')); release(); await late;
   await page.waitForFunction(() => !document.querySelector('#workflow-more').disabled);
   assert.equal(await page.locator('.job-card').count(), 1);
@@ -227,7 +227,7 @@ try {
   await page.locator('#workflow-project-list article').filter({ has: page.getByRole('heading', { name: id, exact: true }) }).getByRole('button', { name: 'Edit project', exact: true }).click();
   await page.locator('#workflow-save-project button[type=submit]').click();
   await page.locator('#confirm-ok').click(); await page.locator('#workflow-save-project').waitFor({ state: 'hidden' });
-  await page.getByRole('link', { name: 'Deliveries', exact: true }).click();
+  await page.getByRole('link', { name: 'Delivery jobs', exact: true }).click();
   await jobEditor.locator('.notification-mode').waitFor();
   assert.equal(await jobEditor.locator('.notification-mode').inputValue(), 'off', 'Project save keeps the unsaved delivery notification editor');
 

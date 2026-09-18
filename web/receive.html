@@ -76,8 +76,8 @@
       <p id="status-cache-note" class="status-cache-note muted" role="status" aria-live="polite" hidden></p>
 
       <form data-unsaved data-draft id="create-form" class="card">
-        <div id="trade-return-guide" class="info-banner" hidden><strong>Set up a receiving route · Choose storage and workflow</strong><p>Give this request a name, choose where files go and set any limits or processing steps. We will return you to Trade routes to set permissions and invite the sending port.</p><a class="text-link" href="/trade-routes#receive">Back to route setup</a></div>
-        <div class="section-heading"><h2>New transfer request</h2><button type="button" class="hint-button" aria-label="Help about receive links" data-hint="Create a private link for someone to ship files to this port. They can upload in their browser without an account.">?</button></div>
+        <div id="trade-return-guide" class="info-banner" hidden><strong>Set up a receiving route · Choose storage and a project</strong><p>Give this request a name, choose where files go and set any limits or processing steps. We will return you to Trade routes to set permissions and invite the sending port.</p><a class="text-link" href="/trade-routes#receive">Back to route setup</a></div>
+        <div class="section-heading"><h2>New request</h2><button type="button" class="hint-button" aria-label="Help about requests" data-hint="Create a private request link for someone to ship files to this port. They can upload in their browser without an account.">?</button></div>
         <div class="grid">
           <label>Name
             <input data-draft-field id="create-label" placeholder="Files from Alex" required maxlength="200" aria-describedby="create-error" />
@@ -100,21 +100,21 @@
             <input data-draft-field id="create-retention" type="number" min="1" max="3650" placeholder="platform default" />
           </label>
         </div>
-        </details><button type="button" class="hint-button" aria-label="Help about receive access and limits" data-hint="The password protects this receive link. Expiry closes it to new uploads. The transfer limit bounds one upload session; server and tenant limits still apply.">?</button></div>
+        </details><button type="button" class="hint-button" aria-label="Help about receive access and limits" data-hint="The password protects this request link. Expiry closes it to new uploads. The transfer limit bounds one upload session; server and tenant limits still apply.">?</button></div>
         <div id="create-workflow"></div>
         <div class="form-advanced-with-hint"><details id="create-notification-options" class="form-advanced" open><summary>Notifications (optional)</summary><div id="create-notifications"></div></details><button type="button" class="hint-button" aria-label="Help about receive notifications" data-hint="Use tenant defaults or choose destinations and events for this request. A destination label helps you recognize it; the saved service connection determines where messages arrive.">?</button></div>
-        <button type="submit">Create receive link</button>
+        <button type="submit">Create request link</button>
         <p class="error" id="create-error" role="alert" hidden></p>
       </form>
 
       <div id="new-link" class="card ok" hidden>
-        <h2>Receive link ready</h2>
+        <h2>Request link ready</h2>
         <p class="mono" id="new-link-url" role="status" tabindex="-1"></p>
         <button id="new-link-copy" type="button">Copy address</button>
         <span id="new-link-note" class="muted"></span>
       </div>
 
-      <h2>Receive requests</h2>
+      <h2>Requests</h2>
       <form id="links-filter" class="card">
         <div class="grid">
           <label>Search requests

@@ -63,7 +63,7 @@ try {
   await page.goto(`${base}/deliver`);
   await page.locator('#nav a[aria-current=page]').waitFor({ state: 'attached' });
   await layout('deliver');
-  await page.getByRole('link', { name: 'Workflows', exact: true }).click();
+  await page.getByRole('link', { name: 'Deliveries', exact: true }).click();
   await page.getByRole('link', { name: 'Projects', exact: true }).click();
   await page.click('#workflow-new-project');
   await page.fill('#wp-label', 'Studio masters');
@@ -120,7 +120,7 @@ try {
   });
   await page.locator('#workflow-create button[type=submit]').click();
   await page.locator(`#job-${issued.job.id}`).getByText('Preparing files', { exact: true }).waitFor();
-  await page.locator(`#job-${issued.job.id}`).getByRole('button', { name: 'Copy download link', exact: true }).waitFor({ timeout: 20000 });
+  await page.locator(`#job-${issued.job.id}`).getByRole('button', { name: 'Copy delivery link', exact: true }).waitFor({ timeout: 20000 });
   assert.ok(jobReads >= 2, 'Preparation should refresh automatically even when the API returns a next cursor');
   assert.equal((await api('workflows/jobs?limit=100')).jobs.filter((entry) => entry.job.project.id === id).length, 1, 'Retry recovers the committed job');
   await page.unroute('**/api/workflows/jobs?*');
@@ -129,8 +129,8 @@ try {
   await page.fill('#wp-label', 'Studio masters updated'); await saveProject();
   await page.getByRole('link', { name: 'Deliveries', exact: true }).click();
   await page.locator(`#job-${issued.job.id}`).waitFor();
-  await page.locator(`#job-${issued.job.id}`).getByRole('button', { name: 'Copy download link', exact: true }).waitFor({ state: 'hidden' });
-  assert.equal(await page.locator(`#job-${issued.job.id}`).getByRole('button', { name: 'Copy download link', exact: true }).count(), 0, 'Changed project rules must remove the cached link');
+  await page.locator(`#job-${issued.job.id}`).getByRole('button', { name: 'Copy delivery link', exact: true }).waitFor({ state: 'hidden' });
+  assert.equal(await page.locator(`#job-${issued.job.id}`).getByRole('button', { name: 'Copy delivery link', exact: true }).count(), 0, 'Changed project rules must remove the cached link');
   await page.route('**/api/workflows/jobs?*', async (route) => {
     const response = await route.fetch(), body = await response.json();
     body.jobs = body.jobs.filter(({ job }) => job.id !== issued.job.id);
@@ -380,7 +380,7 @@ try {
   await api('workflows/storage', { storage: { ...disabled, id: `${storageId}_peer`, revision: 0, kind: 'votport', label: `Connected studio ${id}`, directory: '', prefix: '', endpoint: base, bucket: '', region: '', enabled: true }, credentials: { mode: 'votport', request_url: request.link.url } }, 'PUT');
   await page.reload();
   const peerCard = page.locator('#storage-list article').filter({ has: page.getByRole('heading', { name: `Connected studio ${id}`, exact: true }) });
-  await peerCard.getByRole('button', { name: 'Disable receive-link connection', exact: true }).click(); await page.click('#confirm-ok');
+  await peerCard.getByRole('button', { name: 'Disable request-link connection', exact: true }).click(); await page.click('#confirm-ok');
   await peerCard.getByText('Disabled', { exact: true }).waitFor();
   assert.equal((await api('workflows/storage')).storage.find((item) => item.id === `${storageId}_peer`).enabled, false);
   const reception = await api('workflows/projects', { ...project, id: `${storageId}_reception`, directory: `${id}-incoming`, revision: 0, label: `Reception ${id}`, receive: true, release: 'local', destinations: [`${storageId}_folder`], recipients: [], require_approval: false, sequence: null, media: null, scan_required: false }, 'PUT');
@@ -396,12 +396,12 @@ try {
   const requests = await api('admin/links');
   const incoming = requests.links.find((link) => link.label === `Incoming ${id}`);
   assert.equal(incoming.workflow.project_id, reception.id);
-  await page.locator(`#link-${incoming.id}`).getByText('Reception workflow', { exact: true }).click();
+  await page.locator(`#link-${incoming.id}`).getByText('Reception project', { exact: true }).click();
   await layout('existing-reception-workflow');
 
   await page.goto(`${base}/receive?search=${incoming.id}#link-${incoming.id}`);
   const actionCard = page.locator(`#link-${incoming.id}`);
-  await actionCard.getByRole('button', { name: /^Deactivate receive link: / }).focus();
+  await actionCard.getByRole('button', { name: /^Deactivate request link: / }).focus();
   await page.keyboard.press('Enter');
   const undo = page.locator('#toast-stack').getByRole('button', { name: /^Undo / });
   await undo.waitFor();
@@ -413,10 +413,10 @@ try {
   assert.ok(await page.locator('#links-action-status').evaluate((node) => node === document.activeElement), 'Undo returns focus to the request status');
   await page.route('**/api/admin/links?*', async (route) => {
     const response = await route.fetch();
-    await actionCard.getByRole('button', { name: /^Copy receive link: / }).focus();
+    await actionCard.getByRole('button', { name: /^Copy request link: / }).focus();
     await route.fulfill({ response });
   }, { times: 1 });
-  await actionCard.getByRole('button', { name: /^Deactivate receive link: / }).focus();
+  await actionCard.getByRole('button', { name: /^Deactivate request link: / }).focus();
   await page.keyboard.press('Enter'); await undo.waitFor();
   assert.ok(await page.locator('#links-action-status').evaluate((node) => node === document.activeElement), 'Undo must not steal the fallback of a newly focused row control');
   await undo.focus(); await page.keyboard.press('Enter'); await undo.waitFor({ state: 'detached' });
@@ -427,7 +427,7 @@ try {
       if (moveFocus) await page.locator('#links-query').focus();
       await route.fulfill({ status: 503, json: { error: 'Lost action response fixture' } });
     }, { times: 1 });
-    await actionCard.getByRole('button', { name: /^Deactivate receive link: / }).focus();
+    await actionCard.getByRole('button', { name: /^Deactivate request link: / }).focus();
     await page.keyboard.press('Enter'); await undo.waitFor();
     await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide')));
     await page.getByRole('dialog', { name: 'Something went wrong', exact: true }).waitFor();
@@ -456,7 +456,7 @@ try {
     await page.locator('#links-query').focus();
     await route.fulfill({ response });
   }, { times: 1 });
-  await actionCard.getByRole('button', { name: /^Deactivate receive link: / }).focus();
+  await actionCard.getByRole('button', { name: /^Deactivate request link: / }).focus();
   await page.keyboard.press('Enter'); await undo.waitFor();
   assert.ok(await page.locator('#links-query').evaluate((node) => node === document.activeElement), 'A delayed refresh must not steal newly moved focus');
   await undo.hover(); await undo.focus(); await page.locator('#links-query').focus();
@@ -674,7 +674,7 @@ try {
   releaseOld(); await page.waitForLoadState('networkidle');
   assert.equal(await editor.locator('input[data-metadata]').inputValue(), 'Preserved by manual refresh', 'An older refresh cannot roll back a completed save');
   await editor.locator('input[data-metadata]').fill('Discard with request');
-  await card.getByRole('button', { name: /^Delete receive link: / }).click();
+  await card.getByRole('button', { name: /^Delete request link: / }).click();
   const extraDialogs = []; const onExtra = (dialog) => extraDialogs.push(dialog.message()); page.on('dialog', onExtra);
   await page.locator('#confirm-ok').click(); await card.waitFor({ state: 'detached' }); await page.waitForLoadState('networkidle');
   page.off('dialog', onExtra); assert.deepEqual(extraDialogs, [], 'Confirmed deletion removes the request draft without another discard prompt');
@@ -829,7 +829,7 @@ try {
   await page.goto(`${base}/workflows`);
   const heldCard = page.locator(`#job-${held.job.id}`);
   await heldCard.getByText('Held after restore', { exact: true }).waitFor();
-  assert.equal(await heldCard.getByRole('button', { name: /^(Retry|Approve delivery|Cancel delivery|Copy download link)$/ }).count(), 0);
+  assert.equal(await heldCard.getByRole('button', { name: /^(Retry|Approve delivery|Cancel delivery|Copy delivery link)$/ }).count(), 0);
   assert.equal(await heldCard.getByText(/Revocation awaiting/).count(), 0);
   assert.ok(await heldCard.getByText(/Create a new job to deliver/).isVisible());
   await page.selectOption('#workflow-filter-state', 'suspended');
