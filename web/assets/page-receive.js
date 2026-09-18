@@ -4,7 +4,7 @@ import { notificationEditor, notificationDetails, uploadEvents, workflowEvents }
 // VOTPORT PROPRIETARY LICENSE.
 
 import { appendObjectCard, fieldError } from '/assets/object-card.js';
-import { narrate, summarize } from '/assets/timeline.js';
+import { narrate, outcomeWords, summarize } from '/assets/timeline.js';
 import { startStatusPoll } from '/assets/status-strip.js';
 import {
   alertModal,
@@ -551,6 +551,12 @@ function formatLimit(bytes) {
   return `${gb >= 100 || Number.isInteger(gb) ? Math.round(gb) : gb.toFixed(1)} GB`;
 }
 
+// One mapped table per class: the badge words a request link can show, also
+// the labels the status filter offers (audit item 446). "Closed" is the
+// filter's word for a link an administrator closed, so a closed card says
+// "Closed", never "off".
+const linkStatusNames = { open: 'Open', closed: 'Closed', expired: 'Expired' };
+
 function renderLink(link) {
   // A change inside its undo window shows as if the server had it.
   const pending = pendingLinks.get(link.id);
@@ -569,7 +575,7 @@ function renderLink(link) {
   title.textContent = link.label;
   const badge = document.createElement('span');
   badge.className = `badge ${link.usable ? 'on' : 'off'}`;
-  badge.textContent = link.usable ? 'open' : link.active ? 'expired' : 'off';
+  badge.textContent = linkStatusNames[link.usable ? 'open' : link.active ? 'expired' : 'closed'];
   head.append(title, badge);
   if (link.has_password) {
     const lock = document.createElement('span');
@@ -793,7 +799,7 @@ function renderLink(link) {
       const item = document.createElement('li');
       const eventHead = document.createElement('div');
       eventHead.className = 'upload-head';
-      let text = `${formatWhen(event.at)} · ${event.outcome}`;
+      let text = `${formatWhen(event.at)} · ${outcomeWords[event.outcome] ?? event.outcome}`;
       if (event.at > event.started_at) {
         text += ` after ${formatDuration(event.at - event.started_at)}`;
       }

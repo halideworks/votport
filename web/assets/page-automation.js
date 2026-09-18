@@ -22,6 +22,10 @@ function automationTokenStatus(token) {
   return 'active';
 }
 
+// One mapped table per class: token badges print labels, never wire values
+// (audit item 446).
+const tokenStatusNames = { active: 'Active', expired: 'Expired', revoked: 'Revoked' };
+
 function renderAutomationTokens() {
   const container = $('automation-tokens');
   $('automation-token-status').textContent = tokenRows.length
@@ -47,7 +51,7 @@ function renderAutomationTokens() {
     const status = automationTokenStatus(token);
     const badge = document.createElement('span');
     badge.className = `badge ${status === 'active' ? 'on' : 'off'}`;
-    badge.textContent = status;
+    badge.textContent = tokenStatusNames[status];
     head.append(title, badge);
     card.append(head);
 

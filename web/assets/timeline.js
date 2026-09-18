@@ -6,6 +6,15 @@
 
 import { formatBytes, formatDuration } from './object-card.js';
 
+/// One mapped table for session outcome words: the same sentence an
+/// incomplete session shows on the Receive page and the timeline narrates
+/// (audit item 446). Wire values never print raw.
+export const outcomeWords = {
+  cancelled: 'Cancelled by the sender',
+  interrupted: 'Session went idle and expired',
+  rejected: 'Refused before the first file arrived',
+};
+
 /// Summary figures for one upload record. Every number comes from the
 /// record itself; nothing is estimated.
 export function summarize(upload) {
@@ -65,8 +74,9 @@ export function narrate(event) {
       text: 'Finished, package root recorded',
       detail: count ? `${plural(count, 're-sent chunk')}` : undefined,
     };
-    case 'cancelled': return { text: 'Cancelled by the sender' };
-    case 'interrupted': return { text: 'Session went idle and expired' };
+    case 'cancelled':
+    case 'interrupted':
+      return { text: outcomeWords[event.kind] };
     case 'dropped': return { text: 'Resume refused after a restart; published files kept' };
     case 'elided': return { text: `${plural(count, 'more event')} not kept` };
     default: return { text: event.kind };

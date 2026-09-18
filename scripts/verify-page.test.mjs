@@ -32,11 +32,11 @@ test('signature failure, key fetch failure and root mismatch each get their own 
   assert.match(verifyScript, /This is not a vot-receipt\./);
   assert.match(
     verifyScript,
-    /This receipt was not signed by the receipt key this server publishes\./,
+    /This receipt was not signed by the receipt key this port publishes\./,
   );
   assert.match(
     verifyScript,
-    /This server’s receipt key is unavailable\. Reload the page and try again\./,
+    /This port’s receipt key is unavailable\. Reload the page and try again\./,
   );
   assert.match(verifyScript, /This file is not the object in the receipt\./);
 });

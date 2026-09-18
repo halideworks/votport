@@ -393,6 +393,15 @@ form('workflow-save-project', async () => {
   notice(`Project “${saved.label}” saved.`); await refreshProjects();
 });
 
+// One mapped table per class: webhook attempt rows print labels, never wire
+// status strings (audit item 446).
+const attemptStatusNames = {
+  pending: 'Pending',
+  delivered: 'Delivered',
+  dead: 'Failed; retries exhausted',
+  superseded: 'Superseded',
+};
+
 async function loadAttempts(more = false) {
   if (!more) attemptCursor = 0;
   const page = await api(`/api/workflows/webhook/attempts?after=${attemptCursor}&limit=100`);
@@ -400,7 +409,7 @@ async function loadAttempts(more = false) {
   if (!page.attempts.length && !more) $('workflow-webhook-attempts').append(empty('No webhook attempts yet', 'Enable a receiver to start sending delivery events. Failed attempts retry automatically.'));
   for (const attempt of page.attempts) {
     const row = node('div', '', 'event-row'), content = node('div', '');
-    content.append(node('strong', `Event ${attempt.event_id} · ${attempt.status}`), node('p', `${attempt.attempts} attempts${attempt.error ? ` · ${attempt.error}` : ''}`, 'muted')); row.append(content);
+    content.append(node('strong', `Event ${attempt.event_id} · ${attemptStatusNames[attempt.status] ?? attempt.status}`), node('p', `${attempt.attempts} attempts${attempt.error ? ` · ${attempt.error}` : ''}`, 'muted')); row.append(content);
     row.append(button('Replay event', 'ghost', () => guard(async () => { await api(`/api/workflows/webhook/replay/${attempt.event_id}`, { method: 'POST' }); notice(`Event ${attempt.event_id} queued for replay.`); await loadAttempts(); })));
     $('workflow-webhook-attempts').append(row);
   }

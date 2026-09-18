@@ -22,7 +22,7 @@
 <div class="sheet">
   <main id="main-content" tabindex="-1">
   <header class="masthead">
-    <h1>Check a receipt</h1>
+    <h1>Verify a receipt</h1>
     <p class="sub">A received file plus its .vot-receipt proves exactly what arrived.</p>
   </header>
 
@@ -49,7 +49,7 @@
       <input type="file" id="sidecar-input" accept=".vot-receipt,application/octet-stream" hidden>
 
       <p class="error" id="verify-error" role="alert" hidden></p>
-      <button type="submit" id="check" disabled>Check receipt</button>
+      <button type="submit" id="check" disabled>Verify receipt</button>
     </form>
 
     <div id="verify-result" class="card" hidden aria-live="polite">
@@ -57,15 +57,15 @@
       <ul id="verify-list" class="files"></ul>
       <p class="muted" id="verify-observed" hidden></p>
       <p class="muted" id="verify-next" hidden></p>
-      <button type="button" id="reset" class="ghost" hidden>Check another</button>
+      <button type="button" id="reset" class="ghost" hidden>Verify another</button>
     </div>
 
     <details class="key-box">
-      <summary>This server's receipt key</summary>
+      <summary>This port's receipt key</summary>
       <p class="mono" id="receipt-key">&hellip;</p>
       <p class="muted">Every .vot-receipt names this key as its issuer. If the key
-      here matches what the sender's site showed you, a check below is proof
-      the receipt came from this server.</p>
+      here matches what the sender's port showed you, verifying below is proof
+      the receipt came from this port.</p>
     </details>
   </section>
 

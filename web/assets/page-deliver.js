@@ -34,6 +34,10 @@ $('deliver-notifications').append(createNotifications.element);
 let notificationsReadOnly = true;
 let deliverAdministrator = false;
 
+// One mapped table per class: delivery link badges print labels, never wire
+// values (audit item 446).
+const grantStatusNames = { active: 'Active', used: 'Used up', expired: 'Expired', revoked: 'Revoked' };
+
 function grantStatus(grant) {
   if (grant.revoked_at) return 'revoked';
   if (Number.isFinite(grant.max_downloads) && (grant.downloads ?? 0) >= grant.max_downloads) return 'used';
@@ -93,7 +97,7 @@ function renderGrants() {
     const status = grantStatus(grant);
     const badge = document.createElement('span');
     badge.className = `badge ${status === 'active' ? 'on' : 'off'}`;
-    badge.textContent = status;
+    badge.textContent = grantStatusNames[status];
     head.append(title, badge);
     if (grant.has_password) {
       const protectedBadge = document.createElement('span');
