@@ -521,7 +521,7 @@ Top-level `receipt_key` on that admin listing stays.
 - 200: see Proposed Design.
 - 422: `{ "error": "<human sentence>" }`
 - 413: body over the default limit (axum empty; the page treats non-JSON as "This is not a vot-receipt.")
-- 429: `{ "error": "too many checks from your address; try again later" }`
+- 429: `{ "error": "too many checks from your address; try again in 600 seconds" }`
 
 No query parameters. No JSON request body. No multipart.
 

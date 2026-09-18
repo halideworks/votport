@@ -165,7 +165,7 @@ fn authorize(app: &App, headers: &HeaderMap, ip: &str) -> ScimResult<()> {
         tracing::warn!(target: "audit", event = "scim_throttled", %ip, "scim bearer attempts throttled");
         return Err(ScimError::new(
             StatusCode::TOO_MANY_REQUESTS,
-            "too many failed attempts; wait a minute",
+            super::rate_limit_message("failed attempts", 60),
         )
         .with_retry_after(60));
     }

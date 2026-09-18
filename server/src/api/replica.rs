@@ -26,11 +26,7 @@ fn authorize(app: &App, headers: &HeaderMap, ip: &str) -> ApiResult<()> {
         .resolved_settings(&app.config)
         .map_err(super::store_unavailable)?;
     if app.replica_throttle.locked(&bucket) {
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many failed attempts; wait a minute",
-        )
-        .with_retry_after(60));
+        return Err(super::rate_limited("failed attempts", 60));
     }
     let presented = headers
         .get(header::AUTHORIZATION)

@@ -4294,7 +4294,7 @@ async fn public_verify_checks_sidecars() {
     assert_eq!(response.status(), 429);
     assert_eq!(
         response.json::<Value>().await.unwrap()["error"],
-        json!("too many checks from your address; try again later")
+        json!("too many checks from your address; try again in 600 seconds")
     );
 }
 

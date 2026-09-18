@@ -825,11 +825,7 @@ pub async fn mint_fetch(
     let _operation = begin_outbound_operation(&app, &grant.tenant)?;
     require_grant_access(&app, &grant, &headers)?;
     if !app.outbound_rate.allow(&grant.token_hash) {
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many requests for this delivery",
-        )
-        .with_retry_after(600));
+        return Err(super::rate_limited("requests for this delivery", 600));
     }
     let holder = hex::decode(&request.holder_key)
         .ok()

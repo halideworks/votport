@@ -490,11 +490,10 @@ async fn prepare_session(
     // no-password link can churn sessions into the shared capacity limit.
     let ip = client_ip(headers, peer, &app.config.trusted_proxies);
     if !app.session_rate.allow(&ip) {
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many uploads started from your address; try again later",
-        )
-        .with_retry_after(600));
+        return Err(super::rate_limited(
+            "uploads started from your address",
+            600,
+        ));
     }
     if !link_authorized(app, &link, headers) {
         check_password(
