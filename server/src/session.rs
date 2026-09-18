@@ -720,7 +720,11 @@ fn spawn_worker_from(
         loop {
             // Quiet is measured only across a real wait on the channel; a
             // command carried over from a batch drain waited on the server.
-            let waiting_since = now_unix();
+            // The pause itself comes from the monotonic clock: two wall-clock
+            // reads would let a forward step mid-transfer fabricate a long
+            // quiet event that evicts a real one from the kept log (audit
+            // finding 406). `arrived` stays the wall stamp for the event.
+            let waiting_since = Instant::now();
             let (cmd, waited) = match pending.take() {
                 Some(cmd) => (cmd, false),
                 None => match receiver.blocking_recv() {
@@ -731,7 +735,7 @@ fn spawn_worker_from(
                 },
             };
             let arrived = now_unix();
-            let silent = arrived.saturating_sub(waiting_since);
+            let silent = waiting_since.elapsed().as_secs();
             if waited && heard && silent >= setup.quiet_after_secs {
                 log.push(LogEvent {
                     at: arrived,
@@ -7484,6 +7488,81 @@ mod push_tests {
                 assert!(!journal.exists());
             }
         }
+    }
+
+    /// Audit finding 406: the quiet gap used to be two wall-clock reads, so
+    /// a forward step mid-transfer fabricated a long quiet event that evicted
+    /// a real one from the kept log. The pause is measured by the monotonic
+    /// clock: the logged secs must track the real sender silence (a hair over
+    /// quiet_after_secs, far below a wall-clock step) while `at` keeps its
+    /// wall stamp.
+    #[tokio::test]
+    async fn quiet_gap_measures_the_pause_with_the_monotonic_clock() {
+        let directory = tempfile::tempdir().unwrap();
+        let object = object(Suite::Blake3Bao64, b"");
+        let mut setup = setup(directory.path(), object.clone());
+        setup.quiet_after_secs = 1;
+        let mut files = vec![open_destination_for(&setup, vec!["frame".into()], object).unwrap()];
+        persist_session(&setup, &files).unwrap();
+        publish_file(&setup, &mut files[0], || true).unwrap();
+        setup
+            .store
+            .insert_link(crate::store::tests::test_link(&setup.link_id))
+            .unwrap();
+        let store = Arc::clone(&setup.store);
+        let link_id = setup.link_id.clone();
+        let (sender, receiver) = mpsc::channel(1);
+        spawn_worker_from(setup, receiver, Phase::Receiving { files }, false, 0);
+        let lease = || SessionLease {
+            activity: Arc::new(SessionActivity {
+                in_flight: AtomicUsize::new(1),
+                last_active: Mutex::new(Instant::now()),
+                received: AtomicU64::new(0),
+            }),
+        };
+        // The first command opens the worker's ears; the next arrives after a
+        // real pause past quiet_after_secs.
+        let (reply, done) = oneshot::channel();
+        sender
+            .send(Cmd::Page {
+                bytes: Bytes::new(),
+                reply,
+                _lease: lease(),
+            })
+            .await
+            .unwrap();
+        let _ = done.await;
+        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+        let (reply, done) = oneshot::channel();
+        sender
+            .send(Cmd::Page {
+                bytes: Bytes::new(),
+                reply,
+                _lease: lease(),
+            })
+            .await
+            .unwrap();
+        let _ = done.await;
+        // Ending the transfer commits the log into the link record.
+        let (reply, done) = oneshot::channel();
+        sender
+            .send(Cmd::Abort {
+                reply,
+                _lease: lease(),
+            })
+            .await
+            .unwrap();
+        let _ = done.await;
+        let link = store.link("", &link_id).unwrap().unwrap();
+        let log = &link.uploads[0].log;
+        let quiet: Vec<&LogEvent> = log.iter().filter(|event| event.kind == "quiet").collect();
+        assert_eq!(quiet.len(), 1, "{log:?}");
+        let secs = quiet[0].secs.unwrap();
+        assert!(
+            (1..=5).contains(&secs),
+            "quiet secs must track the real 1.3 s pause: {log:?}"
+        );
+        assert_eq!(log.last().unwrap().kind, "cancelled");
     }
 
     #[tokio::test]

@@ -40,3 +40,12 @@ test('signature failure, key fetch failure and root mismatch each get their own 
   );
   assert.match(verifyScript, /This file is not the object in the receipt\./);
 });
+
+test('the result card renders the receipt authoritative observed_at labelled UTC', () => {
+  // Audit finding 404: the receipt carries the one authoritative timestamp
+  // and the wasm receipt exposes it, but the page never showed it.
+  assert.match(verifyScript, /observedAt: receipt\.observedAt/);
+  assert.match(verifyScript, /\$\('verify-observed'\)/);
+  assert.match(verifyScript, /Observed \$\{observedAt\} \(UTC\)/);
+  assert.match(verifyScript, /observed\.hidden = !observedAt;/);
+});

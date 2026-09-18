@@ -527,7 +527,13 @@ export function showGrantResult(url, protectedGrant = false, focusResult = false
 }
 
 export function formatWhen(unixSeconds) {
-  return new Date(unixSeconds * 1000).toLocaleString();
+  // UTC, named: the server's logs, receipts and audit export all speak UTC,
+  // so admin timestamps read in the same zone instead of an unlabelled
+  // browser-local one (audit finding 405).
+  return new Date(unixSeconds * 1000).toLocaleString([], {
+    timeZone: 'UTC',
+    timeZoneName: 'short',
+  });
 }
 
 /// The stock accent for the current theme, read from the stylesheet, so a

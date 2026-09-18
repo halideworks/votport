@@ -7,6 +7,7 @@
 !client/core/**
 !server/Cargo.toml
 !server/Cargo.lock
+!server/build.rs
 !server/src/
 !server/src/**
 !web/

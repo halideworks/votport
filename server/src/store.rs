@@ -6746,5 +6746,20 @@ pub fn now_unix() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
+/// The build instant in unix seconds, stamped by build.rs. A wall clock that
+/// reads earlier than it is wrong: every clock helper maps an unreadable
+/// clock to 0 and every expiry test is "stamp greater than now", so a
+/// container started before chrony corrects a dead RTC would admit every
+/// expired credential and stamp records with 0. Audit finding 407.
+pub const BUILD_UNIX_SECS: u64 = include!(".build_stamp");
+
+/// True when the wall clock reads earlier than this build (or before the
+/// epoch outright), so the caller must refuse to start instead of serving
+/// from the broken state. Audit finding 407.
+pub fn clock_predates_build(now: SystemTime) -> bool {
+    now.duration_since(UNIX_EPOCH)
+        .map_or(true, |elapsed| elapsed.as_secs() < BUILD_UNIX_SECS)
+}
+
 #[cfg(test)]
 pub(crate) mod tests;
