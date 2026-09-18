@@ -7,7 +7,7 @@
 #   3. slim runtime image
 
 # Pin the production-resolved toolchain and runtime inputs.
-FROM rust:1.97@sha256:b1b3c9c0d921d7fa0a6d1f9ec7e4eab87f8c8ec97644c3d791450f131dec813f AS build
+FROM rust:1.98@sha256:9234385969911ca1f0fbf293f2290c03cd3827381b68681144090f1316cbb123 AS build
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends clang cmake \
