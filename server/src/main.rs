@@ -26,6 +26,19 @@ async fn main() {
         println!("votport {BUILD_VERSION} ({BUILD_REVISION})");
         return;
     }
+    // Audit finding 407: a dead RTC boots before chrony corrects it, and
+    // from that state every clock helper reads 0, every expiry test admits
+    // anything, and healthz answers 200. The build date is a floor the wall
+    // clock can never honestly predate, so refuse to start until the clock
+    // is corrected; the supervisor restarts into a working clock.
+    if votport::store::clock_predates_build(std::time::SystemTime::now()) {
+        eprintln!(
+            "the system clock reads earlier than this build ({} unix seconds); \
+             refusing to start until the clock is corrected",
+            votport::store::BUILD_UNIX_SECS
+        );
+        std::process::exit(2);
+    }
     if command.as_deref() == Some("convert-schema35") {
         if let Err(error) = votport::store::conversion::command(arguments.collect()) {
             eprintln!("{error}");

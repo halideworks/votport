@@ -6319,3 +6319,26 @@ fn tombstoning_blanks_the_in_package_path_but_keeps_the_identity() {
     assert_eq!(file.path, "");
     assert_eq!(store.tenant_received_bytes("").unwrap(), 0);
 }
+
+/// Audit finding 407: a dead RTC reads before the epoch, every clock helper
+/// maps that to 0, and every expiry test is "stamp greater than now", so the
+/// start-up guard must refuse any clock earlier than the build instant.
+#[test]
+fn a_clock_earlier_than_the_build_is_refused() {
+    let epoch = std::time::UNIX_EPOCH;
+    // Dead-RTC readings: before and at the epoch.
+    assert!(clock_predates_build(
+        epoch - std::time::Duration::from_secs(1)
+    ));
+    assert!(clock_predates_build(epoch));
+    // One second before the build instant is refused, ...
+    assert!(clock_predates_build(
+        epoch + std::time::Duration::from_secs(BUILD_UNIX_SECS - 1)
+    ));
+    // ... the build instant itself is not, and the live clock must pass or
+    // every start would refuse.
+    assert!(!clock_predates_build(
+        epoch + std::time::Duration::from_secs(BUILD_UNIX_SECS)
+    ));
+    assert!(!clock_predates_build(std::time::SystemTime::now()));
+}

@@ -28,3 +28,4 @@ client/windows/*/obj/
 /client/macos/VotportCore/votport-cli
 
 __pycache__/
+server/src/.build_stamp

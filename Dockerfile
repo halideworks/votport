@@ -36,7 +36,7 @@ RUN wasm-bindgen --target web --no-typescript --out-dir /wasm-vendor \
 COPY LICENSE /src/LICENSE
 COPY protocol /src/protocol
 COPY client/core /src/client/core
-COPY server/Cargo.toml server/Cargo.lock /src/server/
+COPY server/Cargo.toml server/Cargo.lock server/build.rs /src/server/
 RUN mkdir -p /src/server/src \
     && printf 'fn main() {}\n' > /src/server/src/main.rs \
     && cd /src/server \

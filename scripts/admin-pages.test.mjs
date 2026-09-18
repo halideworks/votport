@@ -268,3 +268,14 @@ test('status strip banners a failed health probe or a draining instance', async 
   assert.match(statusStrip, /renderHealth\(status\)/);
   assert.match(style, /\.status-health-banner/);
 });
+
+test('admin timestamps carry the UTC zone name, matching logs, receipts and the audit export', () => {
+  // Audit finding 405: formatWhen was a bare toLocaleString, so every admin
+  // timestamp rendered in an unlabelled browser-local zone while the server's
+  // logs, receipts and audit export all speak UTC.
+  assert.match(commonScript, /export function formatWhen\(unixSeconds\) \{/);
+  assert.match(
+    commonScript,
+    /\.toLocaleString\(\[\], \{\s*timeZone: 'UTC',\s*timeZoneName: 'short',\s*\}\);/,
+  );
+});

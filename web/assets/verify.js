@@ -96,7 +96,7 @@ function setChecking(active) {
   renderSlots();
 }
 
-function showResult({ ok, title, file, bytes, next, suite, root }) {
+function showResult({ ok, title, file, bytes, next, suite, root, observedAt }) {
   const card = $('verify-result');
   card.classList.toggle('ok', Boolean(ok));
   card.hidden = false;
@@ -114,6 +114,12 @@ function showResult({ ok, title, file, bytes, next, suite, root }) {
       status: `${formatBytes(bytes)}${ok ? ' · receipt ✓' : ''}`,
     },
   );
+
+  // The receipt's signed observation time is the one authoritative stamp:
+  // shown verbatim (it ends in Z) and labelled UTC (audit finding 404).
+  const observed = $('verify-observed');
+  observed.textContent = observedAt ? `Observed ${observedAt} (UTC)` : '';
+  observed.hidden = !observedAt;
 
   const nextLine = $('verify-next');
   nextLine.textContent = next || '';
@@ -216,6 +222,7 @@ async function runCheck() {
       root: signedRoot,
       file: sidecarFile.name,
       bytes: signedLength,
+      observedAt: receipt.observedAt,
       next: 'This receipt carries this server’s signature. Pick the file too if you also want its bytes checked.',
     });
     return;
@@ -240,6 +247,7 @@ async function runCheck() {
     root,
     file: payloadFile.name,
     bytes: length,
+    observedAt: receipt.observedAt,
     next: match
       ? 'Every byte of this file matches the root signed in the receipt.'
       : 'This file is not the object in the receipt. Compare names — a receipt proves one exact file.',
