@@ -747,7 +747,7 @@ pub(super) async fn import(app: &Arc<App>, job: &Job) -> ApiResult<Option<u64>> 
     let objects: Vec<SourceObject> = if source_inventory.exists() {
         let bytes = read_inventory(&source_inventory)?;
         let inventory: SourceInventory = serde_json::from_slice(&bytes)
-            .map_err(|_| conflict("source inventory is corrupt".into()))?;
+            .map_err(|_| conflict("the saved list of source files could not be read; check the storage connection, then retry the delivery".into()))?;
         if inventory.storage_id != config.id || inventory.revision != config.revision {
             return Err(conflict(
                 "storage configuration changed; submit a new delivery".into(),
@@ -803,15 +803,17 @@ pub(super) async fn import(app: &Arc<App>, job: &Job) -> ApiResult<Option<u64>> 
         let bytes = serde_json::to_vec(&inventory)
             .map_err(|_| ApiError::internal("serialize source inventory"))?;
         if bytes.len() > 64 * 1024 * 1024 {
-            return Err(conflict("source inventory exceeds 64 MiB".into()));
+            return Err(conflict("the saved list of source files is too large to read; submit a new delivery with fewer files".into()));
         }
         crate::backup::atomic_write_private(&source_inventory, &bytes)
-            .map_err(|_| conflict("persist S3 source inventory failed".into()))?;
+            .map_err(|_| conflict("the server could not save the list of source files; check free space on the server, then retry the delivery".into()))?;
         sync_directory(parent)?;
         inventory.objects
     };
     if objects.is_empty() || objects.len() > MAX_LIBRARY_PROJECT_FILES {
-        return Err(conflict("invalid S3 inventory".into()));
+        return Err(conflict(
+            "the saved list of source files is unusable; retry the delivery".into(),
+        ));
     }
     crate::paths::admit_portable_paths(objects.iter().map(|object| object.name.as_str()))
         .map_err(conflict)?;
@@ -887,9 +889,13 @@ pub(super) async fn import(app: &Arc<App>, job: &Job) -> ApiResult<Option<u64>> 
 fn read_inventory(path: &Path) -> ApiResult<Vec<u8>> {
     let meta = std::fs::symlink_metadata(path).map_err(|_| ApiError::not_found())?;
     if !meta.is_file() || meta.len() > 64 * 1024 * 1024 {
-        return Err(conflict("invalid workflow inventory".into()));
+        return Err(conflict(
+            "this delivery's saved file list is unusable; retry the delivery".into(),
+        ));
     }
-    std::fs::read(path).map_err(|_| conflict("read workflow inventory failed".into()))
+    std::fs::read(path).map_err(|_| {
+        conflict("this delivery's saved file list could not be read; retry the delivery".into())
+    })
 }
 
 pub(super) fn publish_inventory(
@@ -918,11 +924,11 @@ pub(super) fn publish_inventory(
     let bytes =
         serde_json::to_vec(names).map_err(|_| ApiError::internal("serialize frozen inventory"))?;
     if bytes.len() > 64 * 1024 * 1024 {
-        return Err(conflict("frozen inventory exceeds 64 MiB".into()));
+        return Err(conflict("this delivery's file list is too large to save; submit a new delivery with fewer files".into()));
     }
     let parent = root.parent().ok_or_else(ApiError::not_found)?;
     crate::backup::atomic_write_private(&parent.join("inventory.json"), &bytes)
-        .map_err(|_| conflict("persist frozen inventory failed".into()))?;
+        .map_err(|_| conflict("the server could not save this delivery's file list; check free space on the server, then retry the delivery".into()))?;
     sync_directory(parent)
 }
 
@@ -1021,10 +1027,9 @@ async fn export_destination(app: &Arc<App>, job: &Job, config: &Storage) -> ApiR
         return super::routes::export(app, job, config).await;
     }
     let store = config.connect(&app.store).map_err(conflict)?;
-    let manifest = job
-        .manifest
-        .as_deref()
-        .ok_or_else(|| conflict("frozen manifest missing".into()))?;
+    let manifest = job.manifest.as_deref().ok_or_else(|| {
+        conflict("this job's approved file list is missing; submit a new delivery".into())
+    })?;
     let prefix = format!("deliveries/{}/{manifest}", job.id);
     let mut files = vec![];
     let mut operation = begin_outbound_operation_owned(app, &job.tenant)?;
@@ -1252,7 +1257,7 @@ async fn upload_file(
             .map_err(|_| conflict("verify export payload failed".into()))?;
         if object.object_id() != expected {
             return Err(conflict(
-                "export payload does not match the frozen manifest".into(),
+                "the delivered files do not match this delivery's approved file list; submit a new delivery".into(),
             ));
         }
         upload
@@ -1271,6 +1276,40 @@ async fn upload_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit 436: delivery-card refusals never name the internal artefacts
+    /// (frozen manifest, snapshot, inventory); each refusal is one
+    /// recoverable sentence in the delivery card's own vocabulary.
+    #[test]
+    fn delivery_refusals_never_name_internal_artefacts() {
+        for (file, source) in [
+            ("outbound/workflows.rs", include_str!("../workflows.rs")),
+            ("outbound/workflows/routes.rs", include_str!("routes.rs")),
+            ("outbound/workflows/storage.rs", include_str!("storage.rs")),
+        ] {
+            for (number, line) in source.lines().enumerate() {
+                let bare = line.trim_start();
+                let same_line = line
+                    .find("conflict(\"")
+                    .map(|at| &line[at + "conflict(\"".len()..]);
+                let parts: Vec<&str> = match same_line {
+                    Some(rest) => vec![rest.split('"').next().unwrap_or_default()],
+                    None if bare.starts_with('"') => {
+                        vec![bare.trim_end_matches(',').trim_end_matches('"')]
+                    }
+                    None => continue,
+                };
+                for literal in parts {
+                    for artefact in ["frozen manifest", "snapshot", "inventory"] {
+                        assert!(
+                            !literal.contains(artefact),
+                            "{file}:{number} names the internal artefact {artefact:?}: {literal}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn connection_test_reports_unreachable_votport_port_with_reason_and_no_error_envelope() {

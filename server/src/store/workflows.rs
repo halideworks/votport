@@ -1210,7 +1210,7 @@ impl Store {
             .ok_or_else(|| WorkflowMutationError::conflict("project missing"))?;
         if !project.allows(&identity.subject, "sender", identity.role == "admin") {
             return Err(WorkflowMutationError::conflict(
-                "project sender permission required",
+                crate::workflow::permission_refusal("sender"),
             ));
         }
         if original.manifest.as_deref() != Some(manifest) || manifest.is_empty() {
@@ -1413,7 +1413,7 @@ impl Store {
             "cancel" => {
                 if !project.allows(actor, "sender", administrator) && actor != job.actor {
                     return Err(WorkflowMutationError::conflict(
-                        "sender permission required",
+                        crate::workflow::permission_refusal("sender"),
                     ));
                 }
                 if ["retiring", "retired"].contains(&job.state.as_str()) {
@@ -1429,7 +1429,7 @@ impl Store {
             "retry" => {
                 if !project.allows(actor, "sender", administrator) && actor != job.actor {
                     return Err(WorkflowMutationError::conflict(
-                        "sender permission required",
+                        crate::workflow::permission_refusal("sender"),
                     ));
                 }
                 if !["failed", "retrying"].contains(&job.state.as_str()) {

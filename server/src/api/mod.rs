@@ -327,8 +327,14 @@ pub(crate) fn store_unavailable(error: String) -> ApiError {
     tracing::error!(target: "audit", event = "store_read_failed", %error, "store read failed");
     ApiError::new(
         StatusCode::INTERNAL_SERVER_ERROR,
-        "database unavailable; try again",
+        store_unavailable_message(),
     )
+}
+
+/// The one store-unavailable sentence. Shared with the SCIM error type,
+/// which is not an ApiError, so every store outage reads the same.
+pub(crate) fn store_unavailable_message() -> &'static str {
+    "database unavailable; try again"
 }
 
 /// Recipient-facing branding for a tenant: the stored row's name (falling
