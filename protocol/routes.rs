@@ -53,6 +53,19 @@ pub struct SignedPortMessage {
     pub signature: String,
 }
 
+/// How long a signed port message lives between minting and expiry.
+pub const PORT_MESSAGE_LIFETIME: u64 = 300;
+
+/// Signed port messages expire one lifetime after minting, but the two
+/// ports read independent clocks, so pairing must survive a disagreement
+/// of up to one message lifetime on either side of the expiry: the same
+/// 300-second skew the VOT capability verifier declares. The stale-side
+/// bound lives in `SignedPortMessage::verify`; callers that cap how far
+/// ahead a message may be minted add the lifetime past the same skew.
+/// The invitation purpose is exempt from that cap: its expiry is the
+/// admin-chosen enrollment deadline.
+pub const PORT_MESSAGE_SKEW: u64 = 300;
+
 impl SignedPortMessage {
     pub fn sign(mut document: PortMessage, key: &SigningKey) -> Self {
         document.issuer = hex::encode(key.verifying_key().as_bytes());
@@ -69,7 +82,7 @@ impl SignedPortMessage {
     pub fn verify(&self, purpose: &str, audience: &str, now: u64) -> bool {
         self.document.purpose == purpose
             && self.document.audience == audience
-            && self.document.expires_at > now
+            && self.document.expires_at + PORT_MESSAGE_SKEW > now
             && id(&self.document.nonce)
             && digest(&self.document.issuer)
             && verify(
@@ -77,6 +90,24 @@ impl SignedPortMessage {
                 &self.signature,
                 &message(b"votport-port-message-v1\0", &self.document),
             )
+    }
+
+    /// True when the message is correctly signed and addressed but fell
+    /// outside its expiry window: expired more than one skew window ago,
+    /// or dated more than one lifetime plus skew ahead of `now` (a mint
+    /// horizon no short-lived message justifies). Callers use this to
+    /// blame clock skew instead of reporting a forged signature.
+    pub fn window_failed(&self, purpose: &str, audience: &str, now: u64) -> bool {
+        self.document.purpose == purpose
+            && self.document.audience == audience
+            && digest(&self.document.issuer)
+            && verify(
+                &self.document.issuer,
+                &self.signature,
+                &message(b"votport-port-message-v1\0", &self.document),
+            )
+            && (self.document.expires_at + PORT_MESSAGE_SKEW <= now
+                || self.document.expires_at > now + PORT_MESSAGE_LIFETIME + PORT_MESSAGE_SKEW)
     }
 }
 
@@ -350,6 +381,43 @@ impl RouteRevoked {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn port_messages_pair_across_clock_skew_and_name_a_failed_window() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let audience = hex::encode(key.verifying_key().as_bytes());
+        let mint = |expires_at: u64| {
+            SignedPortMessage::sign(
+                PortMessage {
+                    issuer: String::new(),
+                    audience: audience.clone(),
+                    purpose: "status".into(),
+                    nonce: "nonce-1".into(),
+                    expires_at,
+                    body: serde_json::json!({"grant": "grant"}),
+                },
+                &key,
+            )
+        };
+        let now = 1_800_000_000;
+        // A message minted one lifetime ago verifies now, and a peer clock
+        // up to one skew window behind still pairs; beyond that it refuses.
+        assert!(mint(now + PORT_MESSAGE_LIFETIME).verify("status", &audience, now));
+        assert!(mint(now - PORT_MESSAGE_SKEW + 1).verify("status", &audience, now));
+        assert!(!mint(now - PORT_MESSAGE_SKEW).verify("status", &audience, now));
+        // A message dated a whole day ahead is a mint-horizon refusal, not
+        // a signature failure, and the window test says so.
+        let stale = mint(now - PORT_MESSAGE_SKEW);
+        assert!(stale.window_failed("status", &audience, now));
+        assert!(!stale.window_failed("enroll", &audience, now));
+        let far_future = mint(now + PORT_MESSAGE_LIFETIME + PORT_MESSAGE_SKEW + 1);
+        assert!(far_future.window_failed("status", &audience, now));
+        assert!(!mint(now + PORT_MESSAGE_LIFETIME).window_failed("status", &audience, now));
+        let mut forged = mint(now - PORT_MESSAGE_SKEW);
+        forged.signature = "00".repeat(64);
+        assert!(!forged.window_failed("status", &audience, now));
+        assert!(!forged.verify("status", &audience, now));
+    }
 
     #[test]
     fn receipts_bind_custody_and_refuse_loops_or_changed_statements() {

@@ -19,6 +19,11 @@ pub struct Prepared {
 struct Pending {
     base: String,
     evidence: Evidence,
+    /// The share link token the delivery arrived from, kept so acceptance
+    /// can request a fresh challenge when the cached one nears expiry.
+    /// Older outbox entries predate it and only keep their expired error.
+    #[serde(default)]
+    token: Option<String>,
 }
 
 #[derive(Default, Debug, Clone, uniffi::Record)]
@@ -100,7 +105,12 @@ pub fn prepare_receive(
     Ok(None)
 }
 
-pub fn complete(base: &str, prepared: Option<Prepared>, observer: &mut dyn Observer) {
+pub fn complete(
+    base: &str,
+    prepared: Option<Prepared>,
+    token: Option<&str>,
+    observer: &mut dyn Observer,
+) {
     let Some(prepared) = prepared else {
         return;
     };
@@ -110,7 +120,7 @@ pub fn complete(base: &str, prepared: Option<Prepared>, observer: &mut dyn Obser
         &prepared.key,
     );
     let directory = outbox();
-    match enqueue(base, evidence, &directory) {
+    match enqueue(base, evidence, token.map(str::to_owned), &directory) {
         Ok(_) => {
             observer.event(Event::Evidence {
                 status: "pending".into(),
@@ -146,7 +156,12 @@ fn create_directory(directory: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn enqueue(base: &str, evidence: Evidence, directory: &Path) -> Result<PathBuf> {
+fn enqueue(
+    base: &str,
+    evidence: Evidence,
+    token: Option<String>,
+    directory: &Path,
+) -> Result<PathBuf> {
     create_directory(directory)?;
     #[cfg(unix)]
     {
@@ -157,6 +172,7 @@ fn enqueue(base: &str, evidence: Evidence, directory: &Path) -> Result<PathBuf> 
     let pending = Pending {
         base: base.into(),
         evidence,
+        token,
     };
     let bytes = serde_json::to_vec(&pending).map_err(|e| Error::Other(e.to_string()))?;
     identity::write_private(&path, &bytes)?;
@@ -168,6 +184,9 @@ fn cache(directory: &Path, id: &str, base: &str, evidence: &Evidence) -> Result<
     let bytes = serde_json::to_vec(&Pending {
         base: base.into(),
         evidence: evidence.clone(),
+        // Cached copies (accepted statements, retry sources) are never
+        // refreshed, so they carry no share token.
+        token: None,
     })
     .map_err(|e| Error::Other(e.to_string()))?;
     identity::write_private(&directory.join(format!("{id}.json")), &bytes)
@@ -284,7 +303,7 @@ fn accept_in(directory: &Path, id: &str, device: &Device) -> Result<String> {
     if id.len() != 64 || !id.bytes().all(|c| c.is_ascii_hexdigit()) {
         return Err(Error::Other("invalid verification ID".into()));
     }
-    let pending = read_pending(&directory.join(format!("{id}.json")))
+    let mut pending = read_pending(&directory.join(format!("{id}.json")))
         .or_else(|_| read_pending(&directory.join("verified").join(format!("{id}.json"))))?;
     if pending.evidence.id() != id
         || pending.evidence.kind != EvidenceKind::Verified
@@ -301,9 +320,18 @@ fn accept_in(directory: &Path, id: &str, device: &Device) -> Result<String> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    // An authorization near or past its expiry is replaced from a fresh
+    // challenge when the share token is still held, so a delivery verified
+    // early in its window stays acceptable to the end of that window.
+    // Best effort: a password-protected delivery needs the grant cookie
+    // the original verification used, so a failed refresh keeps the cached
+    // authorization and its expired error below.
+    if pending.evidence.authorization.challenge.expires_at <= now + ACCEPTANCE_REFRESH_WINDOW {
+        let _ = refresh_authorization(&mut pending, device);
+    }
     if pending.evidence.authorization.challenge.expires_at <= now {
         return Err(Error::Other(
-            "the acceptance authorization has expired".into(),
+            "the acceptance authorization has expired; verify the saved delivery files again to request a fresh one".into(),
         ));
     }
     let evidence = Evidence::sign(
@@ -312,7 +340,7 @@ fn accept_in(directory: &Path, id: &str, device: &Device) -> Result<String> {
         &device.signing_key(),
     );
     cache(&directory.join("accepted"), id, &pending.base, &evidence)?;
-    let path = enqueue(&pending.base, evidence, directory)?;
+    let path = enqueue(&pending.base, evidence, pending.token, directory)?;
     let status = if send_pending(&path).is_ok() {
         "recorded"
     } else {
@@ -320,6 +348,37 @@ fn accept_in(directory: &Path, id: &str, device: &Device) -> Result<String> {
     };
     start_retry_worker();
     Ok(status.into())
+}
+
+/// How long before an acceptance authorization's expiry acceptance
+/// refreshes it from a fresh challenge.
+const ACCEPTANCE_REFRESH_WINDOW: u64 = 86_400;
+
+/// Swaps a near-expiry authorization for a fresh challenge from the same
+/// server, requiring the same issuer, grant, manifest, and holder so the
+/// accepted evidence still attests the original verification.
+fn refresh_authorization(pending: &mut Pending, device: &Device) -> Result<()> {
+    let token = pending
+        .token
+        .as_deref()
+        .ok_or_else(|| Error::Other("no share link token for a fresh challenge".into()))?;
+    let client = Client::with_timeout(&pending.base, Some(Duration::from_secs(5)))?;
+    let fresh = client.evidence_challenge(token, None, &device.holder_key_hex())?;
+    let original = &pending.evidence.authorization;
+    let challenge = &fresh.challenge;
+    let unchanged = challenge.grant_id == original.challenge.grant_id
+        && challenge.manifest == original.challenge.manifest
+        && challenge.holder == original.challenge.holder
+        && challenge.origin == original.challenge.origin
+        && fresh.issuer == original.issuer
+        && fresh.verify(&original.issuer);
+    if !unchanged {
+        return Err(Error::Other(
+            "the fresh acceptance authorization does not match the verified delivery".into(),
+        ));
+    }
+    pending.evidence.authorization = fresh;
+    Ok(())
 }
 
 #[uniffi::export]
@@ -338,7 +397,7 @@ fn retry_in(directory: &Path) -> OutboxStatus {
                 continue;
             };
             if report_status(directory, &pending.evidence.id()) == "unavailable" {
-                let _ = enqueue(&pending.base, pending.evidence, directory);
+                let _ = enqueue(&pending.base, pending.evidence, pending.token, directory);
             }
         }
     }
@@ -596,7 +655,7 @@ mod tests {
                 "wrong" => serde_json::json!({"id":"wrong","recorded":true}).to_string(),
                 other => other.into(),
             };
-            let path = enqueue(&base, evidence.clone(), dir.path()).unwrap();
+            let path = enqueue(&base, evidence.clone(), None, dir.path()).unwrap();
             let server = respond(listener, status, body);
             let result = retry_in(dir.path());
             server.join().unwrap();
@@ -629,6 +688,7 @@ mod tests {
             enqueue(
                 base,
                 report(base, &index.to_string(), 1, EvidenceKind::Verified),
+                None,
                 dir.path(),
             )
             .unwrap();
@@ -654,7 +714,7 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let expired = report(&base, "expired", 1, EvidenceKind::Verified);
         let separate = tempfile::tempdir().unwrap();
-        enqueue(&base, expired.clone(), separate.path()).unwrap();
+        enqueue(&base, expired.clone(), None, separate.path()).unwrap();
         let server = respond(listener, 401, "{}".into());
         let result = retry_in(separate.path());
         server.join().unwrap();
@@ -713,7 +773,7 @@ mod tests {
             &server,
         );
         let evidence = Evidence::sign(authorization, EvidenceKind::Verified, &device);
-        let path = enqueue("http://127.0.0.1:1", evidence.clone(), dir.path()).unwrap();
+        let path = enqueue("http://127.0.0.1:1", evidence.clone(), None, dir.path()).unwrap();
         let result = retry_in(dir.path());
         assert_eq!((result.pending, result.recorded), (1, 0));
         let saved: Pending = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
@@ -736,6 +796,7 @@ mod tests {
         enqueue(
             &base,
             report(&base, "stall", u64::MAX, EvidenceKind::Verified),
+            None,
             &outbox(),
         )
         .unwrap();
@@ -780,5 +841,222 @@ mod tests {
             "the stalled pass retains the report for its retry"
         );
         server.join().unwrap();
+    }
+
+    /// Answers two sequential requests on one listener: the evidence
+    /// challenge refresh, then the acknowledgement submit. Returns each
+    /// request's path and body for assertion.
+    fn serve_refresh_then_submit(
+        listener: std::net::TcpListener,
+        responses: Vec<(u16, String)>,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Read, Write};
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(&stream);
+                let mut request = String::new();
+                let mut length = 0;
+                for _ in 0..64 {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if request.is_empty() {
+                        request = line.trim().to_owned();
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                assert!(length < 16384);
+                let mut payload = vec![0; length];
+                reader.read_exact(&mut payload).unwrap();
+                seen.lock().unwrap().push((
+                    request.split(' ').nth(1).unwrap().to_owned(),
+                    String::from_utf8(payload).unwrap(),
+                ));
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        })
+    }
+
+    fn near_expiry_pending(
+        dir: &Path,
+        base: &str,
+        device: &Device,
+        expires_in: u64,
+        token: Option<String>,
+    ) -> (Evidence, String) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let server = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let authorization = SignedChallenge::issue(
+            Challenge {
+                origin: base.to_owned(),
+                grant_id: "grant".into(),
+                manifest: "manifest".into(),
+                holder: device.holder_key_hex(),
+                nonce: "original".into(),
+                issued_at: 1,
+                expires_at: now + expires_in,
+            },
+            &server,
+        );
+        let evidence = Evidence::sign(authorization, EvidenceKind::Verified, &device.signing_key());
+        let id = evidence.id();
+        enqueue(base, evidence.clone(), token, dir).unwrap();
+        (evidence, id)
+    }
+
+    #[test]
+    fn acceptance_refreshes_a_near_expiry_authorization_from_a_fresh_challenge() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = Device::load_or_create_in(&dir.path().join("device")).unwrap();
+        let outbox = dir.path().join("outbox");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (original, id) = near_expiry_pending(&outbox, &base, &device, 100, Some("tok".into()));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let server_key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let fresh = SignedChallenge::issue(
+            Challenge {
+                origin: original.authorization.challenge.origin.clone(),
+                grant_id: "grant".into(),
+                manifest: "manifest".into(),
+                holder: device.holder_key_hex(),
+                nonce: "fresh".into(),
+                issued_at: now,
+                expires_at: now + 7 * 86400,
+            },
+            &server_key,
+        );
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let accepted_id =
+            Evidence::sign(fresh.clone(), EvidenceKind::Accepted, &device.signing_key()).id();
+        let server = serve_refresh_then_submit(
+            listener,
+            vec![
+                (200, serde_json::to_value(&fresh).unwrap().to_string()),
+                (
+                    200,
+                    serde_json::json!({"id": accepted_id, "recorded": true}).to_string(),
+                ),
+            ],
+            std::sync::Arc::clone(&seen),
+        );
+        assert_eq!(
+            accept_in(&outbox, &id, &device).unwrap(),
+            "recorded",
+            "a near-expiry authorization must be refreshed, not refused"
+        );
+        server.join().unwrap();
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0].0.ends_with("/api/s/tok/evidence-challenge"),
+            "{}",
+            requests[0].0
+        );
+        assert!(requests[0].1.contains(&device.holder_key_hex()));
+        // The accepted statement carries the fresh authorization.
+        assert!(requests[1].1.contains("\"nonce\":\"fresh\""));
+        let accepted = read_pending(&outbox.join("accepted").join(format!("{id}.json"))).unwrap();
+        assert_eq!(
+            accepted.evidence.authorization.challenge.expires_at,
+            fresh.challenge.expires_at
+        );
+    }
+
+    #[test]
+    fn an_expired_authorization_without_a_token_names_re_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = Device::load_or_create_in(&dir.path().join("device")).unwrap();
+        let outbox = dir.path().join("outbox");
+        let (_original, id) = near_expiry_pending(&outbox, "http://127.0.0.1:1", &device, 0, None);
+        let error = accept_in(&outbox, &id, &device).unwrap_err().to_string();
+        assert!(
+            error.contains("verify the saved delivery files again"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_mismatched_fresh_challenge_is_refused_and_keeps_the_cached_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = Device::load_or_create_in(&dir.path().join("device")).unwrap();
+        let outbox = dir.path().join("outbox");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (original, id) = near_expiry_pending(&outbox, &base, &device, 100, Some("tok".into()));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let server_key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        // A fresh challenge for a different grant must not replace the
+        // verified delivery's authorization.
+        let mismatched = SignedChallenge::issue(
+            Challenge {
+                origin: original.authorization.challenge.origin.clone(),
+                grant_id: "other-grant".into(),
+                manifest: "manifest".into(),
+                holder: device.holder_key_hex(),
+                nonce: "fresh".into(),
+                issued_at: now,
+                expires_at: now + 7 * 86400,
+            },
+            &server_key,
+        );
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let accepted_id = Evidence::sign(
+            original.authorization.clone(),
+            EvidenceKind::Accepted,
+            &device.signing_key(),
+        )
+        .id();
+        let server = serve_refresh_then_submit(
+            listener,
+            vec![
+                (200, serde_json::to_value(&mismatched).unwrap().to_string()),
+                (
+                    200,
+                    serde_json::json!({"id": accepted_id, "recorded": true}).to_string(),
+                ),
+            ],
+            std::sync::Arc::clone(&seen),
+        );
+        assert_eq!(
+            accept_in(&outbox, &id, &device).unwrap(),
+            "recorded",
+            "the cached authorization is still valid and must be used"
+        );
+        server.join().unwrap();
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].0.ends_with("/api/s/tok/evidence-challenge"));
+        assert!(
+            requests[1].1.contains("\"nonce\":\"original\""),
+            "the accepted statement must carry the original authorization: {}",
+            requests[1].1
+        );
     }
 }

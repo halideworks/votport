@@ -153,6 +153,7 @@ public sealed partial class WorkflowsPage : Page
             row.Children.Add(Text($"{record.Server} · Delivery {record.GrantId}"));
             row.Children.Add(Text($"Manifest: {record.Manifest}"));
             row.Children.Add(Text($"Verification: {record.VerificationStatus} · Acceptance: {record.AcceptanceStatus.Replace('_', ' ')}"));
+            row.Children.Add(Text($"Authorization expires {DateTimeOffset.FromUnixTimeSeconds((long)record.ExpiresAt):g}"));
             if (record.AcceptanceStatus == "not_accepted") row.Children.Add(Action("Accept verified delivery", async () =>
             {
                 var dialog = new ContentDialog { XamlRoot = XamlRoot, Title = "Accept verified delivery", Content = $"Confirm you reviewed and accept manifest {record.Manifest}?", PrimaryButtonText = "Accept", CloseButtonText = "Back" };

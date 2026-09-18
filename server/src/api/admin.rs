@@ -2026,12 +2026,22 @@ fn branding_tenant(
         admit_tenant_ref(key)?
     };
     // Grant check before the store lookup: a foreign admin learns nothing
-    // about which tenant keys exist.
-    if !identity
-        .grants
-        .iter()
-        .any(|grant| grant.role == "admin" && (grant.tenant == tenant || grant.tenant.is_empty()))
-    {
+    // about which tenant keys exist. The active tenant gates: a
+    // default-tenant grant is platform authority only while the session is
+    // switched to the default tenant, and a session switched into a named
+    // tenant manages that tenant's branding only.
+    let admin_grant_for = |tenant: &str| {
+        identity
+            .grants
+            .iter()
+            .any(|grant| grant.role == "admin" && grant.tenant == tenant)
+    };
+    let permitted = if identity.tenant.is_empty() {
+        admin_grant_for("")
+    } else {
+        tenant == identity.tenant && admin_grant_for(&tenant)
+    };
+    if !permitted {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "no admin access to that tenant",
@@ -6901,7 +6911,9 @@ mod branding_tests {
         std::fs::write(&path, b"old").unwrap();
         let mut identity = auth::AdminIdentity::local_admin();
         identity.subject = "sso:editor".into();
-        identity.tenant = "other".into();
+        // The branding gate is scoped to the active tenant, so the editor
+        // works while switched into the tenant being unlinked.
+        identity.tenant = "acme".into();
         identity.grants = ["acme", "other"]
             .map(|tenant| auth::TenantGrant {
                 incarnation: None,
@@ -7191,6 +7203,60 @@ mod branding_tests {
             )
             .await,
             StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn switched_admin_brands_only_the_active_tenant() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        insert_tenant(&application, "acme");
+        insert_tenant(&application, "bloom");
+        // A principal holding both the default-tenant and acme grants sits
+        // switched into acme: the default grant must not reach other
+        // tenants' branding while the session is elsewhere.
+        let mut identity = auth::AdminIdentity {
+            subject: "sso:mixed".into(),
+            tenant: "acme".into(),
+            role: "admin".into(),
+            grants: vec![
+                TenantGrant {
+                    incarnation: None,
+                    tenant: String::new(),
+                    role: "admin".into(),
+                },
+                TenantGrant {
+                    incarnation: None,
+                    tenant: "acme".into(),
+                    role: "admin".into(),
+                },
+            ],
+            credential_version: 1,
+        };
+        let switched = super::test_admin_cookie(&application, &identity);
+        assert_eq!(
+            put_branding(&application, &switched, "bloom", r#"{"name":"Bloom"}"#).await,
+            StatusCode::FORBIDDEN,
+            "a default-tenant grant must not follow a switched-in admin"
+        );
+        assert_eq!(
+            put_branding(&application, &switched, "default", r#"{"name":"X"}"#).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            put_branding(&application, &switched, "acme", r#"{"name":"Acme"}"#).await,
+            StatusCode::OK
+        );
+        // Back on the default tenant, the platform grant brands any tenant.
+        identity.tenant = String::new();
+        let platform = super::test_admin_cookie(&application, &identity);
+        assert_eq!(
+            put_branding(&application, &platform, "bloom", r#"{"name":"Bloom"}"#).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            application.store.branding("bloom").unwrap().unwrap().name,
+            "Bloom"
         );
     }
 

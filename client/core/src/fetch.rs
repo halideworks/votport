@@ -230,7 +230,7 @@ fn try_fetch_with_resume_mode(
         let received = materialize_complete_stage(&stage, &metadata, dest, observer, allow_reuse)?;
         let _ = fs::remove_dir_all(&stage);
         let _ = fs::remove_file(&capability_path);
-        crate::evidence::complete(client.base(), evidence, observer);
+        crate::evidence::complete(client.base(), evidence, Some(&delivery.token), observer);
         observer.event(Event::Finished {
             files: received.files.len(),
         });
@@ -501,7 +501,7 @@ fn try_fetch_with_resume_mode(
     // fail the receive. A leftover whole bundle is removed on the next run.
     let _ = fs::remove_dir_all(&stage);
     let _ = fs::remove_file(&capability_path);
-    crate::evidence::complete(client.base(), evidence, observer);
+    crate::evidence::complete(client.base(), evidence, Some(&delivery.token), observer);
     observer.event(Event::Finished {
         files: received.files.len(),
     });

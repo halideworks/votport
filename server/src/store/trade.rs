@@ -186,9 +186,10 @@ impl Store {
         message: &SignedPortMessage,
     ) -> Result<(TradeRoute, bool), String> {
         let now = now_unix();
-        if !message.verify("enroll", &self.event_signer.public_hex, now)
-            || message.document.expires_at > now + 600
-        {
+        if message.window_failed("enroll", &self.event_signer.public_hex, now) {
+            return Err(crate::api::trade::CLOCK_MISALIGNED.to_owned());
+        }
+        if !message.verify("enroll", &self.event_signer.public_hex, now) {
             return Err("invalid enrollment proof".into());
         }
         let body = &message.document.body;
