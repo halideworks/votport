@@ -4165,18 +4165,19 @@ impl Store {
         })
     }
 
-    /// Manifest roots of grants still open: what the serve registry keeps a
-    /// server for.
-    pub fn servable_manifest_roots(&self, now: u64) -> Result<Vec<String>, String> {
+    /// (Tenant, manifest root) pairs of grants still open: what the serve
+    /// registry keeps a server for. The tenant rides along because grants in
+    /// two tenants can share a byte-identical package root.
+    pub fn servable_manifest_roots(&self, now: u64) -> Result<Vec<(String, String)>, String> {
         self.with(|connection| {
             connection
                 .prepare_cached(
-                    "SELECT m.manifest_root FROM outbound_grant_manifests m
+                    "SELECT g.tenant, m.manifest_root FROM outbound_grant_manifests m
                      JOIN outbound_grants g ON g.id = m.grant_id
                      WHERE g.revoked_at IS NULL AND g.expires_at > ?1
                        AND (g.max_downloads IS NULL OR g.downloads < g.max_downloads)",
                 )?
-                .query_map([now as i64], |row| row.get(0))?
+                .query_map([now as i64], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect()
         })
     }

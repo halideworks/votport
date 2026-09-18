@@ -46,7 +46,10 @@ impl Drop for TestState {
 /// The per-user state directory for votport client data, without creating it.
 ///
 /// `XDG_DATA_HOME` or `~/.local/share` on Linux, `~/Library/Application
-/// Support` on macOS, `%APPDATA%` on Windows, each under a `votport` subdir.
+/// Support` on macOS, `%LOCALAPPDATA%` on Windows, each under a `votport`
+/// subdir. Local, not Roaming: a Roaming profile syncs to the domain
+/// controller and follows the user to every machine, and this directory
+/// holds the device key, the port session cookie, and watch passwords.
 #[must_use]
 pub fn state_dir() -> PathBuf {
     #[cfg(test)]
@@ -59,7 +62,9 @@ pub fn state_dir() -> PathBuf {
 
 #[cfg(target_os = "windows")]
 fn platform_data_home() -> PathBuf {
-    std::env::var_os("APPDATA")
+    // Local, not Roaming: Roaming syncs to the domain controller at logoff
+    // and follows the user to every machine, and this tree holds secrets.
+    std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
 }
@@ -160,11 +165,13 @@ impl Device {
     }
 }
 
-/// Writes `bytes` to `path`, readable and writable only by the owner on Unix.
+/// Writes `bytes` to `path`, readable and writable only by the owner.
 ///
 /// The bytes are written to a per-process sibling temp file and renamed into
 /// place, so an interrupted write never leaves a short `path` for the next run
-/// to reject, and two concurrent first-time writers do not share a temp.
+/// to reject, and two concurrent first-time writers do not share a temp. On
+/// Unix the temp is created 0600; on Windows it gets a protected DACL naming
+/// only this user.
 pub(crate) fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let temp = path.with_extension(format!(
@@ -181,6 +188,8 @@ pub(crate) fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> 
     }
     let result = (|| -> Result<()> {
         let mut file = options.open(&temp)?;
+        #[cfg(windows)]
+        restrict_to_user(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
@@ -196,6 +205,88 @@ pub(crate) fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> 
     }
     result?;
     Ok(())
+}
+
+/// Gives `path` a protected DACL granting only this user, the closest
+/// equivalent of the Unix 0600 a private file gets elsewhere. Without it the
+/// file inherits the parent's ACEs, which on a Roaming-profile or shared
+/// machine can include wider read access. Replaces whatever ACEs the file
+/// inherited; the creator is the user, so the owner keeps full control.
+///
+/// # Errors
+/// Any Win32 failure, so a file that cannot be restricted is not written.
+#[cfg(windows)]
+fn restrict_to_user(path: &std::path::Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS, GENERIC_ALL};
+    use windows_sys::Win32::Security::Authorization::{
+        SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, SET_ACCESS, SE_FILE_OBJECT,
+        TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenUser, ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE,
+        PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
+    };
+    // OpenProcessToken is filed under Threading in windows-sys.
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut length = 0u32;
+        // Sizing call fails with ERROR_INSUFFICIENT_BUFFER by design.
+        let _ = GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut length);
+        let mut buffer = vec![0u8; length as usize];
+        let filled = GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            length,
+            &mut length,
+        );
+        CloseHandle(token);
+        if filled == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let user = &*(buffer.as_ptr().cast::<TOKEN_USER>());
+        let mut trustee: TRUSTEE_W = std::mem::zeroed();
+        trustee.TrusteeForm = TRUSTEE_IS_SID;
+        trustee.TrusteeType = TRUSTEE_IS_USER;
+        trustee.ptstrName = user.User.Sid.cast();
+        let access = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: GENERIC_ALL,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: NO_INHERITANCE,
+            Trustee: trustee,
+        };
+        let mut acl: *mut ACL = std::ptr::null_mut();
+        let built = SetEntriesInAclW(1, &access, std::ptr::null(), &mut acl);
+        if built != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(built as i32).into());
+        }
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let status = SetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            acl,
+            std::ptr::null(),
+        );
+        LocalFree(acl.cast());
+        if status != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(status as i32).into());
+        }
+        Ok(())
+    }
 }
 
 /// Removes the whole per-user state directory: the stored port session,
@@ -276,6 +367,16 @@ mod tests {
                 .unwrap()
                 .is_symlink());
         }
+    }
+
+    // Roaming synced to the domain controller and followed the user to every
+    // machine, carrying the device key, the port session, and watch passwords.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_state_dir_prefers_local_over_roaming() {
+        std::env::set_var("LOCALAPPDATA", r"C:\votport-local-test");
+        std::env::set_var("APPDATA", r"C:\votport-roaming-test");
+        assert!(platform_data_home().starts_with(r"C:\votport-local-test"));
     }
 
     #[test]

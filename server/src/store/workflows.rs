@@ -886,6 +886,35 @@ impl Store {
             return Err(WorkflowMutationError::conflict("project limit reached"));
         }
         drop(query);
+        // Two outgoing routes can name one receiving endpoint: invitations
+        // are not unique per endpoint. Both legs would present the same
+        // (link, issuer, operation id) at the peer with different signed
+        // sources, and the peer keeps one inbound route per operation, so the
+        // second leg fails on every retry. A project keeps one route per
+        // receiving endpoint.
+        if !project.destinations.is_empty() {
+            let mut routes = tx
+                .prepare(&format!(
+                    "SELECT peer_key,endpoint FROM trade_routes WHERE tenant=?1 AND id IN ({})",
+                    vec!["?"; project.destinations.len()].join(",")
+                ))
+                .map_err(|e| e.to_string())?;
+            let mut bound: Vec<&str> = vec![tenant];
+            bound.extend(project.destinations.iter().map(String::as_str));
+            let destinations: Vec<(String, String)> = routes
+                .query_map(rusqlite::params_from_iter(bound.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<_, _>>()
+                .map_err(|e| e.to_string())?;
+            let distinct: std::collections::HashSet<_> = destinations.iter().collect();
+            if distinct.len() < destinations.len() {
+                return Err(WorkflowMutationError::invalid(
+                    "two destinations deliver through the same peer endpoint; choose one route per receiving endpoint",
+                ));
+            }
+        }
         let notifications_only = current.as_ref().is_some_and(|p| {
             p.notifications != project.notifications && p.same_delivery_policy(&project)
         });
@@ -1748,6 +1777,44 @@ pub(super) fn release_in(connection: &Connection, grant_id: &str) -> Result<Opti
 mod tests {
     use super::*;
     use crate::workflow::tests::{project, request};
+
+    #[test]
+    fn a_project_cannot_name_two_routes_to_one_receiving_endpoint() {
+        // Invitations are not unique per endpoint, so two outgoing routes
+        // can share one receiving endpoint. Delivering through both would
+        // present the same (link, issuer, operation id) at the peer with
+        // different signed sources, and the peer keeps one inbound route
+        // per operation, so the second leg fails on every retry.
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .with(|c| {
+                for (id, peer, endpoint) in [
+                    ("route-a", "peer", "endpoint"),
+                    ("route-b", "peer", "endpoint"),
+                    ("route-c", "peer", "other-endpoint"),
+                    ("route-d", "other-peer", "endpoint"),
+                ] {
+                    c.execute(
+                        "INSERT INTO trade_routes(id,tenant,direction,peer_key,endpoint,document,credential) VALUES (?1,'','outgoing',?2,?3,'{}','')",
+                        rusqlite::params![id, peer, endpoint],
+                    )
+                    .unwrap();
+                }
+                Ok(())
+            })
+            .unwrap();
+        let mut colliding = project();
+        colliding.destinations = vec!["route-a".into(), "route-b".into()];
+        assert!(store
+            .save_delivery_project("", "admin", colliding)
+            .err()
+            .unwrap()
+            .contains("one route per receiving endpoint"));
+        let mut distinct = project();
+        distinct.destinations = vec!["route-a".into(), "route-c".into(), "route-d".into()];
+        store.save_delivery_project("", "admin", distinct).unwrap();
+    }
 
     #[test]
     fn unenrolled_route_keeps_the_received_job_recoverable() {
