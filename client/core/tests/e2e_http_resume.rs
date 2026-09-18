@@ -194,6 +194,7 @@ fn a_paused_http_send_resumes_the_same_session_prefix() {
     let resumed = ffi::resume(
         journal_id.clone(),
         None,
+        None,
         resumed_handle,
         resumed_listener.clone(),
     )
@@ -335,7 +336,7 @@ fn a_concurrent_resume_cannot_take_ownership_from_the_first_run() {
     let first = std::thread::spawn({
         let listener = listener.clone();
         let first_handle = first_handle.clone();
-        move || ffi::resume(first_id, None, first_handle, listener)
+        move || ffi::resume(first_id, None, None, first_handle, listener)
     });
     started
         .recv_timeout(Duration::from_secs(10))
@@ -355,6 +356,7 @@ fn a_concurrent_resume_cannot_take_ownership_from_the_first_run() {
     let refused_handle = Transfer::new();
     let refused = ffi::resume(
         paused.journal_id.clone(),
+        None,
         None,
         refused_handle.clone(),
         Arc::new(Recorder::default()),
@@ -380,6 +382,7 @@ fn a_concurrent_resume_cannot_take_ownership_from_the_first_run() {
     let refused_during_settlement = ffi::resume(
         paused.journal_id.clone(),
         None,
+        None,
         Transfer::new(),
         Arc::new(Recorder::default()),
     );
@@ -398,6 +401,7 @@ fn a_concurrent_resume_cannot_take_ownership_from_the_first_run() {
 
     let resumed = ffi::resume(
         paused.journal_id.clone(),
+        None,
         None,
         Transfer::new(),
         Arc::new(Recorder::default()),
@@ -432,6 +436,7 @@ fn paused_http_resume_clears_invalid_expired_and_changed_sessions() {
             ffi::resume(
                 paused.journal_id.clone(),
                 None,
+                None,
                 Transfer::new(),
                 Arc::new(Recorder::default()),
             ),
@@ -454,6 +459,7 @@ fn paused_http_resume_clears_invalid_expired_and_changed_sessions() {
             ffi::resume(
                 paused.journal_id.clone(),
                 None,
+                None,
                 Transfer::new(),
                 Arc::new(Recorder::default()),
             ),
@@ -470,6 +476,7 @@ fn paused_http_resume_clears_invalid_expired_and_changed_sessions() {
         assert!(matches!(
             ffi::resume(
                 paused.journal_id.clone(),
+                None,
                 None,
                 Transfer::new(),
                 Arc::new(Recorder::default()),
@@ -492,6 +499,7 @@ fn paused_http_resume_clears_invalid_expired_and_changed_sessions() {
             ffi::resume(
                 paused.journal_id.clone(),
                 None,
+                None,
                 Transfer::new(),
                 Arc::new(Recorder::default()),
             ),
@@ -509,6 +517,7 @@ fn paused_http_resume_clears_invalid_expired_and_changed_sessions() {
         assert!(matches!(
             ffi::resume(
                 paused.journal_id.clone(),
+                None,
                 None,
                 transfer,
                 Arc::new(Recorder::default()),
@@ -544,6 +553,7 @@ fn a_clear_failure_is_reported_and_retains_the_saved_session() {
     let transfer = Transfer::new();
     let result = ffi::resume(
         paused.journal_id.clone(),
+        None,
         None,
         transfer.clone(),
         listener.clone(),

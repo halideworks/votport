@@ -14,7 +14,7 @@ struct TransferItem: Identifiable {
     let id: UUID
     let kind: Kind
     /// What the user pointed at: the dropped paths or the destination folder.
-    let subject: String
+    var subject: String
     let link: String
     let started: Date
     var files: [TransferFile] = []
@@ -159,11 +159,17 @@ final class TransferStore: ObservableObject {
     }
 
     /// Runs a journalled transfer again under its id, with the password
-    /// supplied afresh when the entry needs one.
-    func resume(_ id: UUID, password: String?) {
+    /// supplied afresh when the entry needs one. A receive's `destination`
+    /// overrides the journalled folder and is remembered as its folder; the
+    /// card re-asks for it on retry, so a refusal like an existing file is
+    /// answered by choosing an empty one.
+    func resume(_ id: UUID, password: String?, destination: URL?) {
         guard let index = items.firstIndex(where: { $0.id == id }),
             let journalId = items[index].journalId, items[index].canResume
         else { return }
+        if let destination {
+            items[index].subject = destination.path
+        }
         items[index].running = true
         items[index].interrupted = false
         items[index].view = nil
@@ -173,7 +179,8 @@ final class TransferStore: ObservableObject {
         items[index].revealDestinationFolder = false
         run(id) { transfer, listener in
             let report = try? VotportCore.resume(
-                id: journalId, password: password, transfer: transfer, listener: listener)
+                id: journalId, password: password, dest: destination?.path,
+                transfer: transfer, listener: listener)
             if case .received(let received)? = report { return received.files }
             return []
         }

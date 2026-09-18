@@ -16,7 +16,9 @@ public sealed class TransferItem : INotifyPropertyChanged
     public Guid Id { get; } = Guid.NewGuid();
     public Kinds Kind { get; init; }
     /// What the user pointed at: the dropped paths or the destination folder.
-    public string Subject { get; init; } = "";
+    /// A receive re-asked for its folder on retry rewrites it.
+    public string Subject { get => subject; internal set { subject = value; Changed(); } }
+    private string subject = "";
     public string Link { get; init; } = "";
     internal string? SnapshotPath { get; set; }
     public DateTime Started { get; init; } = DateTime.Now;
@@ -316,10 +318,14 @@ public sealed class TransferStore
     }
 
     /// Runs a journalled transfer again under its id, with the password
-    /// supplied afresh when the entry needs one.
-    public void Resume(TransferItem item, string? password)
+    /// supplied afresh when the entry needs one. A receive's `destination`
+    /// overrides the journalled folder and is remembered as its folder; the
+    /// card re-asks for it on retry, so a refusal like an existing file is
+    /// answered by choosing an empty one.
+    public void Resume(TransferItem item, string? password, string? destination = null)
     {
         if (!item.CanResume || item.JournalId is not string id) return;
+        if (destination is not null) item.Subject = destination;
         item.Running = true;
         item.Interrupted = false;
         item.View = null;
@@ -330,7 +336,7 @@ public sealed class TransferStore
         {
             try
             {
-                var report = VotportClientCoreMethods.Resume(id, password, transfer, listener);
+                var report = VotportClientCoreMethods.Resume(id, password, destination, transfer, listener);
                 return report is ResumeReport.Received received ? received.V1.Files : Array.Empty<string>();
             }
             catch (VotportException) { return Array.Empty<string>(); }

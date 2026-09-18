@@ -114,7 +114,7 @@ pub fn record(
 
 /// `path` made absolute against the working directory, without touching the
 /// filesystem; a path that cannot be resolved is kept as given.
-fn absolute(path: &str) -> String {
+pub(crate) fn absolute(path: &str) -> String {
     std::path::absolute(path)
         .map(|abs| abs.display().to_string())
         .unwrap_or_else(|_| path.to_owned())
@@ -138,6 +138,22 @@ pub fn mark_http(id: &str, http: HttpResume) -> Result<()> {
     let mut entry = get_in(&dir, id)?;
     entry.http = Some(http);
     write_in(&dir, &entry)
+}
+
+/// Points a journalled receive's next run at `dest`, already absolute: a
+/// retry that re-asks for the folder records the answer, so the card, a
+/// later offer, and the run itself agree on where it lands. Best effort like
+/// [`mark_needs_password`]: a write that fails only means the next offer
+/// suggests the old folder.
+pub fn set_dest(id: &str, dest: &str) {
+    set_dest_in(&dir(), id, dest);
+}
+
+fn set_dest_in(dir: &std::path::Path, id: &str, dest: &str) {
+    if let Ok(mut entry) = get_in(dir, id) {
+        entry.dest = Some(dest.to_owned());
+        let _ = write_in(dir, &entry);
+    }
 }
 
 /// Removes a stale HTTP session association while retaining the journalled
@@ -346,6 +362,37 @@ mod tests {
     fn fresh_ids_differ_within_a_second() {
         assert_ne!(fresh_id(7), fresh_id(7));
         assert!(fresh_id(7).starts_with("7-"));
+    }
+
+    /// A receive re-asked for its folder journals the answer, so the next
+    /// offer and the run itself follow the new folder; an id the journal
+    /// does not hold is quietly ignored, as a missing entry is elsewhere.
+    #[test]
+    fn a_re_asked_receive_journals_the_folder_it_was_given() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("journal");
+        let entry = Entry {
+            id: "1-a".into(),
+            kind: Kind::Receive,
+            link: "https://drop.example/s/DEL".into(),
+            paths: Vec::new(),
+            dest: Some("/tmp/landed".into()),
+            needs_password: false,
+            http: None,
+            started_unix: 0,
+        };
+        fs::create_dir_all(&dir).unwrap();
+        write_in(&dir, &entry).unwrap();
+        set_dest_in(&dir, "1-a", "/tmp/elsewhere");
+        assert_eq!(
+            get_in(&dir, "1-a").unwrap().dest.as_deref(),
+            Some("/tmp/elsewhere")
+        );
+        set_dest_in(&dir, "never-there", "/tmp/ignored");
+        assert!(matches!(
+            get_in(&dir, "never-there"),
+            Err(Error::UnknownTransfer { .. })
+        ));
     }
 
     /// An entry kept for a retry that never came is dropped at the next

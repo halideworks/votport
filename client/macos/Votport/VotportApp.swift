@@ -189,6 +189,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         launchLog.notice(
             "fonts: sans \(families.contains(Type.sansFamily)) mono \(families.contains(Type.monoFamily))")
         MainActor.assumeIsolated {
+            Notifier.start()
             TransferStore.shared.loadPending()
             PortStore.shared.load()
             TransferStore.shared.startWatching()

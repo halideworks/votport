@@ -35,6 +35,7 @@ fn the_ffi_end_to_end() {
     };
     let _state = isolate_state();
     a_two_file_receive_resumes_past_its_verified_first_file(&bin);
+    a_receive_re_asked_to_another_folder_lands_there_and_journals_it(&bin);
     a_quic_resume_reuses_a_verified_file(&bin);
     a_blocked_parent_link_keeps_the_receive_available_for_retry(&bin);
     a_shell_sends_a_folder_and_receives_a_delivery_through_the_view_model(&bin);
@@ -329,6 +330,7 @@ fn a_shell_sends_a_folder_and_receives_a_delivery_through_the_view_model(bin: &s
     let resumed = ffi::resume(
         entry.id.clone(),
         None,
+        None,
         Transfer::new(),
         Arc::new(Recorder::default()),
     )
@@ -344,6 +346,7 @@ fn a_shell_sends_a_folder_and_receives_a_delivery_through_the_view_model(bin: &s
     let gone_handle = Transfer::new();
     let gone = ffi::resume(
         entry.id.clone(),
+        None,
         None,
         gone_handle.clone(),
         Arc::new(Recorder::default()),
@@ -389,6 +392,7 @@ fn a_shell_sends_a_folder_and_receives_a_delivery_through_the_view_model(bin: &s
     let resumed = ffi::resume(
         entry.id.clone(),
         Some("pw".into()),
+        None,
         Transfer::new(),
         Arc::new(Recorder::default()),
     )
@@ -549,6 +553,7 @@ fn a_two_file_receive_resumes_past_its_verified_first_file(bin: &str) {
     let changed = ffi::resume(
         id.clone(),
         None,
+        None,
         Transfer::new(),
         Arc::new(Recorder::default()),
     );
@@ -559,6 +564,7 @@ fn a_two_file_receive_resumes_past_its_verified_first_file(bin: &str) {
     let linked = ffi::resume(
         id.clone(),
         None,
+        None,
         Transfer::new(),
         Arc::new(Recorder::default()),
     );
@@ -568,7 +574,7 @@ fn a_two_file_receive_resumes_past_its_verified_first_file(bin: &str) {
     std::fs::write(&first, b"first").unwrap();
     std::fs::remove_file(&blocker).unwrap();
     let recorder = Arc::new(Recorder::default());
-    let resumed = ffi::resume(id, None, Transfer::new(), recorder.clone()).unwrap();
+    let resumed = ffi::resume(id, None, None, Transfer::new(), recorder.clone()).unwrap();
     assert!(matches!(resumed, ffi::ResumeReport::Received(report) if report.files.len() == 2));
     assert_eq!(std::fs::read(&first).unwrap(), b"first");
     assert_eq!(
@@ -587,6 +593,67 @@ fn a_two_file_receive_resumes_past_its_verified_first_file(bin: &str) {
         .find(|view| view.phase == Phase::Transferring)
         .unwrap();
     assert_eq!(transport.files[0].state, FileState::Verified);
+}
+
+fn a_receive_re_asked_to_another_folder_lands_there_and_journals_it(bin: &str) {
+    let server = common::start_server(bin, &[]);
+    let token = common::deliver(&server.base, &[("only.bin", b"only".to_vec())], None, None);
+    let dest = tempfile::tempdir().unwrap();
+    std::fs::write(dest.path().join("only.bin"), b"clobber me").unwrap();
+    let handle = Transfer::new();
+    let refused = ffi::receive(
+        format!("{}/s/{token}", server.base),
+        None,
+        dest.path().display().to_string(),
+        handle.clone(),
+        Arc::new(Recorder::default()),
+    );
+    assert!(matches!(refused, Err(Error::Exists { .. })), "{refused:?}");
+    let id = handle.journal_id();
+    assert!(journalled(&id));
+    // The re-asked folder is where the retry lands: a blocker there turns
+    // the run into the same refusal, at the new folder. The refusal keeps
+    // the entry, and the entry now points at the folder it was given, so
+    // the next offer follows it without being asked again.
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::write(elsewhere.path().join("only.bin"), b"clobber me").unwrap();
+    let refused_again = ffi::resume(
+        id.clone().unwrap(),
+        None,
+        Some(elsewhere.path().display().to_string()),
+        Transfer::new(),
+        Arc::new(Recorder::default()),
+    );
+    assert!(
+        matches!(refused_again, Err(Error::Exists { .. })),
+        "{refused_again:?}"
+    );
+    assert!(journalled(&id));
+    let entry = ffi::pending()
+        .into_iter()
+        .find(|entry| entry.id == id.clone().unwrap())
+        .unwrap();
+    assert_eq!(
+        entry.dest.as_deref(),
+        Some(elsewhere.path().to_str().unwrap())
+    );
+    // With the blocker gone the plain retry lands in the re-asked folder
+    // and, as on any success, forgets its entry.
+    std::fs::remove_file(elsewhere.path().join("only.bin")).unwrap();
+    let last = id.unwrap();
+    ffi::resume(
+        last.clone(),
+        None,
+        None,
+        Transfer::new(),
+        Arc::new(Recorder::default()),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(elsewhere.path().join("only.bin")).unwrap(),
+        b"only"
+    );
+    assert!(!ffi::pending().iter().any(|entry| entry.id == last));
 }
 
 fn a_quic_resume_reuses_a_verified_file(bin: &str) {
@@ -621,6 +688,7 @@ fn a_quic_resume_reuses_a_verified_file(bin: &str) {
     let recorder = Arc::new(Recorder::default());
     let resumed = ffi::resume(
         handle.journal_id().unwrap(),
+        None,
         None,
         Transfer::new(),
         recorder.clone(),
@@ -667,6 +735,7 @@ fn a_blocked_parent_link_keeps_the_receive_available_for_retry(bin: &str) {
     std::fs::remove_file(root.join("nested")).unwrap();
     let resumed = ffi::resume(
         handle.journal_id().unwrap(),
+        None,
         None,
         Transfer::new(),
         Arc::new(Recorder::default()),

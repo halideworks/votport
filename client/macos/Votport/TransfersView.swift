@@ -96,8 +96,25 @@ struct TransferCard: View {
                                 .frame(width: 160)
                         }
                         Button(item.interrupted || item.view?.phase == .paused ? "Resume" : "Retry") {
-                            store.resume(item.id, password: password.isEmpty ? nil : password)
-                            password = ""
+                            let password = password.isEmpty ? nil : password
+                            self.password = ""
+                            if item.kind == .receive {
+                                // The one thing a journalled receive can be
+                                // asked again: where it lands. Opens on the
+                                // journalled folder; a cancel keeps the card.
+                                let panel = NSOpenPanel()
+                                panel.canChooseDirectories = true
+                                panel.canChooseFiles = false
+                                panel.allowsMultipleSelection = false
+                                panel.directoryURL = URL(fileURLWithPath: item.subject)
+                                panel.message = "Choose where the delivery lands."
+                                guard panel.runModal() == .OK, let folder = panel.url else {
+                                    return
+                                }
+                                store.resume(item.id, password: password, destination: folder)
+                            } else {
+                                store.resume(item.id, password: password, destination: nil)
+                            }
                         }
                         .disabled(item.needsPassword && password.isEmpty)
                     }
