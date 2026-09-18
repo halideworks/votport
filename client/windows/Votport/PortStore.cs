@@ -155,6 +155,24 @@ public sealed class PortStore
 
     }
 
+    /// The Settings screen's "Remove local data": the core deletes the whole
+    /// state directory (the stored session, the watch list with its
+    /// passwords, the journals, the pending verification evidence, and the
+    /// device key), so an uninstall leaves nothing behind.
+    public void RemoveLocalData()
+    {
+        var previous = ClearSso();
+        Run(Scope.Port, () => { previous?.Cancel(); VotportClientCoreMethods.ForgetEverything(); return true; }, _ =>
+        {
+            ResetLibraryUploadForSession();
+            Port = null;
+            AutomationTokens = Array.Empty<AutomationToken>();
+            Requests.Clear();
+            Deliveries.Clear();
+            ReloadWatches();
+        });
+    }
+
     /// Reloads the request links and deliveries.
     public void Refresh() =>
         Run(Scope.Links, () => (VotportClientCoreMethods.Requests(), VotportClientCoreMethods.Deliveries()), lists =>

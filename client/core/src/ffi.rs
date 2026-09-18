@@ -573,6 +573,19 @@ pub fn sign_out() {
     port::sign_out();
 }
 
+/// Removes every piece of local client data: the stored port session, the
+/// watch list with its saved passwords, the transfer journal, the evidence
+/// outbox, and the device key. A shell offers this as "Remove local data"
+/// in Settings, so an uninstall leaves nothing behind. Blocks for the
+/// removal; a shell runs it off its main thread.
+///
+/// # Errors
+/// A state directory that cannot be removed.
+#[uniffi::export]
+pub fn forget_everything() -> std::result::Result<(), port::PortError> {
+    crate::identity::forget_everything().map_err(port::PortError::from)
+}
+
 /// The port's open request links.
 ///
 /// # Errors

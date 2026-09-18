@@ -377,6 +377,28 @@ final class PortStore: ObservableObject {
         }
     }
 
+    /// The Settings screen's "Remove local data": the core deletes the whole
+    /// state directory (the stored session, the watch list with its
+    /// passwords, the journals, the pending verification evidence, and the
+    /// device key), so an uninstall leaves nothing behind.
+    func removeLocalData() {
+        let previous = clearSso()
+        run(.port) {
+            previous?.cancel()
+            try VotportCore.forgetEverything()
+        } then: { [weak self] result in
+            guard let self else { return }
+            if case .failure(let error) = result { self.take(error, .port); return }
+            self.resetLibraryUploadForSession()
+            self.port = nil
+            self.requests = []
+            self.deliveries = []
+            self.automationTokens = []
+            self.watches = VotportCore.watches()
+            self.problem = nil
+        }
+    }
+
     /// A session the server ended clears the port so the screens fold. The
     /// scope is stamped here, at the failure, so a slow call that lands
     /// after a later one still reports under its own form.

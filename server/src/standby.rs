@@ -233,6 +233,19 @@ pub async fn run(config: Config) -> Result<(), String> {
         Ok(count) => tracing::info!(count, "removed leftovers of an interrupted pull"),
         Err(error) => tracing::warn!(%error, "leftover sweep failed"),
     }
+    // The staged replica is this directory's freshest copy of the primary
+    // only while pulls keep landing. A previous run's stage may hold rows
+    // and identity keys the primary has since deleted, so it is dropped
+    // here and the first pull re-stages; the next pull is one interval
+    // away. A restore that was being applied is left for its boot to
+    // finish and is never discarded here.
+    match crate::backup::discard_staged_replica(&config.data_dir) {
+        Ok(true) => tracing::info!(
+            "cleared the replica a previous standby staged; the next pull stages a fresh one"
+        ),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(%error, "staged replica clear failed"),
+    }
     let status = Arc::new(Mutex::new(
         read_status(&config.data_dir).unwrap_or_default(),
     ));
@@ -446,6 +459,47 @@ mod tests {
                 assert!(!config.data_dir.join(name).exists(), "created {name}");
             }
         }
+    }
+
+    /// A replica a previous standby run staged is dropped when the standby
+    /// starts again, so nothing holds the primary's deleted rows until a
+    /// promotion; the next pull re-stages within one interval.
+    #[tokio::test]
+    async fn a_replica_staged_by_a_previous_run_is_cleared_when_the_standby_starts() {
+        let directory = tempfile::tempdir().unwrap();
+        let live = crate::api::testing::config(directory.path());
+        let config = Config {
+            data_dir: live.data_dir.clone(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            source: "http://127.0.0.1:1".into(),
+            token: "unused".into(),
+            interval: Duration::from_secs(60),
+        };
+        let stage = config.data_dir.join(".votport-restore-stage-stale");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("votport.db"), b"stale rows").unwrap();
+        crate::backup::write_pending_restore(
+            &config.data_dir,
+            crate::backup::CleanupPath::directory(stage.clone()),
+            crate::backup::Manifest {
+                version: crate::backup::VERSION,
+                created_at: 1,
+                schema_version: crate::store::SCHEMA_VERSION,
+                entries: Vec::new(),
+            },
+            crate::backup::RestoreMode::Replica,
+        )
+        .unwrap();
+        assert!(config.data_dir.join(crate::backup::PENDING_FILE).exists());
+
+        let mut standby = Box::pin(run(config.clone()));
+        tokio::select! {
+            result = &mut standby => panic!("standby stopped: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert!(!stage.exists(), "the stale staged replica survived startup");
+        assert!(!config.data_dir.join(crate::backup::PENDING_FILE).exists());
+        drop(standby);
     }
 
     #[test]

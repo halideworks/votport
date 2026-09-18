@@ -779,6 +779,16 @@ ignored while the first completes. The CLI signs in with the password.
 delivery creation and recovery, activity, and revocation through JSON CLI and
 MCP tools. Tenant switching follows the admin session's tenant.
 
+Every shell's Settings offers **Remove local data** (the core's
+`forget_everything` FFI call): it deletes the whole per-user state
+directory, `~/.local/share/votport` on Linux,
+`~/Library/Application Support/votport` on macOS, and `%APPDATA%\votport`
+on Windows. That directory holds everything the client keeps on disk: the
+stored port session with its operator cookie, the watch list with each
+watched folder's link and password, the transfer journals, the pending
+verification evidence outbox, and the device key, so an uninstall (or a
+hand-off to another machine) leaves nothing behind.
+
 ### votport server changes
 
 - The recipient page and the sender page get an "Open in the votport app"

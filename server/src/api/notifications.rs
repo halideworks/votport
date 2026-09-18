@@ -1015,6 +1015,86 @@ mod tests {
             assert!(policy.validate(&NOTIFICATION_EVENTS).is_err());
         }
     }
+
+    #[tokio::test]
+    async fn deleting_a_destination_reports_the_rules_still_naming_it() {
+        async fn saved(app: &Arc<App>, label: &str) -> serde_json::Value {
+            let response = save(
+                State(app.clone()),
+                headers(app, "", "admin"),
+                Json(connection(label)),
+            )
+            .await
+            .unwrap();
+            body(response).await
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let app = testing::build(directory.path());
+        let created = saved(&app, "Incoming").await;
+        let id = created["id"].as_str().unwrap().to_owned();
+        let revision = created["revision"].as_u64().unwrap();
+        let rules = policy(&id, "workflow_failed");
+
+        // Defaults, a request link, an outbound grant, and a delivery job
+        // override each still name the destination.
+        app.store.save_notification_defaults("", &rules).unwrap();
+        let mut link = crate::store::tests::test_link("link-1");
+        link.notifications = Some(rules.clone());
+        app.store.insert_link(link).unwrap();
+        let mut grant = crate::notify::tests::test_grant(vec![]);
+        grant.notifications = None;
+        app.store.insert_outbound_grant(grant).unwrap();
+        app.store
+            .set_outbound_notifications("", "grant-id", &rules)
+            .unwrap();
+        app.store
+            .save_delivery_project("", "local", crate::workflow::tests::project())
+            .unwrap();
+        let peer = || axum::extract::ConnectInfo("127.0.0.1:1234".parse().unwrap());
+        let mut request = crate::workflow::tests::request();
+        request.notifications = None;
+        let job = body(
+            crate::api::outbound::workflows::create(
+                State(app.clone()),
+                peer(),
+                headers(&app, "", "admin"),
+                Json(request),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        let job = job["job"]["id"].as_str().unwrap().to_owned();
+        assert!(app
+            .store
+            .set_job_notifications("", &job, Some(&rules))
+            .unwrap());
+
+        assert_eq!(
+            app.store.notification_rules_referencing("", &id).unwrap(),
+            4,
+            "defaults, link, grant, and job override each carry one rule"
+        );
+
+        let response =
+            delete_destination(&app, &id, &headers(&app, "", "admin"), Some(revision), None)
+                .await
+                .unwrap();
+        assert_eq!(body(response).await, json!({"ok":true,"rules":4}));
+
+        // The rules survive the delete on purpose (the operator re-aims
+        // them), and they are the same ones the count reported.
+        assert!(app.store.notification_defaults("").unwrap().enabled());
+        assert_eq!(
+            app.store.notification_rules_referencing("", &id).unwrap(),
+            4
+        );
+        assert!(app
+            .store
+            .notification_destination("", &id)
+            .unwrap()
+            .is_none());
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -1090,12 +1170,19 @@ pub async fn delete(
     if !app.store.with(|connection| connection.execute("DELETE FROM notification_destinations WHERE tenant=?1 AND id=?2 AND json_extract(document,'$.revision')=?3", rusqlite::params![identity.tenant,id,i64::try_from(revision).unwrap_or(-1)]).map(|count| count == 1)).map_err(store_unavailable)? {
         return Err(ApiError::new(StatusCode::CONFLICT,"Destination changed or was removed; reload before deleting"));
     }
+    // The rules survive the delete on purpose (saving a destination or a
+    // policy back is the operator's repair), but every one of them now
+    // skips silently, so the delete reports how many still name it.
+    let referencing = app
+        .store
+        .notification_rules_referencing(&identity.tenant, &id)
+        .map_err(store_unavailable)?;
     app.store.audit(
         &identity.tenant,
         &identity.subject,
         "notification_destination_deleted",
         &id,
-        &json!({}),
+        &json!({"rules": referencing}),
     );
-    Ok(Json(json!({"ok":true})).into_response())
+    Ok(Json(json!({"ok":true,"rules":referencing})).into_response())
 }

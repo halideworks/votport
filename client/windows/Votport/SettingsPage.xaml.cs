@@ -160,6 +160,12 @@ public sealed partial class SettingsPage : Page
 
     private void SignOut_Click(object sender, RoutedEventArgs e) => PortStore.Shared.SignOut();
 
+    private async void RemoveLocalData_Click(object sender, RoutedEventArgs e)
+    {
+        var confirm = new ContentDialog { XamlRoot = XamlRoot, Title = "Remove local data", Content = "This deletes the signed-in session, watch folders and their passwords, unfinished transfers, pending verification evidence, and this PC's device key. This PC stops receiving deliveries until it is enrolled again.", PrimaryButtonText = "Remove", CloseButtonText = "Cancel" };
+        if (await confirm.ShowAsync() == ContentDialogResult.Primary) PortStore.Shared.RemoveLocalData();
+    }
+
     private async void ChooseWatch_Click(object sender, RoutedEventArgs e)
     {
         var picked = await PickFolder(PickerLocationId.DocumentsLibrary);

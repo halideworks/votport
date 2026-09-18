@@ -924,7 +924,11 @@ Layout:
   as the pending restore that its next normal boot applies; the standby
   holds the same `data/lock` as a live instance and never opens the live
   database or touches the receive root. A replacement keeps the previous
-  replica until the new marker is durable. Its `/healthz` is
+  replica until the new marker is durable. A standby start clears a replica
+  a previous run staged and re-pulls, so a stopped standby does not hold
+  deleted rows past its own restart; the
+  [failover runbook](../ops/failover/README.md#erasing-and-decommissioning-a-replica-mode-standby)
+  names the staged copy in its erasure and decommission steps. Its `/healthz` is
   200 while pulls land within two intervals and its `/readyz` is always
   503 with `replica_lag_secs`, so a failover script can see how fresh the
   copy is. A replica-mode standby serves nothing else, so it is not a proxy

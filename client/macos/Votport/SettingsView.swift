@@ -14,6 +14,7 @@ struct SettingsView: View {
     @AppStorage(Prefs.notifyKey) private var notify = true
     @State private var openAtLogin = Self.registered
     @State private var loginProblem: String?
+    @State private var removeData = false
 
     var body: some View {
         ScrollView {
@@ -55,10 +56,16 @@ struct SettingsView: View {
                             .font(Type.caption)
                             .foregroundStyle(Tokens.danger)
                     }
+                    Button("Remove local data", role: .destructive) { removeData = true }
                     LabeledContent("Core", value: coreVersion())
                 }
                 .formStyle(.grouped)
                 .scrollContentBackground(.hidden)
+                .confirmationDialog("Remove local data?", isPresented: $removeData, titleVisibility: .visible) {
+                    Button("Remove local data", role: .destructive) { port.removeLocalData() }
+                } message: {
+                    Text("This deletes the signed-in session, watch folders and their passwords, unfinished transfers, pending verification evidence, and this Mac's device key. This Mac stops receiving deliveries until it is enrolled again.")
+                }
             }
             .padding(20)
         }

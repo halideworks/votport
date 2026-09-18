@@ -7,16 +7,57 @@
 //! web sender uses.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use tempfile::TempDir;
 
 use crate::api::{Client, FinishReport, LinkInfo};
 use crate::error::{Error, Result};
-use crate::identity::Device;
+use crate::identity::{state_dir, Device};
 use crate::package::{self, Prepared};
 use crate::progress::{Event, Observer, PlannedFile};
 use crate::send_push::Outcome;
 use crate::{entries, send_http, send_push};
+
+/// Where a send's staging lives: under the state directory, not the OS
+/// temp dir. A manifest names every source path and object root, so a
+/// package left by a killed send must not sit in a shared location.
+fn staging_root() -> PathBuf {
+    state_dir().join("staging")
+}
+
+/// A send that is killed skips `TempDir`'s Drop, so its staging directory
+/// would otherwise outlive it forever. Directories older than a week are
+/// from a run that died; no send holds one that long without finishing or
+/// failing. Swept each time a send stages, which bounds the leftover's
+/// life to the next launch of a send.
+fn age_staging(now: SystemTime) {
+    let week = Duration::from_secs(7 * 24 * 60 * 60);
+    let Ok(entries) = std::fs::read_dir(staging_root()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let expired = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| match now.duration_since(modified) {
+                Ok(age) => age >= week,
+                Err(_) => false,
+            });
+        if expired {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// A fresh staging directory for one send, under the state directory.
+fn new_staging() -> Result<TempDir> {
+    age_staging(SystemTime::now());
+    std::fs::create_dir_all(staging_root())?;
+    Ok(tempfile::Builder::new()
+        .prefix("votport-manifest-")
+        .tempdir_in(staging_root())?)
+}
 
 /// A drop to send: the link token, an optional password, and the files, each
 /// as the relative path it takes in the package and the file that holds it.
@@ -217,9 +258,7 @@ fn prepare(base: &str, drop: Drop, observer: &mut dyn Observer) -> Result<Ready>
     }
     observer.event(Event::Selected { files: selected });
 
-    let staging: TempDir = tempfile::Builder::new()
-        .prefix("votport-manifest-")
-        .tempdir()?;
+    let staging: TempDir = new_staging()?;
     let manifest_root = staging.path().join("manifest-root");
     let prepared = package::build(admitted, &manifest_root)?;
 
@@ -375,6 +414,48 @@ mod tests {
         selected.clear();
         collect_for_link(&hidden_only, &mut selected, false).unwrap();
         assert!(selected.is_empty());
+    }
+
+    /// A killed send skips `TempDir`'s Drop, so the manifest it staged
+    /// (every source path and object root) must land under the state
+    /// directory, where a later send ages it out, not the OS temp dir.
+    #[test]
+    fn staging_lives_in_the_state_dir_and_a_killed_send_leftover_ages_out() {
+        let root = tempfile::tempdir().unwrap();
+        let _state = crate::identity::test_state_dir(root.path());
+
+        // Staging lands under the state directory, never the OS temp dir.
+        let staging = new_staging().unwrap();
+        assert!(staging.path().starts_with(root.path()));
+
+        // A send that was killed left its manifest behind, and a later
+        // launch of a send sweeps it once it is old. A live send's fresh
+        // staging survives the sweep.
+        let leftover = staging_root().join("votport-manifest-killed");
+        std::fs::create_dir_all(leftover.join("manifest-root")).unwrap();
+        std::fs::write(
+            leftover.join("manifest-root/0000000000000000.cbor"),
+            b"paths",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            let killed = std::fs::File::open(&leftover).unwrap();
+            let age = SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
+            killed
+                .set_times(std::fs::FileTimes::new().set_modified(age))
+                .unwrap();
+        }
+        let live = staging_root().join("votport-manifest-live");
+        std::fs::create_dir_all(&live).unwrap();
+        age_staging(SystemTime::now());
+        #[cfg(unix)]
+        assert!(!leftover.exists(), "the killed send's manifest survived");
+        assert!(live.exists(), "a running send's staging was swept");
+        assert!(
+            staging.path().exists(),
+            "the active send's staging was swept"
+        );
     }
 
     #[cfg(unix)]
