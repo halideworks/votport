@@ -1,5 +1,5 @@
 use super::*;
-use crate::route_protocol::SignedPortMessage;
+use crate::route_protocol::{SignedPortMessage, PORT_MESSAGE_LIFETIME};
 use crate::store::{TradeEndpoint, TradeRoute, TRADE_EVENTS};
 use axum::extract::{ConnectInfo, Path, Query, State};
 use serde::Deserialize;
@@ -33,6 +33,16 @@ fn now() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
+/// Every short-lived port message is minted with the protocol lifetime; the
+/// peer's `verify` tolerates one skew window on either side of the expiry.
+fn minted_now() -> u64 {
+    now() + PORT_MESSAGE_LIFETIME
+}
+/// A signed peer message failed only its expiry window: the two ports'
+/// clocks disagree by more than one skew window, which an operator can
+/// fix, unlike a forged signature.
+pub(crate) const CLOCK_MISALIGNED: &str =
+    "the peer port's clock is more than five minutes out of step; align the clocks and retry";
 fn private(value: impl serde::Serialize) -> Response {
     ([(header::CACHE_CONTROL, "no-store")], Json(value)).into_response()
 }
@@ -77,7 +87,7 @@ pub async fn discover(
         "discovery",
         "",
         query.challenge,
-        now() + 300,
+        minted_now(),
         identity(&app)?,
     )))
 }
@@ -288,7 +298,11 @@ pub async fn probe(
         None::<&serde_json::Value>,
     )
     .await?;
-    if !response.verify("discovery", "", now())
+    let at = now();
+    if response.window_failed("discovery", "", at) {
+        return Err(invalid(CLOCK_MISALIGNED));
+    }
+    if !response.verify("discovery", "", at)
         || response.document.nonce != challenge
         || expected.is_some_and(|key| key != response.document.issuer)
         || !response.document.body["protocols"]
@@ -444,7 +458,7 @@ pub(crate) async fn enroll_outgoing(app: &App, route: &TradeRoute) -> ApiResult<
         .store
         .trade_credential(&route.tenant, &route.id)
         .map_err(store_unavailable)?;
-    let request=app.signer.port_message("enroll",&route.peer_key,invitation.document.nonce.clone(),now()+300,json!({"secret":invitation.document.body["secret"],"credential":credential,"name":identity(app)?["name"],"address":identity(app)?["address"]}));
+    let request=app.signer.port_message("enroll",&route.peer_key,invitation.document.nonce.clone(),minted_now(),json!({"secret":invitation.document.body["secret"],"credential":credential,"name":identity(app)?["name"],"address":identity(app)?["address"]}));
     let response = remote_json(app, &route.address, "/api/port/enroll", Some(&request)).await?;
     verify_response(app, route, &request, &response, "enrolled")?;
     let grant = response.document.body["grant"]
@@ -473,6 +487,9 @@ fn verify_response(
         || !response.verify(purpose, &app.signer.public_hex, now())
         || response.document.nonce != request.document.nonce
     {
+        if response.window_failed(purpose, &app.signer.public_hex, now()) {
+            return Err(invalid(CLOCK_MISALIGNED));
+        }
         return Err(invalid("Port identity mismatch in signed reply"));
     }
     Ok(())
@@ -509,7 +526,7 @@ pub async fn enroll(
         "enrolled",
         &route.peer_key,
         request.document.nonce,
-        now() + 300,
+        minted_now(),
         json!({"grant":route.id,"endpoint":route.endpoint,"state":route.state}),
     )))
 }
@@ -549,7 +566,7 @@ pub async fn status(
         "status",
         &route.peer_key,
         request.document.nonce,
-        now() + 300,
+        minted_now(),
         json!({"grant":route.id,"state":state,"endpoint":route.endpoint,"deliveries":deliveries}),
     )))
 }
@@ -558,7 +575,7 @@ async fn refresh_route_inner(app: &Arc<App>, route: &TradeRoute) -> ApiResult<()
         return enroll_outgoing(app, route).await;
     }
     probe(app, &route.address, Some(&route.peer_key)).await?;
-    let request=app.signer.port_message("status",&route.peer_key,crate::auth::random_token(),now()+300,json!({"grant":route.remote_grant,"credential":app.store.trade_credential(&route.tenant,&route.id).map_err(store_unavailable)?}));
+    let request=app.signer.port_message("status",&route.peer_key,crate::auth::random_token(),minted_now(),json!({"grant":route.remote_grant,"credential":app.store.trade_credential(&route.tenant,&route.id).map_err(store_unavailable)?}));
     let response = remote_json(app, &route.address, "/api/port/status", Some(&request)).await?;
     verify_response(app, route, &request, &response, "status")?;
     let state = response.document.body["state"]
@@ -682,7 +699,7 @@ pub async fn rotate_remote(
         "rotated",
         &route.peer_key,
         request.document.nonce,
-        now() + 300,
+        minted_now(),
         json!({"grant":route.id}),
     )))
 }
@@ -715,7 +732,7 @@ pub async fn rotate(
         "rotate",
         &route.peer_key,
         crate::auth::random_token(),
-        now() + 300,
+        minted_now(),
         json!({"grant":route.remote_grant,"credential":old,"next":next}),
     );
     let response = remote_json(&app, &route.address, "/api/port/rotate", Some(&request)).await?;

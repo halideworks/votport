@@ -96,6 +96,7 @@ struct WorkflowsView: View {
                             Text("\(record.server) · Delivery \(record.grantId)")
                             Text("Manifest: \(record.manifest)").font(Type.monoBody).textSelection(.enabled)
                             Text("Verification: \(human(record.verificationStatus)) · Acceptance: \(human(record.acceptanceStatus))")
+                            Text("Authorization expires \(Date(timeIntervalSince1970: Double(record.expiresAt)).formatted())").font(Type.caption)
                             if record.acceptanceStatus == "not_accepted" {
                                 Button("Accept verified delivery") { confirmation = Confirmation(id: record.id, action: "accept", manifest: record.manifest) }.disabled(busy)
                             }

@@ -308,7 +308,7 @@ fn receive_over_http_inner(
         }
         files.push(path);
     }
-    crate::evidence::complete(base, evidence, observer);
+    crate::evidence::complete(base, evidence, Some(&delivery.token), observer);
     observer.event(Event::Finished { files: files.len() });
     Ok(Received { files })
 }

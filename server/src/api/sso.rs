@@ -613,6 +613,9 @@ fn sso_error_code(message: &str) -> &'static str {
             "provider_misconfigured"
         }
         "identity could not be verified" => "identity_unverified",
+        "the id token expired before verification; check that this port's clock is set correctly" => {
+            "clock_skew"
+        }
         "could not verify group membership"
         | "overage or distributed group claims are not supported" => "groups_unverified",
         "this account is blocked" => "account_blocked",
@@ -742,8 +745,16 @@ pub async fn sso_callback(
         return home("no id token in response");
     };
     let expected_nonce = nonce;
+    // The IdP's clock can run ahead of the port's, and a short-lived id
+    // token can read as already expired on arrival. Verify against a clock
+    // moved back by this leeway (twice the five-minute drift the pairing
+    // skew allows), so a drifted IdP still signs users in; anything staler
+    // names the clock instead of an unverified identity.
+    const ID_TOKEN_CLOCK_LEEWAY_SECS: i64 = 600;
     let claims = match id_token.claims(
-        &client.client.id_token_verifier(),
+        &client.client.id_token_verifier().set_time_fn(|| {
+            chrono::Utc::now() - chrono::Duration::seconds(ID_TOKEN_CLOCK_LEEWAY_SECS)
+        }),
         move |actual: Option<&Nonce>| {
             actual
                 .map(|nonce| nonce.secret() == expected_nonce)
@@ -754,13 +765,21 @@ pub async fn sso_callback(
     ) {
         Ok(claims) => claims,
         Err(error) => {
+            let expired = matches!(error, openidconnect::ClaimsVerificationError::Expired(_));
             // A verification failure usually means the IdP rolled its signing
             // key and discovery's cached JWKS is stale. Drop the Ready slot
             // into the same Failed cooldown a failed discovery uses so the
             // next sign-in re-discovers; the cooldown bounds the flip to once
-            // per window, so bad tokens cannot force discovery storms.
-            app.sso_client.invalidate_ready();
-            tracing::warn!(target: "audit", event = "sso_failed", error = %error, "id token verification failed");
+            // per window, so bad tokens cannot force discovery storms. An
+            // expired token verified fine up to its expiry, so the cached
+            // keys are good and need no re-discovery.
+            if !expired {
+                app.sso_client.invalidate_ready();
+            }
+            tracing::warn!(target: "audit", event = "sso_failed", error = %error, expired, "id token verification failed");
+            if expired {
+                return home("the id token expired before verification; check that this port's clock is set correctly");
+            }
             return home("identity could not be verified");
         }
     };
@@ -1215,6 +1234,10 @@ mod tests {
             ),
             ("no id token in response", "provider_misconfigured"),
             ("identity could not be verified", "identity_unverified"),
+            (
+                "the id token expired before verification; check that this port's clock is set correctly",
+                "clock_skew",
+            ),
             ("could not verify group membership", "groups_unverified"),
             (
                 "overage or distributed group claims are not supported",
@@ -1650,6 +1673,184 @@ mod tests {
             assert_eq!(token_calls.load(Ordering::Relaxed), 1, "{case}");
             assert!(pkce_valid.load(Ordering::Relaxed), "{case} PKCE verifier");
             assert_eq!(unexpected_calls.load(Ordering::Relaxed), 0, "{case}");
+            tasks.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn an_id_token_expired_within_leeway_signs_in_but_a_stale_one_names_the_clock() {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::Request;
+        use openidconnect::core::{
+            CoreEdDsaPrivateSigningKey, CoreGenderClaim, CoreJweContentEncryptionAlgorithm,
+            CoreJwsSigningAlgorithm,
+        };
+        use openidconnect::{IdToken, IdTokenClaims, PrivateSigningKey as _};
+        use std::sync::{Arc, Mutex};
+        use tower::ServiceExt as _;
+
+        #[derive(Debug, Deserialize, Serialize)]
+        struct TestClaims {
+            #[serde(flatten)]
+            claims: serde_json::Map<String, serde_json::Value>,
+        }
+        impl openidconnect::AdditionalClaims for TestClaims {}
+        type TestToken = IdToken<
+            TestClaims,
+            CoreGenderClaim,
+            CoreJweContentEncryptionAlgorithm,
+            CoreJwsSigningAlgorithm,
+        >;
+
+        let key = CoreEdDsaPrivateSigningKey::from_ed25519_pem(
+            "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEICWeYPLxoZKHZlQ6rkBi11E9JwchynXtljATLqym/XS9\n-----END PRIVATE KEY-----",
+            None,
+        ).unwrap();
+        // A five-minute-fast IdP and a five-minute token lifetime leave a
+        // token readable but already expired: sign-in must still succeed.
+        // Hours-stale tokens are refused with the clock, not the identity.
+        for (age, expected) in [(300, None), (6 * 3600, Some("clock_skew"))] {
+            let directory = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let issuer = format!("http://{}", listener.local_addr().unwrap());
+            let metadata = json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "jwks_uri": format!("{issuer}/jwks"),
+                "response_types_supported": ["code"],
+                "subject_types_supported": ["public"],
+                "id_token_signing_alg_values_supported": ["EdDSA"]
+            });
+            let token = Arc::new(Mutex::new(String::new()));
+            let response_token = Arc::clone(&token);
+            let jwks = json!({"keys": [key.as_verification_key()]});
+            let provider = axum::Router::new()
+                .route(
+                    "/token",
+                    axum::routing::post(move || {
+                        let response_token = Arc::clone(&response_token);
+                        async move {
+                            axum::Json(json!({
+                                "access_token": "test-access",
+                                "token_type": "Bearer",
+                                "id_token": response_token.lock().unwrap().clone()
+                            }))
+                            .into_response()
+                        }
+                    }),
+                )
+                .fallback(move |uri: axum::http::Uri| {
+                    let response = match uri.path() {
+                        "/.well-known/openid-configuration" => {
+                            axum::Json(metadata.clone()).into_response()
+                        }
+                        "/jwks" => axum::Json(jwks.clone()).into_response(),
+                        _ => StatusCode::NOT_FOUND.into_response(),
+                    };
+                    async move { response }
+                });
+            let mut tasks = tokio::task::JoinSet::new();
+            tasks.spawn(async move { axum::serve(listener, provider).await.unwrap() });
+            let mut config = crate::api::testing::config(directory.path());
+            config.oidc = Some(crate::config::OidcConfig {
+                issuer: issuer.clone(),
+                client_id: "votport".into(),
+                client_secret: "secret".into(),
+                admin_group: Some("platform-admins".into()),
+                auditor_group: None,
+                subject_claim: crate::config::SubjectClaim::Sub,
+            });
+            let app = crate::app::build(config).unwrap();
+            let router = crate::app::router(Arc::clone(&app));
+            let peer = ConnectInfo("198.51.100.1:1".parse::<std::net::SocketAddr>().unwrap());
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::get("/api/admin/sso/start")
+                        .extension(peer)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FOUND, "age {age}");
+            let cookie = response.headers()[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap();
+            let redirect =
+                reqwest::Url::parse(response.headers()[header::LOCATION].to_str().unwrap())
+                    .unwrap();
+            let state = redirect
+                .query_pairs()
+                .find(|(name, _)| name == "state")
+                .unwrap()
+                .1
+                .into_owned();
+            let nonce = redirect
+                .query_pairs()
+                .find(|(name, _)| name == "nonce")
+                .unwrap()
+                .1
+                .into_owned();
+            let now = crate::store::now_unix();
+            let claims = json!({
+                "iss": issuer, "aud": "votport", "sub": "clock-test",
+                "iat": now - age - 300, "exp": now - age,
+                "nonce": nonce, "groups": ["platform-admins"]
+            });
+            let claims: IdTokenClaims<TestClaims, CoreGenderClaim> =
+                serde_json::from_value(claims).unwrap();
+            *token.lock().unwrap() =
+                TestToken::new(claims, &key, CoreJwsSigningAlgorithm::EdDsa, None, None)
+                    .unwrap()
+                    .to_string();
+            let response = router
+                .oneshot(
+                    Request::get(format!("/api/admin/callback?code=test&state={state}"))
+                        .extension(peer)
+                        .header(header::COOKIE, cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FOUND, "age {age}");
+            match expected {
+                None => {
+                    assert_eq!(response.headers()[header::LOCATION], "/", "age {age}");
+                    let cookie = response
+                        .headers()
+                        .get_all(header::SET_COOKIE)
+                        .iter()
+                        .find(|value| {
+                            value.to_str().unwrap().starts_with("votport_admin=")
+                                && !value.to_str().unwrap().contains("Max-Age=0")
+                        })
+                        .unwrap();
+                    let mut headers = HeaderMap::new();
+                    headers.insert(header::COOKIE, cookie.clone());
+                    let identity = super::super::admin::require_admin(&app, &headers).unwrap();
+                    assert_eq!(identity.subject, "clock-test");
+                    assert_eq!(identity.role, "admin");
+                }
+                Some(code) => {
+                    assert_eq!(
+                        response.headers()[header::LOCATION],
+                        format!("/?sso_error={code}"),
+                        "age {age}"
+                    );
+                    assert!(response
+                        .headers()
+                        .get_all(header::SET_COOKIE)
+                        .iter()
+                        .all(|value| !value.to_str().unwrap().starts_with("votport_admin=")));
+                }
+            }
             tasks.shutdown().await;
         }
     }

@@ -169,9 +169,14 @@ export function initDeliveryEvidence(getMetadata, savedNames) {
       const manifest = document.createElement('span'); manifest.className = 'mono';
       manifest.textContent = `Manifest ${record.evidence.authorization.challenge.manifest}`;
       const result = document.createElement('p'); result.textContent = `Files verified on this device. ${record.status === 'recorded' ? 'Verification reported to the sender.' : 'Verification report: ' + record.status + '.'} ${accepted ? (accepted.status === 'recorded' ? 'Delivery accepted and reported to the sender.' : 'Delivery accepted on this device; report: ' + accepted.status + '.') : 'Ready for your acceptance.'}`;
-      const detail = document.createElement('details'), caption = document.createElement('summary'); caption.textContent = 'Signed delivery fingerprint'; detail.append(caption, manifest); row.append(result, detail);
+      const expires = document.createElement('p'); expires.className = 'field-help';
+      const stale = record.evidence.authorization.challenge.expires_at <= Date.now() / 1000;
+      expires.textContent = stale
+        ? `Acceptance authorization expired ${new Date(record.evidence.authorization.challenge.expires_at * 1000).toLocaleString()}; verify the saved files again to request a fresh one.`
+        : `Acceptance authorization expires ${new Date(record.evidence.authorization.challenge.expires_at * 1000).toLocaleString()}.`;
+      const detail = document.createElement('details'), caption = document.createElement('summary'); caption.textContent = 'Signed delivery fingerprint'; detail.append(caption, manifest); row.append(result, expires, detail);
       if (!accepted) {
-        const button = document.createElement('button'); button.type = 'button'; button.textContent = 'Accept verified delivery';
+        const button = document.createElement('button'); button.type = 'button'; button.textContent = 'Accept verified delivery'; button.disabled = stale;
         button.onclick = () => run(async () => {
           if (!window.confirm('Accept this verified delivery? This records your acceptance of the exact files shown here and sends a signed report to the sender.')) return;
           const auth = await verifyAuthorization(record.evidence.authorization, record.evidence.authorization.issuer);

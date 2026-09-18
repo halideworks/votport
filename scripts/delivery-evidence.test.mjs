@@ -48,3 +48,20 @@ test('browser evidence uses the same ordered manifest and signed bytes as the Ru
     delete globalThis.window;
   }
 });
+
+test('acceptance surfaces name the authorization deadline in the desktop and web clients', async () => {
+  const swift = await readFile(new URL('../client/macos/Votport/WorkflowsView.swift', import.meta.url), 'utf8');
+  assert.ok(
+    swift.includes('Authorization expires \\(Date(timeIntervalSince1970: Double(record.expiresAt)).formatted())'),
+    'the Swift acceptance row must show the authorization deadline'
+  );
+  const csharp = await readFile(new URL('../client/windows/Votport/WorkflowsPage.cs', import.meta.url), 'utf8');
+  assert.ok(
+    csharp.includes('Authorization expires {DateTimeOffset.FromUnixTimeSeconds((long)record.ExpiresAt):g}'),
+    'the Windows acceptance row must show the authorization deadline'
+  );
+  const web = await readFile(new URL('../web/assets/delivery-evidence.js', import.meta.url), 'utf8');
+  assert.match(web, /Acceptance authorization expires/);
+  assert.match(web, /Acceptance authorization expired/);
+  assert.match(web, /button\.disabled = stale/);
+});
