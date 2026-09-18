@@ -544,6 +544,13 @@ function renderStatus(status) {
   receivingKey = key;
 }
 
+// The receive-link cap is quoted decimally, like the create form and the
+// desktops; formatBytes stays binary for the file sizes beside it.
+function formatLimit(bytes) {
+  const gb = bytes / 1000 ** 3;
+  return `${gb >= 100 || Number.isInteger(gb) ? Math.round(gb) : gb.toFixed(1)} GB`;
+}
+
 function renderLink(link) {
   // A change inside its undo window shows as if the server had it.
   const pending = pendingLinks.get(link.id);
@@ -623,7 +630,7 @@ function renderLink(link) {
     `created ${formatWhen(link.created_at)}`,
   ];
   if (link.expires_at) parts.push(`expires ${formatWhen(link.expires_at)}`);
-  if (link.max_bytes) parts.push(`limit ${formatBytes(link.max_bytes)}`);
+  if (link.max_bytes) parts.push(`limit ${formatLimit(link.max_bytes)}`);
   if (link.retention_days) parts.push(`kept ${link.retention_days}d`);
   meta.textContent = parts.join(' · ');
   card.append(meta);
@@ -915,7 +922,7 @@ $('create-form').addEventListener('submit', async (event) => {
   let created = false;
   submit.disabled = true; $('create-form').inert = true;
   createError.clear();
-  const maxGib = parseInt($('create-max').value, 10);
+  const maxGb = parseInt($('create-max').value, 10);
   const expires = parseInt($('create-expires').value, 10);
   const retention = parseInt($('create-retention').value, 10);
   try {
@@ -926,7 +933,7 @@ $('create-form').addEventListener('submit', async (event) => {
         dest: $('create-dest').value,
         password: creatingRoute ? null : $('create-password').value || null,
         expires_days: Number.isFinite(expires) ? expires : null,
-        max_bytes: Number.isFinite(maxGib) ? maxGib * 1024 ** 3 : null,
+        max_bytes: Number.isFinite(maxGb) ? maxGb * 1000 ** 3 : null,
         retention_days: Number.isFinite(retention) ? retention : null,
         notifications: creatingRoute ? { mode: 'off', rules: [] } : createNotifications.read(),
         workflow: createWorkflow?.read() || null,

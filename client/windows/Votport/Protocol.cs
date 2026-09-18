@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Microsoft.Win32;
 
 namespace Votport;
@@ -34,6 +35,43 @@ public static class Protocol
         {
             // Registration is a convenience for the web pages' links; the
             // app works without it.
+        }
+    }
+
+    /// The uninstall entry point. An unpackaged launch rewrites the protocol
+    /// command, the Run value and the toast AUMID on every start, and
+    /// nothing removed them, so a deleted folder left dead links, a failing
+    /// Run entry and a stale AUMID. This removes all three.
+    public static void UnregisterIfUnpackaged()
+    {
+        try
+        {
+            if (IsPackaged()) return;
+            // Inline the Run-value removal: Protocol.cs compiles into the
+            // activation test project, which does not carry Settings.cs.
+            using (var run = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run"))
+            {
+                // The value name and shape Settings writes; keep in sync.
+                run.DeleteValue("Votport", throwOnMissingValue: false);
+            }
+            try { Microsoft.Windows.AppLifecycle.ActivationRegistrationManager.UnregisterForProtocolActivation("votport", null); }
+            catch (Exception) { }
+            Registry.CurrentUser.DeleteSubKeyTree(@"Software\Classes\votport", throwOnMissingSubKey: false);
+            // The toast AUMID key the App SDK's Register wrote. Unpackaged,
+            // the SDK names the AUMID from the executable's FileDescription,
+            // falling back to the file name; drift there leaves a cosmetic
+            // key behind, nothing worse.
+            if (Environment.ProcessPath is string exe)
+            {
+                var aumid = FileVersionInfo.GetVersionInfo(exe).FileDescription;
+                if (string.IsNullOrEmpty(aumid)) aumid = Path.GetFileNameWithoutExtension(exe);
+                Registry.CurrentUser.DeleteSubKeyTree($@"Software\Classes\AppUserModelId\{aumid}", throwOnMissingSubKey: false);
+            }
+        }
+        catch (Exception)
+        {
+            // The registrations are conveniences; a refused removal still
+            // leaves the app working.
         }
     }
 

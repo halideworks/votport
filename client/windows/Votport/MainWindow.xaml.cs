@@ -1,3 +1,5 @@
+using System;
+using System.Runtime.InteropServices;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media.Animation;
@@ -25,12 +27,9 @@ public sealed partial class MainWindow : Window
             // on Settings.
             if (!operating && Nav.SelectedItem is NavigationViewItem current && ((string)current.Tag == "links" || (string)current.Tag == "share")) Show("settings");
         };
-        TransferStore.Shared.ActiveChanged += count =>
-        {
-            ActiveBadge.Value = count;
-            ActiveBadge.Visibility = count > 0 ? Visibility.Visible : Visibility.Collapsed;
-            tray.SetTip(count == 0 ? "votport" : $"votport, {count} active");
-        };
+        TransferStore.Shared.ActiveChanged += _ => Indicate();
+        // Every view moves the taskbar bar; the tip already re-reads here too.
+        TransferStore.Shared.ViewChanged += Indicate;
         Nav.SelectedItem = Nav.MenuItems[0];
         // The taskbar and Alt-Tab icon; the executable's own icon does not
         // reach an unpackaged WinUI window.
@@ -62,6 +61,75 @@ public sealed partial class MainWindow : Window
         // Built once the window is up, so the first tray click shows it at
         // once instead of paying for the XAML load then.
         DispatcherQueue.TryEnqueue(Microsoft.UI.Dispatching.DispatcherQueuePriority.Low, () => panel ??= new TrayPanel());
+    }
+
+    /// The tray tip and the taskbar bar. The tip carries the last settled
+    /// transfer's outcome, so a failure reads differently from idle; the
+    /// bar is the active transfers' moved bytes over their totals.
+    private void Indicate()
+    {
+        var store = TransferStore.Shared;
+        var count = store.ActiveCount;
+        ActiveBadge.Value = count;
+        ActiveBadge.Visibility = count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        var last = store.Items.FirstOrDefault(item => !item.Running);
+        tray.SetTip(count == 0
+            ? (last is null ? "votport" : $"votport; {Format.StatusLine(last)}")
+            : $"votport, {count} active" + (last is null ? "" : $"; {Format.StatusLine(last)}"));
+        ulong moved = 0, total = 0;
+        foreach (var item in store.Items.Where(item => item.Running))
+        {
+            moved += item.View?.MovedBytes ?? 0;
+            total += item.View?.TotalBytes ?? 0;
+        }
+        var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
+        if (total > 0)
+        {
+            Taskbar.SetProgressState(hwnd, TaskbarState.Normal);
+            Taskbar.SetProgressValue(hwnd, moved, total);
+        }
+        else
+        {
+            Taskbar.SetProgressState(hwnd, TaskbarState.NoProgress);
+        }
+    }
+
+    /// Taskbar progress through the Win32 taskbar interface: the App SDK's
+    /// AppWindow carries no taskbar surface, so the shell talks to
+    /// ITaskbarList3 directly.
+    private static class Taskbar
+    {
+        private static readonly ITaskbarList3 Instance = (ITaskbarList3)new TaskbarInstance();
+
+        public static void SetProgressValue(IntPtr hwnd, ulong completed, ulong total) =>
+            Instance.SetProgressValue(hwnd, completed, total);
+
+        public static void SetProgressState(IntPtr hwnd, TaskbarState state) =>
+            Instance.SetProgressState(hwnd, state);
+
+        [ComImport, Guid("ea1afb91-9e28-4b86-90e9-9e9f8a5eefaf")]
+        private class TaskbarInstance;
+
+        [ComImport, Guid("56FDF344-FD6D-11d0-958A-006097C9A090"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface ITaskbarList3
+        {
+            // Vtable order: ITaskbarList, ITaskbarList2, then the progress
+            // members. Only the two progress members are called.
+            [PreserveSig] int HrInit();
+            [PreserveSig] int AddTab(IntPtr hwnd);
+            [PreserveSig] int DeleteTab(IntPtr hwnd);
+            [PreserveSig] int ActivateTab(IntPtr hwnd);
+            [PreserveSig] int SetActiveAlt(IntPtr hwnd);
+            [PreserveSig] int MarkFullscreenWindow(IntPtr hwnd, [MarshalAs(UnmanagedType.Bool)] bool fullscreen);
+            void SetProgressValue(IntPtr hwnd, ulong completed, ulong total);
+            void SetProgressState(IntPtr hwnd, TaskbarState state);
+        }
+    }
+
+    private enum TaskbarState : uint
+    {
+        NoProgress = 0,
+        Normal = 2,
     }
 
     /// Ends the app from the tray or the panel: the icon goes first, so no

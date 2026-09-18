@@ -279,3 +279,13 @@ test('admin timestamps carry the UTC zone name, matching logs, receipts and the 
     /\.toLocaleString\(\[\], \{\s*timeZone: 'UTC',\s*timeZoneName: 'short',\s*\}\);/,
   );
 });
+
+test('the receive-link transfer limit is decimal GB on the web like the desktops', () => {
+  assert.match(receive, /Transfer limit <span class="muted">GB, optional<\/span>/);
+  // The cap is created in decimal GB and read back the same way; the binary
+  // formatBytes stays for the file sizes beside it.
+  assert.match(receiveScript, /max_bytes: Number\.isFinite\(maxGb\) \? maxGb \* 1000 \*\* 3 : null/);
+  assert.doesNotMatch(receiveScript, /1024 \*\* 3/);
+  assert.match(receiveScript, /function formatLimit\(bytes\) \{[\s\S]*?bytes \/ 1000 \*\* 3[\s\S]*? GB`/);
+  assert.match(receiveScript, /limit \$\{formatLimit\(link\.max_bytes\)\}/);
+});

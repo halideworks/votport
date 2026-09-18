@@ -91,6 +91,15 @@ final class TransferStore: ObservableObject {
 
     var active: [TransferItem] { items.filter(\.running) }
 
+    /// The menu bar glyph: full while bytes move, plain after a clean end,
+    /// and a warning when the last settled transfer failed or was cut, so a
+    /// failure reads differently from idle. The menu bar has no tooltip.
+    var menuBarSymbol: String {
+        if !active.isEmpty { return "sailboat.fill" }
+        guard let last = items.first(where: { !$0.running }) else { return "sailboat" }
+        return last.interrupted || last.view?.phase == .failed ? "exclamationmark.triangle" : "sailboat"
+    }
+
     func send(link: String, password: String?, paths: [String]) {
         let item = start(kind: .send, subject: Self.subject(for: paths), link: link)
         run(item.id) { transfer, listener in
@@ -258,6 +267,21 @@ final class TransferStore: ObservableObject {
             }
         }
         items[index].view = view
+        updateDockTile()
+    }
+
+    /// Dock progress from the active transfers' moved bytes over their
+    /// totals; zero hides the bar. Every view and every finish lands here,
+    /// straight from the store's main-actor updates.
+    private func updateDockTile() {
+        var moved: UInt64 = 0
+        var total: UInt64 = 0
+        for item in active {
+            moved += item.view?.movedBytes ?? 0
+            total += item.view?.totalBytes ?? 0
+        }
+        NSApp.dockTile.progress = total > 0 ? Double(moved) / Double(total) : 0
+        NSApp.dockTile.display()
     }
 
     func finished(_ id: UUID, landed: [String]) {
@@ -273,6 +297,7 @@ final class TransferStore: ObservableObject {
         }
         items[index].compactStopped(landed: landed)
         handles[id] = nil
+        updateDockTile()
         let item = items[index]
         log.notice("ended: \(String(describing: item.view?.phase), privacy: .public)")
         Notifier.transferEnded(item)
