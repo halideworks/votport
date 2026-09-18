@@ -28,11 +28,7 @@ pub async fn verify_receipt(
     let ip = client_ip(&headers, &peer, &app.config.trusted_proxies);
     // Full address: a quota, not a guessing throttle. See create_session.
     if !app.verify_rate.allow(&ip) {
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many checks from your address; try again later",
-        )
-        .with_retry_after(600));
+        return Err(super::rate_limited("checks from your address", 600));
     }
     if body.is_empty() {
         return Err(not_a_receipt());

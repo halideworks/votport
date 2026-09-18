@@ -20,6 +20,11 @@ const draftKey = `votport-workflow-draft:${JSON.stringify([session.subject, sess
 const initialFilters = new URLSearchParams(window.location.search);
 let jobsLoading = false, committedFilters = '';
 let jobFilter = { q: initialFilters.get('q') || '', project: initialFilters.get('project') || '', state: initialFilters.get('state') || '' };
+// The status filter offers exactly the card labels: one option per store
+// state, so no filter names a state the store cannot return or a label no
+// card shows.
+const stateFilterOptions = () => Object.entries(stateNames).map(([id, label]) => ({ id, label }));
+options($('workflow-filter-state'), stateFilterOptions(), 'All deliveries');
 $('workflow-query').value = jobFilter.q; $('workflow-filter-state').value = jobFilter.state;
 
 function notice(message) { $('workflow-notice').textContent = message; $('workflow-notice').hidden = false; }

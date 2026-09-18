@@ -94,10 +94,10 @@ test('named admission refusals stop with the server sentence', () => {
   const address = retryDecision({
     attempt: 0,
     status: 429,
-    body: { error: 'too many uploads started from your address; try again later' },
+    body: { error: 'too many uploads started from your address; try again in 600 seconds' },
   });
   assert.equal(address.retry, false);
-  assert.equal(address.message, 'too many uploads started from your address; try again later');
+  assert.equal(address.message, 'too many uploads started from your address; try again in 600 seconds');
   const tenant = retryDecision({
     attempt: 0,
     status: 429,

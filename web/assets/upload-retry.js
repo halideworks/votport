@@ -11,7 +11,7 @@ export const RETRY_BUDGET_MS = 90 * 1000;
 // pausing indefinitely. Matched exactly, case-sensitive: these are the
 // server's documented sentences, and a near-miss must keep retrying.
 const REFUSALS = new Set([
-  'too many uploads started from your address; try again later',
+  'too many uploads started from your address; try again in 600 seconds',
   'too many concurrent uploads for this tenant',
   'the server is draining for maintenance; your upload will resume shortly',
 ]);

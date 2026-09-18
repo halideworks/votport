@@ -391,12 +391,9 @@ pub async fn evidence(
         .after
         .unwrap_or_else(|| "0".into())
         .parse::<u64>()
-        .map_err(|_| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid evidence cursor"))?;
+        .map_err(|_| crate::api::invalid_page("invalid evidence cursor"))?;
     if !(1..=100).contains(&limit) || after > i64::MAX as u64 {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid evidence page",
-        ));
+        return Err(crate::api::invalid_page("invalid evidence page"));
     }
     let records = app
         .store
@@ -559,12 +556,9 @@ pub async fn events(
         .after
         .unwrap_or_else(|| "0".into())
         .parse::<u64>()
-        .map_err(|_| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid event cursor"))?;
+        .map_err(|_| crate::api::invalid_page("invalid event cursor"))?;
     if !(1..=100).contains(&limit) || after > i64::MAX as u64 {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid event page",
-        ));
+        return Err(crate::api::invalid_page("invalid event page"));
     }
     let projects = app
         .store
@@ -1442,11 +1436,10 @@ pub(crate) fn recipient_rate(
     if app.automation_read_rate.allow(&ip) {
         Ok(())
     } else {
-        Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many recipient authentication requests",
-        )
-        .with_retry_after(600))
+        Err(crate::api::rate_limited(
+            "recipient authentication requests",
+            600,
+        ))
     }
 }
 
@@ -1547,13 +1540,10 @@ pub async fn webhook_attempts(
         .after
         .unwrap_or_else(|| "0".into())
         .parse::<u64>()
-        .map_err(|_| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid webhook cursor"))?;
+        .map_err(|_| crate::api::invalid_page("invalid webhook cursor"))?;
     let limit = page.limit.unwrap_or(50);
     if after > i64::MAX as u64 || !(1..=100).contains(&limit) {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid webhook page",
-        ));
+        return Err(crate::api::invalid_page("invalid webhook page"));
     }
     let attempts = app
         .store
@@ -2776,11 +2766,14 @@ mod tests {
             )
             .await;
             assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{query}");
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            // Audit 434: the internal parameter fault never reaches the
+            // caller; the generic sentence replaces it.
             assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["code"],
-                "invalid_request",
+                body["error"], "This page of results could not be loaded. Reload the page.",
                 "{query}"
             );
+            assert_eq!(body["code"], "invalid_request", "{query}");
         }
         let (status, _, body) = call(
             &app,

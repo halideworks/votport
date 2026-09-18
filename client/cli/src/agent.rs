@@ -4,7 +4,7 @@ use votport_client_core::automation::{error_json, Automation};
 pub fn run(args: &[String]) -> Result<Value, Value> {
     let Some((command, args)) = args.split_first() else {
         return Err(invalid(
-            "agent needs session, files, share, recover, deliveries, delivery or revoke",
+            "agent needs session, notifications, files, share, recover, deliveries, delivery, revoke, projects, jobs, create-job, job, retry-job, cancel-job, events or job-evidence",
         ));
     };
     let valued: &[&str] = match command.as_str() {
@@ -136,7 +136,40 @@ pub fn exit_code(value: &Value) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{exit_code, invalid};
+    use super::{exit_code, invalid, run};
+
+    /// Audit 432: the usage refusal must name every subcommand, not a
+    /// hand-picked seven of sixteen.
+    #[test]
+    fn usage_error_lists_every_agent_subcommand() {
+        let message = run(&[]).unwrap_err()["error"]
+            .as_str()
+            .expect("usage error carries a message")
+            .to_owned();
+        for command in [
+            "session",
+            "notifications",
+            "files",
+            "share",
+            "recover",
+            "deliveries",
+            "delivery",
+            "revoke",
+            "projects",
+            "jobs",
+            "create-job",
+            "job",
+            "retry-job",
+            "cancel-job",
+            "events",
+            "job-evidence",
+        ] {
+            assert!(
+                message.contains(command),
+                "{command} missing from: {message}"
+            );
+        }
+    }
 
     #[test]
     fn agent_exit_codes_mirror_the_share_subcommand_split() {

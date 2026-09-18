@@ -203,6 +203,34 @@ impl ApiError {
     }
 }
 
+/// Audit 433: one rate-limit sentence whose wait is the Retry-After value
+/// itself, so the copy and the header can never disagree. Shared with the
+/// SCIM error type, which is not an ApiError.
+pub fn rate_limit_message(what: &str, seconds: u64) -> String {
+    format!("too many {what}; try again in {seconds} seconds")
+}
+
+/// The rate-limit refusal every 429 handler returns: the shared sentence
+/// carrying the Retry-After number.
+pub fn rate_limited(what: &str, seconds: u64) -> ApiError {
+    ApiError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        rate_limit_message(what, seconds),
+    )
+    .with_retry_after(seconds)
+}
+
+/// Audit 434: paging refusals a normal session cannot cause answer with one
+/// sentence; the parameter fault goes to the log, not the caller. The reason
+/// stays in the code at each call site so operators can match log to check.
+pub fn invalid_page(reason: &str) -> ApiError {
+    tracing::warn!(target: "audit", event = "invalid_page", reason, "paging parameters refused");
+    ApiError::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "This page of results could not be loaded. Reload the page.",
+    )
+}
+
 impl From<SessionError> for ApiError {
     fn from(error: SessionError) -> Self {
         Self::new(
@@ -587,6 +615,49 @@ mod ip_tests {
             client_ip(&headers, &mapped_public, &[]),
             "::ffff:203.0.113.9"
         );
+    }
+}
+
+#[cfg(test)]
+mod refusal_copy_tests {
+    use super::*;
+    use http_body_util::BodyExt as _;
+
+    /// Audit 433: the rate-limit sentence carries the Retry-After number
+    /// itself, and the header matches it.
+    #[tokio::test]
+    async fn rate_limit_copy_carries_the_retry_after_seconds() {
+        for (what, seconds) in [("automation requests", 600), ("failed attempts", 60)] {
+            let response = rate_limited(what, seconds).into_response();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok()),
+                Some(seconds.to_string().as_str())
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
+                json!(format!("too many {what}; try again in {seconds} seconds"))
+            );
+        }
+    }
+
+    /// Audit 434: a paging refusal a session cannot cause answers with the
+    /// one generic sentence, whatever internal parameter fault produced it.
+    #[tokio::test]
+    async fn paging_refusals_share_one_sentence_and_log_the_fault() {
+        for reason in ["invalid job page", "invalid evidence cursor"] {
+            let response = invalid_page(reason).into_response();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
+                json!("This page of results could not be loaded. Reload the page.")
+            );
+        }
     }
 }
 

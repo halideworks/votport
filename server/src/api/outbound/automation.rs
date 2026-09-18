@@ -49,11 +49,7 @@ pub(super) fn authenticate(
         &app.automation_read_rate
     };
     if !rate.allow(&ip) {
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many automation requests; try again later",
-        )
-        .with_retry_after(600));
+        return Err(crate::api::rate_limited("automation requests", 600));
     }
     let refused = |reason: &str| {
         app.store.audit(
@@ -455,17 +451,9 @@ pub async fn deliveries(
         .as_deref()
         .unwrap_or("0")
         .parse::<i64>()
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "after must be a non-negative integer",
-            )
-        })?;
+        .map_err(|_| crate::api::invalid_page("after must be a non-negative integer"))?;
     if after < 0 {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "after must be non-negative",
-        ));
+        return Err(crate::api::invalid_page("after must be non-negative"));
     }
     let mut rows = app
         .store

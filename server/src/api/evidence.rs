@@ -145,10 +145,7 @@ pub async fn submit(
 fn rate(app: &App, headers: &HeaderMap, peer: &std::net::SocketAddr) -> ApiResult<()> {
     let ip = super::client_ip(headers, peer, &app.config.trusted_proxies);
     if !app.automation_read_rate.allow(&ip) {
-        return Err(
-            ApiError::new(StatusCode::TOO_MANY_REQUESTS, "too many evidence requests")
-                .with_retry_after(600),
-        );
+        return Err(super::rate_limited("evidence requests", 600));
     }
     Ok(())
 }
@@ -189,10 +186,7 @@ pub async fn list(
     }
     let limit = page.limit.unwrap_or(50);
     if !(1..=100).contains(&limit) || page.after.unwrap_or(0) > i64::MAX as u64 {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid evidence page",
-        ));
+        return Err(super::invalid_page("invalid evidence page"));
     }
     let evidence = app
         .store
