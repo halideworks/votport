@@ -381,6 +381,7 @@ mod persistence_tests {
         ] {
             store
                 .insert_link(Link {
+                    retention_days: None,
                     id: id.into(),
                     tenant: String::new(),
                     label: id.into(),

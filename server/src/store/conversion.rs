@@ -176,7 +176,7 @@ fn convert(data: &Path, public_url: &str) -> Result<Conversion> {
         &transaction,
         &target,
         "tenants",
-        &["incarnation"],
+        &["incarnation", "retention_days"],
         |connection| {
             let mut rows = connection.prepare("SELECT key FROM tenants ORDER BY key")?;
             for key in rows.query_map([], |row| row.get::<_, String>(0))? {
@@ -185,6 +185,9 @@ fn convert(data: &Path, public_url: &str) -> Result<Conversion> {
                     params![key?, auth::random_token()],
                 )?;
             }
+            // Finding 378: the source predates scoped retention; every
+            // converted tenant defers to the platform setting.
+            connection.execute("UPDATE conversion_tenants SET retention_days=NULL", [])?;
             Ok(())
         },
     )?;
@@ -533,7 +536,18 @@ fn normalize_uploads(connection: &Connection, target: &Connection) -> Result<()>
     connection.execute_batch("DROP TABLE files; ALTER TABLE conversion_files RENAME TO files;")?;
     target_indexes(connection, target, "files")?;
     target_indexes(connection, target, "link_uploads")?;
-    rebuild(connection, target, "links", &[], |_| Ok(()))?;
+    // Finding 378: the source predates scoped link retention; converted
+    // links defer to tenant and platform windows.
+    rebuild(
+        connection,
+        target,
+        "links",
+        &["retention_days"],
+        |connection| {
+            connection.execute("UPDATE conversion_links SET retention_days=NULL", [])?;
+            Ok(())
+        },
+    )?;
     // Schema 35 tokens predate creator tracking; the column stays ''.
     rebuild(
         connection,

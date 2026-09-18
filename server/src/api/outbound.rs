@@ -514,7 +514,7 @@ pub async fn upload_outbound_file(
     let relative = query.path.trim_matches('/').replace('\\', "/");
     match app
         .store
-        .has_active_library_grant(&identity.tenant, &relative, now_unix())
+        .has_active_library_grant(&identity.tenant, &relative)
     {
         Ok(false) => {}
         Ok(true) => {
@@ -1090,7 +1090,7 @@ pub async fn delete_outbound_file(
         }
         if worker
             .store
-            .has_active_library_grant(&tenant, &relative_path_for_worker, now_unix())
+            .has_active_library_grant(&tenant, &relative_path_for_worker)
             .map_err(super::store_unavailable)?
         {
             return Err(ApiError::new(
@@ -7220,6 +7220,7 @@ mod tests {
             .unwrap();
         app.store
             .insert_link(crate::store::Link {
+                retention_days: None,
                 id: "link".to_owned(),
                 label: "link".to_owned(),
                 tenant: String::new(),

@@ -425,7 +425,6 @@ pub async fn put(
 pub struct TestStorage {
     revision: u64,
 }
-
 pub async fn test_connection(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -602,6 +601,64 @@ pub async fn test_connection(
 enum ConnectionProbe {
     Verified(&'static str),
     Unreachable(&'static str),
+}
+
+/// Audit finding 381: a delivery storage connection was undeletable. Remove
+/// the connection and its stored credentials, refusing while a non-retired
+/// delivery job still references it or a trade route owns the id.
+pub async fn remove(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> ApiResult<Response> {
+    let identity = admin::require_operator_write(&app, &headers)?;
+    if !identity.tenant.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "platform administrator required for storage connections",
+        ));
+    }
+    // Read the label before deletion for a value-free audit row.
+    let removed_config = app
+        .store
+        .delivery_storages()
+        .map_err(crate::api::store_unavailable)?
+        .into_iter()
+        .find(|config| config.id == id);
+    use crate::store::DeliveryStorageRemoval;
+    match app
+        .store
+        .delete_delivery_storage(&id)
+        .map_err(crate::api::store_unavailable)?
+    {
+        DeliveryStorageRemoval::Deleted => {}
+        DeliveryStorageRemoval::Absent => return Err(ApiError::not_found()),
+        DeliveryStorageRemoval::PairedTradeRoute => {
+            return Err(conflict("Manage paired routes in Trade routes".into()))
+        }
+        DeliveryStorageRemoval::JobsAttached => {
+            return Err(conflict(
+                "Deliveries still use this connection. Retire them before removing it.".into(),
+            ))
+        }
+    }
+    let audiences: Vec<String> = match &removed_config {
+        Some(config) if !config.tenants.is_empty() => config.tenants.clone(),
+        _ => vec![String::new()],
+    };
+    let detail = json!({
+        "label": removed_config.as_ref().map(|config| config.label.clone()),
+        "kind": removed_config.as_ref().map(|config| config.kind),
+    });
+    for tenant in audiences {
+        app.store
+            .audit(&tenant, &identity.subject, "storage_deleted", &id, &detail);
+    }
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({"ok": true})),
+    )
+        .into_response())
 }
 
 fn folder_root(config: &Storage) -> ApiResult<PathBuf> {

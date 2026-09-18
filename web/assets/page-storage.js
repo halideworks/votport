@@ -69,6 +69,12 @@ async function refresh() {
       const actions = node('div', '', 'actions'); actions.append(button('Edit connection', 'ghost', () => edit(connection)), button('Test connection', 'ghost', (element) => guard(async () => {
         element.disabled = true;
         try { const result = await test(connection); notice(`${connection.label}: ${result.message}`); } finally { element.disabled = false; }
+      })), button('Remove connection', 'ghost', () => guard(async () => {
+        if (!await confirmModal('Remove connection', `Deletes the ${connection.label} connection and its stored credentials. Deliveries still using it must be retired first; files already delivered remain in place.`, 'Remove connection')) return;
+        try {
+          await api(`/api/workflows/storage/${encodeURIComponent(connection.id)}`, { method: 'DELETE' });
+          await refresh();
+        } catch (error) { notice(error.message); }
       }))); card.append(actions);
     }
     list.append(card);

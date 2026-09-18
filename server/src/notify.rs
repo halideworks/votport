@@ -1113,6 +1113,7 @@ pub(crate) mod tests {
         application
             .store
             .insert_tenant(Tenant {
+                retention_days: None,
                 key: "studio".into(),
                 incarnation: String::new(),
                 label: "Atelier été".into(),
@@ -1747,6 +1748,7 @@ pub(crate) mod tests {
         application
             .store
             .insert_link(Link {
+                retention_days: None,
                 id: "link-id".into(),
                 tenant: String::new(),
                 label: "upload-label".into(),

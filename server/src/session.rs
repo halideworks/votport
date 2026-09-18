@@ -7354,6 +7354,7 @@ mod push_tests {
             setup
                 .store
                 .insert_link(crate::store::Link {
+                    retention_days: None,
                     id: setup.link_id.clone(),
                     tenant: String::new(),
                     label: "checkpoint".into(),
@@ -7997,6 +7998,7 @@ mod push_tests {
         setup
             .store
             .insert_link(crate::store::Link {
+                retention_days: None,
                 id: setup.link_id.clone(),
                 tenant: String::new(),
                 label: "recovery".into(),
@@ -8127,6 +8129,7 @@ mod push_tests {
             application
                 .store
                 .insert_link(crate::store::Link {
+                    retention_days: None,
                     id: "link".to_owned(),
                     tenant: String::new(),
                     label: "retry".to_owned(),
@@ -8273,6 +8276,7 @@ mod push_tests {
         application
             .store
             .insert_link(crate::store::Link {
+                retention_days: None,
                 id: "link".to_owned(),
                 tenant: String::new(),
                 label: "retry".to_owned(),
@@ -8408,6 +8412,7 @@ mod push_tests {
         application
             .store
             .insert_link(crate::store::Link {
+                retention_days: None,
                 id: "link".to_owned(),
                 tenant: String::new(),
                 label: "retry".to_owned(),

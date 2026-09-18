@@ -193,6 +193,7 @@ fn delivered_candidates_match_full_identity_and_seek_past_aliases() {
 
 pub(crate) fn test_link(id: &str) -> Link {
     Link {
+        retention_days: None,
         id: id.to_owned(),
         tenant: String::new(),
         label: "test".to_owned(),
@@ -219,6 +220,7 @@ pub(crate) fn link_in(tenant: &str, id: &str) -> Link {
 
 pub(crate) fn test_tenant(key: &str) -> Tenant {
     Tenant {
+        retention_days: None,
         incarnation: String::new(),
         key: key.to_owned(),
         label: key.to_owned(),
@@ -789,7 +791,7 @@ fn outbound_grants_are_tenant_scoped_and_hash_lookup_is_global() {
 }
 
 #[test]
-fn active_library_grants_match_source_with_tenant_and_lifecycle_scope() {
+fn active_library_grants_match_source_with_tenant_and_revocation_scope() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path()).unwrap();
     let mut active = test_outbound_grant("active", "acme", 0);
@@ -820,6 +822,9 @@ fn active_library_grants_match_source_with_tenant_and_lifecycle_scope() {
     }];
     store.insert_outbound_grant(other).unwrap();
 
+    // Finding 380: expiry and exhausted downloads no longer free a source
+    // for deletion or overwrite (extend refuses to revive an expired grant);
+    // only revocation does.
     for (id, revoked_at, expires_at, downloads, max_downloads) in [
         ("expired", None, Some(14), 0, None),
         ("revoked", Some(12), Some(20), 0, None),
@@ -845,14 +850,206 @@ fn active_library_grants_match_source_with_tenant_and_lifecycle_scope() {
     }
 
     assert!(store
-        .has_active_library_grant("acme", "project/file.bin", 15)
+        .has_active_library_grant("acme", "project/file.bin")
         .unwrap());
     assert!(!store
-        .has_active_library_grant("other", "project/file.bin", 15)
+        .has_active_library_grant("other", "project/file.bin")
         .unwrap());
+    // Expired and download-spent grants still pin their sources; revoking
+    // every non-revoked grant is what frees the files again.
+    assert!(store
+        .has_active_library_grant("acme", "ignored/file.bin")
+        .unwrap());
+    assert!(store.revoke_outbound_grant("acme", "expired", 15).unwrap());
+    // "spent" is still non-revoked, so the source stays pinned...
+    assert!(store
+        .has_active_library_grant("acme", "ignored/file.bin")
+        .unwrap());
+    // ...until the last pinning grant is revoked.
+    assert!(store.revoke_outbound_grant("acme", "spent", 15).unwrap());
     assert!(!store
-        .has_active_library_grant("acme", "ignored/file.bin", 15)
+        .has_active_library_grant("acme", "ignored/file.bin")
         .unwrap());
+}
+
+#[test]
+fn purge_expired_revoked_grants_drops_traces_keeps_live_and_signed() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    let mut dead = test_outbound_grant("dead", "acme", 0);
+    dead.expires_at = 50;
+    dead.revoked_at = Some(40);
+    store.insert_outbound_grant(dead).unwrap();
+    // Revoked but not yet expired: traces stay until the window closes.
+    let mut fresh = test_outbound_grant("fresh", "acme", 0);
+    fresh.expires_at = 500;
+    fresh.revoked_at = Some(40);
+    store.insert_outbound_grant(fresh).unwrap();
+    // Expired but never revoked: still deliverable history (finding 380).
+    let mut live = test_outbound_grant("live", "acme", 0);
+    live.expires_at = 50;
+    store.insert_outbound_grant(live).unwrap();
+    // Revoked and expired, but its delivery job has not retired yet: the
+    // retirement sweep and reprocessing still read the grant row. A twin
+    // ("gone") has a retired job and loses its row like "dead".
+    let mut jobbed = test_outbound_grant("jobbed", "acme", 0);
+    jobbed.expires_at = 50;
+    jobbed.revoked_at = Some(40);
+    store.insert_outbound_grant(jobbed).unwrap();
+    let mut gone = test_outbound_grant("gone", "acme", 0);
+    gone.expires_at = 50;
+    gone.revoked_at = Some(40);
+    store.insert_outbound_grant(gone).unwrap();
+    store
+        .with(|connection| {
+            connection.execute_batch(
+                "INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,token,document,created_at)
+                 VALUES ('jobbed','acme','alice','op1','project','queued',0,'t','{}',10),
+                        ('gone','acme','alice','op2','project','retired',0,'t2','{}',10);
+                 INSERT INTO outbound_grant_files(grant_id,file_index,source,name,suite,root,bytes_hi,bytes_lo,receipt_b64) VALUES
+                     ('dead',0,'project/file.bin','file.bin','blake3','root',0,1,'r'),
+                     ('fresh',0,'project/file.bin','file.bin','blake3','root',0,1,'r'),
+                     ('live',0,'project/file.bin','file.bin','blake3','root',0,1,'r'),
+                     ('gone',0,'project/file.bin','file.bin','blake3','root',0,1,'r');
+                 INSERT INTO delivery_manifests(grant_id,digest) VALUES ('orphan','digest');
+                 INSERT INTO delivery_evidence(id,grant_id,holder,kind,received_at,document) VALUES
+                     ('e1','dead','holder','accepted',10,'{}'),
+                     ('e2','gone','holder','accepted',10,'{}');
+                 INSERT INTO delivery_policy_cache(grant_id,protected) VALUES
+                     ('dead',0),('orphan',1);
+                 INSERT INTO outbound_grant_manifests(grant_id,manifest_root,created_at) VALUES
+                     ('dead','mroot',10),('gone','mroot',10);
+                 INSERT INTO outbound_fetch_tickets(token_id,grant_id,manifest_root,expires_at) VALUES
+                     ('t1','dead','mroot',500),('t2','orphan','mroot',500);
+                 INSERT INTO delivery_events(tenant,grant_id,kind,created_at,payload,previous_hash,hash,issuer,signature) VALUES
+                     ('acme','dead','delivery_revoked',40,'{}','p','h','i','s');",
+            )
+        })
+        .unwrap();
+
+    let purged = store.purge_expired_revoked_grants(100).unwrap();
+    assert_eq!(purged, 2);
+    let survivors: Vec<String> = store
+        .with(|connection| {
+            let mut statement = connection.prepare("SELECT id FROM outbound_grants ORDER BY id")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<_>>()
+        })
+        .unwrap();
+    assert_eq!(survivors, ["fresh", "jobbed", "live"]);
+    store
+        .with(|connection| {
+            for table in [
+                "outbound_grant_files",
+                "delivery_manifests",
+                "delivery_evidence",
+                "delivery_policy_cache",
+                "outbound_grant_manifests",
+                "outbound_fetch_tickets",
+            ] {
+                let grants: Vec<String> = connection
+                    .prepare(&format!("SELECT DISTINCT grant_id FROM {table}"))
+                    .unwrap()
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                assert!(
+                    grants
+                        .iter()
+                        .all(|grant| { grant == "fresh" || grant == "live" || grant == "jobbed" }),
+                    "{table} still holds {grants:?}"
+                );
+            }
+            // The signed delivery event survives the purge of its grant row.
+            let events: i64 = connection
+                .query_row("SELECT COUNT(*) FROM delivery_events", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(events, 1);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn delivery_storage_deletion_refuses_jobs_and_trade_routes() {
+    // Finding 381: delivery storage connections were undeletable. Removal
+    // works once no non-retired job references the connection, and stored
+    // credentials go with it.
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    let folder: crate::api::outbound::workflows::storage::Storage = serde_json::from_str(
+        r#"{"id":"archive","revision":0,"label":"Archive","kind":"s3",
+            "endpoint":"https://s3.example.com","bucket":"bucket","region":"us-east-1",
+            "kms_key_id":null,"tenants":[],"enabled":true}"#,
+    )
+    .unwrap();
+    let saved = store
+        .save_delivery_storage(
+            "alice",
+            folder,
+            Some(
+                crate::api::outbound::workflows::storage::Credentials::AccessKey {
+                    access_key_id: "key".into(),
+                    secret_access_key: "secret".into(),
+                    session_token: None,
+                },
+            ),
+        )
+        .unwrap();
+    assert!(store.delivery_storage_has_credentials("archive").unwrap());
+    assert_eq!(saved.revision, 1);
+
+    // A queued job still importing from, or delivering to, the connection
+    // pins it; a retired job does not.
+    store
+        .with(|connection| {
+            connection.execute_batch(
+                "INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,token,document,created_at) VALUES
+                     ('job-queued','acme','alice','op1','project','queued',0,'t',
+                      '{\"project\":{\"destinations\":[\"archive\"]}}',10),
+                     ('job-retired','acme','alice','op2','project','retired',0,'t2',
+                      '{\"request\":{\"import\":{\"storage_id\":\"archive\"}}}',10);
+                 INSERT INTO trade_routes(id,tenant,direction,peer_key,endpoint,document,credential)
+                 VALUES ('routed','acme','outbound','peer','https://peer.example','{}','{}');",
+            )
+        })
+        .unwrap();
+
+    assert_eq!(
+        store.delete_delivery_storage("archive").unwrap(),
+        crate::store::DeliveryStorageRemoval::JobsAttached
+    );
+    assert_eq!(store.delivery_storages().unwrap().len(), 1);
+
+    // A trade route owns its id; the store refuses and the page says so.
+    assert_eq!(
+        store.delete_delivery_storage("routed").unwrap(),
+        crate::store::DeliveryStorageRemoval::PairedTradeRoute
+    );
+
+    // Unknown ids answer Absent so the handler can 404.
+    assert_eq!(
+        store.delete_delivery_storage("nope").unwrap(),
+        crate::store::DeliveryStorageRemoval::Absent
+    );
+
+    // Once every referencing job has retired, the connection and its stored
+    // credentials go together.
+    store
+        .with(|connection| {
+            connection.execute(
+                "UPDATE delivery_jobs SET state='retired' WHERE id='job-queued'",
+                [],
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        store.delete_delivery_storage("archive").unwrap(),
+        crate::store::DeliveryStorageRemoval::Deleted
+    );
+    assert!(store.delivery_storages().unwrap().is_empty());
+    assert!(!store.delivery_storage_has_credentials("archive").unwrap());
 }
 
 #[test]
@@ -1577,6 +1774,8 @@ fn schema41_upgrade_preserves_existing_grants_and_can_store_new_addresses() {
              DROP INDEX delivery_jobs_tenant_snapshot;
              ALTER TABLE outbound_grants DROP COLUMN share_token;
              ALTER TABLE delivery_jobs DROP COLUMN created_at;
+                 ALTER TABLE tenants DROP COLUMN retention_days;
+                 ALTER TABLE links DROP COLUMN retention_days;
              ALTER TABLE delivery_jobs DROP COLUMN snapshot_bytes;
              ALTER TABLE automation_tokens DROP COLUMN created_by;
              UPDATE meta SET value='41' WHERE key='schema_version';",
@@ -1675,6 +1874,8 @@ fn schema45_upgrade_backfills_delivery_job_snapshot_and_created_columns() {
                  ALTER TABLE delivery_jobs DROP COLUMN created_at;
                  ALTER TABLE delivery_jobs DROP COLUMN snapshot_bytes;
                  ALTER TABLE automation_tokens DROP COLUMN created_by;
+                 ALTER TABLE tenants DROP COLUMN retention_days;
+                 ALTER TABLE links DROP COLUMN retention_days;
                  UPDATE meta SET value='44' WHERE key='schema_version';",
             )
         })
@@ -1781,6 +1982,8 @@ fn schema46_upgrade_backfills_automation_token_creator() {
                  INSERT INTO audit_log(at,tenant,actor,event,subject,detail)
                  VALUES (1,'acme','Minter@Example.com','automation_token_created','audited','{}');
                  ALTER TABLE automation_tokens DROP COLUMN created_by;
+                 ALTER TABLE tenants DROP COLUMN retention_days;
+                 ALTER TABLE links DROP COLUMN retention_days;
                  UPDATE meta SET value='45' WHERE key='schema_version';",
             )
         })
@@ -1830,6 +2033,72 @@ fn schema46_upgrade_backfills_automation_token_creator() {
         })
         .unwrap();
     assert_eq!(preserved, "Minter@Example.com");
+}
+
+#[test]
+fn schema47_upgrade_adds_scoped_upload_retention_columns() {
+    let directory = tempfile::tempdir().unwrap();
+    // Fresh databases stamp 47 and carry the retention columns from the
+    // start; unset scopes read as NULL.
+    let store = Store::open(directory.path()).unwrap();
+    assert_eq!(
+        store
+            .with(|connection| {
+                connection.query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap(),
+        SCHEMA_VERSION.to_string()
+    );
+    // Seed rows the way schema 46 stored them (a tenant with quotas and a
+    // link under it), then strip the 47 columns and stamp the old version.
+    store
+        .with(|connection| {
+            connection.execute_batch(
+                "INSERT INTO tenants(key,incarnation,label,admin_group,max_total_bytes,max_links,max_sessions,created_at)
+                 VALUES ('acme','inc','Acme',NULL,1000,5,2,7);
+                 INSERT INTO links(id,tenant,label,dest,created_at,expires_at,active,events_json,legal_hold)
+                 VALUES ('link','acme','Link','work',10,NULL,1,'[]',0);
+                 ALTER TABLE tenants DROP COLUMN retention_days;
+                 ALTER TABLE links DROP COLUMN retention_days;
+                 UPDATE meta SET value='46' WHERE key='schema_version';",
+            )
+        })
+        .unwrap();
+    drop(store);
+    // The upgrade runs inside one transaction, so a restart mid-migration
+    // presents exactly as this 46 database does and the next open reruns
+    // the whole step.
+    let store = Store::open(directory.path()).unwrap();
+    assert_eq!(
+        store
+            .with(|connection| {
+                connection.query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap(),
+        SCHEMA_VERSION.to_string()
+    );
+    let tenant = store.tenant("acme").unwrap().unwrap();
+    assert_eq!(tenant.retention_days, None);
+    let link = store.link("acme", "link").unwrap().unwrap();
+    assert_eq!(link.retention_days, None);
+    // Values written at 47 survive a reopen.
+    assert!(store
+        .update_link("acme", "link", |link| link.retention_days = Some(30))
+        .unwrap());
+    drop(store);
+    let store = Store::open(directory.path()).unwrap();
+    assert_eq!(
+        store.link("acme", "link").unwrap().unwrap().retention_days,
+        Some(30)
+    );
 }
 
 #[test]
@@ -1932,11 +2201,12 @@ fn outbound_grant_extension_handles_live_expired_and_scoped_rows() {
         store.extend_outbound_grant("acme", "live", 5, 15).unwrap(),
         Some(25)
     );
+    // Finding 380: an expired grant refuses extension and keeps its expiry.
     assert_eq!(
         store
             .extend_outbound_grant("acme", "expired", 5, 20)
             .unwrap(),
-        Some(25)
+        None
     );
     assert_eq!(
         store.extend_outbound_grant("other", "live", 5, 20).unwrap(),
@@ -1954,7 +2224,40 @@ fn outbound_grant_extension_handles_live_expired_and_scoped_rows() {
             .unwrap()
             .unwrap()
             .expires_at,
-        25
+        10
+    );
+}
+
+#[test]
+fn outbound_grant_extension_never_revives_an_expired_grant() {
+    // Finding 380: extending an expired grant used to resurrect it as a
+    // live delivery, so expiry must refuse the extension outright.
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    let mut expired = test_outbound_grant("expired", "acme", 0);
+    expired.expires_at = 10;
+    store.insert_outbound_grant(expired).unwrap();
+    assert_eq!(
+        store
+            .extend_outbound_grant("acme", "expired", 5, 20)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .outbound_grant_by_token_hash("hash-expired")
+            .unwrap()
+            .unwrap()
+            .expires_at,
+        10
+    );
+    // A live grant still extends from its own expiry.
+    let mut live = test_outbound_grant("live", "acme", 1);
+    live.expires_at = 30;
+    store.insert_outbound_grant(live).unwrap();
+    assert_eq!(
+        store.extend_outbound_grant("acme", "live", 5, 20).unwrap(),
+        Some(35)
     );
 }
 
@@ -3288,6 +3591,7 @@ mod tenant_tests {
         let store = Store::open(directory.path()).unwrap();
         store
             .insert_tenant(Tenant {
+                retention_days: None,
                 incarnation: String::new(),
                 key: "acme".to_owned(),
                 label: "Acme".to_owned(),
@@ -3316,6 +3620,7 @@ mod tenant_tests {
         let store = Store::open(directory.path()).unwrap();
         store
             .insert_tenant(Tenant {
+                retention_days: None,
                 incarnation: String::new(),
                 key: "acme".to_owned(),
                 label: String::new(),
@@ -4209,14 +4514,14 @@ mod ops_tests {
         assert_eq!(
             first,
             vec![
-                (String::new(), "a-link".into()),
-                (String::new(), "b-link".into())
+                (String::new(), "a-link".into(), None),
+                (String::new(), "b-link".into(), None)
             ]
         );
         let second = store
             .retention_link_ids(Some(&first.last().unwrap().1), 2)
             .unwrap();
-        assert_eq!(second, vec![("acme".into(), "c-link".into())]);
+        assert_eq!(second, vec![("acme".into(), "c-link".into(), None)]);
         assert!(store
             .retention_link_ids(Some(&second.last().unwrap().1), 2)
             .unwrap()
@@ -5379,6 +5684,8 @@ mod settings_tests {
                  ALTER TABLE delivery_jobs DROP COLUMN created_at;
                  ALTER TABLE delivery_jobs DROP COLUMN snapshot_bytes;
                  ALTER TABLE automation_tokens DROP COLUMN created_by;
+                 ALTER TABLE tenants DROP COLUMN retention_days;
+                 ALTER TABLE links DROP COLUMN retention_days;
                  UPDATE meta SET value='43' WHERE key='schema_version';",
             )
             .unwrap();
@@ -5440,6 +5747,7 @@ mod settings_tests {
         let store = Store::open(directory.path()).unwrap();
         store
             .insert_tenant(Tenant {
+                retention_days: None,
                 incarnation: String::new(),
                 key: "acme".to_owned(),
                 label: String::new(),

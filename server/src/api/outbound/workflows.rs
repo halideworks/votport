@@ -3075,6 +3075,7 @@ mod tests {
                 recipients: vec![],
             };
             let link = crate::store::Link {
+                retention_days: None,
                 id: "incoming".into(),
                 tenant: String::new(),
                 label: "Incoming".into(),
@@ -3662,6 +3663,7 @@ mod tests {
             let receiver = crate::app::build(config).unwrap();
             crate::app::start_push_receiver(Arc::clone(&receiver));
             let mut tenant = crate::store::Tenant {
+                retention_days: None,
                 incarnation: String::new(),
                 key: "nyc".into(),
                 label: "Independent NYC tenant".into(),
@@ -3685,6 +3687,7 @@ mod tests {
             receiver
                 .store
                 .insert_link(crate::store::Link {
+                    retention_days: None,
                     id: token.clone(),
                     tenant: "nyc".into(),
                     label: "NYC reception".into(),
@@ -4176,6 +4179,91 @@ mod tests {
             );
             server.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn storage_remove_deletes_the_connection_and_audits_it() {
+        // Finding 381: the storage page gains a Remove control backed by
+        // DELETE /api/workflows/storage/{id}.
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let cookie = admin_cookie(&app);
+        let folder = json!({"id":"shared", "revision":0, "label":"Shared folder", "kind":"folder", "directory":directory.path().join("shared"), "tenants":[""], "enabled":true});
+        assert_eq!(
+            call(
+                &app,
+                Method::PUT,
+                "/api/workflows/storage",
+                Some(&cookie),
+                Some(json!({"storage":folder}))
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+
+        // Removal requires an operator; anything else is refused first.
+        assert_eq!(
+            call(
+                &app,
+                Method::DELETE,
+                "/api/workflows/storage/shared",
+                None,
+                None
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        // Deleting an unknown id is 404, not a silent success.
+        assert_eq!(
+            call(
+                &app,
+                Method::DELETE,
+                "/api/workflows/storage/unknown",
+                Some(&cookie),
+                None
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+
+        let (status, _, body) = call(
+            &app,
+            Method::DELETE,
+            "/api/workflows/storage/shared",
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let removed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(removed["ok"], true);
+        assert!(app.store.delivery_storages().unwrap().is_empty());
+        let audits = app.store.audit_export(None, 0, 0, 100).unwrap();
+        // The signed delivery event is mirrored into the audit trail with an
+        // empty subject; the handler's own row carries the operator, the id
+        // and the label for the per-audience view.
+        let row = audits
+            .iter()
+            .find(|row| row.event == "storage_deleted" && row.subject == "shared")
+            .expect("removal is audited");
+        assert_eq!(row.subject, "shared");
+        assert_eq!(row.detail["label"], "Shared folder");
+        // The removal itself is audited per audience; a repeat answers 404.
+        assert_eq!(
+            call(
+                &app,
+                Method::DELETE,
+                "/api/workflows/storage/shared",
+                Some(&cookie),
+                None
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]
@@ -5599,6 +5687,7 @@ mod tests {
         let app = testing::build(directory.path());
         app.store
             .insert_tenant(crate::store::Tenant {
+                retention_days: None,
                 incarnation: String::new(),
                 key: "acme".into(),
                 label: "acme".into(),

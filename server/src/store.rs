@@ -32,7 +32,7 @@ mod workflows;
 pub use evidence::*;
 pub use routes::{InboundRoute, OutboundControl};
 pub use webhooks::*;
-pub use workflows::WorkflowMutationError;
+pub use workflows::{DeliveryStorageRemoval, WorkflowMutationError};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FileRecord {
@@ -252,6 +252,10 @@ pub struct Link {
     pub legal_hold: bool,
     #[serde(default)]
     pub notifications: Option<crate::store::NotificationPolicy>,
+    /// Tenant-scoped upload retention (days) that narrows the global sweep
+    /// window for this link's uploads; None defers to tenant and platform.
+    #[serde(default)]
+    pub retention_days: Option<u64>,
     #[serde(default)]
     pub uploads: Vec<UploadRecord>,
     #[serde(default)]
@@ -290,6 +294,10 @@ pub struct Tenant {
     pub max_links: Option<u64>,
     /// Cap on concurrent upload sessions for the whole tenant.
     pub max_sessions: Option<u64>,
+    /// Tenant-scoped upload retention (days) that narrows the global sweep
+    /// window; None defers to the platform setting.
+    #[serde(default)]
+    pub retention_days: Option<u64>,
     pub created_at: u64,
 }
 
@@ -489,7 +497,7 @@ struct ValidatedSettings {
     draining: Option<bool>,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 46;
+pub(crate) const SCHEMA_VERSION: u64 = 47;
 pub(crate) const DELIVERED_CANDIDATE_PAGE: usize = 128;
 pub(crate) const RETENTION_CLOCK_KEY: &str = "retention_clock_trusted_at";
 
@@ -792,7 +800,8 @@ CREATE TABLE IF NOT EXISTS tenants (
     max_total_bytes INTEGER,
     max_links INTEGER,
     max_sessions INTEGER,
-    created_at INTEGER NOT NULL DEFAULT 0
+    created_at INTEGER NOT NULL DEFAULT 0,
+    retention_days INTEGER
 );
 CREATE TABLE IF NOT EXISTS links (
     id TEXT PRIMARY KEY,
@@ -806,7 +815,8 @@ CREATE TABLE IF NOT EXISTS links (
     active INTEGER NOT NULL DEFAULT 1,
     events_json TEXT NOT NULL DEFAULT '[]',
     legal_hold INTEGER NOT NULL DEFAULT 0,
-    notifications_json TEXT
+    notifications_json TEXT,
+    retention_days INTEGER
 );
 CREATE INDEX links_tenant ON links(tenant);
 CREATE INDEX links_tenant_created ON links(tenant, created_at DESC, id DESC);
@@ -1373,7 +1383,8 @@ impl Store {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                        active, legal_hold, events_json, notifications_json
+                        active, legal_hold, events_json, notifications_json,
+                        retention_days
                  FROM links WHERE tenant = ?1 ORDER BY rowid",
             )?;
             let rows =
@@ -1626,7 +1637,8 @@ impl Store {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                        active, legal_hold, events_json, notifications_json
+                        active, legal_hold, events_json, notifications_json,
+                        retention_days
                  FROM links
                  WHERE tenant = ?1
                    AND (?2 = '' OR lower(label) LIKE '%' || ?2 || '%' ESCAPE '\\'
@@ -1689,7 +1701,8 @@ impl Store {
             connection
                 .query_row(
                     "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                            active, legal_hold, events_json, notifications_json
+                            active, legal_hold, events_json, notifications_json,
+                        retention_days
                      FROM links WHERE tenant = ?1 AND id = ?2",
                     rusqlite::params![tenant, id],
                     |row| row_to_link_with_uploads(connection, row),
@@ -1706,7 +1719,8 @@ impl Store {
             connection
                 .query_row(
                     "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                            active, legal_hold, events_json, notifications_json
+                            active, legal_hold, events_json, notifications_json,
+                        retention_days
                      FROM links WHERE id = ?1",
                     [id],
                     |row| row_to_link_with_uploads(connection, row),
@@ -1721,7 +1735,8 @@ impl Store {
             connection
                 .prepare_cached(
                     "SELECT id, tenant, label, dest, password_hash, created_at, expires_at,
-                            max_bytes, active, legal_hold, '[]' AS events_json, notifications_json
+                            max_bytes, active, legal_hold, '[]' AS events_json, notifications_json,
+                            retention_days
                      FROM links WHERE id = ?1",
                 )?
                 .query_row([id], row_to_link)
@@ -2224,7 +2239,7 @@ impl Store {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT key, label, admin_group, CAST(max_total_bytes AS TEXT),
-                        CAST(max_links AS TEXT), CAST(max_sessions AS TEXT), created_at, incarnation
+                        CAST(max_links AS TEXT), CAST(max_sessions AS TEXT), created_at, incarnation, retention_days
                  FROM tenants ORDER BY rowid",
             )?;
             let rows = statement.query_map([], map_tenant)?;
@@ -2251,7 +2266,7 @@ impl Store {
             };
             let mut statement = connection.prepare(
                 "SELECT key, label, admin_group, CAST(max_total_bytes AS TEXT),
-                        CAST(max_links AS TEXT), CAST(max_sessions AS TEXT), created_at, incarnation
+                        CAST(max_links AS TEXT), CAST(max_sessions AS TEXT), created_at, incarnation, retention_days
                  FROM tenants
                  WHERE (created_at,key) > (?1,?2)
                  ORDER BY created_at,key LIMIT ?3",
@@ -2267,7 +2282,7 @@ impl Store {
             connection
                 .query_row(
                     "SELECT key, label, admin_group, CAST(max_total_bytes AS TEXT),
-                            CAST(max_links AS TEXT), CAST(max_sessions AS TEXT), created_at, incarnation
+                            CAST(max_links AS TEXT), CAST(max_sessions AS TEXT), created_at, incarnation, retention_days
                      FROM tenants WHERE key = ?1",
                     [key],
                     map_tenant,
@@ -2434,7 +2449,7 @@ impl Store {
         self.with(|connection| {
             let changed = connection.execute(
                 "UPDATE tenants SET label = ?2, admin_group = ?3, max_total_bytes = ?4,
-                                    max_links = ?5, max_sessions = ?6
+                                    max_links = ?5, max_sessions = ?6, retention_days = ?7
                  WHERE key = ?1",
                 rusqlite::params![
                     tenant.key,
@@ -2443,6 +2458,9 @@ impl Store {
                     tenant.max_total_bytes.map(encode_quota),
                     tenant.max_links.map(encode_quota),
                     tenant.max_sessions.map(encode_quota),
+                    tenant
+                        .retention_days
+                        .map(|days| i64::try_from(days).unwrap_or(i64::MAX)),
                 ],
             )?;
             Ok(changed > 0)
@@ -3307,7 +3325,8 @@ impl Store {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                        active, legal_hold, events_json, notifications_json
+                        active, legal_hold, events_json, notifications_json,
+                        retention_days
                  FROM links ORDER BY rowid",
             )?;
             let rows = statement.query_map([], |row| row_to_link_with_uploads(connection, row))?;
@@ -3315,35 +3334,69 @@ impl Store {
         })
     }
 
-    /// Link identities for the retention sweep. The caller hydrates each link
-    /// separately so one pass never keeps every tenant's upload history alive.
+    /// Link identities for the retention sweep, with each link's
+    /// tenant-level upload retention (finding 378). The caller hydrates each
+    /// link separately so one pass never keeps every tenant's upload history
+    /// alive.
     pub(crate) fn retention_link_ids(
         &self,
         after: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<(String, String)>, String> {
+    ) -> Result<Vec<(String, String, Option<u64>)>, String> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        // LEFT JOIN: the default tenant has no tenants row, and a missing
+        // tenant row means "no tenant-level retention".
         self.with(|connection| {
             if let Some(after) = after {
                 let mut statement = connection.prepare_cached(
-                    "SELECT tenant, id FROM links
-                     WHERE id > ?1
-                     ORDER BY id LIMIT ?2",
+                    "SELECT links.tenant, links.id, tenants.retention_days
+                     FROM links LEFT JOIN tenants ON tenants.key = links.tenant
+                     WHERE links.id > ?1
+                     ORDER BY links.id LIMIT ?2",
                 )?;
                 let rows = statement.query_map(rusqlite::params![after, limit], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?
+                            .and_then(|value| u64::try_from(value).ok()),
+                    ))
                 })?;
                 rows.collect()
             } else {
-                let mut statement = connection
-                    .prepare_cached("SELECT tenant, id FROM links ORDER BY id LIMIT ?1")?;
-                let rows = statement.query_map([limit], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                let mut statement = connection.prepare_cached(
+                    "SELECT links.tenant, links.id, tenants.retention_days
+                     FROM links LEFT JOIN tenants ON tenants.key = links.tenant
+                     ORDER BY links.id LIMIT ?1",
+                )?;
+                let rows = statement.query_map([limit], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?
+                            .and_then(|value| u64::try_from(value).ok()),
+                    ))
+                })?;
                 rows.collect()
             }
         })
+    }
+
+    /// Whether any tenant or link sets its own upload retention, so the
+    /// sweep runs even when the platform-wide setting is off (finding 378).
+    pub(crate) fn scoped_retention_exists(&self) -> Result<bool, String> {
+        self.with(|connection| {
+            connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM links WHERE retention_days IS NOT NULL)
+                     OR EXISTS(SELECT 1 FROM tenants WHERE retention_days IS NOT NULL)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+        })
+        .map(|exists| exists != 0)
     }
 
     pub fn audit_count(&self) -> Result<u64, String> {
@@ -4382,8 +4435,8 @@ impl Store {
             let existing: Option<i64> = transaction
                 .query_row(
                     "SELECT expires_at FROM outbound_grants
-                     WHERE tenant = ?1 AND id = ?2 AND revoked_at IS NULL",
-                    rusqlite::params![tenant, id],
+                     WHERE tenant = ?1 AND id = ?2 AND revoked_at IS NULL AND expires_at > ?3",
+                    rusqlite::params![tenant, id, i64::try_from(now).unwrap_or(i64::MAX)],
                     |row| row.get(0),
                 )
                 .optional()
@@ -4391,7 +4444,9 @@ impl Store {
             let Some(existing) = existing else {
                 return Ok(None);
             };
-            let base = (existing.max(0) as u64).max(now.min(i64::MAX as u64));
+            // The predicate above already requires existing > now, so the
+            // extension only ever pushes the expiry further out.
+            let base = existing.max(0) as u64;
             let new_expiry = base.saturating_add(seconds).min(i64::MAX as u64);
             let changed = transaction
                 .execute(
@@ -4439,6 +4494,52 @@ impl Store {
                 .optional()
                 .map(|found| found.is_some())
         })
+    }
+
+    /// Finding 379: deleting a delivery is only a revoke, so revoked grants
+    /// keep their names, roots and receipts alive in the grant row and its
+    /// dependents. Once a grant is both revoked and expired, the retention
+    /// sweep deletes that row and everything keyed by it, plus any orphaned
+    /// dependent rows from earlier partial deletions; the signed
+    /// delivery_events survive. A grant whose delivery job has not retired
+    /// still holds its row, because job retirement and reprocessing read it.
+    /// Returns how many grant rows were removed.
+    pub fn purge_expired_revoked_grants(&self, now: u64) -> Result<u64, String> {
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let purged = transaction
+            .execute(
+                "DELETE FROM outbound_grants
+                 WHERE revoked_at IS NOT NULL AND expires_at <= ?1
+                   AND NOT EXISTS (SELECT 1 FROM delivery_jobs
+                                   WHERE id = outbound_grants.id AND state <> 'retired')",
+                [i64::try_from(now).unwrap_or(i64::MAX)],
+            )
+            .map_err(|error| error.to_string())?;
+        if purged == 0 {
+            return Ok(0);
+        }
+        for table in [
+            "outbound_grant_files",
+            "delivery_manifests",
+            "delivery_evidence",
+            "delivery_policy_cache",
+            "outbound_grant_manifests",
+            "outbound_fetch_tickets",
+        ] {
+            transaction
+                .execute(
+                    &format!(
+                        "DELETE FROM {table} WHERE grant_id NOT IN (SELECT id FROM outbound_grants)"
+                    ),
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(purged as u64)
     }
 
     pub fn record_outbound_download(
@@ -4718,24 +4819,19 @@ impl Store {
         .map(|exists| exists != 0)
     }
 
-    pub fn has_active_library_grant(
-        &self,
-        tenant: &str,
-        source: &str,
-        now: u64,
-    ) -> Result<bool, String> {
+    /// Whether the tenant owns any live (not revoked) grant whose files
+    /// include the library source. Finding 380: expiry alone no longer
+    /// frees a source, because extend refuses to revive an expired grant,
+    /// so deletion and overwrite stay blocked until the grant is revoked.
+    pub fn has_active_library_grant(&self, tenant: &str, source: &str) -> Result<bool, String> {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT files_json
                  FROM outbound_grants
                  WHERE tenant = ?1 AND length(trim(files_json)) > 2
-                   AND revoked_at IS NULL AND expires_at > ?2
-                   AND (max_downloads IS NULL OR downloads < max_downloads)",
+                   AND revoked_at IS NULL",
             )?;
-            let rows = statement.query_map(
-                rusqlite::params![tenant, i64::try_from(now).unwrap_or(i64::MAX)],
-                |row| row.get::<_, String>(0),
-            )?;
+            let rows = statement.query_map([tenant], |row| row.get::<_, String>(0))?;
             for row in rows {
                 let files: Vec<OutboundGrantFile> =
                     serde_json::from_str(&row?).map_err(|error| {
@@ -4852,8 +4948,9 @@ fn escape_like(value: &str) -> String {
 fn insert_link_row(connection: &Connection, link: &Link) -> rusqlite::Result<()> {
     connection.execute(
         "INSERT INTO links (id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                            active, legal_hold, events_json, notifications_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                            active, legal_hold, events_json, notifications_json,
+                        retention_days)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         link_params(link),
     )?;
     for upload in &link.uploads {
@@ -4876,7 +4973,8 @@ fn write_link_row(connection: &Connection, link: &Link) -> rusqlite::Result<()> 
     connection.execute(
         "UPDATE links SET label = ?3, dest = ?4, password_hash = ?5, created_at = ?6,
                           expires_at = ?7, max_bytes = ?8, active = ?9,
-                          legal_hold = ?10, events_json = ?11, notifications_json = ?12
+                          legal_hold = ?10, events_json = ?11, notifications_json = ?12,
+                          retention_days = ?13
          WHERE id = ?1 AND tenant = ?2",
         link_params(link),
     )?;
@@ -5499,7 +5597,7 @@ fn decode_quota(value: Option<String>, column: usize) -> rusqlite::Result<Option
         .transpose()
 }
 
-fn link_params(link: &Link) -> [rusqlite::types::Value; 12] {
+fn link_params(link: &Link) -> [rusqlite::types::Value; 13] {
     use rusqlite::types::Value as V;
     let events = serde_json::to_string(&link.events).unwrap_or_else(|_| "[]".to_owned());
     [
@@ -5520,6 +5618,10 @@ fn link_params(link: &Link) -> [rusqlite::types::Value; 12] {
         V::from(link.legal_hold),
         V::from(events),
         V::from(serde_json::to_string(&link.notifications).expect("serializable notifications")),
+        link.retention_days
+            .map(|days| i64::try_from(days).unwrap_or(i64::MAX))
+            .map(V::from)
+            .unwrap_or(V::Null),
     ]
 }
 
@@ -5546,6 +5648,9 @@ fn row_to_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<Link> {
             .map(|text| parse_json(&text, row.as_ref().column_index("notifications_json")?))
             .transpose()?
             .flatten(),
+        retention_days: row
+            .get::<_, Option<i64>>("retention_days")?
+            .and_then(|value| u64::try_from(value).ok()),
         uploads: Vec::new(),
         events: parse_json(&events_json, row.as_ref().column_index("events_json")?)?,
     })
@@ -5712,7 +5817,8 @@ fn read_link_metadata(
     connection
         .query_row(
             "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                        active, legal_hold, events_json, notifications_json
+                        active, legal_hold, events_json, notifications_json,
+                        retention_days
              FROM links WHERE tenant = ?1 AND id = ?2",
             rusqlite::params![tenant, id],
             row_to_link,
@@ -5821,6 +5927,9 @@ fn map_tenant(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tenant> {
         max_links: decode_quota(row.get(4)?, 4)?,
         max_sessions: decode_quota(row.get(5)?, 5)?,
         created_at: row.get::<_, i64>(6)?.max(0) as u64,
+        retention_days: row
+            .get::<_, Option<i64>>(8)?
+            .and_then(|value| u64::try_from(value).ok()),
     })
 }
 
@@ -6239,6 +6348,28 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
                           ORDER BY at DESC LIMIT 1),
                          '');
                      UPDATE meta SET value='46' WHERE key='schema_version';",
+                )
+                .map_err(|e| e.to_string())?;
+            transaction.commit().map_err(|e| e.to_string())?;
+        }
+        if stored == 46
+            || stored == 45
+            || stored == 44
+            || stored == 41
+            || stored == 42
+            || stored == 43
+        {
+            validate_schema(connection, 46)?;
+            // One transaction keeps the bump atomic: a restart mid-migration
+            // rolls back to 46 and the next open reruns the whole step. The
+            // columns arrive as NULL, which reads as "follow the platform
+            // default" until a tenant or link sets its own scope.
+            let transaction = connection.transaction().map_err(|e| e.to_string())?;
+            transaction
+                .execute_batch(
+                    "ALTER TABLE tenants ADD COLUMN retention_days INTEGER;
+                     ALTER TABLE links ADD COLUMN retention_days INTEGER;
+                     UPDATE meta SET value='47' WHERE key='schema_version';",
                 )
                 .map_err(|e| e.to_string())?;
             transaction.commit().map_err(|e| e.to_string())?;

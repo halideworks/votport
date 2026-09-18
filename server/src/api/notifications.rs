@@ -348,6 +348,7 @@ mod tests {
     }
     fn tenant(key: &str) -> Tenant {
         Tenant {
+            retention_days: None,
             incarnation: String::new(),
             key: key.into(),
             label: key.into(),

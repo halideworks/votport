@@ -96,6 +96,9 @@
           <label>Transfer limit <span class="muted">GiB, optional</span>
             <input data-draft-field id="create-max" type="number" min="1" max="10000" placeholder="server default" />
           </label>
+          <label>Upload retention <span class="muted">days, optional; narrowest scope wins</span>
+            <input data-draft-field id="create-retention" type="number" min="1" max="3650" placeholder="platform default" />
+          </label>
         </div>
         </details><button type="button" class="hint-button" aria-label="Help about receive access and limits" data-hint="The password protects this receive link. Expiry closes it to new uploads. The transfer limit bounds one upload session; server and tenant limits still apply.">?</button></div>
         <div id="create-workflow"></div>

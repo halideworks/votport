@@ -608,6 +608,7 @@ mod handler_tests {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
         let link = Link {
+            retention_days: None,
             id: "closed-link-id".to_owned(),
             tenant: String::new(),
             label: "tax documents".to_owned(),
@@ -644,6 +645,7 @@ mod handler_tests {
 
     fn test_link(id: &str, password_hash: Option<String>) -> Link {
         Link {
+            retention_days: None,
             id: id.to_owned(),
             tenant: String::new(),
             label: "quarterly docs".to_owned(),
@@ -809,6 +811,7 @@ mod handler_tests {
         application
             .store
             .insert_tenant(crate::store::Tenant {
+                retention_days: None,
                 incarnation: String::new(),
                 key: "acme".to_owned(),
                 label: "Acme Legal".to_owned(),

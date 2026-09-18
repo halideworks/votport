@@ -1374,6 +1374,7 @@ mod session_rate_tests {
 
     pub(super) fn open_link(id: &str) -> Link {
         Link {
+            retention_days: None,
             id: id.to_owned(),
             tenant: String::new(),
             label: "open".to_owned(),
@@ -2201,6 +2202,7 @@ mod push_preflight_tests {
 
     fn open_link(id: &str) -> Link {
         Link {
+            retention_days: None,
             id: id.to_owned(),
             tenant: String::new(),
             label: "open".to_owned(),
@@ -3249,6 +3251,7 @@ mod push_preflight_tests {
         application
             .store
             .insert_tenant(Tenant {
+                retention_days: None,
                 incarnation: String::new(),
                 key: "gone".to_owned(),
                 label: "gone".to_owned(),
@@ -3300,6 +3303,7 @@ mod push_preflight_tests {
         application
             .store
             .insert_tenant(Tenant {
+                retention_days: None,
                 incarnation: String::new(),
                 key: "no-sessions".to_owned(),
                 label: "no sessions".to_owned(),
@@ -3387,6 +3391,7 @@ mod push_preflight_tests {
         application
             .store
             .insert_tenant(Tenant {
+                retention_days: None,
                 incarnation: String::new(),
                 key: "tenant".to_owned(),
                 label: "tenant".to_owned(),
