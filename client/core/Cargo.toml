@@ -25,7 +25,7 @@ hex = "0.4"
 percent-encoding = "2"
 sha2 = "0.10"
 base64 = "0.22"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "3", features = ["rand_core"] }
 rand = "0.8"
 thiserror = "2"
 # Pinned to the release uniffi-bindgen-cs (the Windows shell's C# generator)
