@@ -679,8 +679,13 @@ function renderLink(link) {
   if (link.legal_hold) {
     const holdNote = document.createElement('p');
     holdNote.className = 'muted';
-    holdNote.textContent = 'Manual deletion of stored files and transfer history is disabled while this request is under legal hold.';
+    holdNote.textContent = 'Manual deletion of stored files and transfer history is disabled and the retention sweep is suspended while this request is under legal hold.';
     card.append(holdNote);
+  } else if (receiveAdministrator) {
+    const holdHint = document.createElement('p');
+    holdHint.className = 'muted';
+    holdHint.textContent = 'Legal hold blocks manual deletion and suspends the retention sweep until released.';
+    card.append(holdHint);
   }
 
   // Lazily-loaded QR of the request link, toggled from the actions row.
@@ -727,6 +732,11 @@ function renderLink(link) {
     const holdButton = button(link.legal_hold ? 'Release hold' : 'Legal hold', 'tiny ghost', async (control) => {
       if (pending) return;
       if (!link.legal_hold) {
+        if (!(await confirmModal(
+          'Set legal hold',
+          `Set a legal hold on "${link.label}"? Manual deletion is blocked and the retention sweep is suspended until the hold is released.`,
+          'Set hold',
+        ))) return;
         await api(`/api/admin/links/${link.id}`, {
           method: 'POST',
           body: JSON.stringify({ legal_hold: true }),

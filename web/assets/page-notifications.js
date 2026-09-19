@@ -32,7 +32,7 @@ function fields() {
   for (const [field, shown] of Object.entries(visible)) { $(`nd-${field}-field`).hidden = !shown; $(`nd-${field}`).disabled = !shown; }
   $('nd-url').required = visible.url && !editing?.url_set; $('nd-user').required = visible.user && !editing?.user_set; $('nd-token').required = channel === 'pushover' && !editing?.token_set; $('nd-recipients').required = visible.recipients;
   const [help, href] = guides[channel]; $('nd-guide').replaceChildren(document.createTextNode(help));
-  if (href) { const link = node('a', ' Setup guide'); link.href = href; link.target = '_blank'; link.rel = 'noopener noreferrer'; $('nd-guide').append(link); }
+  if (href) { const link = node('a', 'Setup guide'); link.href = href; link.target = '_blank'; link.rel = 'noopener noreferrer'; $('nd-guide').append(' ', link); }
 }
 function edit(destination = null) {
   if (!discardForm($('notification-form'))) return;

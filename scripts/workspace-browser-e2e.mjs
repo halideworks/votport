@@ -440,6 +440,8 @@ try {
   }
   await actionCard.getByRole('button', { name: /^Legal hold: / }).focus();
   await page.keyboard.press('Enter');
+  await page.getByRole('dialog', { name: 'Set legal hold', exact: true }).waitFor();
+  await page.locator('#confirm-ok').press('Enter');
   await page.getByText('Legal hold set.', { exact: true }).waitFor();
   assert.ok(await page.locator('#links-action-status').evaluate((node) => node === document.activeElement), 'Immediate row replacement retains keyboard position');
   await actionCard.getByRole('button', { name: /^Release hold: / }).focus();

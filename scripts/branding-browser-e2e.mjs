@@ -36,10 +36,10 @@ try {
   await openAncestors(page.locator('#ws-id'));
   await page.getByLabel(/^Local connection ID/).waitFor();
   assert.equal(await page.locator('#ws-kind option[value=votport]').count(), 0);
-  const hint = page.getByRole('button', { name: 'Help about local connection IDs', exact: true });
+  const hint = page.getByRole('button', { name: 'Help about S3 credentials', exact: true });
   await hint.hover();
   await page.locator('.field-hint:popover-open').waitFor();
-  assert.ok((await page.locator('.field-hint:popover-open').innerText()).includes('Scripts and agents'));
+  assert.ok((await page.locator('.field-hint:popover-open').innerText()).includes('permission to write'));
   await page.keyboard.press('Escape');
   await page.locator('.field-hint:popover-open').waitFor({ state: 'hidden' });
   await page.mouse.move(0, 0);

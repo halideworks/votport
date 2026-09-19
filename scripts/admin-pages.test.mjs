@@ -130,6 +130,24 @@ test('repeated actions and help controls carry their context', () => {
   assert.match(tenantsScript, /summary\.setAttribute\('aria-label', `Edit namespace: \$\{tenant\.key\}`\)/);
 });
 
+test('setting a legal hold confirms and describes the retention pause', () => {
+  assert.match(receiveScript, /holdButton = button\(link\.legal_hold \? 'Release hold' : 'Legal hold', 'tiny ghost', async \(control\) => \{[\s\S]*?if \(!\(await confirmModal\(\s*'Set legal hold',[\s\S]*?the retention sweep is suspended until the hold is released\.[\s\S]*?'Set hold',[\s\S]*?\)\)\) return;/);
+  assert.match(receiveScript, /Legal hold blocks manual deletion and suspends the retention sweep until released\./);
+  assert.match(receiveScript, /Manual deletion of stored files and transfer history is disabled and the retention sweep is suspended while this request is under legal hold\./);
+});
+
+test('the hidden files deployment value carries the dot-name hint', () => {
+  assert.match(system, /<dt>Hidden files<button type="button" class="hint-button" aria-label="Help about hidden files" data-hint="A hidden file is one whose name starts with a dot\. When blocked, an upload that contains one is refused\."><\/button><\/dt>/);
+});
+
+test('connection and project ID help each state the name and audience once', () => {
+  assert.doesNotMatch(storage, /This local ID is filled from the name/);
+  assert.match(storage, /<summary>Connection ID<\/summary>[\s\S]*?Filled from the connection name\. People choose the connection by name; scripts and agents use this ID\.<\/p>/);
+  assert.doesNotMatch(storage, /Connection ID for scripts and agents/);
+  assert.match(workflows, /<summary>Project ID<\/summary>[\s\S]*?Filled from the name\. Scripts and agents use this ID\./);
+  assert.doesNotMatch(workflows, /agents and integrations/);
+});
+
 const verify = await readFile(new URL('../web/verify.html', import.meta.url), 'utf8');
 
 test('no page repeats an element id', () => {
