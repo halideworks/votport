@@ -1026,6 +1026,10 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
     let store = Arc::new(Store::open(&config.data_dir)?);
     if let Some(applied) = applied_restore {
         crate::backup::record_applied_restore(&store, &applied);
+        // Finding 498: with the rolled-back database installed, records and
+        // the receive tree can disagree; stat both before session recovery
+        // starts publishing again.
+        crate::backup::survey_restored_payloads(&store, &config.receive_dir);
     }
     let orphan_count = crate::backup::sweep_data_dir_orphans(&config.data_dir)?;
     if orphan_count > 0 {

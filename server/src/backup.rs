@@ -1540,6 +1540,103 @@ pub(crate) fn record_applied_restore(store: &crate::store::Store, applied: &Appl
     );
 }
 
+/// Reconciles the restored records against the receive tree (audit finding
+/// 498): a restore rolls the database back, so payloads and receipts
+/// published after the backup stay on disk with no record, while live
+/// records can name payloads removed since the backup. Stats the live
+/// records after install and reports both gaps in one audit row so holdings
+/// and disk can be reconciled deliberately instead of silently disagreeing.
+pub(crate) fn survey_restored_payloads(store: &crate::store::Store, receive_dir: &Path) {
+    if !receive_dir.try_exists().unwrap_or(false) {
+        return;
+    }
+    let referenced: HashSet<String> = match store.with(|connection| {
+        connection
+            .prepare("SELECT tenant, stored_as FROM files WHERE deleted = 0 AND stored_as <> ''")?
+            .query_map([], |row| {
+                Ok(crate::paths::stored_components(
+                    &row.get::<_, String>(0)?,
+                    &row.get::<_, String>(1)?,
+                )
+                .join("/"))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+    }) {
+        Ok(rows) => rows.into_iter().collect(),
+        Err(error) => {
+            tracing::warn!(%error, "restored payload survey could not read records");
+            return;
+        }
+    };
+    let mut on_disk = HashSet::new();
+    collect_payload_files(receive_dir, "", &mut on_disk);
+    let missing: Vec<&String> = referenced.difference(&on_disk).collect();
+    let unreferenced: Vec<&String> = on_disk.difference(&referenced).collect();
+    if missing.is_empty() && unreferenced.is_empty() {
+        return;
+    }
+    let detail = serde_json::json!({
+        "missing_count": missing.len(),
+        "missing": sample_names(&missing),
+        "unreferenced_count": unreferenced.len(),
+        "unreferenced": sample_names(&unreferenced),
+    });
+    tracing::warn!(
+        target: "audit",
+        event = "restore_payload_mismatch",
+        missing = missing.len(),
+        unreferenced = unreferenced.len(),
+        "restored records and receive tree disagree"
+    );
+    store.audit("", "", "restore_payload_mismatch", "", &detail);
+}
+
+/// Every payload file under the receive root, as receive-root-relative
+/// paths. Upload staging and the instance lease are machinery, not payloads;
+/// a receipt sidecar rides with its payload, so only the payload is named.
+fn collect_payload_files(directory: &Path, prefix: &str, out: &mut HashSet<String>) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let directory = metadata.is_dir();
+        let file = metadata.is_file();
+        if directory && (name == ".vot-stage" || crate::protocol_paths::is_push_staging_name(&name))
+        {
+            continue;
+        }
+        if file && crate::protocol_paths::is_receipt_name(&name) {
+            continue;
+        }
+        let relative = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if directory {
+            collect_payload_files(&entry.path(), &relative, out);
+        } else if file {
+            out.insert(relative);
+        }
+    }
+}
+
+/// Bounds the audit row: a wide mismatch still names a inspectable sample.
+fn sample_names(names: &[&String]) -> Vec<String> {
+    const SAMPLE: usize = 8;
+    names
+        .iter()
+        .take(SAMPLE)
+        .map(|name| (*name).clone())
+        .collect()
+}
+
 pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2504,6 +2601,63 @@ mod tests {
         fs::write(root.path().join("receipt.key"), [8; 32]).unwrap();
         crate::paths::tighten_private_file(&root.path().join("receipt.key")).unwrap();
         (root, store)
+    }
+
+    /// Audit finding 498: after a restore, live records can name payloads
+    /// that are gone while post-backup payloads sit on disk unreferenced.
+    /// The survey must report both, and nothing else, exactly once.
+    #[test]
+    fn restored_payload_survey_reports_both_gaps_in_one_audit_row() {
+        let (root, store) = initialized_root();
+        let receive = root.path().join("received");
+        store
+            .with(|connection| {
+                connection.execute(
+                    "INSERT INTO files(link_id,tenant,upload_id,file_index,bytes_hi,bytes_lo,
+                        deleted,stored_as,path,suite,root,receipt)
+                     VALUES ('link-gone','','upload-gone',0,0,20,0,'gone.bin','gone.bin','md5','root',0)",
+                    [],
+                )
+            })
+            .unwrap();
+        std::fs::create_dir_all(receive.join("sub")).unwrap();
+        fs::write(receive.join("sub/kept.bin"), [0u8; 64]).unwrap();
+        fs::write(receive.join("sub/kept.bin.vot-receipt"), b"signed").unwrap();
+        // Staging machinery and an unrelated tenant namespace stay unreported.
+        std::fs::create_dir_all(receive.join(".vot-stage")).unwrap();
+        fs::write(receive.join(".vot-stage/lease"), b"lease").unwrap();
+
+        survey_restored_payloads(&store, &receive);
+
+        let rows = store.audit_export(None, 0, 0, 100).unwrap();
+        let rows: Vec<_> = rows
+            .into_iter()
+            .filter(|row| row.event == "restore_payload_mismatch")
+            .collect();
+        assert_eq!(rows.len(), 1, "exactly one mismatch row");
+        let detail = &rows[0].detail;
+        assert_eq!(detail["missing_count"], 1, "{detail}");
+        assert_eq!(detail["missing"][0], "gone.bin", "{detail}");
+        assert_eq!(detail["unreferenced_count"], 1, "{detail}");
+        assert_eq!(detail["unreferenced"][0], "sub/kept.bin", "{detail}");
+
+        // Once the tree is reconciled, a further survey stays quiet.
+        store
+            .with(|connection| {
+                connection.execute("DELETE FROM files WHERE stored_as = 'gone.bin'", [])
+            })
+            .unwrap();
+        fs::remove_file(receive.join("sub/kept.bin")).unwrap();
+        fs::remove_file(receive.join("sub/kept.bin.vot-receipt")).unwrap();
+        survey_restored_payloads(&store, &receive);
+        let rows = store.audit_export(None, 0, 0, 100).unwrap();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.event == "restore_payload_mismatch")
+                .count(),
+            1,
+            "an agreeing tree writes no further row"
+        );
     }
 
     #[test]

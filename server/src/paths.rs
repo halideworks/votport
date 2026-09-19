@@ -19,6 +19,21 @@ pub fn tenant_prefix(key: &str) -> Vec<String> {
     }
 }
 
+/// The receive-root-relative components of a stored file record: the tenant's
+/// own subtree, then the stored name. `stored_path` in api::admin joins these
+/// under the receive root; the post-restore payload survey in backup shares
+/// this one spelling of the layout.
+pub fn stored_components(tenant: &str, stored_as: &str) -> Vec<String> {
+    let mut components = tenant_prefix(tenant);
+    components.extend(
+        stored_as
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned),
+    );
+    components
+}
+
 pub fn portable_tenant_key(key: &str) -> bool {
     if key.is_empty()
         || !key.bytes().all(|byte| {

@@ -21,10 +21,13 @@ pub const CREATED_HEADER: &str = "x-votport-archive-created-at";
 /// per client like the SCIM bearer.
 fn authorize(app: &App, headers: &HeaderMap, ip: &str) -> ApiResult<()> {
     let bucket = super::throttle_key(ip);
-    let settings = app
-        .store
-        .resolved_settings(&app.config)
-        .map_err(super::store_unavailable)?;
+    let settings = app.store.resolved_settings(&app.config).map_err(|error| {
+        // Audit finding 501: a store failure on a correct token must not be
+        // mistaken for a refused bearer, so it is named distinctly like the
+        // SCIM gate names its own.
+        tracing::error!(target: "audit", event = "replica_store_failed", %error, "replica store call failed");
+        super::store_unavailable(error)
+    })?;
     if app.replica_throttle.locked(&bucket) {
         return Err(super::rate_limited("failed attempts", 60));
     }
@@ -204,5 +207,53 @@ mod tests {
         assert!(rows
             .iter()
             .any(|row| row.event == "replica_pulled" && row.subject == "10.3.0.1"));
+    }
+
+    /// Audit finding 501: a store failure during the bearer check on a
+    /// correct token must be audited as a store failure, not read as a
+    /// refused bearer.
+    #[tokio::test]
+    async fn replica_store_failure_is_distinct_from_a_refused_bearer() {
+        use tracing::instrument::WithSubscriber as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let app = testing::build(directory.path());
+        app.store
+            .put_settings(
+                "test",
+                &[(
+                    "replica_token".to_owned(),
+                    SettingWrite::Set(crate::api::scim::hash_bearer(TOKEN)),
+                )],
+            )
+            .unwrap();
+        // With the settings cache stale, the bearer check must read the
+        // store; removing the table makes that read fail.
+        app.store
+            .with(|connection| connection.execute("DROP TABLE settings", []))
+            .unwrap();
+
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let writer = log.reopen().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.try_clone().unwrap())
+            .finish();
+        let (status, _, _) = pull(&app, [10, 4, 0, 1], Some(TOKEN))
+            .with_subscriber(subscriber)
+            .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        assert!(
+            text.contains("replica_store_failed"),
+            "the store failure is named: {text}"
+        );
+        assert!(
+            !text.contains("replica_unauthorized"),
+            "a store failure is not a refused bearer: {text}"
+        );
     }
 }

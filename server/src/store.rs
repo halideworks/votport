@@ -3286,7 +3286,13 @@ impl Store {
             .map_err(|error| error.to_string())?;
         connection
             .execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| {
+                // Audit finding 500: the failure still leaves SQLite's
+                // destination file behind; strip group/other bits so the
+                // partial is private until the caller's cleanup removes it.
+                let _ = crate::paths::tighten_private_file(destination);
+                error.to_string()
+            })?;
         crate::paths::tighten_private_file(destination).map(|_| ())?;
         Self::checkpoint_wal_after_backup(&connection);
         Ok(())
