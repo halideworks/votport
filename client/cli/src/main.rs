@@ -27,6 +27,16 @@ use votport_client_core::Transport;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "--version") {
+        out!("votport {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+    // `-h`/`--help` on a command prints that command's usage before any
+    // positional parsing can take the flag as a file or link name.
+    if let Some(usage) = command_help(&args) {
+        out!("{usage}");
+        return ExitCode::SUCCESS;
+    }
     if args.first().is_some_and(|arg| arg == "agent") {
         return match agent::run(&args[1..]) {
             Ok(value) => {
@@ -74,11 +84,14 @@ fn run(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("send") => send(&args[1..]),
         Some("receive") => receive(&args[1..]),
-        Some("status") => status(),
+        Some("status") => status(&args[1..]),
         Some("evidence") => evidence(&args[1..]),
         Some("resume") => resume(&args[1..]),
         Some("signin") => signin(&args[1..]),
         Some("signout") => {
+            if let Some(error) = takes_nothing("signout", &args[1..]) {
+                return Err(error);
+            }
             votport_client_core::port::sign_out();
             Ok(())
         }
@@ -125,10 +138,12 @@ fn evidence(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Help goes to stdout so `votport help | grep` sees it; only errors use
-/// stderr.
-fn print_usage() {
-    out!("votport agent session
+/// Usage lines for each command group, keyed by the word that heads the
+/// command; `-h`/`--help` on a command prints its group's lines.
+const USAGE: &[(&str, &str)] = &[
+    (
+        "agent",
+        "votport agent session
 votport agent notifications
 votport agent files [<directory>] [--after <cursor>] [--limit <n>]
 votport agent share <directory> --operation-id <id> [--expires-days <n>] [--label <label>] [--max-downloads <n>] [--notifications <json>]
@@ -141,39 +156,87 @@ votport agent jobs [--after <cursor>] [--limit <n>]
 votport agent create-job <request.json | ->
 votport agent job | retry-job | cancel-job <id>
 votport agent events [--after <cursor>] [--limit <n>]
-votport agent job-evidence <id> [--after <cursor>] [--limit <n>]
-votport evidence list | device-key | retry
-votport evidence accept <verification-id>
-votport mcp
+votport agent job-evidence <id> [--after <cursor>] [--limit <n>]",
+    ),
+    ("mcp", "votport mcp"),
+    (
+        "evidence",
+        "votport evidence list | device-key | retry
+votport evidence accept <verification-id>",
+    ),
+    (
+        "send",
+        "votport send <link> <path>...      [--password <p> | --password-file <path|->] [--json]",
+    ),
+    (
+        "receive",
+        "votport receive <link> <dir>       [--password <p> | --password-file <path|->] [--json]",
+    ),
+    ("inspect", "votport inspect <link>"),
+    ("status", "votport status"),
+    (
+        "resume",
+        "votport resume <id>                [--password <p> | --password-file <path|->] [--json]",
+    ),
+    (
+        "signin",
+        "votport signin <origin>            [--password <p> | --password-file <path|->]  (else read from stdin)",
+    ),
+    ("signout", "votport signout"),
+    ("port", "votport port                       [--json]"),
+    ("requests", "votport requests                   [--json]"),
+    (
+        "issue-request",
+        "votport issue-request <label>      [--password <p>] [--expires-days <n>] [--max-bytes <n>] [--json]",
+    ),
+    ("close-request", "votport close-request <id>"),
+    ("deliveries", "votport deliveries                 [--json]"),
+    ("revoke-delivery", "votport revoke-delivery <id>"),
+    (
+        "library",
+        "votport library [<dir>]            [--after <cursor>] [--json]",
+    ),
+    (
+        "issue-delivery",
+        "votport issue-delivery <label> <path>... [--password <p>] [--expires-days <n>] [--max-downloads <n>] [--json]",
+    ),
+    (
+        "upload",
+        "votport upload <path>...           [--into <dir>] [--json]",
+    ),
+    (
+        "watch",
+        "votport watch add <dir> <link>     [--password <p>]
+votport watch list | remove <id> | run [--json]",
+    ),
+];
 
-Verification reports are queued durably. Long-running desktop apps retry automatically;
-short-lived CLI processes can flush pending reports with votport evidence retry.
-Agent commands always return JSON and use VOTPORT_URL and VOTPORT_AUTOMATION_TOKEN.
-");
+/// The usage lines for the command heading `args`, when `-h` or `--help`
+/// asks for them; None leaves the arguments to the command itself.
+fn command_help(args: &[String]) -> Option<&'static str> {
+    if !args
+        .iter()
+        .skip(1)
+        .any(|arg| arg == "-h" || arg == "--help")
+    {
+        return None;
+    }
+    let name = args.first()?;
+    USAGE
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, lines)| *lines)
+}
+
+/// Help goes to stdout so `votport help | grep` sees it; only errors use
+/// stderr.
+fn print_usage() {
+    for (_, lines) in USAGE {
+        out!("{lines}");
+    }
+    out!("\nVerification reports are queued durably. Long-running desktop apps retry automatically;\nshort-lived CLI processes can flush pending reports with votport evidence retry.\nAgent commands always return JSON and use VOTPORT_URL and VOTPORT_AUTOMATION_TOKEN.");
     out!(
-        "votport send <link> <path>...      [--password <p> | --password-file <path|->] [--json]\n\
-         votport receive <link> <dir>       [--password <p> | --password-file <path|->] [--json]\n\
-         votport inspect <link>\n\
-         votport status\n\
-         votport resume <id>                [--password <p> | --password-file <path|->] [--json]\n\
-         votport signin <origin>            [--password <p> | --password-file <path|->]  (else read from stdin)\n\
-         votport signout\n\
-         votport port                       [--json]\n\
-         votport requests                   [--json]\n\
-         votport issue-request <label>      [--password <p>] [--expires-days <n>] [--max-bytes <n>] [--json]\n\
-         votport close-request <id>\n\
-         votport deliveries                 [--json]\n\
-         votport revoke-delivery <id>\n\
-         votport library [<dir>]            [--after <cursor>] [--json]\n\
-         votport issue-delivery <label> <path>... [--password <p>] [--expires-days <n>] [--max-downloads <n>] [--json]\n\
-         votport upload <path>...           [--into <dir>] [--json]\n\
-         votport watch add <dir> <link>     [--password <p>]\n\
-         votport watch list | remove <id> | run [--json]\n\
-         \n\
-         send's <link> is a request URL, e.g. https://drop.example/r/TOKEN;\n\
-         each <path> is a file or folder, and a folder keeps its name.\n\
-         receive's <link> is a delivery URL, e.g. https://drop.example/s/TOKEN;\n\
-         <dir> is where its files land, verified against their announced roots."
+        " \nsend's <link> is a request URL, e.g. https://drop.example/r/TOKEN;\neach <path> is a file or folder, and a folder keeps its name.\nreceive's <link> is a delivery URL, e.g. https://drop.example/s/TOKEN;\n<dir> is where its files land, verified against their announced roots."
     );
 }
 
@@ -228,6 +291,9 @@ fn send(args: &[String]) -> Result<(), String> {
 
 /// Prints what a link is as one JSON object, spending nothing on the server.
 fn inspect(args: &[String]) -> Result<ExitCode, String> {
+    if let Some(error) = no_options("inspect", args) {
+        return Err(error);
+    }
     let [link] = args else {
         return Err("inspect takes one link".to_owned());
     };
@@ -261,7 +327,10 @@ fn inspect(args: &[String]) -> Result<ExitCode, String> {
 }
 
 /// Prints the journalled transfers, one JSON object per line, oldest first.
-fn status() -> Result<(), String> {
+fn status(args: &[String]) -> Result<(), String> {
+    if let Some(error) = takes_nothing("status", args) {
+        return Err(error);
+    }
     for entry in votport_client_core::ffi::pending() {
         out!(
             "{}",
@@ -380,6 +449,20 @@ fn receive(args: &[String]) -> Result<(), String> {
 
 /// The parsed `--flag value` options of a command.
 type Options = std::collections::HashMap<String, String>;
+
+/// The error for a command that takes positionals but no options, when one
+/// was passed: it names the option instead of blaming the positional count.
+fn no_options(command: &str, args: &[String]) -> Option<String> {
+    let flag = args.iter().find(|arg| arg.starts_with('-'))?;
+    Some(format!("{command} takes no options ({flag} was given)"))
+}
+
+/// The error for a command that takes nothing at all, when it was handed
+/// something: it names what was given instead of running on.
+fn takes_nothing(command: &str, args: &[String]) -> Option<String> {
+    let given = args.first()?;
+    Some(format!("{command} takes no arguments ({given} was given)"))
+}
 
 /// Splits `args` into `--flag value` options and positionals; `--json` is a
 /// bare flag. Unknown `--` options are refused.
@@ -561,6 +644,9 @@ fn issue_request(args: &[String]) -> Result<(), String> {
 }
 
 fn close_request(args: &[String]) -> Result<(), String> {
+    if let Some(error) = no_options("close-request", args) {
+        return Err(error);
+    }
     let [id] = args else {
         return Err("close-request takes a link id".to_owned());
     };
@@ -621,6 +707,9 @@ fn deliveries(args: &[String]) -> Result<(), String> {
 }
 
 fn revoke_delivery(args: &[String]) -> Result<(), String> {
+    if let Some(error) = no_options("revoke-delivery", args) {
+        return Err(error);
+    }
     let [id] = args else {
         return Err("revoke-delivery takes a delivery id".to_owned());
     };
@@ -844,6 +933,34 @@ fn watch_json(item: &votport_client_core::watch::Watch) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::{is_absolute_filesystem_path, issue_delivery};
+
+    #[test]
+    fn optionless_commands_name_the_option_not_the_count() {
+        // Audit 481: these commands take no options, so a flag must draw a
+        // usage error naming the flag, not a count complaint or silence.
+        for (arguments, flag) in [
+            (vec!["close-request", "--json"], "--json"),
+            (vec!["revoke-delivery", "--json"], "--json"),
+            (vec!["status", "--wat"], "--wat"),
+            (vec!["signout", "--wat"], "--wat"),
+        ] {
+            let args = arguments.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            let error = super::run(&args).unwrap_err();
+            assert!(
+                error.contains("no options") || error.contains("no arguments"),
+                "{error}"
+            );
+            assert!(error.contains(flag), "{error}");
+        }
+        // inspect is dispatched beside run(); same contract there.
+        let inspect_args = ["--json".to_owned(), "link".to_owned()];
+        let error = super::inspect(&inspect_args).unwrap_err();
+        assert!(error.contains("no options"), "{error}");
+        assert!(error.contains("--json"), "{error}");
+        // Without a flag, the count error keeps its own shape.
+        let args = ["inspect".to_owned(), "a".to_owned(), "b".to_owned()];
+        assert!(super::inspect(&args).unwrap_err().contains("one link"));
+    }
 
     #[test]
     fn transfer_commands_share_option_validation() {

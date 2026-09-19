@@ -319,7 +319,7 @@ fn parse_share_args(arguments: Vec<String>) -> Result<ShareArgs, String> {
         }
     }
     let directory = directory.filter(|value| !value.is_empty()).ok_or_else(|| {
-        "usage: votport share <server-relative-directory> [--expires 7d] [--label LABEL] [--max-downloads N]".to_owned()
+        "usage: votport share <server-relative-directory> [--expires 7d] [--label LABEL] [--max-downloads N] [--operation-id ID] [--json]".to_owned()
     })?;
     if std::path::Path::new(&directory)
         .components()
@@ -515,6 +515,15 @@ mod cli_tests {
                 json: true,
             }
         );
+    }
+
+    #[test]
+    fn share_usage_names_operation_id_and_json() {
+        // Audit 483: both flags are implemented, so the usage error must
+        // name them alongside the rest.
+        let error = parse_share_args(Vec::new()).unwrap_err();
+        assert!(error.contains("--operation-id"), "{error}");
+        assert!(error.contains("--json"), "{error}");
     }
 
     #[test]

@@ -70,11 +70,16 @@ fn inspect_exit_status_matches_the_printed_link_state() {
         assert_eq!(json["needs_password"], password);
         assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 1);
     }
-    for link in ["not a link", "--json"] {
-        let output = inspect(link);
-        assert_eq!(output.status.code(), Some(1));
-        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(json["usable"], false);
-        assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 1);
-    }
+    let output = inspect("not a link");
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["usable"], false);
+    assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 1);
+    // Audit 481: a flag on an optionless command draws the usage error
+    // naming the flag, not an inspection of the flag as if it were a link.
+    let output = inspect("--json");
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(json["error"].as_str().unwrap().contains("no options"));
+    assert!(json["error"].as_str().unwrap().contains("--json"));
 }
