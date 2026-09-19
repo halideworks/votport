@@ -379,7 +379,7 @@ function validateComponent(component) {
     if (/^\.vot-tenants\.stage$/i.test(component)
       || /^\.vot-push-[0-9a-f]{32}$/.test(component)
       || /^\.vot-.*\.(stage|journal)$/.test(component)) {
-      return 'this name is reserved for the server';
+      return "this name is reserved for the port's own files";
     }
   }
   const compatibility = component.normalize('NFKC');
@@ -798,7 +798,7 @@ async function uploadEntryChunks(sessionId, entryIndex, item, from, onProgress) 
         const start = Number(proof.coveredOffset);
         const length = Number(proof.coveredLength);
         if (BigInt(start) !== range.offset || BigInt(length) !== range.want) {
-          throw new Error('a proof covered an unexpected range; retry the upload');
+          throw new Error(`"${item.path}" failed an upload check; retry the upload`);
         }
         const data = await file.slice(start, start + length).arrayBuffer().catch(() => null);
         if (!data || data.byteLength !== length) {

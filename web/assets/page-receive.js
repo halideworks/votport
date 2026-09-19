@@ -246,7 +246,7 @@ function renderUpload(link, upload) {
         const url = window.URL.createObjectURL(new window.Blob([JSON.stringify(evidence, null, 2)], { type: 'application/json' }));
         const anchor = document.createElement('a'); anchor.href = url; anchor.download = `trade-route-${upload.id}.json`; anchor.click();
         setTimeout(() => window.URL.revokeObjectURL(url), 1000);
-      } catch (error) { await alertModal('Could not load custody evidence', error.message); }
+      } catch (error) { await alertModal('Could not load route evidence', error.message); }
     }));
   }
   if (upload.partial) {

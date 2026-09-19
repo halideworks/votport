@@ -80,17 +80,17 @@ pub fn admit_component(component: &str, allow_hidden: bool) -> Result<(), String
         return Err("name is reserved for delivery workflows".into());
     }
     if component.eq_ignore_ascii_case(TENANT_STORAGE_DIR) {
-        return Err("name is reserved for tenant storage".to_owned());
+        return Err("name is reserved for the port's own files".to_owned());
     }
     if component.eq_ignore_ascii_case(LEASE_FILE_NAME) {
-        return Err("name is reserved for the instance lease".to_owned());
+        return Err("name is reserved for the port's own files".to_owned());
     }
     if component.eq_ignore_ascii_case(".vot-stage")
         || is_push_staging_name(component)
         || (component.starts_with(".vot-")
             && (component.ends_with(".stage") || component.ends_with(".journal")))
     {
-        return Err("name is reserved for votport staging files".to_owned());
+        return Err("name is reserved for the port's own files".to_owned());
     }
     Ok(())
 }
@@ -145,7 +145,10 @@ mod tests {
     /// rule: the staging suffixes are exact-case (the boot sweep deletes
     /// exactly that shape), while the whole-name reservations fold case. The
     /// server and the client run this one implementation, so this table is
-    /// the contract both ends ship.
+    /// the contract both ends ship. The housekeeping reservations (tenant
+    /// subtree, lease, staging) share one plain refusal so neither end names
+    /// server internals to senders; the message no longer tells the rules
+    /// apart, only that each name is refused.
     #[test]
     fn admission_rejects_exactly_the_shared_reserved_list() {
         let rejected: &[(&str, bool, &str)] = &[
@@ -163,23 +166,23 @@ mod tests {
             (".café", true, "non-ASCII hidden names are reserved"),
             (".votport-workflows", true, "delivery workflows"),
             (".VOTPORT-WORKFLOWS", true, "delivery workflows"),
-            (TENANT_STORAGE_DIR, true, "tenant storage"),
-            (".VOT-TENANTS.STAGE", true, "tenant storage"),
+            (TENANT_STORAGE_DIR, true, "port's own files"),
+            (".VOT-TENANTS.STAGE", true, "port's own files"),
             (
                 ".VOT-TENANTſ.STAGE",
                 true,
                 "non-ASCII hidden names are reserved",
             ),
-            (LEASE_FILE_NAME, true, "instance lease"),
-            (".VOTPORT-LEASE", true, "instance lease"),
-            (".vot-stage", true, "votport staging files"),
-            (".VOT-STAGE", true, "votport staging files"),
-            (".vot-1a2b-0-3c4d.stage", true, "votport staging files"),
-            (".vot-1a2b-0-3c4d.journal", true, "votport staging files"),
+            (LEASE_FILE_NAME, true, "port's own files"),
+            (".VOTPORT-LEASE", true, "port's own files"),
+            (".vot-stage", true, "port's own files"),
+            (".VOT-STAGE", true, "port's own files"),
+            (".vot-1a2b-0-3c4d.stage", true, "port's own files"),
+            (".vot-1a2b-0-3c4d.journal", true, "port's own files"),
             (
                 ".vot-push-0123456789abcdef0123456789abcdef",
                 true,
-                "votport staging files",
+                "port's own files",
             ),
         ];
         for (name, hidden, needle) in rejected {

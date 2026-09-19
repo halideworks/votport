@@ -46,7 +46,7 @@ impl TradeEndpoint {
                 .iter()
                 .any(|key| !crate::workflow::valid_id(key))
         {
-            return Err("invalid endpoint name, category or metadata allowlist".into());
+            return Err("invalid endpoint name, category or accepted metadata fields".into());
         }
         self.notifications.validate(&TRADE_EVENTS)
     }

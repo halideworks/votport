@@ -218,7 +218,7 @@ its frozen manifest. NYC verifies the arriving files and records its own signed
 custody receipt in the upload completion transaction. Forwarding from NYC
 includes the parent receipt's digest and its complete signed ancestry. Receivers
 verify the chain and reject loops; a route allows at most eight sending ports.
-**Workflows > Deliveries > Download custody evidence** exports the peer receipt,
+**Workflows > Deliveries > Download route evidence** exports the peer receipt,
 ancestors and any revocation acknowledgment. **Receive > Trade route > evidence**
 exports evidence retained by the receiving port. File publication receipts
 continue to identify their actual storage commit profile; custody signatures do
