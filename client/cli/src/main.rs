@@ -125,10 +125,13 @@ fn evidence(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Help goes to stdout so `votport help | grep` sees it; only errors use
+/// stderr.
 fn print_usage() {
-    eprintln!("votport agent session
+    out!("votport agent session
+votport agent notifications
 votport agent files [<directory>] [--after <cursor>] [--limit <n>]
-votport agent share <directory> --operation-id <id> [--expires-days <n>] [--label <label>] [--max-downloads <n>]
+votport agent share <directory> --operation-id <id> [--expires-days <n>] [--label <label>] [--max-downloads <n>] [--notifications <json>]
 votport agent recover <operation-id>
 votport agent deliveries [--after <cursor>] [--limit <n>]
 votport agent delivery <id> [--offset <n>] [--limit <n>]
@@ -147,7 +150,7 @@ Verification reports are queued durably. Long-running desktop apps retry automat
 short-lived CLI processes can flush pending reports with votport evidence retry.
 Agent commands always return JSON and use VOTPORT_URL and VOTPORT_AUTOMATION_TOKEN.
 ");
-    eprintln!(
+    out!(
         "votport send <link> <path>...      [--password <p> | --password-file <path|->] [--json]\n\
          votport receive <link> <dir>       [--password <p> | --password-file <path|->] [--json]\n\
          votport inspect <link>\n\
