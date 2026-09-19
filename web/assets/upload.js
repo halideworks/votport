@@ -585,7 +585,7 @@ async function apiJson(path, options = {}) {
 // replayed into its session: on a transient failure the caller restarts the
 // session, since a replay that reached the server is refused outright.
 async function postWithRetry(path, options = {}) {
-  const { singleShot = false, ...request } = options;
+  const { singleShot = false, drainPhase = false, ...request } = options;
   const startedAt = Date.now();
   for (let attempt = 0; ; attempt += 1) {
     checkCancelled();
@@ -643,7 +643,16 @@ async function postWithRetry(path, options = {}) {
         } else {
           failure.fatal = true;
         }
-      } else if (failure?.name !== 'AbortError') failure.paused = true;
+      } else if (failure?.name !== 'AbortError') {
+        failure.paused = true;
+        if (status === 503 && drainPhase) {
+          // The retry budget ran out against a drain 503 on session
+          // admission; the send loop retries this session, so the phase
+          // keeps saying why it waits. Other 503s stay Paused: upload
+          // tests key their release handshake on that phase.
+          setPhase('Not accepting new transfers right now, retrying');
+        }
+      }
       throw failure;
     }
     if (singleShot) {
@@ -655,7 +664,12 @@ async function postWithRetry(path, options = {}) {
       failure.restart = true;
       throw failure;
     }
-    setPhase('Paused');
+    // A drained or restarting server answers 503 on session admission:
+    // name that state instead of a bare Paused over 0 B (audit finding 497).
+    // Only session-create posts say this; other 503s keep the Paused phase.
+    setPhase(status === 503 && drainPhase
+      ? 'Not accepting new transfers right now, retrying'
+      : 'Paused');
     await sleepCancellable(decision.delayMs);
     resumePhase();
   }
@@ -969,6 +983,7 @@ async function runUpload() {
           // request that reached the server can orphan a session; the server
           // sweeps idle sessions, so that costs nothing durable.
           const session = await postWithRetry(`/api/r/${token}/session`, {
+            drainPhase: true,
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               password: password || null,

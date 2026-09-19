@@ -2913,6 +2913,7 @@ async fn restore_backup_operation(
         stage_cleanup,
         result.clone(),
         crate::backup::RestoreMode::Historical,
+        Some(&body.id),
     )
     .map_err(ApiError::internal)?;
     app.store.audit(

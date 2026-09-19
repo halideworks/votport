@@ -3957,7 +3957,6 @@ async fn outbound_file_inner(
             .await
             .map_err(|_| ApiError::not_found())?;
             drop(probe);
-            record_download(&app, &grant, &[index]).await?;
             audit_download_request(&app, &grant, &headers, peer, "file", Some(index), leased)
                 .await?;
             let lifetime = grant
@@ -3992,6 +3991,30 @@ async fn outbound_file_inner(
         .map_err(|_| ApiError::not_found())?;
         drop(pin);
         let length = range.map_or(source.object.length, |(start, end)| end - start + 1);
+        // The batch route records each file as its last byte is handed to the
+        // transport; this route now applies the same completion rule (audit
+        // finding 490): only a response covering the whole object records,
+        // once its last frame has passed through, so an interrupted download
+        // burns no quota and range resumes on the leased URL never recount.
+        let whole_object =
+            range.is_none_or(|(start, end)| start == 0 && end + 1 == source.object.length);
+        let remaining = if length == 0 {
+            // An empty body has no last frame to carry the record, so it
+            // lands before the response, the way the empty batch records.
+            record_download(&app, &grant, &[index]).await?;
+            None
+        } else if whole_object {
+            Some(length)
+        } else {
+            None
+        };
+        let stream = RecordingStream {
+            inner: stream,
+            remaining,
+            app: Arc::clone(&app),
+            grant: Arc::clone(&grant),
+            index,
+        };
         let mut response = Body::from_stream(stream).into_response();
         add_file_headers(&mut response, &source, length, range)?;
         if range.is_some() {
@@ -4837,6 +4860,56 @@ struct VerifiedStream {
     /// Set only on the body stream, never on the preparation probe or the
     /// batch chunks (the batch loop checks its own gate per frame).
     gate: Option<StreamGate>,
+}
+
+/// Wraps the file route's body stream to record the download the way the
+/// batch stream records each file: when the response's last byte is handed
+/// to the transport (audit finding 490). `remaining` counts down the bytes
+/// of a whole-object response and fires the record on the frame that reaches
+/// zero, before that frame is returned, because a known-length body may
+/// never be polled again. A dropped stream before that frame leaves the
+/// download unrecorded and retryable. The record is spawned rather than
+/// awaited so the final frame is not held back; a crash in that window
+/// leaves the file downloadable, the safe direction.
+struct RecordingStream {
+    inner: VerifiedStream,
+    /// Bytes still to hand off before the count lands. `None` never records:
+    /// a partial range response (resumes stay free under the download lease)
+    /// and the empty body, which recorded before the response.
+    remaining: Option<u64>,
+    app: Arc<App>,
+    grant: Arc<OutboundGrant>,
+    index: usize,
+}
+
+impl Stream for RecordingStream {
+    type Item = Result<Bytes, io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let frame = match Pin::new(&mut this.inner).poll_next(cx) {
+            Poll::Ready(frame) => frame,
+            Poll::Pending => return Poll::Pending,
+        };
+        if let (Some(Ok(bytes)), Some(remaining)) = (&frame, &mut this.remaining) {
+            *remaining = remaining.saturating_sub(bytes.len() as u64);
+            if *remaining == 0 {
+                this.remaining = None;
+                let app = Arc::clone(&this.app);
+                let grant = Arc::clone(&this.grant);
+                let index = this.index;
+                let grant_id = this.grant.id.clone();
+                tokio::spawn(async move {
+                    // The body is already gone, so a refusal (a racing stream
+                    // took the last allowed download) can only be logged.
+                    if let Err(error) = record_download(&app, &grant, &[index]).await {
+                        tracing::debug!(%grant_id, ?error, "download record after delivery refused");
+                    }
+                });
+            }
+        }
+        Poll::Ready(frame)
+    }
 }
 
 impl Stream for VerifiedStream {
@@ -7076,6 +7149,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_interrupted_file_download_records_nothing_until_completion() {
+        // One recorded download must mean one delivered download (audit
+        // finding 490): admission and mid-stream drops burn no quota, and
+        // only a whole-object response that finished counts once.
+        let (_directory, app, _cookie, _expected) = fixture().await;
+        let contents = vec![0xa5u8; 9 * 1024 * 1024];
+        std::fs::write(app.config.outbound_dir.join("large.bin"), &contents).unwrap();
+        let object = object_id(&contents);
+        let token = "d".repeat(32);
+        let mut grant = crate::store::tests::test_outbound_grant("file-once", "", 0);
+        grant.token_hash = hash_token(&token);
+        grant.expires_at = now_unix() + 600;
+        grant.max_downloads = Some(1);
+        grant.bytes = contents.len() as u64;
+        grant.files = vec![OutboundGrantFile {
+            source: "large.bin".to_owned(),
+            name: "large.bin".to_owned(),
+            suite: "blake3".to_owned(),
+            root: hex::encode(object.root),
+            bytes: contents.len() as u64,
+            receipt_b64: String::new(),
+            downloads: 0,
+            first_download_at: None,
+            last_download_at: None,
+        }];
+        app.store.insert_outbound_grant(grant).unwrap();
+
+        // Admission redirects and records nothing.
+        let admission = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/file"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 5))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(admission.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = admission.headers()[header::LOCATION].to_str().unwrap();
+        let lease = location
+            .strip_prefix(&format!("/api/s/{token}/file?download_lease="))
+            .unwrap_or_else(|| panic!("unexpected redirect location {location}"))
+            .to_owned();
+        let grant = app
+            .store
+            .outbound_grant_by_token_hash(&hash_token(&token))
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.files[0].downloads, 0);
+
+        // The final URL streams frame by frame; dropping after the first
+        // frame leaves the download unrecorded and the quota unspent.
+        let first_url = format!("/api/s/{token}/file?download_lease={lease}");
+        let aborted = router(app.clone())
+            .oneshot(
+                Request::get(&first_url)
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 5))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(aborted.status(), StatusCode::OK);
+        let mut stream = aborted.into_body().into_data_stream();
+        let frame = stream.next().await.unwrap().unwrap();
+        assert!(!frame.is_empty());
+        drop(stream);
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        let grant = app
+            .store
+            .outbound_grant_by_token_hash(&hash_token(&token))
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.files[0].downloads, 0);
+
+        // A fresh request is still admitted, and finishing the delivery
+        // records the download exactly once.
+        let completed = router(app.clone())
+            .oneshot(
+                Request::get(&first_url)
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 5))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.status(), StatusCode::OK);
+        let body = completed.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.len(), contents.len());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let downloads = app
+                    .store
+                    .outbound_grant_by_token_hash(&hash_token(&token))
+                    .unwrap()
+                    .unwrap()
+                    .files[0]
+                    .downloads;
+                if downloads == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the completed download was not recorded");
+
+        // The single download is spent, so a tokenless retry is refused.
+        let exhausted = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/file"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 5))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exhausted.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn batch_defers_trailing_empty_file_until_its_chunk_is_validated() {
         let (_directory, app, _cookie, expected) = fixture().await;
         let expected_object = object_id(&expected);
@@ -8742,9 +8938,18 @@ mod tests {
                     .all(|byte| byte.is_ascii_hexdigit() || byte == b'.'),
             "lease {lease} is not an issued token"
         );
+        // Admission does not record: an aborted delivery must burn no quota
+        // (audit finding 490).
+        let grant = app
+            .store
+            .outbound_grant_by_id(created["grant"]["id"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.downloads, 0);
 
-        // The redirected request streams the counted range and hands out no
-        // lease cookie.
+        // The redirected request streams the range and hands out no lease
+        // cookie. A partial range response records nothing (audit finding
+        // 490): only a whole-object delivery counts, so resumes stay free.
         let final_url = format!("/api/s/{token}/file?download_lease={lease}");
         let second = router(app.clone())
             .oneshot(
@@ -8785,6 +8990,69 @@ mod tests {
             resume.into_body().collect().await.unwrap().to_bytes(),
             &expected_bytes[7..]
         );
+        let grant = app
+            .store
+            .outbound_grant_by_id(created["grant"]["id"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.downloads, 0);
+
+        // The abandoned ranges spent nothing, so a tokenless retry is
+        // admitted again instead of refused. The plain router (no redirect
+        // replay) observes the admission alone.
+        let retry = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/file"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = retry.headers()[header::LOCATION].to_str().unwrap();
+        let fresh = location
+            .strip_prefix(&format!("/api/s/{token}/file?download_lease="))
+            .unwrap_or_else(|| panic!("unexpected redirect location {location}"))
+            .to_owned();
+
+        // A full delivery records once, after its last frame is handed to
+        // the transport (audit finding 490).
+        let full = router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/file?download_lease={fresh}"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(full.status(), StatusCode::OK);
+        assert_eq!(
+            full.headers()[header::CONTENT_LENGTH],
+            expected_bytes.len().to_string()
+        );
+        assert_eq!(
+            full.into_body().collect().await.unwrap().to_bytes(),
+            &expected_bytes[..]
+        );
+        let grant_id = created["grant"]["id"].as_str().unwrap().to_owned();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let downloads = app
+                    .store
+                    .outbound_grant_by_id(&grant_id)
+                    .unwrap()
+                    .unwrap()
+                    .downloads;
+                if downloads == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the completed download was not recorded");
 
         // The single download is spent, so a tokenless retry is refused.
         let exhausted = router(app.clone())
@@ -9081,6 +9349,25 @@ mod tests {
             first.into_body().collect().await.unwrap().to_bytes(),
             expected_bytes
         );
+        // The record lands after the body's last frame is handed off, on a
+        // spawned task; a second admission must observe it (finding 490).
+        let grant_id = created["grant"]["id"].as_str().unwrap().to_owned();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let downloads = app
+                    .store
+                    .outbound_grant_by_id(&grant_id)
+                    .unwrap()
+                    .unwrap()
+                    .downloads;
+                if downloads == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the completed download was not recorded");
         let second = router(app)
             .oneshot(
                 Request::get(format!("/api/s/{token}/file"))
