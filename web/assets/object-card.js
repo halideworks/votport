@@ -3,13 +3,27 @@
 // full suite:root; clicking it copies the pasteable form. VOTPORT PROPRIETARY LICENSE.
 
 // Byte size for status lines; shared home so public pages (verify) do not
-// import the admin module for one helper.
+// import the admin module for one helper. Decimal units, one vocabulary with
+// the desktops' Rust human_bytes: transfer limits are created in decimal GB
+// and rates are quoted the same way, so sizes read the same everywhere.
 export function formatBytes(bytes) {
-  if (bytes === 0) return '0 B';
-  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
-  const exponent = Math.min(Math.floor(Math.log2(bytes) / 10), units.length - 1);
-  const value = bytes / 2 ** (10 * exponent);
-  return `${value >= 100 || exponent === 0 ? Math.round(value) : value.toFixed(1)} ${units[exponent]}`;
+  if (bytes === 0) return '0 bytes';
+  if (bytes === 1) return '1 byte';
+  const units = ['bytes', 'KB', 'MB', 'GB', 'TB'];
+  let amount = bytes;
+  let unit = 0;
+  while (amount >= 1000 && unit < units.length - 1) {
+    amount /= 1000;
+    unit += 1;
+  }
+  // One decimal below 100, none at or above, and a carry when rounding
+  // reaches the next unit (999.5 KB reads 1.0 MB).
+  if (unit < units.length - 1 && amount >= 999.5) {
+    amount /= 1000;
+    unit += 1;
+  }
+  if (unit === 0) return `${bytes} bytes`;
+  return `${amount >= 99.95 ? Math.round(amount) : amount.toFixed(1)} ${units[unit]}`;
 }
 
 /// Copies text and flips the button label to Copied for a moment.
@@ -126,9 +140,32 @@ export function appendObjectCard(parent, file, options = {}) {
   return row;
 }
 
-/// Whole seconds as a short duration: 45s, 2m 40s, 1h 5m.
+/// Whole seconds as a short duration: 45s, 2m 40s, 1h 5m. Fractional
+/// estimates from live rates round to the shown second.
 export function formatDuration(seconds) {
-  if (seconds < 60) return `${seconds}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
-  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+  const total = Math.round(seconds);
+  if (total < 60) return `${total}s`;
+  if (total < 3600) return `${Math.floor(total / 60)}m ${total % 60}s`;
+  return `${Math.floor(total / 3600)}h ${Math.floor((total % 3600) / 60)}m`;
+}
+
+/// Relative age for an activity stamp: "just now", "3 min ago", "2 d ago";
+/// a future moment reads "in 5 min". Pair it with formatWhen in a title so
+/// the exact moment stays one hover away (audit finding 462).
+export function formatAgo(unixSeconds, now = Math.round(Date.now() / 1000)) {
+  const delta = now - unixSeconds;
+  // Cutoff, divisor, unit: pick the largest unit that fits the distance.
+  const steps = [
+    [60, 1, 'just now'],
+    [3600, 60, 'min'],
+    [86400, 3600, 'h'],
+    [604800, 86400, 'd'],
+    [2629800, 604800, 'w'],
+    [31557600, 2629800, 'mo'],
+    [Infinity, 31557600, 'y'],
+  ];
+  const [, divisor, unit] = steps.find(([limit]) => Math.abs(delta) < limit);
+  if (unit === 'just now') return unit;
+  const value = Math.max(1, Math.floor(Math.abs(delta) / divisor));
+  return delta > 0 ? `${value} ${unit} ago` : `in ${value} ${unit}`;
 }

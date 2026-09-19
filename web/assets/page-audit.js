@@ -1,7 +1,7 @@
 // votport audit page: queryable event log viewer + JSONL export.
 // VOTPORT PROPRIETARY LICENSE.
 
-import { formatWhen, requireSession } from '/assets/admin-common.js';
+import { formatAgo, formatWhen, requireSession } from '/assets/admin-common.js';
 
 const $ = (id) => document.getElementById(id);
 const PAGE_SIZE = 250;
@@ -147,7 +147,8 @@ function renderRow(row) {
   const line = document.createElement('div');
   line.className = 'audit-row';
 
-  const when = renderField('span', 'audit-when muted', 'Time', formatWhen(row.at));
+  const when = renderField('span', 'audit-when muted', 'Time', formatAgo(row.at));
+  when.title = formatWhen(row.at);
   const tenant = renderField('span', 'audit-tenant muted', 'Tenant', row.tenant || 'default');
   const event = renderField('strong', 'audit-event', 'Event', row.event || 'unknown');
   const subject = renderField('span', 'audit-subject', 'Subject', row.subject || 'None');
@@ -172,7 +173,10 @@ function renderRow(row) {
 
 function rangeText() {
   const retained = $('audit-log').childElementCount;
-  return retained ? `Showing rows ${loadedRows - retained + 1} to ${loadedRows}.` : '0 rows loaded';
+  if (!retained) return '0 rows loaded';
+  return retained === 1
+    ? 'Showing row 1.'
+    : `Showing rows ${loadedRows - retained + 1} to ${loadedRows}.`;
 }
 
 async function load(reset = false) {

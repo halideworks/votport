@@ -276,7 +276,7 @@ test('admin timestamps carry the UTC zone name, matching logs, receipts and the 
   assert.match(commonScript, /export function formatWhen\(unixSeconds\) \{/);
   assert.match(
     commonScript,
-    /\.toLocaleString\(\[\], \{\s*timeZone: 'UTC',\s*timeZoneName: 'short',\s*\}\);/,
+    /\.toLocaleString\(\[\], \{\s*timeZone: 'UTC',\s*timeZoneName: 'short',\s*year: 'numeric',\s*month: 'short',\s*day: 'numeric',\s*hour: '2-digit',\s*minute: '2-digit',\s*\}\);/,
   );
 });
 

@@ -21,6 +21,7 @@ use serde_json::json;
 use crate::app::App;
 use crate::session::FinishReport;
 use crate::store::{OutboundDownloadResult, OutboundGrant, ResolvedSmtp};
+use votport_client_core::error::human_bytes;
 
 const MAX_NOTIFICATION_FILES: usize = 100;
 const DESTINATION_FAILURE: &str =
@@ -142,10 +143,12 @@ pub async fn uploaded(
         title_brand(&app, &tenant)
     );
     let mut body = format!(
-        "{count} file(s), {total} bytes\n{}",
+        "{count} {}, {}\n{}",
+        if count == 1 { "file" } else { "files" },
+        human_bytes(total),
         files
             .iter()
-            .map(|file| format!("{} ({} bytes)", file.stored_as, file.bytes))
+            .map(|file| format!("{} ({})", file.stored_as, human_bytes(file.bytes)))
             .collect::<Vec<_>>()
             .join("\n")
     );
@@ -241,8 +244,10 @@ pub async fn outbound_downloaded(
             grant.label
         );
         let body = format!(
-            "{}\n{transition}: {file_count} file(s), {total_bytes} bytes",
-            grant.label
+            "{}\n{transition}: {file_count} {}, {}",
+            grant.label,
+            if file_count == 1 { "file" } else { "files" },
+            human_bytes(total_bytes)
         );
         let payload = json!({
             "event": event,
@@ -284,8 +289,10 @@ pub async fn upload_ended(app: Arc<App>, ended: crate::session::SessionEnded) {
         ended.label
     );
     let body = format!(
-        "{}\n{} of {} bytes received",
-        event.detail, event.received_bytes, event.expected_bytes
+        "{}\n{} of {} received",
+        event.detail,
+        human_bytes(event.received_bytes),
+        human_bytes(event.expected_bytes)
     );
     let url = admin_link(&app, &receive_link(&ended.link_id));
     let payload = json!({
@@ -1196,7 +1203,7 @@ pub(crate) mod tests {
         assert!(url
             .query_pairs()
             .any(|(key, value)| key == "title" && value.starts_with("Müller 撮影:")));
-        assert!(body.starts_with("ID: up-ntfy\n100 file(s), 100 bytes\n"));
+        assert!(body.starts_with("ID: up-ntfy\n100 files, 100 bytes\n"));
         assert!(body.len() <= 4096 && body.ends_with('…'));
         assert!(body.contains("撮影🎬"));
         for ((uri, headers, body), brand) in
@@ -2202,7 +2209,7 @@ pub(crate) mod tests {
             .decode(encoded.lines().collect::<String>())
             .unwrap();
         let text = String::from_utf8(decoded).unwrap().replace("\r\n", "\n");
-        assert!(text.starts_with("ID: up-smtp\n100 file(s), 100 bytes\n"));
+        assert!(text.starts_with("ID: up-smtp\n100 files, 100 bytes\n"));
         assert!(text.contains("Müller_撮影-0.mov"));
         assert!(text.len() <= 64 * 1024 && text.ends_with('…'));
     }
