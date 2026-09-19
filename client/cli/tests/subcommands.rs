@@ -326,3 +326,160 @@ fn a_closed_request_link_refuses_a_send() {
     assert_eq!(error["code"], "command_failed");
     assert_eq!(error["retryable"], false);
 }
+
+/// Audit finding 470: the CLI's send and receive route through the core's
+/// journalled FFI paths, so a transfer refused for a missing password (a
+/// retry-worthy failure) leaves a resume record that `votport status` lists
+/// and `votport resume` finishes; a transfer that ends well leaves nothing.
+#[test]
+fn interrupted_cli_transfers_leave_a_resume_record() {
+    let Some(binary) = server_binary() else {
+        return;
+    };
+    let server = start_server(&binary);
+    let state = UniqueDir::new("journal-state");
+    let source = UniqueDir::new("journal-source");
+    let note = b"a note the cli journalled".to_vec();
+    let file = source.0.join("note.txt");
+    std::fs::write(&file, &note).unwrap();
+    let destination = UniqueDir::new("journal-dest");
+
+    sign_in(&state.0, &server.base);
+
+    // A password request link refuses a passwordless send; the core keeps
+    // the journalled entry because the failure could go differently next
+    // time.
+    let created = cli(
+        &state.0,
+        &[
+            "issue-request",
+            "journalled send",
+            "--password",
+            "hush",
+            "--json",
+        ],
+    );
+    assert!(
+        created.status.success(),
+        "issue-request failed:\n{}",
+        output_text(&created)
+    );
+    let link: serde_json::Value = last_json_line(&created.stdout);
+    let url = find_json_field(&link, "url");
+
+    let refused = cli(&state.0, &["send", &url, file.to_str().unwrap()]);
+    assert!(
+        !refused.status.success(),
+        "a password link must refuse a passwordless send:\n{}",
+        output_text(&refused)
+    );
+
+    let listed = cli(&state.0, &["status"]);
+    assert!(
+        listed.status.success(),
+        "status failed:\n{}",
+        output_text(&listed)
+    );
+    let entry = journal_entry(&listed, "send");
+    assert_eq!(entry["needs_password"], true);
+    assert!(entry["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path.as_str().unwrap().ends_with("note.txt")));
+    let id = find_json_field(&entry, "id");
+
+    // The record resumes: the same id completes with the password, the drop
+    // lands, and the journal empties.
+    let resumed = cli(&state.0, &["resume", &id, "--password", "hush", "--json"]);
+    assert!(
+        resumed.status.success(),
+        "resume failed:\n{}",
+        output_text(&resumed)
+    );
+    let summary = last_json_line(&resumed.stdout);
+    assert_eq!(summary["event"], "done");
+    assert_eq!(summary["kind"], "send");
+    let landed = find_file(&server.received, "note.txt").expect("the resumed drop landed");
+    assert_eq!(std::fs::read(&landed).unwrap(), note);
+
+    // The same for receive: a password delivery refused without a password
+    // keeps a receive entry, and its resume lands the delivery.
+    let uploaded = cli(&state.0, &["upload", file.to_str().unwrap(), "--json"]);
+    assert!(
+        uploaded.status.success(),
+        "upload failed:\n{}",
+        output_text(&uploaded)
+    );
+    let library: serde_json::Value = last_json_line(&uploaded.stdout);
+    let library_path = library[0]["path"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no library path in {library}"))
+        .to_owned();
+    let issued = cli(
+        &state.0,
+        &[
+            "issue-delivery",
+            "journalled delivery",
+            &library_path,
+            "--password",
+            "hush",
+            "--json",
+        ],
+    );
+    assert!(
+        issued.status.success(),
+        "issue-delivery failed:\n{}",
+        output_text(&issued)
+    );
+    let link: serde_json::Value = last_json_line(&issued.stdout);
+    let url = find_json_field(&link, "url");
+
+    let refused = cli(
+        &state.0,
+        &["receive", &url, destination.0.to_str().unwrap()],
+    );
+    assert!(
+        !refused.status.success(),
+        "a password delivery must refuse a passwordless receive:\n{}",
+        output_text(&refused)
+    );
+
+    let listed = cli(&state.0, &["status"]);
+    let entry = journal_entry(&listed, "receive");
+    assert_eq!(entry["needs_password"], true);
+    let id = find_json_field(&entry, "id");
+
+    let resumed = cli(&state.0, &["resume", &id, "--password", "hush", "--json"]);
+    assert!(
+        resumed.status.success(),
+        "receive resume failed:\n{}",
+        output_text(&resumed)
+    );
+    let summary = last_json_line(&resumed.stdout);
+    assert_eq!(summary["event"], "done");
+    assert_eq!(summary["kind"], "receive");
+    let landed = find_file(&destination.0, "note.txt").expect("the resumed delivery landed");
+    assert_eq!(std::fs::read(&landed).unwrap(), note);
+
+    // Both transfers ended well, so the journal is empty again.
+    let listed = cli(&state.0, &["status"]);
+    assert_eq!(
+        String::from_utf8_lossy(&listed.stdout).trim(),
+        "",
+        "a finished transfer must not stay in the journal:\n{}",
+        output_text(&listed)
+    );
+}
+
+/// The one journal entry of `kind` in a `votport status` run.
+fn journal_entry(listed: &Output, kind: &str) -> serde_json::Value {
+    let text = String::from_utf8_lossy(&listed.stdout);
+    text.lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|error| panic!("status line was not JSON ({error}): {line}"))
+        })
+        .find(|entry| entry["kind"] == kind)
+        .unwrap_or_else(|| panic!("no {kind} entry in the journal:\n{text}"))
+}

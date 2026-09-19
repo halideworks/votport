@@ -206,9 +206,18 @@ if (await page.getAttribute("#new-link-url", "role") !== "status"
 if (!receiveListFailed || await page.locator("#create-error").isVisible()) {
   throw new Error("a list refresh failure must not hide or fail a successfully created request link");
 }
+// The copy click runs while a one-shot links route interception is armed;
+// the Chromium Fetch-domain race can freeze the clipboard stub. One bounded
+// re-click absorbs the stall without weakening the assertion.
+const copySettled = async () => page.waitForFunction((url) => window.__copiedText === url
+  && document.getElementById("links-action-status").textContent === "Request link copied.", linkUrl, { timeout: 30000, polling: 50 });
 await page.click("#new-link-copy");
-await page.waitForFunction((url) => window.__copiedText === url
-  && document.getElementById("links-action-status").textContent === "Request link copied.", linkUrl, { timeout: 60000, polling: 50 });
+try {
+  await copySettled();
+} catch {
+  await page.click("#new-link-copy");
+  await copySettled();
+}
 await page.evaluate(() => { window.__clipboardFailure = true; window.__clipboardHold = true; window.__releaseClipboard = null; });
 await page.click("#new-link-copy");
 await page.waitForFunction(() => typeof window.__releaseClipboard === "function", null, { polling: 50 });

@@ -9,11 +9,9 @@ mod mcp;
 
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
 
-use votport_client_core::progress::{Event, Observer};
-use votport_client_core::{
-    receive_with_device_or_http, split_link_as, Delivery, Device, Drop, LinkKind, Sent, Transport,
-};
+use votport_client_core::Transport;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -173,67 +171,42 @@ fn send(args: &[String]) -> Result<(), String> {
     if paths.is_empty() {
         return Err("send needs at least one file or folder".to_owned());
     }
-    let link = split_link_as(link, LinkKind::Request).map_err(|error| error.to_string())?;
-    let (base, token) = (link.base, link.token);
-    let info = votport_client_core::api::Client::new(&base)
-        .map_err(|error| error.to_string())?
-        .link_info(&token)
-        .map_err(|error| error.to_string())?;
-
-    let mut files = Vec::new();
-    for path in paths {
-        votport_client_core::transfer::collect_for_link(
-            Path::new(path),
-            &mut files,
-            info.allow_hidden,
-        )
-        .map_err(|error| format!("{path}: {error}"))?;
-    }
-    if files.is_empty() {
-        return Err("none of the given paths held any files".to_owned());
-    }
-
-    let drop = Drop {
-        token,
+    // The journalled core path: a transfer cut by a kill or kept for a
+    // retryable failure leaves a resume record for `votport status` and
+    // `votport resume`.
+    let sent = votport_client_core::ffi::send(
+        link.clone(),
         password,
-        files,
-    };
-
-    let device = Device::load_or_create().map_err(|error| error.to_string())?;
-    let mut observer = CliObserver { json };
-    let sent = votport_client_core::send(&base, drop, &device, &mut observer)
-        .map_err(|error| error.to_string())?;
-    match sent {
-        Sent::Push { files } => {
-            if json {
-                println!("{{\"event\":\"done\",\"via\":\"push\",\"files\":{files}}}");
-            } else {
-                println!(
-                    "done: {files} {} pushed",
-                    if files == 1 { "file" } else { "files" }
-                );
-            }
+        paths.to_vec(),
+        votport_client_core::ffi::Transfer::new(),
+        Arc::new(ViewPrinter { json }),
+    )
+    .map_err(|error| error.to_string())?;
+    if matches!(sent.transport, Transport::Push) {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"event":"done","via":"push","files":sent.files})
+            );
+        } else {
+            println!(
+                "done: {} {} pushed",
+                sent.files,
+                if sent.files == 1 { "file" } else { "files" }
+            );
         }
-        Sent::Http(report) => {
-            if json {
-                println!(
-                    "{{\"event\":\"done\",\"via\":\"http\",\"upload_id\":{:?},\"files\":{}}}",
-                    report.upload_id,
-                    report.files.len()
-                );
-            } else {
-                println!(
-                    "done: {} {} published (upload {})",
-                    report.files.len(),
-                    if report.files.len() == 1 {
-                        "file"
-                    } else {
-                        "files"
-                    },
-                    report.upload_id
-                );
-            }
-        }
+    } else if json {
+        println!(
+            "{}",
+            serde_json::json!({"event":"done","via":"http","upload_id":sent.upload_id,"files":sent.files})
+        );
+    } else {
+        println!(
+            "done: {} {} published (upload {})",
+            sent.files,
+            if sent.files == 1 { "file" } else { "files" },
+            sent.upload_id.as_deref().unwrap_or_default()
+        );
     }
     Ok(())
 }
@@ -362,13 +335,15 @@ fn receive(args: &[String]) -> Result<(), String> {
     let [link, dir] = positional.as_slice() else {
         return Err("receive needs one delivery link and one directory".to_owned());
     };
-    let link = split_link_as(link, LinkKind::Delivery).map_err(|error| error.to_string())?;
-    let (base, token) = (link.base, link.token);
-
-    let delivery = Delivery { token, password };
-    let mut observer = CliObserver { json };
-    let received = receive_with_device_or_http(&base, delivery, Path::new(dir), &mut observer)
-        .map_err(|error| error.to_string())?;
+    // Journalled like send, so an interrupted receive is resumable too.
+    let received = votport_client_core::ffi::receive(
+        link.clone(),
+        password,
+        dir.clone(),
+        votport_client_core::ffi::Transfer::new(),
+        Arc::new(ViewPrinter { json }),
+    )
+    .map_err(|error| error.to_string())?;
     if json {
         println!(
             "{{\"event\":\"done\",\"via\":\"receive\",\"files\":{}}}",
@@ -386,81 +361,6 @@ fn receive(args: &[String]) -> Result<(), String> {
         );
     }
     Ok(())
-}
-
-fn transport_name(transport: Transport) -> &'static str {
-    match transport {
-        Transport::Push => "push",
-        Transport::Http => "http",
-        Transport::Fetch => "fetch",
-    }
-}
-
-struct CliObserver {
-    json: bool,
-}
-
-impl Observer for CliObserver {
-    fn event(&mut self, event: Event) {
-        if matches!(event, Event::Transferred { .. }) {
-            return;
-        }
-        if self.json {
-            use serde_json::json;
-            let line = match &event {
-                Event::Evidence { status } => {
-                    json!({"event": "delivery_evidence", "status": status})
-                }
-                Event::Transferred { .. } => return,
-                Event::Selected { files } | Event::Planned { files } => {
-                    json!({"event": if matches!(event, Event::Selected { .. }) { "selected" } else { "planned" }, "files": files.iter().map(|f| json!({"index": f.index, "path": f.path, "bytes": f.bytes})).collect::<Vec<_>>()})
-                }
-                Event::Transport(transport) => {
-                    json!({"event": "transport", "via": transport_name(*transport)})
-                }
-                Event::Bytes { moved, total } => {
-                    json!({"event": "bytes", "moved": moved, "total": total})
-                }
-                Event::SessionCreated { session } => {
-                    json!({"event": "session", "session": session})
-                }
-                Event::Chunk {
-                    index,
-                    covered,
-                    total,
-                } => json!({"event": "chunk", "entry": index, "covered": covered, "total": total}),
-                Event::EntryComplete { index, path } => {
-                    json!({"event": "entry", "index": index, "path": path})
-                }
-                Event::Rebegin => json!({"event": "rebegin"}),
-                Event::Finished { files } => json!({"event": "finished", "files": files}),
-                Event::Downloading {
-                    index,
-                    received,
-                    total,
-                } => {
-                    json!({"event": "downloading", "index": index, "received": received, "total": total})
-                }
-                Event::FileVerified { index, path } => {
-                    json!({"event": "verified", "index": index, "path": path})
-                }
-            };
-            println!("{line}");
-            return;
-        }
-        match event {
-            Event::Evidence { status } => println!("  delivery evidence: {status}"),
-            Event::Transport(_) | Event::Bytes { .. } | Event::Transferred { .. } => {}
-            Event::Selected { .. } | Event::Planned { .. } => {}
-            Event::SessionCreated { .. } => {}
-            Event::Chunk { .. } => {}
-            Event::EntryComplete { path, .. } => println!("  sent {path}"),
-            Event::Rebegin => println!("  server restarted; resuming"),
-            Event::Finished { .. } => {}
-            Event::Downloading { .. } => {}
-            Event::FileVerified { path, .. } => println!("  received {path}"),
-        }
-    }
 }
 
 /// The parsed `--flag value` options of a command.
