@@ -147,6 +147,12 @@ struct PendingRestore {
     phase: RestorePhase,
     #[serde(default)]
     rollback: Option<String>,
+    /// The inventory id of the restored archive, recorded when the restore
+    /// was staged from a named backup. A replica pull stages from the live
+    /// primary and has none; the applied-restore log and audit row then name
+    /// the archive only by its manifest created_at.
+    #[serde(default)]
+    archive: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -154,6 +160,25 @@ struct PendingRestore {
 pub(crate) enum RestoreMode {
     Historical,
     Replica,
+}
+
+impl RestoreMode {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            RestoreMode::Historical => "historical",
+            RestoreMode::Replica => "replica",
+        }
+    }
+}
+
+/// What a boot-time `apply_pending_restore` installed, for the applied
+/// log line and the audit row that closes the silent gap between the last
+/// pre-backup entry and the next login (audit finding 494).
+pub(crate) struct AppliedRestore {
+    pub(crate) archive: Option<String>,
+    pub(crate) created_at: u64,
+    pub(crate) mode: RestoreMode,
+    pub(crate) schema_version: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -1258,12 +1283,14 @@ fn prepare_restored_database(
 
 /// Commit a validated extraction as a restart-time transaction. The marker
 /// contains only a basename, and the extracted directory has already passed
-/// the fixed archive allowlist above.
+/// the fixed archive allowlist above. `archive` is the inventory id of the
+/// restored archive when one exists, carried to the applied-restore record.
 pub(crate) fn write_pending_restore(
     data_dir: &Path,
     mut extracted: CleanupPath,
     manifest: Manifest,
     mode: RestoreMode,
+    archive: Option<&str>,
 ) -> Result<(), String> {
     let previous = read_pending_restore(data_dir)?;
     if previous
@@ -1290,6 +1317,7 @@ pub(crate) fn write_pending_restore(
         mode,
         phase: RestorePhase::Prepared,
         rollback: None,
+        archive: archive.filter(|id| !id.is_empty()).map(|id| id.to_owned()),
     };
     // A failed directory sync can leave the new marker installed. Retain both stages until success.
     extracted.keep();
@@ -1338,10 +1366,16 @@ pub(crate) fn discard_staged_replica(data_dir: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
-pub fn apply_pending_restore(data_dir: &Path, schema_version: u64) -> Result<(), String> {
+/// Applies a staged restore at boot. Returns what was installed, so the
+/// caller with an open store can land the `backup_restore_applied` audit
+/// row; `None` when nothing was pending.
+pub(crate) fn apply_pending_restore(
+    data_dir: &Path,
+    schema_version: u64,
+) -> Result<Option<AppliedRestore>, String> {
     let marker_path = data_dir.join(PENDING_FILE);
     let Some(mut marker) = read_pending_restore(data_dir)? else {
-        return Ok(());
+        return Ok(None);
     };
     if marker.version != VERSION
         || marker.manifest.version != VERSION
@@ -1468,7 +1502,42 @@ pub fn apply_pending_restore(data_dir: &Path, schema_version: u64) -> Result<(),
         fs::remove_dir_all(&stage).map_err(|e| e.to_string())?;
     }
     fs::remove_file(marker_path).map_err(|e| e.to_string())?;
-    sync_directory(data_dir)
+    sync_directory(data_dir)?;
+    // A boot restore used to be silent between the marker and the next
+    // login: name the archive it installed here (audit finding 494).
+    let applied = AppliedRestore {
+        archive: marker.archive.clone(),
+        created_at: marker.manifest.created_at,
+        mode: marker.mode,
+        schema_version: marker.manifest.schema_version,
+    };
+    tracing::info!(
+        target: "audit",
+        event = "backup_restore_applied",
+        id = applied.archive.as_deref().unwrap_or("unknown"),
+        mode = applied.mode.label(),
+        created_at = applied.created_at,
+        schema_version = applied.schema_version,
+        "backup restore applied at boot"
+    );
+    Ok(Some(applied))
+}
+
+/// Lands the audit row for a boot-applied restore into the freshly restored
+/// store, so the log no longer jumps from the last pre-backup entry to the
+/// next login without marking the gap (audit finding 494).
+pub(crate) fn record_applied_restore(store: &crate::store::Store, applied: &AppliedRestore) {
+    store.audit(
+        "",
+        "",
+        "backup_restore_applied",
+        applied.archive.as_deref().unwrap_or_default(),
+        &serde_json::json!({
+            "mode": applied.mode.label(),
+            "created_at": applied.created_at,
+            "schema_version": applied.schema_version,
+        }),
+    );
 }
 
 pub fn now() -> u64 {
@@ -2519,6 +2588,7 @@ mod tests {
                 entries: Vec::new(),
             },
             RestoreMode::Replica,
+            None,
         )
         .unwrap();
 
@@ -3146,6 +3216,7 @@ mod tests {
             CleanupPath::directory(stage.clone()),
             manifest.clone(),
             RestoreMode::Historical,
+            None,
         )
         .unwrap();
         let original = fs::read(root.path().join(PENDING_FILE)).unwrap();
@@ -3157,6 +3228,7 @@ mod tests {
             CleanupPath::directory(new.clone()),
             manifest.clone(),
             RestoreMode::Historical,
+            None,
         );
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         assert!(failed.is_err(), "test requires an unprivileged user");
@@ -3171,6 +3243,7 @@ mod tests {
             CleanupPath::directory(new.clone()),
             manifest.clone(),
             RestoreMode::Historical,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -3196,6 +3269,7 @@ mod tests {
                 CleanupPath::directory(stage.clone()),
                 manifest.clone(),
                 RestoreMode::Historical,
+                None,
             )
             .unwrap_err()
             .contains("being applied"));
@@ -3227,6 +3301,7 @@ mod tests {
             CleanupPath::directory(stale.clone()),
             manifest.clone(),
             RestoreMode::Replica,
+            None,
         )
         .unwrap();
         assert!(discard_staged_replica(root.path()).unwrap());
@@ -3246,6 +3321,7 @@ mod tests {
                 mode: RestoreMode::Replica,
                 phase: RestorePhase::OldMoved,
                 rollback: Some(".votport-restore-rollback-keep".into()),
+                archive: None,
             },
         )
         .unwrap();
@@ -3268,6 +3344,7 @@ mod tests {
             CleanupPath::directory(stage.clone()),
             manifest,
             RestoreMode::Historical,
+            None,
         )
         .unwrap();
         fs::write(stage.join("receipt.key"), b"tampered").unwrap();
@@ -3364,6 +3441,7 @@ mod tests {
                         mode: RestoreMode::Historical,
                         phase,
                         rollback: Some(".votport-restore-rollback-test".into()),
+                        archive: Some("archive-test".into()),
                     },
                 )
                 .unwrap();
@@ -3507,8 +3585,14 @@ mod tests {
                 fs::create_dir(&stage).unwrap();
                 let manifest =
                     validate_and_extract(&archive, &stage, crate::store::SCHEMA_VERSION).unwrap();
-                write_pending_restore(root.path(), CleanupPath::directory(stage), manifest, mode)
-                    .unwrap();
+                write_pending_restore(
+                    root.path(),
+                    CleanupPath::directory(stage),
+                    manifest,
+                    mode,
+                    None,
+                )
+                .unwrap();
                 assert_eq!(fs::read(&secret_path).unwrap(), secrets);
                 assert_eq!(fs::read(&status_path).unwrap(), history);
                 if interrupted {
@@ -3586,6 +3670,7 @@ mod tests {
             CleanupPath::directory(stage.clone()),
             manifest,
             RestoreMode::Historical,
+            None,
         )
         .unwrap();
         apply_pending_restore(root.path(), crate::store::SCHEMA_VERSION).unwrap();
@@ -3610,6 +3695,68 @@ mod tests {
                 ..historical
             }
         );
+    }
+
+    #[test]
+    fn an_applied_boot_restore_is_logged_and_audited() {
+        let (root, store) = initialized_root();
+        let archive = root.path().join("bundle.tar");
+        create_archive(&store, root.path(), &archive, crate::store::SCHEMA_VERSION).unwrap();
+        let stage = root.path().join(".votport-restore-stage-test");
+        fs::create_dir(&stage).unwrap();
+        let manifest =
+            validate_and_extract(&archive, &stage, crate::store::SCHEMA_VERSION).unwrap();
+        drop(store);
+        write_pending_restore(
+            root.path(),
+            CleanupPath::directory(stage),
+            manifest.clone(),
+            RestoreMode::Historical,
+            Some("arch-7"),
+        )
+        .unwrap();
+        // Capture the boot log the way the scratch-removal warning is
+        // asserted: a JSON subscriber over a temp file (audit finding 494).
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let writer = log.reopen().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.try_clone().unwrap())
+            .finish();
+        let applied = tracing::subscriber::with_default(subscriber, || {
+            apply_pending_restore(root.path(), crate::store::SCHEMA_VERSION).unwrap()
+        })
+        .expect("an applied restore is returned to the caller");
+        assert_eq!(applied.archive.as_deref(), Some("arch-7"));
+        assert_eq!(applied.created_at, manifest.created_at);
+        assert_eq!(applied.mode, RestoreMode::Historical);
+        assert_eq!(applied.schema_version, crate::store::SCHEMA_VERSION);
+        let lines: Vec<String> = std::fs::read_to_string(log.path())
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            lines.iter().any(|line| {
+                line.contains("backup_restore_applied")
+                    && line.contains(r#""id":"arch-7""#)
+                    && line.contains(r#""mode":"historical""#)
+            }),
+            "applied restore line missing from {lines:?}"
+        );
+
+        // The freshly restored store carries the audit row that marks the
+        // silent gap between the last pre-backup entry and the next login.
+        let restored_store = crate::store::Store::open(root.path()).unwrap();
+        record_applied_restore(&restored_store, &applied);
+        assert!(restored_store
+            .audit_export(Some(""), 0, 0, 100)
+            .unwrap()
+            .iter()
+            .any(|row| row.event == "backup_restore_applied"));
     }
 
     #[test]
@@ -3703,8 +3850,14 @@ mod tests {
             fs::create_dir(&stage).unwrap();
             let manifest =
                 validate_and_extract(&archive, &stage, crate::store::SCHEMA_VERSION).unwrap();
-            write_pending_restore(root.path(), CleanupPath::directory(stage), manifest, mode)
-                .unwrap();
+            write_pending_restore(
+                root.path(),
+                CleanupPath::directory(stage),
+                manifest,
+                mode,
+                None,
+            )
+            .unwrap();
             assert_eq!(
                 read_pending_restore(root.path()).unwrap().unwrap().mode,
                 mode

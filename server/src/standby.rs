@@ -216,6 +216,7 @@ async fn pull_replica(
         stage_cleanup,
         manifest.clone(),
         crate::backup::RestoreMode::Replica,
+        None,
     )?;
     Ok(manifest)
 }
@@ -488,6 +489,7 @@ mod tests {
                 entries: Vec::new(),
             },
             crate::backup::RestoreMode::Replica,
+            None,
         )
         .unwrap();
         assert!(config.data_dir.join(crate::backup::PENDING_FILE).exists());
@@ -524,6 +526,7 @@ mod tests {
             crate::backup::CleanupPath::directory(data.join(live)),
             manifest,
             crate::backup::RestoreMode::Replica,
+            None,
         )
         .unwrap();
         assert_eq!(sweep_orphans(data).unwrap(), 2);

@@ -5897,6 +5897,41 @@ async fn status_reports_receiving_sessions_and_the_days_uploads() {
 /// The lease token from a download redirect, asserting the canonical
 /// same-origin location shape and the no-store, no-referrer, no-cookie
 /// policy that must ride the admission response.
+/// The download record lands on a spawned task once a body's last frame is
+/// handed off (finding 490), so tests that assert cap exhaustion poll the
+/// grant's count through the admin list before expecting refusals.
+async fn wait_for_grant_downloads(
+    admin: &reqwest::Client,
+    base: &str,
+    grant_id: &str,
+    expected: u64,
+) {
+    for _ in 0..400 {
+        let grants: Value = admin
+            .get(format!("{base}/api/admin/outbound-grants"))
+            .header("x-votport", "1")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let hit = grants["grants"]
+            .as_array()
+            .and_then(|grants| {
+                grants
+                    .iter()
+                    .find(|grant| grant["id"].as_str() == Some(grant_id))
+            })
+            .unwrap_or_else(|| panic!("grant {grant_id} missing from the list"));
+        if hit["downloads"].as_u64() == Some(expected) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("grant {grant_id} downloads never reached {expected}");
+}
+
 fn download_redirect_lease(response: reqwest::Response, expected_path: &str) -> String {
     assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
     assert!(
@@ -6051,6 +6086,18 @@ async fn a_download_lease_moves_to_the_final_url_and_counts_once() {
     let second = download_redirect_lease(response, &file_path);
     assert_ne!(second, lease);
 
+    // The count waits for delivery (finding 490), so the second admission
+    // alone spends nothing: delivering the second lease completes the cap.
+    let response = no_redirects
+        .get(format!("{file_url}?download_lease={second}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.bytes().await.unwrap(), &body[..]);
+    let grant_id = grant["grant"]["id"].as_str().unwrap().to_owned();
+    wait_for_grant_downloads(&admin, &base, &grant_id, 2).await;
+
     // The cap holds: the third tokenless attempt finds the file exhausted,
     // and a forged lease counts as absent, so it is refused the same way.
     assert_eq!(
@@ -6165,20 +6212,36 @@ async fn parallel_file_downloads_count_once_each_and_the_cap_holds() {
         final_urls.push(final_url);
     }
 
-    // Every index counted exactly once: one more tokenless request per
-    // index is still admitted, and the one after that is over the cap.
+    // Every index counted once in the wave (finding 490: the count waits
+    // for delivery). One more tokenless admission per index is granted, and
+    // delivering it spends the per-index cap.
     let no_redirects = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap();
+    let mut second_leases = Vec::new();
     for index in 0..3 {
+        let path = format!("/api/s/{token}/files/{index}");
         let response = no_redirects
-            .get(format!("{base}/api/s/{token}/files/{index}"))
+            .get(format!("{base}{path}"))
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), 307);
+        second_leases.push(download_redirect_lease(response, &path));
     }
+    for (index, lease) in second_leases.iter().enumerate() {
+        let response = no_redirects
+            .get(format!(
+                "{base}/api/s/{token}/files/{index}?download_lease={lease}"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.bytes().await.unwrap(), bodies[index]);
+    }
+    let grant_id = grant["grant"]["id"].as_str().unwrap().to_owned();
+    wait_for_grant_downloads(&admin, &base, &grant_id, 2).await;
     for index in 0..3 {
         let response = no_redirects
             .get(format!("{base}/api/s/{token}/files/{index}"))

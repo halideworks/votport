@@ -446,6 +446,9 @@ struct PreparedSession {
     cap: u64,
     max_total: Option<u64>,
     max_sessions: Option<u64>,
+    /// The sender's address as the rate limiter keyed it, carried so a
+    /// refused admission can hand the address's rate slot back (finding 491).
+    ip: String,
 }
 
 async fn prepare_session(
@@ -531,6 +534,10 @@ async fn prepare_session(
     let expected = parse()?;
     let cap = effective_cap(app, &link);
     if expected.length > cap {
+        // A cap-refused creation never becomes a session, so the address's
+        // rate slot comes back (audit finding 491): retries against a capped
+        // link must not lock the address out of starting uploads.
+        app.session_rate.refund(&ip);
         audit_session_rejected(app, &link.tenant, "per-link size cap");
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -593,6 +600,7 @@ async fn prepare_session(
         cap,
         max_total,
         max_sessions,
+        ip,
     })
 }
 
@@ -643,7 +651,7 @@ async fn register_session(
         );
         ApiError::internal(error.to_string())
     })?
-    .map_err(|error| session_insert_error(app, &prepared.link.tenant, error))?;
+    .map_err(|error| session_insert_error(app, &prepared.link.tenant, &prepared.ip, error))?;
     match app.store.upload_link(&prepared.link.id) {
         Ok(Some(current)) if current.tenant == prepared.link.tenant && current.usable_now() => {
             if route.is_none() {
@@ -688,7 +696,16 @@ async fn register_session(
     }
 }
 
-fn session_insert_error(app: &App, tenant: &str, error: session::InsertError) -> ApiError {
+/// Maps a refused session admission to its API error. The cap refusals hand
+/// the address's rate slot back (audit finding 491): the creation never
+/// became a session, so senders retrying against a capped tenant or busy
+/// link must not burn their per-address creation budget on refusals.
+fn session_insert_error(
+    app: &App,
+    tenant: &str,
+    ip: &str,
+    error: session::InsertError,
+) -> ApiError {
     match error {
         session::InsertError::ShuttingDown => ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -703,6 +720,7 @@ fn session_insert_error(app: &App, tenant: &str, error: session::InsertError) ->
             ApiError::new(StatusCode::GONE, "this link no longer exists")
         }
         session::InsertError::ByteQuota => {
+            app.session_rate.refund(ip);
             audit_session_rejected(app, tenant, "byte quota exhausted");
             ApiError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -710,6 +728,7 @@ fn session_insert_error(app: &App, tenant: &str, error: session::InsertError) ->
             )
         }
         session::InsertError::TenantSessionLimit => {
+            app.session_rate.refund(ip);
             audit_session_rejected(app, tenant, "tenant session cap reached");
             ApiError::new(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -718,6 +737,7 @@ fn session_insert_error(app: &App, tenant: &str, error: session::InsertError) ->
             .with_retry_after(1)
         }
         session::InsertError::Capacity => {
+            app.session_rate.refund(ip);
             audit_session_rejected(app, tenant, "global or per-link session cap");
             ApiError::new(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -1569,6 +1589,48 @@ mod session_rate_tests {
         let router = app::router(Arc::clone(&application));
         let response = router.oneshot(session_request()).await.unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn a_capped_link_refusal_does_not_burn_the_address_creation_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let mut capped = open_link("capped-link");
+        capped.max_bytes = Some(1);
+        application.store.insert_link(capped).unwrap();
+        application
+            .store
+            .insert_link(open_link("open-link"))
+            .unwrap();
+
+        // A valid-looking package over the per-link cap is refused 422 after
+        // the address's rate slot was taken; with the refund it can be
+        // retried past the 20-per-window budget without the address being
+        // locked out (audit finding 491).
+        let package = format!(
+            r#"{{"package":{{"suite":"blake3","root":"{}","length":2}}}}"#,
+            "0".repeat(64),
+        );
+        for _ in 0..25 {
+            let request = Request::post("/api/r/capped-link/session")
+                .header("content-type", "application/json")
+                .extension(ConnectInfo(std::net::SocketAddr::from((
+                    [127, 0, 0, 1],
+                    1234,
+                ))))
+                .body(Body::from(package.clone()))
+                .unwrap();
+            let response = app::router(application.clone())
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+
+        // Without the refund this fresh session on an uncapped link from the
+        // same address answers 429: the refusals above would have spent the
+        // whole 20-per-window budget.
+        create_received_session(&application, "open-link").await;
     }
 
     #[tokio::test]
@@ -3377,7 +3439,7 @@ mod push_preflight_tests {
             ),
         ] {
             assert_eq!(
-                session_insert_error(&application, "", error).status,
+                session_insert_error(&application, "", "127.0.0.1:1", error).status,
                 expected
             );
         }

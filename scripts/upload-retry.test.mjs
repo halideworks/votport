@@ -256,3 +256,22 @@ test('a user cancel aborts the retry loop before any classification retry', () =
   assert.equal(loop.split('checkCancelled();').length - 1, 2);
   assert.match(loop, /retryDecision\(\{[\s\S]*failure,\n\s+online: navigator\.onLine !== false,/);
 });
+
+test('a drain 503 on session create names the wait instead of a bare Paused', () => {
+  // A drained port answers 503 on session admission and is retried until
+  // the budget runs out (a standby takes over mid-drain). The phase line
+  // must then say why it is waiting rather than a bare Paused over 0 B
+  // (audit finding 497); other transient exhaustion keeps the old text.
+  assert.match(
+    upload,
+    /setPhase\(status === 503 && drainPhase\n\s+\? 'Not accepting new transfers right now, retrying'\n\s+: 'Paused'\);/,
+  );
+  assert.match(
+    upload,
+    /if \(status === 503 && drainPhase\) \{/,
+  );
+  // The drain text belongs to session admission only; every other 503 keeps
+  // the Paused phase that upload handshakes key on.
+  assert.match(upload, /drainPhase: true,/);
+  assert.doesNotMatch(upload, /setPhase\(status === 503\n/);
+});

@@ -1021,8 +1021,12 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
     }
     crate::paths::tighten_private_dir(&config.data_dir).map_err(|error| error.to_string())?;
     let data_lock = lock_data_dir(&config.data_dir)?;
-    crate::backup::apply_pending_restore(&config.data_dir, crate::store::SCHEMA_VERSION)?;
+    let applied_restore =
+        crate::backup::apply_pending_restore(&config.data_dir, crate::store::SCHEMA_VERSION)?;
     let store = Arc::new(Store::open(&config.data_dir)?);
+    if let Some(applied) = applied_restore {
+        crate::backup::record_applied_restore(&store, &applied);
+    }
     let orphan_count = crate::backup::sweep_data_dir_orphans(&config.data_dir)?;
     if orphan_count > 0 {
         tracing::info!(
