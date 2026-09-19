@@ -167,7 +167,8 @@ fn push(
     let identity = decode_digest(&preflight.certificate_digest)?;
 
     let server = BundleServer::assemble(&prepared.manifest_root, prepared.served.clone())?;
-    with_progress(observer, |progress| {
+    let mut bridge = EntryBridge::new(prepared, observer);
+    with_progress(&mut bridge, |progress| {
         push_from(
             &server,
             PushOptions {
@@ -182,6 +183,86 @@ fn push(
         )
     })?;
     Ok(())
+}
+
+/// The push carrier reports only cumulative carrier bytes with no total and
+/// no per-entry marks, so a long push is silent and every file's row waits
+/// for [`Event::Finished`]. This bridge fills the total from the prepared
+/// summary and emits [`Event::EntryComplete`] as `moved` crosses each
+/// entry's cumulative end, so push progress carries the same per-file marks
+/// and the same total the HTTP path reports.
+struct EntryBridge<'a> {
+    inner: &'a mut dyn Observer,
+    /// Cumulative byte end of each entry, in index order.
+    ends: Vec<(u64, String)>,
+    /// The package length the carrier never reports.
+    total: u64,
+    /// Next entry not yet reported complete.
+    next: usize,
+}
+
+impl EntryBridge<'_> {
+    fn new<'a>(prepared: &Prepared, observer: &'a mut dyn Observer) -> EntryBridge<'a> {
+        Self::from_entries(
+            prepared
+                .objects
+                .iter()
+                .map(|entry| (entry.object.length, entry.path.clone())),
+            prepared.summary.logical_length,
+            observer,
+        )
+    }
+
+    fn from_entries<'a>(
+        entries: impl Iterator<Item = (u64, String)>,
+        total: u64,
+        observer: &'a mut dyn Observer,
+    ) -> EntryBridge<'a> {
+        let mut ends = Vec::new();
+        let mut run = 0u64;
+        for (length, path) in entries {
+            run = run.saturating_add(length);
+            ends.push((run, path));
+        }
+        EntryBridge {
+            inner: observer,
+            ends,
+            total,
+            next: 0,
+        }
+    }
+}
+
+impl Observer for EntryBridge<'_> {
+    fn event(&mut self, event: Event) {
+        let (moved, mut total) = match event {
+            Event::Bytes { moved, total } => (moved, total),
+            other => {
+                self.inner.event(other);
+                return;
+            }
+        };
+        while self.next < self.ends.len() && moved >= self.ends[self.next].0 {
+            let path = self.ends[self.next].1.clone();
+            self.inner.event(Event::EntryComplete {
+                index: self.next,
+                path,
+            });
+            self.next += 1;
+        }
+        if total.is_none() {
+            total = Some(self.total);
+        }
+        self.inner.event(Event::Bytes { moved, total });
+    }
+
+    fn cancelled(&self) -> bool {
+        self.inner.cancelled()
+    }
+
+    fn paused(&self) -> bool {
+        self.inner.paused()
+    }
 }
 
 fn decode_digest(hex_digest: &str) -> Result<[u8; 32]> {
@@ -200,6 +281,8 @@ fn base64_decode(value: &str) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn direct_rails_limits_only_macos_loopback() {
         for (address, loopback) in [
@@ -218,5 +301,105 @@ mod tests {
                 "{address}"
             );
         }
+    }
+
+    struct Collector {
+        events: Vec<Event>,
+        cancelled: bool,
+    }
+
+    impl Observer for Collector {
+        fn event(&mut self, event: Event) {
+            self.events.push(event);
+        }
+
+        fn cancelled(&self) -> bool {
+            self.cancelled
+        }
+    }
+
+    fn bridge<'a>(observer: &'a mut Collector) -> EntryBridge<'a> {
+        EntryBridge::from_entries(
+            [(100, "a.bin".to_owned()), (50, "b.bin".to_owned())].into_iter(),
+            150,
+            observer,
+        )
+    }
+
+    #[test]
+    fn push_bridge_emits_entry_completion_and_fills_the_total() {
+        let mut inner = Collector {
+            events: Vec::new(),
+            cancelled: false,
+        };
+        let mut push = bridge(&mut inner);
+        push.event(Event::SessionCreated {
+            session: "s".to_owned(),
+        });
+        push.event(Event::Bytes {
+            moved: 60,
+            total: None,
+        });
+        push.event(Event::Bytes {
+            moved: 130,
+            total: None,
+        });
+        push.event(Event::Bytes {
+            moved: 200,
+            total: None,
+        });
+        assert_eq!(inner.events.len(), 6, "{:?}", inner.events);
+        assert!(matches!(&inner.events[0], Event::SessionCreated { session } if session == "s"));
+        assert!(matches!(
+            &inner.events[1],
+            Event::Bytes {
+                moved: 60,
+                total: Some(150)
+            }
+        ));
+        assert!(
+            matches!(&inner.events[2], Event::EntryComplete { index: 0, path } if path == "a.bin")
+        );
+        assert!(matches!(
+            &inner.events[3],
+            Event::Bytes {
+                moved: 130,
+                total: Some(150)
+            }
+        ));
+        assert!(
+            matches!(&inner.events[4], Event::EntryComplete { index: 1, path } if path == "b.bin")
+        );
+        assert!(matches!(
+            &inner.events[5],
+            Event::Bytes {
+                moved: 200,
+                total: Some(150)
+            }
+        ));
+    }
+
+    #[test]
+    fn push_bridge_forwards_the_observer_and_keeps_a_carrier_total() {
+        let mut inner = Collector {
+            events: Vec::new(),
+            cancelled: true,
+        };
+        let mut push = bridge(&mut inner);
+        push.event(Event::Bytes {
+            moved: 40,
+            total: Some(999),
+        });
+        let cancelled = push.cancelled();
+        drop(push);
+        assert_eq!(inner.events.len(), 1, "{:?}", inner.events);
+        assert!(matches!(
+            &inner.events[0],
+            Event::Bytes {
+                moved: 40,
+                total: Some(999)
+            }
+        ));
+        assert!(cancelled);
     }
 }

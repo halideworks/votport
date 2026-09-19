@@ -260,6 +260,9 @@ pub struct App {
     pub automation_read_rate: crate::api::session_rate::SessionRate,
     /// Grants currently preparing or streaming, capped globally and per grant.
     pub outbound_active: Mutex<HashSet<String>>,
+    /// Cancellation token per grant with a live download stream; a revocation
+    /// cancels it so admitted streams stop at their next frame.
+    pub outbound_stream_cancels: Mutex<HashMap<String, tokio_util::sync::CancellationToken>>,
     /// Concurrent byte reservations for outbound staging on the data filesystem.
     pub outbound_stage_budget: Arc<crate::api::outbound::StageBudget>,
     pub(crate) admin_status: crate::api::admin::AdminStatusCache,
@@ -1131,6 +1134,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         automation_rate: crate::api::session_rate::SessionRate::with_limit(60),
         automation_read_rate: crate::api::session_rate::SessionRate::with_limit(6000),
         outbound_active: Mutex::new(HashSet::new()),
+        outbound_stream_cancels: Mutex::new(HashMap::new()),
         outbound_stage_budget: Arc::new(crate::api::outbound::StageBudget::new()),
         admin_status: crate::api::admin::AdminStatusCache::default(),
         staging_permits: Arc::new(tokio::sync::Semaphore::new(

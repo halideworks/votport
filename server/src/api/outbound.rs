@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncSeekExt as _, AsyncWriteExt as _, ReadBuf, SeekFrom};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio_util::io::ReaderStream;
+use tokio_util::sync::CancellationToken;
 use vot_sdk::object::{InMemoryObjectBuilder, ObjectId, Suite};
 use vot_sdk::proof::{self, CatalogHeader};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
@@ -2928,6 +2929,11 @@ pub async fn delete_outbound_grant(
     {
         return Err(ApiError::not_found());
     }
+    // A stream already admitted before the revocation stops at its next
+    // frame instead of delivering the rest of the body.
+    if let Ok(Some(grant)) = app.store.outbound_grant_by_id(&id) {
+        cancel_grant_streams(&app, &grant.token_hash);
+    }
     app.store.audit(
         &identity.tenant,
         &identity.subject,
@@ -3495,6 +3501,7 @@ pub async fn outbound_batch(
         return Ok(response);
     }
     let active = ActiveDownload::claim(Arc::clone(&app), &format!("{}:batch", grant.token_hash))?;
+    let gate = StreamGate::for_grant(&app, &grant);
     let chunks = batch_chunks(&grant, count);
     let permit = staging_permit(&app, &chunks[0]).await;
     let first_file = await_batch_chunk(start_batch_chunk(
@@ -3525,6 +3532,7 @@ pub async fn outbound_batch(
         grant,
         _operation: operation,
         _active: active,
+        gate,
         chunks,
         chunk_index: 0,
         file: Some(file),
@@ -3543,6 +3551,11 @@ pub async fn outbound_batch(
         // A drop or failure before that frame leaves its files retryable.
         state.record_delivered(false).await.map_err(api_error_io)?;
         loop {
+            // A stream admitted before its grant was revoked or expired stops
+            // at the next frame; bytes already handed off stay recorded.
+            if state.gate.stopped() {
+                return Ok(None);
+            }
             let item = match state.file.as_mut() {
                 Some(file) => file.next().await,
                 None => None,
@@ -3755,6 +3768,7 @@ fn start_batch_chunk(
                 integrity,
                 Some(operation),
                 None,
+                None,
             )
             .await?;
             drop(pin);
@@ -3938,6 +3952,7 @@ async fn outbound_file_inner(
                 integrity.clone(),
                 None,
                 None,
+                None,
             )
             .await
             .map_err(|_| ApiError::not_found())?;
@@ -3971,6 +3986,7 @@ async fn outbound_file_inner(
             integrity,
             Some(operation),
             Some(active),
+            Some(StreamGate::for_grant(&app, &grant)),
         )
         .await
         .map_err(|_| ApiError::not_found())?;
@@ -4229,6 +4245,7 @@ pub async fn outbound_bundle(
         return Ok(response);
     }
     let active = ActiveDownload::claim(Arc::clone(&app), &format!("{}:bundle", grant.token_hash))?;
+    let gate = StreamGate::for_grant(&app, &grant);
     let worker = Arc::clone(&app);
     let (grant, archive, _operation, active, _pin) = tokio::task::spawn_blocking(move || {
         let _pin = legacy_link_pin(&worker, &grant, grant.files.is_empty())?;
@@ -4266,6 +4283,7 @@ pub async fn outbound_bundle(
             file,
             _archive: archive,
             _active: active,
+            gate,
         },
         CHUNK,
     );
@@ -4816,6 +4834,9 @@ struct VerifiedStream {
     receiver: mpsc::Receiver<Result<Bytes, io::Error>>,
     _operation: Option<OwnedOutboundOperation>,
     _active: Option<ActiveDownload>,
+    /// Set only on the body stream, never on the preparation probe or the
+    /// batch chunks (the batch loop checks its own gate per frame).
+    gate: Option<StreamGate>,
 }
 
 impl Stream for VerifiedStream {
@@ -4825,10 +4846,18 @@ impl Stream for VerifiedStream {
         if let Some(item) = self.first.take() {
             return Poll::Ready(Some(item));
         }
-        self.receiver.poll_recv(cx)
+        match self.receiver.poll_recv(cx) {
+            Poll::Ready(Some(_)) if self.gate.as_ref().is_some_and(StreamGate::stopped) => {
+                Poll::Ready(Some(Err(io::Error::other(
+                    "download revoked or expired mid-stream",
+                ))))
+            }
+            item => item,
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_verified_stream(
     source: PathBuf,
     expected: ObjectId,
@@ -4837,6 +4866,7 @@ async fn start_verified_stream(
     integrity: IntegrityContext,
     operation: Option<OwnedOutboundOperation>,
     active: Option<ActiveDownload>,
+    gate: Option<StreamGate>,
 ) -> io::Result<VerifiedStream> {
     let (first_tx, first_rx) = oneshot::channel();
     let (sender, receiver) = mpsc::channel(1);
@@ -4856,6 +4886,7 @@ async fn start_verified_stream(
         receiver,
         _operation: operation,
         _active: active,
+        gate,
     })
 }
 
@@ -5226,6 +5257,55 @@ pub(crate) struct ActiveDownload {
     app: Arc<App>,
     key: String,
 }
+
+/// Stops a live download when its grant is revoked or expires. Revocation
+/// cancels the grant's token (see [`cancel_grant_streams`]); expiry is a
+/// clock compare against the grant's own deadline, checked at the same frame
+/// boundaries. Admission-only checks would otherwise let a stream verified
+/// before the revocation deliver the whole body.
+#[derive(Clone)]
+struct StreamGate {
+    cancel: CancellationToken,
+    expires_at: u64,
+}
+
+impl StreamGate {
+    fn for_grant(app: &App, grant: &OutboundGrant) -> Self {
+        Self {
+            cancel: stream_cancel_token(app, &grant.token_hash),
+            expires_at: grant.expires_at,
+        }
+    }
+
+    fn stopped(&self) -> bool {
+        self.cancel.is_cancelled() || self.expires_at <= now_unix()
+    }
+}
+
+/// The cancellation token every live download stream of the grant holds.
+/// Created on first claim; dropped when the grant's last stream ends
+/// ([`ActiveDownload::drop`]) or when a revocation cancels it.
+fn stream_cancel_token(app: &App, token_hash: &str) -> CancellationToken {
+    let mut cancels = app
+        .outbound_stream_cancels
+        .lock()
+        .expect("outbound stream cancels poisoned");
+    cancels.entry(token_hash.to_owned()).or_default().clone()
+}
+
+/// Cancels every live download stream of a grant. Called by the revoke
+/// handlers once the store records the revocation.
+pub(crate) fn cancel_grant_streams(app: &App, token_hash: &str) {
+    let token = app
+        .outbound_stream_cancels
+        .lock()
+        .expect("outbound stream cancels poisoned")
+        .remove(token_hash);
+    if let Some(token) = token {
+        token.cancel();
+    }
+}
+
 impl ActiveDownload {
     fn claim(app: Arc<App>, key: &str) -> ApiResult<Self> {
         let grant = key.rsplit_once(':').map_or(key, |(grant, _)| grant);
@@ -5265,11 +5345,29 @@ impl ActiveDownload {
 }
 impl Drop for ActiveDownload {
     fn drop(&mut self) {
-        self.app
+        // Keys start with the grant's token hash, which holds no colon:
+        // "{hash}:{index}", "{hash}:{index}:{random}", "{hash}:batch",
+        // "{hash}:bundle".
+        let grant = self.key.split(':').next().unwrap_or(&self.key);
+        let mut active = self
+            .app
             .outbound_active
             .lock()
-            .expect("outbound active poisoned")
-            .remove(&self.key);
+            .expect("outbound active poisoned");
+        active.remove(&self.key);
+        // The grant's last live download ended, so its cancellation token has
+        // no listener left and the map must not keep it.
+        if !active.iter().any(|other| {
+            other
+                .strip_prefix(grant)
+                .is_some_and(|rest| rest.starts_with(':'))
+        }) {
+            self.app
+                .outbound_stream_cancels
+                .lock()
+                .expect("outbound stream cancels poisoned")
+                .remove(grant);
+        }
     }
 }
 
@@ -5291,6 +5389,7 @@ struct BundleReader {
     file: tokio::fs::File,
     _archive: StagedFile,
     _active: ActiveDownload,
+    gate: StreamGate,
 }
 
 struct StagedReader {
@@ -5313,6 +5412,7 @@ struct BatchStream {
     grant: Arc<OutboundGrant>,
     _operation: OwnedOutboundOperation,
     _active: ActiveDownload,
+    gate: StreamGate,
     chunks: Vec<BatchChunk>,
     chunk_index: usize,
     file: Option<BatchFile>,
@@ -5451,6 +5551,13 @@ impl AsyncRead for BundleReader {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // A stream admitted before its grant was revoked or expired stops at
+        // the next read instead of delivering the rest of the archive.
+        if self.gate.stopped() {
+            return Poll::Ready(Err(io::Error::other(
+                "download revoked or expired mid-stream",
+            )));
+        }
         Pin::new(&mut self.file).poll_read(cx, buf)
     }
 }
@@ -6415,6 +6522,99 @@ mod tests {
             .lock()
             .unwrap()
             .contains_key(&catalog_path(&root, &expected)));
+    }
+
+    #[tokio::test]
+    async fn revocation_stops_a_batch_stream_mid_body() {
+        let (_directory, mut app, cookie, _first) = fixture().await;
+        Arc::get_mut(&mut app).unwrap().config.max_upload_bytes = 64 * 1024 * 1024;
+        let count = 8usize;
+        let part_bytes = 512 * 1024;
+        let total = count * part_bytes;
+        for index in 0..count {
+            let path = format!("cap/part-{index}.bin");
+            let response = router(app.clone())
+                .oneshot(
+                    Request::post(format!("/api/admin/outbound-files?path={path}"))
+                        .header("cookie", &cookie)
+                        .header("x-votport", "1")
+                        .body(Body::from(vec![b'a' + index as u8; part_bytes]))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let paths = (0..count)
+            .map(|index| format!("\"cap/part-{index}.bin\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let created = router(app.clone())
+            .oneshot(
+                Request::post("/api/admin/outbound-grants")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        "{{\"paths\":[{paths}],\"max_downloads\":1}}"
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let created = body(created).await;
+        let token = created["url"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_owned();
+        let id = created["grant"]["id"].as_str().unwrap().to_owned();
+        let response = router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/batch"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        12,
+                    ))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        let first = stream.next().await.unwrap().unwrap();
+        assert!(
+            first.len() < total,
+            "the batch must have frames left to deliver"
+        );
+        // Paused: the recipient holds the stream open without polling while
+        // the grant is revoked through the admin handler.
+        let revoke = Request::delete(format!("/api/admin/outbound-grants/{id}"))
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router(app.clone()).oneshot(revoke).await.unwrap().status(),
+            StatusCode::OK
+        );
+        // Resuming must stop at the next frame, not deliver the rest of the
+        // body the old admission-only checks let through.
+        let mut delivered = first.len();
+        while let Some(item) = stream.next().await {
+            delivered += item.map(|bytes| bytes.len()).unwrap_or(0);
+        }
+        assert!(
+            delivered < total,
+            "a revoked stream must not deliver the whole body ({delivered} of {total})"
+        );
+        // The grant's last live stream ended, so its cancellation token is
+        // gone from the map instead of leaking per streamed grant.
+        assert!(app.outbound_stream_cancels.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

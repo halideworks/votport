@@ -498,6 +498,11 @@ pub async fn revoke(
         .revoke_outbound_grant(&token.tenant, &id, now_unix())
         .map_err(crate::api::store_unavailable)?
     {
+        // A stream already admitted before the revocation stops at its next
+        // frame instead of delivering the rest of the body.
+        if let Ok(Some(grant)) = app.store.outbound_grant_by_id(&id) {
+            super::cancel_grant_streams(&app, &grant.token_hash);
+        }
         app.store.audit(
             &token.tenant,
             &format!("automation:{}", token.id),
