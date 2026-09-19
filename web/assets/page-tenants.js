@@ -314,7 +314,7 @@ function renderTenant(tenant, usage) {
           !(await confirmModal(
             'Delete tenant',
             tenant.key.includes('/')
-              ? `Delete "${tenant.key}"? Refused while its links still exist. No files are deleted: nothing was ever stored under a key with a separator.`
+              ? `Delete "${tenant.key}"? Refused while its links still exist. No files are deleted.`
               : `Delete "${tenant.key}"? Refused while its links or operations still exist. Received and outbound files under the tenant prefix are deleted; if purge fails, retry Delete.`,
             'Delete',
           ))
@@ -381,7 +381,7 @@ function renderPrincipal(principal) {
         if (
           !(await confirmModal(
             'Unblock principal',
-            'They can sign in with SSO again. Old sessions stay dead. Lasting access still depends on the IdP group.',
+            'They can sign in with SSO again. Open sessions end. Lasting access still depends on the IdP group.',
             'Unblock',
           ))
         )
@@ -414,7 +414,7 @@ function renderPrincipal(principal) {
         if (
           !(await confirmModal(
             'Revoke principal',
-            'Kicks current sessions and refuses SSO until unblocked; remove the IdP group to make it stick.',
+            'Ends current sessions and refuses SSO until unblocked; remove the IdP group for a lasting revoke.',
             'Revoke',
           ))
         )

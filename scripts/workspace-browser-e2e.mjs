@@ -752,8 +752,8 @@ try {
     stale: true,
     stale_error: 'status refresh unavailable',
   }));
-  await page.waitForFunction(() => document.querySelector('#stat-active').textContent === '4' && document.querySelector('#stat-today').textContent === '–');
-  assert.equal(await page.locator('#stat-stored').textContent(), '–');
+  await page.waitForFunction(() => document.querySelector('#stat-active').textContent === '4' && document.querySelector('#stat-today').textContent === 'not measured');
+  assert.equal(await page.locator('#stat-stored').textContent(), 'not measured');
   assert.equal(await page.locator('#status-cache-note').textContent(), 'Totals are temporarily unavailable.');
   assert.doesNotMatch(await page.locator('#status-strip').textContent(), /warming up/i);
   assert.notEqual(await page.locator('#stat-today').textContent(), '0');
@@ -790,8 +790,8 @@ try {
     stale: true,
     stale_error: 'status refresh unavailable',
   }));
-  await page.waitForFunction(() => document.querySelector('#stat-active').textContent === '10' && document.querySelector('#stat-open').textContent === '–');
-  assert.equal(await page.locator('#stat-deliveries').textContent(), '–');
+  await page.waitForFunction(() => document.querySelector('#stat-active').textContent === '10' && document.querySelector('#stat-open').textContent === 'not measured');
+  assert.equal(await page.locator('#stat-deliveries').textContent(), 'not measured');
   assert.equal(await page.locator('#status-cache-note').textContent(), 'Totals are temporarily unavailable.');
   assert.doesNotMatch(await page.locator('#status-strip').textContent(), /warming up/i);
   assert.notEqual(await page.locator('#stat-open').textContent(), '0');

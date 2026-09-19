@@ -56,8 +56,8 @@
         <form id="receiving-qualification">
           <fieldset id="receiving-nas-contract" hidden disabled><legend>Enable this NAS for verified receiving</legend>
             <p class="field-help">Confirm these settings with your storage administrator for this exact share. The connection check can test file operations, but cannot prove how the server behaves during power loss.</p>
-            <label class="check"><input id="receiving-stable" type="checkbox" required /><span>The server keeps acknowledged writes and folder changes through power loss. Its SMB FLUSH or NFS COMMIT configuration provides stable storage.</span></label>
-            <label class="check"><input id="receiving-private" type="checkbox" required /><span>Server permissions make Votport’s temporary files private from creation and prevent other users from replacing the private folder or its ancestors. Other programs using this account do not modify Votport’s temporary files.</span></label>
+            <label class="check"><input id="receiving-stable" type="checkbox" required /><span>I confirm that the server keeps acknowledged writes and folder changes through power loss. Its SMB FLUSH or NFS COMMIT configuration provides stable storage.</span></label>
+            <label class="check"><input id="receiving-private" type="checkbox" required /><span>I confirm that server permissions make Votport’s temporary files private from creation and prevent other users from replacing the private folder or its ancestors. Other programs using this account do not modify Votport’s temporary files.</span></label>
             <p class="field-help">Votport creates its own private control folder on the share. You do not need to reserve a separate staging volume. The server must support coordinated file locks and hard links.</p>
           </fieldset>
           <div class="actions"><button id="receiving-check" type="submit" class="ghost">Check storage</button><span id="receiving-result" role="status"></span></div>

@@ -884,15 +884,15 @@ function renderStatus(status) {
   const outbound = status.outbound || {};
   const active = outbound.active ?? null;
   $('status-strip').hidden = false;
-  $('stat-active').textContent = active === null ? '–' : String(active);
+  $('stat-active').textContent = active === null ? 'not measured' : String(active);
   $('stat-active-detail').textContent = active === null
     ? 'unavailable'
     : active
     ? `recipient${active === 1 ? '' : 's'} downloading now`
     : 'nothing being served';
-  $('stat-open').textContent = String(outbound.open_grants ?? '–');
-  $('stat-deliveries').textContent = String(outbound.deliveries ?? '–');
-  $('stat-disk').textContent = outbound.disk ? formatBytes(outbound.disk.free_bytes) : '–';
+  $('stat-open').textContent = String(outbound.open_grants ?? 'not measured');
+  $('stat-deliveries').textContent = String(outbound.deliveries ?? 'not measured');
+  $('stat-disk').textContent = outbound.disk ? formatBytes(outbound.disk.free_bytes) : 'not measured';
   const note = $('status-cache-note');
   note.hidden = false;
   note.textContent = status.stale

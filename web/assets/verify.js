@@ -250,7 +250,7 @@ async function runCheck() {
     observedAt: receipt.observedAt,
     next: match
       ? 'Every byte of this file matches the root signed in the receipt.'
-      : 'This file is not the object in the receipt. Compare names — a receipt proves one exact file.',
+      : 'This file is not the object in the receipt. Compare names; a receipt proves one exact file.',
   });
 }
 

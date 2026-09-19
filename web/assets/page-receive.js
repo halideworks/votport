@@ -146,8 +146,8 @@ async function openTimeline(link, upload, trigger) {
     return box;
   };
   stats.append(
-    cell('Duration', summary.duration === null ? '–' : formatDuration(summary.duration)),
-    cell('Average rate', summary.average === null ? '–' : `${formatBytes(summary.average)}/s`,
+    cell('Duration', summary.duration === null ? 'not measured' : formatDuration(summary.duration)),
+    cell('Average rate', summary.average === null ? 'not measured' : `${formatBytes(summary.average)}/s`,
       summary.peak === null ? undefined : `peak ${formatBytes(summary.peak)}/s`),
     cell('Pauses', summary.pauses ? formatDuration(summary.pauses) : 'none',
       summary.restarts ? `${summary.restarts} restart${summary.restarts === 1 ? '' : 's'}` : undefined),
@@ -504,11 +504,11 @@ function renderStatus(status) {
     : 'nothing in flight';
   const stored = status.stored;
   const today = status.today;
-  $('stat-today').textContent = today ? String(today.uploads) : '–';
+  $('stat-today').textContent = today ? String(today.uploads) : 'not measured';
   $('stat-today-detail').textContent = today
     ? (today.uploads ? `received · ${formatBytes(today.bytes)}` : 'received')
     : 'unavailable';
-  $('stat-stored').textContent = stored ? formatBytes(stored.bytes) : '–';
+  $('stat-stored').textContent = stored ? formatBytes(stored.bytes) : 'not measured';
   let detail = stored
     ? `${stored.files} received file${stored.files === 1 ? '' : 's'} on disk`
     : 'unavailable';
@@ -516,7 +516,7 @@ function renderStatus(status) {
     detail += ` · ${stored.missing_files} record${stored.missing_files === 1 ? '' : 's'} (${formatBytes(stored.missing_bytes)}) not on disk`;
   }
   $('stat-stored-detail').textContent = detail;
-  $('stat-disk').textContent = status.disk ? formatBytes(status.disk.free_bytes) : '–';
+  $('stat-disk').textContent = status.disk ? formatBytes(status.disk.free_bytes) : 'not measured';
   const note = $('status-cache-note');
   note.hidden = false;
   note.textContent = status.stale
