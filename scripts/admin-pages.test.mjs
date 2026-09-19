@@ -205,7 +205,9 @@ test('non-destructive receive actions use undo toasts, destructive ones keep the
   assert.match(clearRecord, /deferred\(/);
   assert.match(receiveScript, /await undoable\(/);
   assert.doesNotMatch(clearRecord, /confirmModal\(/);
-  const deleteFiles = receiveScript.slice(receiveScript.indexOf("button('Delete stored files'"), receiveScript.indexOf("button('Delete stored files'") + 600);
+  // The deletion modal lives in the card handler (finding 533 moved the loop
+  // into delete-stored-files.js); the destructive action keeps its confirm.
+  const deleteFiles = receiveScript.slice(receiveScript.indexOf('async function deleteStoredFilesFromCard'), receiveScript.indexOf('function renderUpload'));
   assert.match(deleteFiles, /confirmModal\(/);
   assert.match(receiveScript, /keepalive: true/);
   assert.match(commonScript, /pagehide/);

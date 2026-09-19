@@ -4,6 +4,7 @@ import { notificationEditor, notificationDetails, uploadEvents, workflowEvents }
 // VOTPORT PROPRIETARY LICENSE.
 
 import { appendObjectCard, fieldError } from '/assets/object-card.js';
+import { deleteStoredFiles } from '/assets/delete-stored-files.js';
 import { narrate, outcomeWords, summarize } from '/assets/timeline.js';
 import { startStatusPoll } from '/assets/status-strip.js';
 import {
@@ -193,6 +194,10 @@ async function openTimeline(link, upload, trigger) {
 // pending state; the server hears about it when the window closes.
 const pendingClears = new Map();
 const pendingLinks = new Map();
+// Stored-file deletions in flight, keyed by upload id. A deletion can run
+// for minutes on a large transfer, so the same button doubles as its Stop
+// control (audit finding 533) and a re-render relabels the fresh card.
+const deletingFiles = new Map();
 // Cards whose transfer list is open, so a re-render does not collapse them.
 const openLinks = new Set();
 
@@ -218,6 +223,41 @@ async function deferred(control, { text, mark, unmark, commit }) {
     control.disabled = false;
   }
   await refreshLinksSafe();
+}
+
+// Audit finding 533: the per-file DELETE loop lives in delete-stored-files.js
+// so its paging, progress and stop checks are unit-tested; this wires it to
+// the card. The button shows the running count and a second click stops the
+// run after the request in flight. No catch: a failure surfaces through the
+// button's modal without re-fetching the link list first; the one refresh
+// happens only after the loop finishes.
+async function deleteStoredFilesFromCard(link, upload, control) {
+  const running = deletingFiles.get(upload.id);
+  if (running) {
+    running.stop = true;
+    control.textContent = 'Stopping';
+    return;
+  }
+  if (!(await confirmModal('Delete stored files', 'Delete the stored files from this transfer? This cannot be undone.', 'Delete'))) return;
+  const state = { stop: false };
+  deletingFiles.set(upload.id, state);
+  const label = control.textContent;
+  try {
+    const result = await deleteStoredFiles({
+      upload,
+      fetchPage: (offset) => api(`/api/admin/links/${link.id}/uploads/${upload.id}/files?offset=${offset}&limit=100`),
+      deleteFile: (index) => api(`/api/admin/links/${link.id}/uploads/${upload.id}/files/${index}`, { method: 'DELETE' }),
+      onProgress: (done, total) => { control.textContent = `Deleting ${done}/${total}`; },
+      shouldStop: () => state.stop,
+    });
+    await refreshLinks();
+    announce('links-action-status', result.stopped
+      ? `Stored-file deletion stopped after ${result.done} files.`
+      : 'Stored-file deletion completed.');
+  } finally {
+    deletingFiles.delete(upload.id);
+    control.textContent = label;
+  }
 }
 
 function renderUpload(link, upload) {
@@ -277,26 +317,9 @@ function renderUpload(link, upload) {
     );
   }
   if (receiveAdministrator && !held && upload.file_count) {
-    head.append(button('Delete stored files', 'tiny danger', async () => {
-      if (!(await confirmModal('Delete stored files', 'Delete the stored files from this transfer? This cannot be undone.', 'Delete'))) return;
-      let offset = 0;
-      try {
-        do {
-          const page = await api('/api/admin/links/' + link.id + '/uploads/' + upload.id + '/files?offset=' + offset + '&limit=100');
-          if (page.file_count !== upload.file_count) throw new Error('Transfer history changed. Review the files before deleting them.');
-          for (const file of page.files) {
-            if (!file.exists) continue;
-            await api('/api/admin/links/' + link.id + '/uploads/' + upload.id + '/files/' + file.file_index, { method: 'DELETE' });
-          }
-          offset = page.next_offset;
-        } while (offset !== null);
-      } catch (error) {
-        try { await refreshLinks(); } catch { /* keep the deletion error visible */ }
-        throw error;
-      }
-      await refreshLinks();
-      announce('links-action-status', 'Stored-file deletion completed.');
-    }));
+    const deleteControl = button('Delete stored files', 'tiny danger', (control) => deleteStoredFilesFromCard(link, upload, control));
+    if (deletingFiles.has(upload.id)) deleteControl.textContent = 'Stop deletion';
+    head.append(deleteControl);
   }
   item.append(head);
 
