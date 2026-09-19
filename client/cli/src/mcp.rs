@@ -25,12 +25,21 @@ fn serve(mut input: impl BufRead, mut output: impl Write) -> Result<(), String> 
         if count == 0 {
             return Ok(());
         }
-        if count > 1024 * 1024 {
-            return Err("MCP message exceeds 1 MiB".to_owned());
-        }
-        let response = match serde_json::from_slice::<Value>(&line) {
-            Ok(message) => dispatch(message),
-            Err(_) => Some(rpc_error(None, -32700, "Parse error")),
+        let response = if count > 1024 * 1024 {
+            // An oversized line must not end the session: drain the rest of
+            // the line, refuse it, and keep serving the next one.
+            if line.last() != Some(&b'\n') {
+                let mut rest = Vec::new();
+                input
+                    .read_until(b'\n', &mut rest)
+                    .map_err(|e| e.to_string())?;
+            }
+            Some(rpc_error(None, -32600, "MCP message exceeds 1 MiB"))
+        } else {
+            match serde_json::from_slice::<Value>(&line) {
+                Ok(message) => dispatch(message),
+                Err(_) => Some(rpc_error(None, -32700, "Parse error")),
+            }
         };
         if let Some(response) = response {
             serde_json::to_writer(&mut output, &response).map_err(|e| e.to_string())?;
@@ -502,6 +511,26 @@ mod tests {
         }
         assert_eq!(responses[4]["error"]["code"], -32700);
         assert!(responses[4].get("id").is_none());
+    }
+
+    #[test]
+    fn oversized_line_is_refused_without_ending_the_session() {
+        let mut input = "x".repeat(1024 * 1024 + 64);
+        input.push('\n');
+        input.push_str(&request("tools/list", json!({})).to_string());
+        input.push('\n');
+        let mut output = Vec::new();
+        serve(input.as_bytes(), &mut output).expect("an oversized line must not end the session");
+        let responses: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["error"]["code"], -32600);
+        assert!(responses[0].get("id").is_none());
+        assert_eq!(responses[1]["id"], 1);
+        assert_eq!(responses[1]["result"]["resultType"], "complete");
     }
 
     #[test]

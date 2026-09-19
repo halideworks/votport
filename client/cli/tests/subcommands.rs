@@ -584,3 +584,45 @@ fn a_closed_stdout_pipe_ends_quietly_instead_of_panicking() {
         "a closed pipe must not panic:\n{stderr}"
     );
 }
+
+/// Audit 479: help goes to stdout, so `votport help | grep` sees it, and
+/// stderr stays reserved for errors.
+#[test]
+fn help_prints_to_stdout_and_leaves_stderr_empty() {
+    let state = UniqueDir::new("help-state");
+    let output = cli(&state.0, &["help"]);
+    assert!(
+        output.status.success(),
+        "help failed:\n{}",
+        output_text(&output)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("votport send <link>"), "help:\n{stdout}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).is_empty(),
+        "help must not use stderr:\n{}",
+        output_text(&output)
+    );
+}
+
+/// Audit 480: the help must name the agent notifications command and the
+/// --notifications flag on share.
+#[test]
+fn help_names_the_agent_notification_surface() {
+    let state = UniqueDir::new("help-state");
+    let output = cli(&state.0, &["help"]);
+    assert!(
+        output.status.success(),
+        "help failed:\n{}",
+        output_text(&output)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("votport agent notifications"),
+        "help:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[--notifications <json>]"),
+        "help:\n{stdout}"
+    );
+}

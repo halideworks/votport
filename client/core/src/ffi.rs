@@ -2152,6 +2152,27 @@ mod tests {
         }
     }
 
+    /// A connect refusal is exactly the first-attempt failure audit 476
+    /// named: the preview makes its one attempt and answers at once instead
+    /// of riding the 90 s transfer retry budget.
+    #[test]
+    fn inspect_makes_one_attempt_against_a_refusing_server() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let link = format!("{base}/r/{}", "ab".repeat(16));
+        let started = Instant::now();
+        let preview = inspect(link, Some(LinkKind::Request));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < crate::api::PREVIEW_TIMEOUT,
+            "refused preview took {elapsed:?}"
+        );
+        assert!(!preview.usable, "{preview:?}");
+        assert!(preview.problem.is_some(), "{preview:?}");
+    }
+
     #[test]
     fn a_paused_transfer_keeps_its_journal_entry_and_a_cancelled_one_does_not() {
         let state = tempfile::tempdir().unwrap();
