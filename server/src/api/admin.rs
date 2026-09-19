@@ -2449,6 +2449,26 @@ fn tenant_outbound_dir(
     Ok(path)
 }
 
+/// Builds the snapshot file for [`backup_database`]. Audit finding 500: a
+/// failed export used to leave SQLite's partial, world-readable destination
+/// in data/backups where only the 30-day legacy prune would take it; the
+/// cleanup guard removes it unless the snapshot opens whole.
+fn export_database_snapshot(
+    store: &crate::store::Store,
+    backups: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<std::fs::File, String> {
+    let mut cleanup = crate::backup::CleanupPath::new(destination.to_path_buf());
+    let Some(_root_lock) = crate::backup::try_lock_backup_root(backups)? else {
+        return Err("backup root is busy".to_owned());
+    };
+    store.backup_into(destination)?;
+    let file =
+        std::fs::File::open(destination).map_err(|error| format!("open snapshot: {error}"))?;
+    cleanup.keep();
+    Ok(file)
+}
+
 /// Streams a consistent SQLite snapshot as a download. It writes a snapshot
 /// file and an audit row, so it takes the CSRF header like every other
 /// mutating route; the System page fetches it with the header and saves the
@@ -2468,11 +2488,7 @@ pub async fn backup_database(
     let destination_clone = destination.clone();
     let file = tokio::task::spawn_blocking(move || {
         let _guard = guard;
-        let Some(_root_lock) = crate::backup::try_lock_backup_root(&backups)? else {
-            return Err("backup root is busy".to_owned());
-        };
-        store.backup_into(&destination_clone)?;
-        std::fs::File::open(&destination_clone).map_err(|error| format!("open snapshot: {error}"))
+        export_database_snapshot(&store, &backups, &destination_clone)
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?
@@ -9054,6 +9070,47 @@ mod backup_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Audit finding 500: a failed snapshot export used to leave SQLite's
+    /// 0-byte, world-readable destination in data/backups, where only the
+    /// 30-day legacy prune would take it; the export guard removes it.
+    #[test]
+    fn failed_snapshot_export_removes_the_partial_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        let store = crate::store::Store::open(&data).unwrap();
+        // Corrupt every page past the first so the header still opens but
+        // VACUUM INTO fails after SQLite has created its destination: the
+        // exact leftover the finding observed.
+        let database = data.join("votport.db");
+        let size = std::fs::metadata(&database).unwrap().len();
+        assert!(size > 4096, "a fresh store database spans multiple pages");
+        {
+            use std::io::{Seek as _, Write as _};
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&database)
+                .unwrap();
+            let mut offset = 4096;
+            while offset < size {
+                file.seek(std::io::SeekFrom::Start(offset)).unwrap();
+                file.write_all(&[0xDE; 1024]).unwrap();
+                offset += 1024;
+            }
+        }
+        std::fs::remove_file(data.join("votport.db-wal")).ok();
+        std::fs::remove_file(data.join("votport.db-shm")).ok();
+
+        let backups = directory.path().join("backups");
+        std::fs::create_dir(&backups).unwrap();
+        let destination = backups.join("votport-test.db");
+        let error = export_database_snapshot(&store, &backups, &destination).unwrap_err();
+        assert_ne!(error, "backup root is busy", "{error}");
+        assert!(
+            !destination.exists(),
+            "the partial export must be removed: {error}"
+        );
     }
 }
 

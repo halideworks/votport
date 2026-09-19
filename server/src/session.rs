@@ -659,17 +659,20 @@ enum Phase {
 /// sender, then passes the receiver here so the thread cannot touch disk
 /// before the session is in the map.
 pub fn spawn_worker(setup: WorkerSetup, receiver: mpsc::Receiver<Cmd>) {
-    spawn_worker_from(setup, receiver, Phase::AwaitSeal, false, 0);
+    spawn_worker_from(setup, receiver, Phase::AwaitSeal, false, 0, Vec::new());
 }
 
 /// `already` is what a re-attached session had covered before the restart,
 /// so the byte count reported to the admin spans the whole transfer.
+/// `recovered` carries per-file events for publications the resume itself
+/// completed (audit finding 499), replayed into the log after "reattached".
 fn spawn_worker_from(
     setup: WorkerSetup,
     mut receiver: mpsc::Receiver<Cmd>,
     mut phase: Phase,
     resumed: bool,
     already: u64,
+    recovered: Vec<LogEvent>,
 ) {
     std::thread::spawn(move || {
         // Feedback for the admin: bytes newly accepted this session and the
@@ -700,6 +703,11 @@ fn spawn_worker_from(
                 "reattached",
                 Some(published as u64),
             ));
+        }
+        // Publications completed by the resume itself (audit finding 499);
+        // empty for a fresh worker.
+        for event in recovered {
+            log.push(event);
         }
         // A resumed worker's first wait measures uptime, not sender silence.
         let mut heard = !resumed;
@@ -1436,7 +1444,7 @@ pub fn resume_worker(
     receiver: mpsc::Receiver<Cmd>,
     persisted: &mut PersistedUploadSession,
 ) -> Result<(Vec<PathBuf>, u64), String> {
-    let (mut files, kept) = restore_files(&setup, persisted, || {
+    let (mut files, kept, recovered) = restore_files(&setup, persisted, || {
         setup.destinations.check_live().is_ok()
     })?;
     for file in files.iter_mut().filter(|file| !file.published) {
@@ -1446,7 +1454,14 @@ pub fn resume_worker(
     }
 
     let already = persisted_received(persisted);
-    spawn_worker_from(setup, receiver, Phase::Receiving { files }, true, already);
+    spawn_worker_from(
+        setup,
+        receiver,
+        Phase::Receiving { files },
+        true,
+        already,
+        recovered,
+    );
     Ok((kept, already))
 }
 
@@ -1596,11 +1611,12 @@ fn discard_staged_path(
     location.sync_parent().map_err(|error| error.to_string())
 }
 
+#[allow(clippy::type_complexity)]
 fn restore_files(
     setup: &WorkerSetup,
     persisted: &mut PersistedUploadSession,
     active: impl Fn() -> bool,
-) -> Result<(Vec<FileState>, Vec<PathBuf>), String> {
+) -> Result<(Vec<FileState>, Vec<PathBuf>, Vec<LogEvent>), String> {
     check_session_entry_cap(persisted.files.len()).map_err(|error| error.message)?;
     if persisted.committed_upload_id.is_some() {
         return Err("completed upload cannot resume receiving".into());
@@ -1626,6 +1642,10 @@ fn restore_files(
     }
     let mut files = Vec::with_capacity(persisted.files.len());
     let mut kept = Vec::new();
+    // Audit finding 499: publications completed on the recover path never
+    // pass the worker's accept loop, so the resumed log would jump straight
+    // from "reattached" to "finished" with no per-file record.
+    let mut recovered = Vec::new();
     for file in &mut persisted.files {
         if !active() {
             return Err("receive recovery cancelled".into());
@@ -1664,6 +1684,14 @@ fn restore_files(
                     .map_err(|error| error.to_string())?;
                 setup.destinations.check_location(&location)?;
                 file.published = true;
+                recovered.push(LogEvent {
+                    at: now_unix(),
+                    kind: "published".to_owned(),
+                    path: Some(file.display_path.clone()),
+                    bytes: Some(file.object.length),
+                    secs: None,
+                    count: None,
+                });
                 if !file.receipt {
                     file.receipt = setup
                         .signer
@@ -1733,6 +1761,16 @@ fn restore_files(
             if let Some(staged) = &file.native {
                 persisted.files[index].prefix_bytes = staged.progress().prefix_bytes;
             }
+            if result.is_ok() {
+                recovered.push(LogEvent {
+                    at: now_unix(),
+                    kind: "published".to_owned(),
+                    path: Some(file.display_path.clone()),
+                    bytes: Some(file.object.length),
+                    secs: None,
+                    count: None,
+                });
+            }
             if let Err(error) = result {
                 checkpoint_session(setup, &mut files);
                 return Err(error.message);
@@ -1740,7 +1778,7 @@ fn restore_files(
         }
     }
     checkpoint_session(setup, &mut files);
-    Ok((files, kept))
+    Ok((files, kept, recovered))
 }
 
 fn persisted_received(session: &PersistedUploadSession) -> u64 {
@@ -7303,11 +7341,46 @@ mod push_tests {
         file.native.take().unwrap().abandon();
         let mut saved = setup.store.load_upload_sessions().unwrap().remove(0);
         assert!(!saved.files[0].published && !saved.files[0].receipt);
-        let (files, _) = restore_files(&setup, &mut saved, || true).unwrap();
+        let (files, _, _) = restore_files(&setup, &mut saved, || true).unwrap();
         assert!(files[0].published && files[0].receipt);
         assert_eq!(fs::read(&sidecar).unwrap(), evidence);
         assert_eq!(fs::read(setup.dest_dir.join("frame")).unwrap(), bytes);
         assert!(setup.store.load_upload_sessions().unwrap()[0].files[0].receipt);
+    }
+
+    /// Audit finding 499: a finish-time restart publishes a fully
+    /// checkpointed file on the recover path, and the resumed log used to
+    /// jump from "reattached" to "finished" with no per-file publication.
+    #[test]
+    fn recovered_publication_is_recorded_in_the_resumed_log() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = b"frame";
+        let object = object(Suite::Blake3Bao64, bytes);
+        let setup = setup(directory.path(), object.clone());
+        let source = directory.path().join("source");
+        fs::write(&source, bytes).unwrap();
+        let mut file = open_destination_for(&setup, vec!["frame".into()], object.clone()).unwrap();
+        reprove_staging(&source, &file.object.clone(), vec![&mut file], || true).unwrap();
+        persist_session(&setup, std::slice::from_ref(&file)).unwrap();
+        file.native.take().unwrap().abandon();
+        let mut saved = setup.store.load_upload_sessions().unwrap().remove(0);
+        assert!(!saved.files[0].published);
+        assert_eq!(
+            saved.files[0].prefix_bytes, object.length,
+            "finish-time state"
+        );
+        assert!(
+            !setup.dest_dir.join("frame").exists(),
+            "publication is pending"
+        );
+
+        let (files, _, events) = restore_files(&setup, &mut saved, || true).unwrap();
+        assert!(files[0].published);
+        assert_eq!(events.len(), 1, "the recovered publication must be logged");
+        assert_eq!(events[0].kind, "published");
+        assert_eq!(events[0].path.as_deref(), Some("frame"));
+        assert_eq!(events[0].bytes, Some(bytes.len() as u64));
+        assert_eq!(fs::read(setup.dest_dir.join("frame")).unwrap(), bytes);
     }
 
     #[test]
@@ -7344,7 +7417,7 @@ mod push_tests {
             saved.files[1].stored_components,
             ["nested", "dir", "report.pdf"]
         );
-        let (restored, _) = restore_files(&setup, &mut saved, || true).unwrap();
+        let (restored, _, _) = restore_files(&setup, &mut saved, || true).unwrap();
         assert_eq!(restored[1].stored_components, "nested\0dir\0report.pdf");
         persist_session(&setup, &restored).unwrap();
         let resaved = setup.store.load_upload_sessions().unwrap().remove(0);
@@ -7500,7 +7573,14 @@ mod push_tests {
                 })
                 .await
                 .unwrap();
-            spawn_worker_from(setup, receiver, Phase::Receiving { files }, false, 0);
+            spawn_worker_from(
+                setup,
+                receiver,
+                Phase::Receiving { files },
+                false,
+                0,
+                Vec::new(),
+            );
             tokio::time::timeout(std::time::Duration::from_secs(5), completed)
                 .await
                 .unwrap()
@@ -7549,7 +7629,14 @@ mod push_tests {
         let store = Arc::clone(&setup.store);
         let link_id = setup.link_id.clone();
         let (sender, receiver) = mpsc::channel(1);
-        spawn_worker_from(setup, receiver, Phase::Receiving { files }, false, 0);
+        spawn_worker_from(
+            setup,
+            receiver,
+            Phase::Receiving { files },
+            false,
+            0,
+            Vec::new(),
+        );
         let lease = || SessionLease {
             activity: Arc::new(SessionActivity {
                 in_flight: AtomicUsize::new(1),
@@ -7800,7 +7887,7 @@ mod push_tests {
                 .unwrap(),
             0
         );
-        let (files, _) = restore_files(&setup, &mut saved, || true).unwrap();
+        let (files, _, _) = restore_files(&setup, &mut saved, || true).unwrap();
         assert!(
             files[0].published,
             "an uncommitted publication must remain recoverable"
@@ -8030,7 +8117,7 @@ mod push_tests {
         assert_eq!(persisted.files[0].prefix_bytes, 0);
         let mut persisted = setup.store.load_upload_sessions().unwrap().remove(0);
         assert_eq!(persisted.files[0].prefix_bytes, 0);
-        let (mut files, _) = restore_files(&setup, &mut persisted, || true).unwrap();
+        let (mut files, _, _) = restore_files(&setup, &mut persisted, || true).unwrap();
         reprove_staging(&source, &object, vec![&mut files[0]], || true).unwrap();
         publish_file(&setup, &mut files[0], || true).unwrap();
         assert_eq!(fs::read(setup.dest_dir.join("frame")).unwrap(), bytes);
@@ -8226,7 +8313,7 @@ mod push_tests {
             .execute_batch("DROP TRIGGER fail_checkpoint;")
             .unwrap();
         let mut persisted = setup.store.load_upload_sessions().unwrap().remove(0);
-        let (files, _) = restore_files(&setup, &mut persisted, || true).unwrap();
+        let (files, _, _) = restore_files(&setup, &mut persisted, || true).unwrap();
         assert!(files[0].published);
         assert!(!journal.exists());
         drop(files);
