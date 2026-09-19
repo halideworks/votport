@@ -590,7 +590,7 @@ const pickedPreview = await page.evaluate(() => ({
   fileRows: document.querySelectorAll("#file-list > li[data-path]").length,
   sendDisabled: document.getElementById("send").disabled,
 }));
-if (!pickedPreview.totals.replaceAll(",", "").includes("100000 file(s)")
+if (!pickedPreview.totals.replaceAll(",", "").includes("100000 files")
   || !pickedPreview.totals.replaceAll(",", "").includes("Showing first 200 of 100000 selected files")
   || pickedPreview.rows !== 200 || pickedPreview.fileRows !== 200 || pickedPreview.sendDisabled) {
   throw new Error(`large picked preview failed: ${JSON.stringify(pickedPreview)}`);

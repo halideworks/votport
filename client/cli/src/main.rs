@@ -208,7 +208,10 @@ fn send(args: &[String]) -> Result<(), String> {
             if json {
                 println!("{{\"event\":\"done\",\"via\":\"push\",\"files\":{files}}}");
             } else {
-                println!("done: {files} file(s) pushed");
+                println!(
+                    "done: {files} {} pushed",
+                    if files == 1 { "file" } else { "files" }
+                );
             }
         }
         Sent::Http(report) => {
@@ -220,8 +223,13 @@ fn send(args: &[String]) -> Result<(), String> {
                 );
             } else {
                 println!(
-                    "done: {} file(s) published (upload {})",
+                    "done: {} {} published (upload {})",
                     report.files.len(),
+                    if report.files.len() == 1 {
+                        "file"
+                    } else {
+                        "files"
+                    },
                     report.upload_id
                 );
             }
@@ -311,7 +319,10 @@ fn resume(args: &[String]) -> Result<(), String> {
             serde_json::json!({ "event": "done", "kind": kind, "files": files })
         );
     } else {
-        println!("done: {files} file(s), {kind} complete");
+        println!(
+            "done: {files} {}, {kind} complete",
+            if files == 1 { "file" } else { "files" }
+        );
     }
     Ok(())
 }
@@ -364,7 +375,15 @@ fn receive(args: &[String]) -> Result<(), String> {
             received.files.len()
         );
     } else {
-        println!("done: {} file(s) received into {dir}", received.files.len());
+        println!(
+            "done: {} {} received into {dir}",
+            received.files.len(),
+            if received.files.len() == 1 {
+                "file"
+            } else {
+                "files"
+            }
+        );
     }
     Ok(())
 }
@@ -594,7 +613,11 @@ fn request_line(link: &votport_client_core::port::RequestLink) -> String {
     if link.has_password {
         parts.push("password".to_owned());
     }
-    parts.push(format!("{} drop(s)", link.drops));
+    parts.push(format!(
+        "{} {}",
+        link.drops,
+        if link.drops == 1 { "drop" } else { "drops" }
+    ));
     if link.receiving > 0 {
         parts.push(format!("{} shipping now", link.receiving));
     }
@@ -661,8 +684,21 @@ fn deliveries(args: &[String]) -> Result<(), String> {
                 "live"
             };
             println!(
-                "{}  {}  {} file(s)  {} download(s)  {state}",
-                delivery.id, name, delivery.file_count, delivery.downloads
+                "{}  {}  {} {}  {} {}  {state}",
+                delivery.id,
+                name,
+                delivery.file_count,
+                if delivery.file_count == 1 {
+                    "file"
+                } else {
+                    "files"
+                },
+                delivery.downloads,
+                if delivery.downloads == 1 {
+                    "download"
+                } else {
+                    "downloads"
+                }
             );
         }
     }
@@ -858,10 +894,15 @@ fn watch(args: &[String]) -> Result<(), String> {
                         ),
                         Ok(report) => match report.park_problem {
                             Some(problem) => println!(
-                                "shipped {path}: {} file(s), left in place: {problem}",
-                                report.files
+                                "shipped {path}: {} {}, left in place: {problem}",
+                                report.files,
+                                if report.files == 1 { "file" } else { "files" }
                             ),
-                            None => println!("shipped {path}: {} file(s)", report.files),
+                            None => println!(
+                                "shipped {path}: {} {}",
+                                report.files,
+                                if report.files == 1 { "file" } else { "files" }
+                            ),
                         },
                         Err(error) if self.json => println!(
                             "{}",

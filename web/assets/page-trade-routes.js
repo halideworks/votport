@@ -186,7 +186,7 @@ function routeCard(route, savedEditor) {
   if (route.error) card.append(node('p', route.error, 'error'));
   const deliveries = catalog.deliveries[route.id] || [];
   const failures = deliveries.filter((d) => ['failed', 'retrying'].includes(d.state)).length;
-  if (failures) card.append(node('p', `${failures} failed or retrying recent deliveries`, 'error'));
+  if (failures) card.append(node('p', `${failures} failed or retrying recent ${failures === 1 ? 'delivery' : 'deliveries'}`, 'error'));
   if (deliveries.length) {
     const detail = node('details'); detail.append(node('summary', 'Recent deliveries'));
     for (const delivery of deliveries) {

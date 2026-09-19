@@ -47,7 +47,7 @@ test('narrate turns each event kind into a sentence with its facts', () => {
   assert.equal(narrate(upload.log[0]).text, 'Session opened, manifest verified');
   const published = narrate(upload.log[1]);
   assert.equal(published.text, 'a.mov published with its receipt');
-  assert.match(published.detail, /412 MiB in 3s · 137 MiB\/s/);
+  assert.match(published.detail, /432 MB in 3s · 144 MB\/s/);
   assert.equal(narrate(upload.log[2]).text, 'Sender went quiet for 2m 40s');
   assert.match(narrate(upload.log[3]).detail, /1 file already published/);
   assert.equal(narrate(upload.log[5]).detail, '17 re-sent chunks');

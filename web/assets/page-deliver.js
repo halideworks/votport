@@ -17,6 +17,7 @@ import {
   button,
   confirmModal,
   copyToClipboard,
+  formatAgo,
   formatBytes,
   formatWhen,
   requireSession,
@@ -897,7 +898,7 @@ function renderStatus(status) {
   note.hidden = false;
   note.textContent = status.stale
     ? (status.sampled_at
-      ? `Status sampled at ${new Date(status.sampled_at * 1000).toLocaleTimeString()} and may be out of date.${status.stale_error ? ` ${status.stale_error}.` : ''}`
+      ? `Status sampled ${formatAgo(status.sampled_at)} (${formatWhen(status.sampled_at)}) and may be out of date.${status.stale_error ? ` ${status.stale_error}.` : ''}`
       : 'Totals are temporarily unavailable.')
     : 'Totals refresh about once a minute. Transfer activity is live.';
 }

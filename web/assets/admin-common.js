@@ -4,7 +4,7 @@ import { mountDrafts, confirmLeave } from '/assets/form-drafts.js';
 
 // Copying text with a Copied flash lives with the shared public helpers so
 // public pages need not import this admin module for it.
-import { copyToClipboard, formatBytes, formatDuration } from '/assets/object-card.js';
+import { copyToClipboard, formatAgo, formatBytes, formatDuration } from '/assets/object-card.js';
 import { createUndoQueue } from '/assets/undo.js';
 export { copyToClipboard };
 
@@ -386,7 +386,7 @@ export function alertModal(message) {
   dialog.showModal();
 }
 
-export { formatBytes, formatDuration };
+export { formatAgo, formatBytes, formatDuration };
 
 /// Action button whose handler, sync or async, reports failures via the
 /// shared modal.
@@ -529,10 +529,16 @@ export function showGrantResult(url, protectedGrant = false, focusResult = false
 export function formatWhen(unixSeconds) {
   // UTC, named: the server's logs, receipts and audit export all speak UTC,
   // so admin timestamps read in the same zone instead of an unlabelled
-  // browser-local one (audit finding 405).
+  // browser-local one (audit finding 405). Seconds are dropped: a transfer
+  // stamp never needs them and the audit export carries full precision.
   return new Date(unixSeconds * 1000).toLocaleString([], {
     timeZone: 'UTC',
     timeZoneName: 'short',
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
   });
 }
 

@@ -13,6 +13,7 @@ import {
   button,
   confirmModal,
   copyToClipboard,
+  formatAgo,
   formatBytes,
   formatDuration,
   formatWhen,
@@ -160,7 +161,8 @@ async function openTimeline(link, upload, trigger) {
     row.dataset.kind = event.kind;
     const when = document.createElement('span');
     when.className = 'when mono';
-    when.textContent = new Date(event.at * 1000).toLocaleTimeString();
+    when.textContent = formatAgo(event.at);
+    when.title = formatWhen(event.at);
     const text = document.createElement('span');
     const line = narrate(event);
     text.textContent = line.text;
@@ -226,7 +228,9 @@ function renderUpload(link, upload) {
   const head = document.createElement('div');
   head.className = 'upload-head';
   const when = document.createElement('span');
-  when.textContent = `${formatWhen(upload.completed_at)} · ${formatBytes(upload.total_bytes)}`;
+  when.textContent = formatAgo(upload.completed_at);
+  when.title = formatWhen(upload.completed_at);
+  when.textContent += ` · ${formatBytes(upload.total_bytes)}`;
   // started_at is 0 on records from before it was tracked.
   if (upload.started_at && upload.completed_at > upload.started_at) {
     const seconds = upload.completed_at - upload.started_at;
@@ -482,7 +486,7 @@ function applyReceiving(card, transfers, now = null) {
       const elapsed = Math.max(1, now - transfer.started_at);
       parts.push(`${formatBytes(Math.round(transfer.received / elapsed))}/s`);
     }
-    parts.push(`sender started ${new Date(transfer.started_at * 1000).toLocaleTimeString([], { timeStyle: 'short' })}`);
+    parts.push(`sender started ${formatWhen(transfer.started_at)}`);
     if (transfer.transport === 'push') parts.push('native push');
     row.textContent = parts.join(' · ');
     line.append(row);
@@ -521,7 +525,7 @@ function renderStatus(status) {
   note.hidden = false;
   note.textContent = status.stale
     ? (status.sampled_at
-      ? `Status sampled at ${new Date(status.sampled_at * 1000).toLocaleTimeString()} and may be out of date.${status.stale_error ? ` ${status.stale_error}.` : ''}`
+      ? `Status sampled ${formatAgo(status.sampled_at)} (${formatWhen(status.sampled_at)}) and may be out of date.${status.stale_error ? ` ${status.stale_error}.` : ''}`
       : 'Totals are temporarily unavailable.')
     : 'Totals refresh about once a minute. Transfer activity is live.';
 

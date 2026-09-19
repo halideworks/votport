@@ -147,7 +147,7 @@ function renderProjects() {
   }
   for (const project of projects) {
     const card = node('article', '', 'card'); card.append(node('h3', project.label), node('p', project.directory, 'connection-meta'));
-    const rules = [project.require_approval ? 'Approval required' : 'No approval step', `${project.recipients.length} enrolled recipients`, `${project.required_metadata.length} required fields`];
+    const rules = [project.require_approval ? 'Approval required' : 'No approval step', `${project.recipients.length} enrolled recipient${project.recipients.length === 1 ? '' : 's'}`, `${project.required_metadata.length} required field${project.required_metadata.length === 1 ? '' : 's'}`];
     if (project.receive) rules.push('Incoming and outgoing files');
     for (const id of project.destinations) rules.push(`Copy to ${storage.find((item) => item.id === id)?.label || id}`);
     if (project.scan_required) rules.push('Malware scan');

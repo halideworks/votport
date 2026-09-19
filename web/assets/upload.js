@@ -2,7 +2,7 @@
 // streams proven ranges to the server. VOTPORT PROPRIETARY LICENSE.
 
 import { applyBranding } from '/assets/branding.js';
-import { appendObjectCard, appLink, copyToClipboard, fieldError, formatBytes } from '/assets/object-card.js';
+import { appendObjectCard, appLink, copyToClipboard, fieldError, formatBytes, formatDuration } from '/assets/object-card.js';
 import { entryFiles, runUploadBatch } from '/assets/upload-entries.js';
 import {
   clearResumeRecord,
@@ -288,20 +288,6 @@ function makeRate() {
   };
 }
 
-// Decimal units here, unlike the binary units used for sizes: transfer rates
-// are quoted decimally everywhere else a sender will compare them.
-function formatRate(bytesPerSecond) {
-  if (bytesPerSecond === null) return '';
-  const units = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
-  let value = bytesPerSecond;
-  let unit = 0;
-  while (value >= 1000 && unit < units.length - 1) {
-    value /= 1000;
-    unit += 1;
-  }
-  return `${value >= 100 || unit === 0 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
-}
-
 // Screen wake lock while sending: an unattended laptop otherwise hits its
 // sleep timer mid-transfer and the upload dies. Best effort; browsers without
 // the API (or a denied request) just keep today's behavior. A closed lid
@@ -509,7 +495,7 @@ function renderPicked() {
   const preview = picked.size > visible
     ? ` · Showing first ${visible.toLocaleString()} of ${picked.size.toLocaleString()} selected files`
     : '';
-  $('totals').textContent = `${picked.size} file(s), ${formatBytes(total)} total${maxBytes === null ? '' : ` · limit ${formatBytes(maxBytes)}`}${preview}`;
+  $('totals').textContent = `${picked.size} file${picked.size === 1 ? '' : 's'}, ${formatBytes(total)} total${maxBytes === null ? '' : ` · limit ${formatBytes(maxBytes)}`}${preview}`;
   $('clear-files').hidden = picked.size === 0;
   if (limitError) {
     fail(limitError);
@@ -710,16 +696,12 @@ function renderNote() {
   const now = performance.now();
   const parts = [];
   if (now - lastHashAt < RATE_WINDOW_MS && lastHashBps > 0) {
-    const rate = formatRate(lastHashBps);
-    if (rate) parts.push(`preparing ${rate}`);
+    parts.push(`preparing ${formatBytes(Math.round(lastHashBps))}/s`);
   }
   if (now - lastSendAt < RATE_WINDOW_MS && lastSendBps > 0) {
-    const rate = formatRate(lastSendBps);
-    if (rate) {
-      parts.push(`sending ${rate}`);
-      const remaining = totalForNote - sentForNote;
-      if (remaining > 0) parts.push(`${formatDuration(remaining / lastSendBps)} left`);
-    }
+    parts.push(`sending ${formatBytes(Math.round(lastSendBps))}/s`);
+    const remaining = totalForNote - sentForNote;
+    if (remaining > 0) parts.push(`${formatDuration(remaining / lastSendBps)} left`);
   }
   parts.push(`${formatBytes(sentForNote)} of ${formatBytes(totalForNote)}`);
   const verified = deliveredPaths.size;
@@ -733,12 +715,6 @@ function setMeter(fraction) {
   $('meter').setAttribute('aria-valuenow', String(percent));
 }
 
-
-function formatDuration(seconds) {
-  if (seconds < 60) return `${Math.ceil(seconds)}s`;
-  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
-  return `${Math.floor(seconds / 3600)}h ${Math.round((seconds % 3600) / 60)}m`;
-}
 
 function buildPackage(items) {
   // Canonical manifest order: case-folded path keys, byte-wise.

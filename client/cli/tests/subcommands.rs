@@ -275,7 +275,7 @@ fn receive_delivers_a_grant_into_a_directory() {
         output_text(&received)
     );
     assert!(
-        String::from_utf8_lossy(&received.stdout).contains("done: 1 file(s) received into"),
+        String::from_utf8_lossy(&received.stdout).contains("done: 1 file received into"),
         "unexpected receive output:\n{}",
         output_text(&received)
     );
