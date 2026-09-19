@@ -483,3 +483,104 @@ fn journal_entry(listed: &Output, kind: &str) -> serde_json::Value {
         .find(|entry| entry["kind"] == kind)
         .unwrap_or_else(|| panic!("no {kind} entry in the journal:\n{text}"))
 }
+
+/// A send pasted the wrong link kind reads as one sentence with the raw
+/// text behind it, like every port command: the raw `to_string` used to
+/// print the link variant alone.
+#[test]
+fn send_failures_print_the_headline_with_the_detail() {
+    let state = UniqueDir::new("human-send-state");
+    // No server needed: a delivery link in send refuses before anything
+    // is read or reached.
+    let output = cli(
+        &state.0,
+        &["send", "https://drop.example/s/token", "missing.bin"],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("votport: That is a delivery link. Paste it into Receive. ("),
+        "the headline with its detail is missing:\n{stderr}"
+    );
+}
+
+/// A resume the journal does not hold reads as one sentence, not the raw
+/// error variant.
+#[test]
+fn resume_failures_print_the_headline_with_the_detail() {
+    let state = UniqueDir::new("human-resume-state");
+    let output = cli(&state.0, &["resume", "gone"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("votport: That transfer is no longer on record. ("),
+        "the headline with its detail is missing:\n{stderr}"
+    );
+}
+
+/// Piping into a filter that walks away (`| head`) must end the output
+/// quietly: a broken pipe on stdout used to panic with exit 101, which
+/// aborts a send mid-transfer because a downstream filter closed.
+#[test]
+fn a_closed_stdout_pipe_ends_quietly_instead_of_panicking() {
+    // `status` prints the journal locally, no server needed. Enough fat
+    // entries to hold far more than the pipe buffer, so the process is
+    // still writing when the reader leaves.
+    let state = UniqueDir::new("pipe-state");
+    let journal = state.0.join("votport/journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    let filler = "x".repeat(400);
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    for index in 0..400 {
+        let entry = serde_json::json!({
+            "id": format!("pipe-{index}"),
+            "kind": "send",
+            "link": format!("https://drop.example/r/{filler}"),
+            "paths": [format!("/shots/{filler}.bin")],
+            "needs_password": false,
+            "started_unix": started,
+        });
+        std::fs::write(
+            journal.join(format!("pipe-{index}.json")),
+            entry.to_string(),
+        )
+        .unwrap();
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_votport"))
+        .arg("status")
+        .env("XDG_DATA_HOME", &state.0)
+        .env("HOME", &state.0)
+        .env("APPDATA", &state.0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut first = String::new();
+    std::io::BufRead::read_line(&mut stdout, &mut first).expect("one status line");
+    drop(stdout); // The reader walks away, as `head` does after its lines.
+    let deadline = Instant::now() + CLI_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "votport status did not finish");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_string(&mut stderr).unwrap();
+    }
+    assert!(
+        status.success(),
+        "exit {:?} with stderr:\n{stderr}",
+        status.code()
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "a closed pipe must not panic:\n{stderr}"
+    );
+}

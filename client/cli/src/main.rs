@@ -11,6 +11,18 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+/// Prints one line to stdout, swallowing a broken pipe: a downstream filter
+/// (`votport send --json | head`) takes its lines and exits, and the writes
+/// that follow must end the output quietly rather than panic (exit 101)
+/// behind a transfer still running, which would abort a send mid-flight.
+macro_rules! out {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let stdout = std::io::stdout();
+        let _ = writeln!(stdout.lock(), $($arg)*);
+    }};
+}
+
 use votport_client_core::Transport;
 
 fn main() -> ExitCode {
@@ -18,11 +30,11 @@ fn main() -> ExitCode {
     if args.first().is_some_and(|arg| arg == "agent") {
         return match agent::run(&args[1..]) {
             Ok(value) => {
-                println!("{value}");
+                out!("{value}");
                 ExitCode::SUCCESS
             }
             Err(value) => {
-                println!("{value}");
+                out!("{value}");
                 ExitCode::from(agent::exit_code(&value))
             }
         };
@@ -46,7 +58,7 @@ fn main() -> ExitCode {
         Ok(status) => status,
         Err(message) => {
             if args.iter().any(|arg| arg == "--json") {
-                println!(
+                out!(
                     "{}",
                     serde_json::json!({"error": message, "code": "command_failed", "retryable": false})
                 );
@@ -109,7 +121,7 @@ fn evidence(args: &[String]) -> Result<(), String> {
             )
         }
     };
-    println!("{value}");
+    out!("{value}");
     Ok(())
 }
 
@@ -181,27 +193,27 @@ fn send(args: &[String]) -> Result<(), String> {
         votport_client_core::ffi::Transfer::new(),
         Arc::new(ViewPrinter { json }),
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(human)?;
     if matches!(sent.transport, Transport::Push) {
         if json {
-            println!(
+            out!(
                 "{}",
                 serde_json::json!({"event":"done","via":"push","files":sent.files})
             );
         } else {
-            println!(
+            out!(
                 "done: {} {} pushed",
                 sent.files,
                 if sent.files == 1 { "file" } else { "files" }
             );
         }
     } else if json {
-        println!(
+        out!(
             "{}",
             serde_json::json!({"event":"done","via":"http","upload_id":sent.upload_id,"files":sent.files})
         );
     } else {
-        println!(
+        out!(
             "done: {} {} published (upload {})",
             sent.files,
             if sent.files == 1 { "file" } else { "files" },
@@ -222,7 +234,7 @@ fn inspect(args: &[String]) -> Result<ExitCode, String> {
         .iter()
         .map(|file| serde_json::json!({ "path": file.path, "bytes": file.bytes }))
         .collect();
-    println!(
+    out!(
         "{}",
         serde_json::json!({
             "kind": preview.kind.map(|kind| format!("{kind:?}").to_lowercase()),
@@ -248,7 +260,7 @@ fn inspect(args: &[String]) -> Result<ExitCode, String> {
 /// Prints the journalled transfers, one JSON object per line, oldest first.
 fn status() -> Result<(), String> {
     for entry in votport_client_core::ffi::pending() {
-        println!(
+        out!(
             "{}",
             serde_json::json!({
                 "id": entry.id,
@@ -279,7 +291,7 @@ fn resume(args: &[String]) -> Result<(), String> {
         votport_client_core::ffi::Transfer::new(),
         listener,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(human)?;
     let (kind, files) = match &report {
         votport_client_core::ffi::ResumeReport::Sent(sent) => ("send", sent.files),
         votport_client_core::ffi::ResumeReport::Received(received) => {
@@ -287,12 +299,12 @@ fn resume(args: &[String]) -> Result<(), String> {
         }
     };
     if json {
-        println!(
+        out!(
             "{}",
             serde_json::json!({ "event": "done", "kind": kind, "files": files })
         );
     } else {
-        println!(
+        out!(
             "done: {files} {}, {kind} complete",
             if files == 1 { "file" } else { "files" }
         );
@@ -309,7 +321,7 @@ struct ViewPrinter {
 impl votport_client_core::ffi::TransferListener for ViewPrinter {
     fn update(&self, view: votport_client_core::ffi::TransferView) {
         if self.json {
-            println!(
+            out!(
                 "{}",
                 serde_json::json!({
                     "event": "view",
@@ -343,14 +355,14 @@ fn receive(args: &[String]) -> Result<(), String> {
         votport_client_core::ffi::Transfer::new(),
         Arc::new(ViewPrinter { json }),
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(human)?;
     if json {
-        println!(
+        out!(
             "{{\"event\":\"done\",\"via\":\"receive\",\"files\":{}}}",
             received.files.len()
         );
     } else {
-        println!(
+        out!(
             "done: {} {} received into {dir}",
             received.files.len(),
             if received.files.len() == 1 {
@@ -455,7 +467,7 @@ fn signin(args: &[String]) -> Result<(), String> {
         }
     };
     let port = votport_client_core::port::sign_in(base, &password).map_err(human)?;
-    println!("signed in to {}{}", port.base, tenant_suffix(&port.tenant));
+    out!("signed in to {}{}", port.base, tenant_suffix(&port.tenant));
     Ok(())
 }
 
@@ -471,14 +483,14 @@ fn port_status(args: &[String]) -> Result<(), String> {
     let (_, _, json) = parse(args, &[])?;
     let port = votport_client_core::port::check().map_err(human)?;
     if json {
-        println!(
+        out!(
             "{}",
             serde_json::json!({ "port": port.as_ref().map(|p| serde_json::json!({ "base": p.base, "tenant": p.tenant })) })
         );
     } else if let Some(port) = port {
-        println!("signed in to {}{}", port.base, tenant_suffix(&port.tenant));
+        out!("signed in to {}{}", port.base, tenant_suffix(&port.tenant));
     } else {
-        println!("not signed in");
+        out!("not signed in");
     }
     Ok(())
 }
@@ -488,13 +500,13 @@ fn requests(args: &[String]) -> Result<(), String> {
     let links = votport_client_core::port::requests().map_err(human)?;
     if json {
         for link in &links {
-            println!("{}", request_json(link));
+            out!("{}", request_json(link));
         }
     } else if links.is_empty() {
-        println!("no open request links");
+        out!("no open request links");
     } else {
         for link in &links {
-            println!("{}", request_line(link));
+            out!("{}", request_line(link));
         }
     }
     Ok(())
@@ -538,9 +550,9 @@ fn issue_request(args: &[String]) -> Result<(), String> {
     })
     .map_err(human)?;
     if json {
-        println!("{}", request_json(&link));
+        out!("{}", request_json(&link));
     } else {
-        println!("{}", link.url);
+        out!("{}", link.url);
     }
     Ok(())
 }
@@ -567,10 +579,10 @@ fn deliveries(args: &[String]) -> Result<(), String> {
     let list = votport_client_core::port::deliveries().map_err(human)?;
     if json {
         for delivery in &list {
-            println!("{}", delivery_json(delivery));
+            out!("{}", delivery_json(delivery));
         }
     } else if list.is_empty() {
-        println!("no deliveries");
+        out!("no deliveries");
     } else {
         for delivery in &list {
             let name = delivery
@@ -583,7 +595,7 @@ fn deliveries(args: &[String]) -> Result<(), String> {
             } else {
                 "live"
             };
-            println!(
+            out!(
                 "{}  {}  {} {}  {} {}  {state}",
                 delivery.id,
                 name,
@@ -619,7 +631,7 @@ fn library(args: &[String]) -> Result<(), String> {
         votport_client_core::port::library(&directory, options.get("--after").map(String::as_str))
             .map_err(human)?;
     if json {
-        println!(
+        out!(
             "{}",
             serde_json::json!({
                 "directory": listing.directory,
@@ -631,13 +643,13 @@ fn library(args: &[String]) -> Result<(), String> {
         );
     } else {
         for name in &listing.directories {
-            println!("{name}/");
+            out!("{name}/");
         }
         for file in &listing.files {
-            println!("{}  {}", file.path, file.bytes);
+            out!("{}  {}", file.path, file.bytes);
         }
         if listing.truncated {
-            println!(
+            out!(
                 "(more not listed; use --after {})",
                 listing.next_cursor.as_deref().unwrap_or_default()
             );
@@ -670,12 +682,12 @@ fn issue_delivery(args: &[String]) -> Result<(), String> {
         })
         .map_err(human)?;
     if json {
-        println!(
+        out!(
             "{}",
             serde_json::json!({ "url": issued.url, "delivery": delivery_json(&issued.delivery) })
         );
     } else {
-        println!("{}", issued.url);
+        out!("{}", issued.url);
     }
     Ok(())
 }
@@ -707,7 +719,7 @@ fn upload(args: &[String]) -> Result<(), String> {
     let made =
         votport_client_core::port::upload(&positional, &into, &|| false, &Quiet).map_err(human)?;
     if json {
-        println!(
+        out!(
             "{}",
             serde_json::json!(made
                 .iter()
@@ -716,7 +728,7 @@ fn upload(args: &[String]) -> Result<(), String> {
         );
     } else {
         for file in &made {
-            println!("{}  {}", file.path, file.bytes);
+            out!("{}  {}", file.path, file.bytes);
         }
     }
     Ok(())
@@ -739,9 +751,9 @@ fn watch(args: &[String]) -> Result<(), String> {
             )
             .map_err(human)?;
             if json {
-                println!("{}", watch_json(&added));
+                out!("{}", watch_json(&added));
             } else {
-                println!("{}  {}  {}", added.id, added.dir, added.link);
+                out!("{}  {}  {}", added.id, added.dir, added.link);
             }
             Ok(())
         }
@@ -749,9 +761,9 @@ fn watch(args: &[String]) -> Result<(), String> {
             let (_, _, json) = parse(&args[1..], &[])?;
             for item in votport_client_core::watch::watches() {
                 if json {
-                    println!("{}", watch_json(&item));
+                    out!("{}", watch_json(&item));
                 } else {
-                    println!("{}  {}  {}", item.id, item.dir, item.link);
+                    out!("{}  {}  {}", item.id, item.dir, item.link);
                 }
             }
             Ok(())
@@ -788,23 +800,23 @@ fn watch(args: &[String]) -> Result<(), String> {
                         transfer,
                         listener,
                     ) {
-                        Ok(report) if self.json => println!(
+                        Ok(report) if self.json => out!(
                             "{}",
                             serde_json::json!({ "event": "shipped", "path": path, "files": report.files, "parked": report.parked, "park_problem": report.park_problem })
                         ),
                         Ok(report) => match report.park_problem {
-                            Some(problem) => println!(
+                            Some(problem) => out!(
                                 "shipped {path}: {} {}, left in place: {problem}",
                                 report.files,
                                 if report.files == 1 { "file" } else { "files" }
                             ),
-                            None => println!(
+                            None => out!(
                                 "shipped {path}: {} {}",
                                 report.files,
                                 if report.files == 1 { "file" } else { "files" }
                             ),
                         },
-                        Err(error) if self.json => println!(
+                        Err(error) if self.json => out!(
                             "{}",
                             serde_json::json!({ "event": "failed", "path": path, "headline": error.headline(), "detail": error.to_string() })
                         ),

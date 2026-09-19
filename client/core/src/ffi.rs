@@ -351,7 +351,24 @@ pub fn resume(
     };
     match entry.kind {
         journal::Kind::Send => {
-            run_send(entry, password, transfer, listener, false, None).map(ResumeReport::Sent)
+            // A watch ship moves its drop into the folder's `shipped`
+            // subfolder only once the send ends well. A resume runs the
+            // same journalled send, so it parks a drop that starts in a
+            // watched folder the same way; left in place, the next watch
+            // run would ship what this run just delivered. A send that
+            // does not start in a watched folder is left alone, and a
+            // failed park leaves the drop for the next watch run, whose
+            // ship the server's dedupe keeps short, as in `ship`.
+            let drop = entry.paths.first().cloned();
+            let sent = run_send(entry, password, transfer, listener, false, None);
+            if sent.is_ok() {
+                if let Some(path) = drop {
+                    if watch::is_watched_drop(Path::new(&path)) {
+                        let _ = watch::park(Path::new(&path));
+                    }
+                }
+            }
+            sent.map(ResumeReport::Sent)
         }
         journal::Kind::Receive => {
             let dest = dest.map(|dest| journal::absolute(&dest));
