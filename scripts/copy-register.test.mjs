@@ -200,11 +200,20 @@ test('uploader failures speak to the sender, not about proofs and ranges (458)',
 
 test('504: the browser refuses the same reserved list before hashing', async () => {
   const upload = await read('../web/assets/upload.js');
-  // protocol/paths.rs refuses these case-insensitively at begin; the sender
-  // mirrors the list so the refusal costs nothing hashed.
-  assert.ok(upload.includes('/^\\.votport-(lease|workflows)$/i'), 'lease and workflows');
-  assert.ok(upload.includes('/^\\.vot-stage$/i'), 'vot-stage');
-  assert.ok(upload.includes('/^\\.vot-tenants\\.stage$/i'), 'tenant storage');
-  assert.ok(upload.includes('/^\\.vot-push-[0-9a-f]{32}$/'), 'push staging');
-  assert.ok(upload.includes('/^\\.vot-.*\\.(stage|journal)$/'), 'staging suffixes');
+  // protocol/paths.rs folds the component to lowercase once and matches
+  // the reserved shapes against that (finding 542); the sender mirrors the
+  // list so the refusal costs nothing hashed (finding 543).
+  assert.ok(upload.includes('/^\\.votport-(lease|workflows)$/.test(lower)'), 'lease and workflows');
+  assert.ok(upload.includes('/^\\.vot-stage$/.test(lower)'), 'vot-stage');
+  assert.ok(upload.includes('/^\\.vot-tenants\\.stage$/.test(lower)'), 'tenant storage');
+  assert.ok(
+    upload.includes('/^\\.vot-push-[0-9a-f]{32}$/.test(lower)'),
+    'push staging',
+  );
+  assert.ok(
+    upload.includes('/^\\.vot-.*\\.(stage|journal)$/.test(lower)'),
+    'staging suffixes',
+  );
+  // The fold happens once, before the reserved matches.
+  assert.ok(upload.includes('const lower = component.toLowerCase()'), 'lowercase once');
 });

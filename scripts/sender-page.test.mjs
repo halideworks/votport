@@ -68,6 +68,20 @@ test('the shipped card carries proof the sender can copy', () => {
   assert.match(script, /status: formatBytes\(file\.bytes\) \+ \(file\.receipt \? ' · receipt ✓' : ''\)/);
 });
 
+test('543: the pick-time reserved list folds case exactly like the server', () => {
+  // The server lowercases once before matching the reserved shapes
+  // (finding 542); the mirror here must agree or a casing variant is
+  // admitted, hashed, and only refused by begin (finding 543).
+  assert.match(script, /const lower = component\.toLowerCase\(\);/);
+  assert.match(script, /\^\\\.votport-\(lease\|workflows\)\$\/\.test\(lower\)/);
+  assert.match(script, /\^\\\.vot-stage\$\/\.test\(lower\)/);
+  assert.match(script, /\^\\\.vot-tenants\\\.stage\$\/\.test\(lower\)/);
+  assert.match(script, /\^\\\.vot-push-\[0-9a-f\]\{32\}\$\/\.test\(lower\)/);
+  assert.match(script, /\^\\\.vot-\.\*\\\.\(stage\|journal\)\$\/\.test\(lower\)/);
+  // No exact-case reserved match may remain against the raw component.
+  assert.doesNotMatch(script, /test\(component\)\s*\{\s*\n\s*return "this name is reserved/);
+});
+
 test('503: the plan collision check folds full Unicode, not per character', () => {
   // toLowerCase alone leaves the final sigma, the long s and sharp s
   // distinct while macOS, SMB3 and NTFS collapse them; the shared fold

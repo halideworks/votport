@@ -43,6 +43,38 @@ pub(crate) fn is_push_staging_name(name: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// Whether `ch` is a Unicode format character (general category Cf):
+/// invisible characters that either render as nothing or reorder the text
+/// around them. `char` carries no category data, so the ranges are spelled
+/// out; this is the Cf set of Unicode 15.0. (Audit finding 541: the old
+/// `ch <= U+001F` test let DEL, the C1 controls, and every format character
+/// reach the disk.)
+fn is_format_character(ch: char) -> bool {
+    matches!(ch,
+        '\u{00ad}'                  // soft hyphen
+        | '\u{0600}'..='\u{0605}'   // Arabic number signs
+        | '\u{061c}'                // Arabic letter mark
+        | '\u{06dd}'                // Arabic end of ayah
+        | '\u{070f}'                // Syriac abbreviation mark
+        | '\u{0890}'..='\u{0891}'   // Arabic currency markers
+        | '\u{08e2}'                // Arabic pound mark above
+        | '\u{180e}'                // Mongolian vowel separator
+        | '\u{200b}'..='\u{200f}'   // zero-width marks and bidi controls
+        | '\u{202a}'..='\u{202e}'   // embedding reordering controls
+        | '\u{2060}'..='\u{2064}'   // invisible operators and joiners
+        | '\u{2066}'..='\u{206f}'   // isolates and deprecated format marks
+        | '\u{feff}'                // byte-order mark / zero-width no-break
+        | '\u{fff9}'..='\u{fffb}'   // interlinear annotation
+        | '\u{110bd}'               // Kaithi number sign
+        | '\u{110cd}'               // Kaithi number sign above
+        | '\u{13430}'..='\u{1343f}' // Egyptian format controls
+        | '\u{1bca0}'..='\u{1bca3}' // Shorthand format controls
+        | '\u{1d173}'..='\u{1d17a}' // Musical format controls
+        | '\u{e0001}'               // language tag
+        | '\u{e0020}'..='\u{e007f}' // tag characters
+    )
+}
+
 /// Validates one package path component for on-disk placement. This is the
 /// one implementation both ends run: the server before any path touches the
 /// disk, and the client before a drop hashes gigabytes the server would
@@ -54,10 +86,21 @@ pub fn admit_component(component: &str, allow_hidden: bool) -> Result<(), String
     if component == "." || component == ".." {
         return Err("path component is a directory reference".to_owned());
     }
-    if component
-        .chars()
-        .any(|ch| ch == '/' || ch == '\\' || ch == '~' || ch == '\0' || ch <= '\u{1f}')
-    {
+    // Audit finding 541: controls beyond C0 (DEL, the C1 controls), the
+    // format characters, the line separator, and the no-break space all
+    // used to reach the disk because only `ch <= U+001F` was tested. The
+    // format characters are the same display-reordering class as the
+    // U+202E the portable profile blocks.
+    if component.chars().any(|ch| {
+        ch == '/'
+            || ch == '\\'
+            || ch == '~'
+            || ch == '\0'
+            || ch.is_control()
+            || is_format_character(ch)
+            || ch == '\u{2028}'
+            || ch == '\u{a0}'
+    }) {
         return Err(
             "path component contains a separator, control character, or DOS alias marker"
                 .to_owned(),
@@ -76,19 +119,24 @@ pub fn admit_component(component: &str, allow_hidden: bool) -> Result<(), String
     }
     // Reserved even with VOTPORT_ALLOW_HIDDEN: a sender file of this shape
     // would publish fine and then be deleted by the next boot's staging sweep.
-    if component.eq_ignore_ascii_case(".votport-workflows") {
+    // Audit finding 542: the staging-suffix and push shapes used to match
+    // exact case while every other reservation folded it, so `.VOT-X.STAGE`
+    // and an uppercased push key were admitted and never swept. Lowercase
+    // once; the sweep lowercases too.
+    let lower = component.to_ascii_lowercase();
+    if lower == ".votport-workflows" {
         return Err("name is reserved for delivery workflows".into());
     }
-    if component.eq_ignore_ascii_case(TENANT_STORAGE_DIR) {
+    if lower == TENANT_STORAGE_DIR {
         return Err("name is reserved for the port's own files".to_owned());
     }
-    if component.eq_ignore_ascii_case(LEASE_FILE_NAME) {
+    if lower == LEASE_FILE_NAME {
         return Err("name is reserved for the port's own files".to_owned());
     }
-    if component.eq_ignore_ascii_case(".vot-stage")
-        || is_push_staging_name(component)
-        || (component.starts_with(".vot-")
-            && (component.ends_with(".stage") || component.ends_with(".journal")))
+    if lower == ".vot-stage"
+        || is_push_staging_name(&lower)
+        || (lower.starts_with(".vot-")
+            && (lower.ends_with(".stage") || lower.ends_with(".journal")))
     {
         return Err("name is reserved for the port's own files".to_owned());
     }
@@ -142,8 +190,10 @@ mod tests {
     }
 
     /// The full shared reject list, including the case sensitivity of each
-    /// rule: the staging suffixes are exact-case (the boot sweep deletes
-    /// exactly that shape), while the whole-name reservations fold case. The
+    /// rule: every reservation folds case (audit finding 542: the staging
+    /// suffixes and the push shape used to match exact case, so an
+    /// uppercased spelling was admitted and never swept), and the whole-name
+    /// reservations fold with it. The
     /// server and the client run this one implementation, so this table is
     /// the contract both ends ship. The housekeeping reservations (tenant
     /// subtree, lease, staging) share one plain refusal so neither end names
@@ -179,8 +229,15 @@ mod tests {
             (".VOT-STAGE", true, "port's own files"),
             (".vot-1a2b-0-3c4d.stage", true, "port's own files"),
             (".vot-1a2b-0-3c4d.journal", true, "port's own files"),
+            (".VOT-1A2B-0-3C4D.STAGE", true, "port's own files"),
+            (".VOT-1A2B-0-3C4D.JOURNAL", true, "port's own files"),
             (
                 ".vot-push-0123456789abcdef0123456789abcdef",
+                true,
+                "port's own files",
+            ),
+            (
+                ".vot-push-0123456789ABCDEF0123456789ABCDEF",
                 true,
                 "port's own files",
             ),
@@ -189,30 +246,53 @@ mod tests {
             let error = admit_component(name, *hidden).unwrap_err();
             assert!(error.contains(needle), "{name:?}: {error}");
         }
-        // The staging suffix rule is exact-case, matching the sweep, and the
-        // push shape needs 32 lowercase hex digits; near misses are admitted
-        // (hidden rules permitting).
+        // Near misses are admitted (hidden rules permitting).
         let admitted: &[(&str, bool)] = &[
             ("report.pdf", false),
             (".env", true),
             (".vot-notes.txt", true),
-            (".vot-X.STAGE", true),
-            (".vot-X.JOURNAL", true),
             (".vot-notes.id", true),
             (".vot-notes.lease", true),
             (".vot-push-sender", true),
             (".vot-push-0123456789abcdef0123456789abcde", true),
-            (".vot-push-0123456789ABCDEF0123456789abcdef", true),
         ];
         for (name, hidden) in admitted {
             assert!(admit_component(name, *hidden).is_ok(), "{name:?}");
         }
-        // The push staging shape is exact: only 32 lowercase hex digits.
-        assert!(!is_push_staging_name(
-            ".VOT-PUSH-0123456789ABCDEF0123456789ABCDEF"
-        ));
+        // The push staging shape is exact: only 32 hex digits.
         assert!(is_push_staging_name(
             ".vot-push-0123456789abcdef0123456789abcdef"
         ));
+    }
+
+    /// Audit finding 541: C0 was never the whole control story. DEL, the C1
+    /// controls, the format characters (which display as nothing or reorder
+    /// the name), the line separator, and the no-break space all reached the
+    /// disk while only `ch <= U+001F` was tested. Both ends run this one
+    /// admission, so the table here pins the shared character set.
+    #[test]
+    fn admission_refuses_invisible_and_reordering_characters() {
+        for name in [
+            "a\u{7f}b",     // DEL
+            "a\u{85}b",     // NEL, C1
+            "a\u{9f}b",     // the last C1 control
+            "a\u{ad}b",     // soft hyphen
+            "a\u{200b}b",   // zero-width space
+            "a\u{200e}b",   // left-to-right mark
+            "a\u{feff}b",   // byte-order mark
+            "a\u{202a}b",   // embedding reordering, the U+202E family
+            "a\u{2028}b",   // line separator
+            "a\u{a0}b",     // no-break space
+            ".vo\u{200b}t", // invisible inside a reserved shape too
+        ] {
+            let error = admit_component(name, true).unwrap_err();
+            assert!(
+                error.contains("separator, control character"),
+                "{name:?}: {error}"
+            );
+        }
+        for name in ["a b", "a.b", "a-b", "árbol", "アセッツ"] {
+            assert!(admit_component(name, true).is_ok(), "{name:?}");
+        }
     }
 }

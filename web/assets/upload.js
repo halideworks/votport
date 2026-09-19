@@ -553,13 +553,18 @@ function validateComponent(component) {
   }
   if (component.startsWith('.')) {
     // Mirrors paths::admit_component so a refusal costs nothing hashed.
+    // Like the server (finding 542), the reserved shapes fold case: the
+    // component lowercases once, so a casing variant of a reserved name is
+    // refused here instead of by begin after the whole drop is hashed
+    // (finding 543).
     if (!allowHidden) return 'hidden names (starting with a dot) are not accepted here';
     if (/[^\x00-\x7f]/.test(component)) return 'non-ASCII hidden names are reserved';
-    if (/^\.votport-(lease|workflows)$/i.test(component)
-      || /^\.vot-stage$/i.test(component)
-      || /^\.vot-tenants\.stage$/i.test(component)
-      || /^\.vot-push-[0-9a-f]{32}$/.test(component)
-      || /^\.vot-.*\.(stage|journal)$/.test(component)) {
+    const lower = component.toLowerCase();
+    if (/^\.votport-(lease|workflows)$/.test(lower)
+      || /^\.vot-stage$/.test(lower)
+      || /^\.vot-tenants\.stage$/.test(lower)
+      || /^\.vot-push-[0-9a-f]{32}$/.test(lower)
+      || /^\.vot-.*\.(stage|journal)$/.test(lower)) {
       return "this name is reserved for the port's own files";
     }
   }
