@@ -12,6 +12,7 @@ import {
   resumeDropId,
   retryDecision,
   saveResumeRecord,
+  sessionUnknown,
 } from '/assets/upload-retry.js';
 import { segments } from '/assets/hash-plan.js';
 import init, {
@@ -632,8 +633,17 @@ async function postWithRetry(path, options = {}) {
       const refused = decision.message !== undefined
         || (status !== null && status !== 429 && status < 500)
         || body?.retryable === false;
-      if (refused) failure.fatal = true;
-      else if (failure?.name !== 'AbortError') failure.paused = true;
+      if (refused) {
+        if (singleShot && sessionUnknown(failure)) {
+          // A restart between the seal or a page and the next request leaves
+          // the new server holding no sessions at all: the same unknown-
+          // session 404 the chunk loop treats as rebegin, so restart the
+          // session instead of failing a transfer it never received.
+          failure.restart = true;
+        } else {
+          failure.fatal = true;
+        }
+      } else if (failure?.name !== 'AbortError') failure.paused = true;
       throw failure;
     }
     if (singleShot) {
@@ -924,8 +934,18 @@ async function runUpload() {
         let entries = null;
         if (sessionId) {
           try {
+          try {
             ({ entries } = await postWithRetry(`/api/session/${sessionId}/begin`, {}));
-            for (const item of items) {
+          } catch (error) {
+            if (sessionUnknown(error)) {
+              // The server restarted between the last page and begin and
+              // holds no sessions: restart the way the re-begin 404 below
+              // does, instead of failing at Preparing.
+              error.restart = true;
+            }
+            throw error;
+          }
+          for (const item of items) {
               // deliveredPaths is the authority: rows past the visible
               // limit have no element, so a done-class check would reset
               // their delivered mark on every rebegin.

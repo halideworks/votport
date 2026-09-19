@@ -54,6 +54,16 @@ export function retryDecision({
   return { retry: true, delayMs };
 }
 
+// The sentence the session commands answer with when the server holds no
+// such session. A restart leaves it holding none at all, so on the seal, a
+// page, or the fresh session's begin this 404 means restart the session
+// rather than fail a transfer the new server never received. Matched like
+// REFUSALS: the sentence is the server's, and a bare 404 must not restart.
+export function sessionUnknown(error) {
+  return error.status === 404
+    && /unknown or expired session/.test(error.message || '');
+}
+
 // A finish that failed this way may still have committed server-side: the
 // reply was lost and the retry found the session gone, or the session was
 // swept right after completing. The resume record stays and the next begin

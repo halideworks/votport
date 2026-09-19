@@ -11,6 +11,7 @@ import {
   resumeDropId,
   retryDecision,
   saveResumeRecord,
+  sessionUnknown,
 } from '../web/assets/upload-retry.js';
 
 const upload = await readFile(new URL('../web/assets/upload.js', import.meta.url), 'utf8');
@@ -227,6 +228,22 @@ test('the seal and pages restart the session instead of replaying the manifest',
   assert.match(upload, /singleShot: true,\n\s+headers: \{ 'Content-Type': 'application\/octet-stream' \},\n\s+body: seal,/);
   assert.match(upload, /failure\.restart = true;/);
   assert.match(upload, /if \(error\.restart\) \{\n\s+\/\/ The manifest phase cannot be replayed into the same session/);
+});
+
+test('a restarted server\'s unknown-session 404 restarts, not fails, the send', () => {
+  // Only the server's own unknown-session sentence on a 404 counts: a bare
+  // 404, a closed link (410), or a transient failure must not restart.
+  assert.equal(sessionUnknown({ status: 404, message: 'unknown or expired session' }), true);
+  assert.equal(sessionUnknown({ status: 404, message: 'request failed (404)' }), false);
+  assert.equal(sessionUnknown({ status: 410, message: 'this link is no longer accepting uploads' }), false);
+  assert.equal(sessionUnknown({ status: 500, message: 'unknown or expired session' }), false);
+  assert.equal(sessionUnknown({ message: 'unknown or expired session' }), false);
+  // Wiring, per the established source-assertion style: the single-shot
+  // manifest phases mark the unknown-session refusal for a restart instead
+  // of fatal, and the fresh session's begin does the same.
+  assert.match(upload, /singleShot && sessionUnknown\(failure\)/);
+  assert.match(upload, /if \(sessionUnknown\(error\)\) \{\n\s+\/\/ The server restarted between the last page and begin/);
+  assert.match(upload, /error\.restart = true;\n\s+\}\n\s+throw error;/);
 });
 
 test('a user cancel aborts the retry loop before any classification retry', () => {
