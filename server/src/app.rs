@@ -4979,6 +4979,76 @@ mod asset_cache_tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), b"page not found\n");
     }
+
+    #[tokio::test]
+    async fn assets_carry_the_page_content_security_policy() {
+        // Audit finding 517: a dedicated worker's policy comes from its own
+        // response, so hash-worker.js ran with no CSP at all.
+        let directory = tempfile::tempdir().unwrap();
+        let assets = directory.path().join("web/assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::write(assets.join("hash-worker.js"), b"self.onmessage = () => {};").unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let response = request(app, "/assets/hash-worker.js").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_SECURITY_POLICY], CSP);
+    }
+}
+
+#[cfg(test)]
+mod page_header_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt as _;
+
+    #[tokio::test]
+    async fn pages_send_cross_origin_opener_policy_and_no_coep() {
+        // Audit finding 518: without COOP an attacker page that opens the
+        // login or a recipient page in a popup keeps a cross-origin window
+        // handle for XS-Leaks. COEP stays off: nothing uses SharedArrayBuffer.
+        let directory = tempfile::tempdir().unwrap();
+        let web = directory.path().join("web");
+        std::fs::create_dir_all(&web).unwrap();
+        std::fs::write(
+            web.join("index.html"),
+            "<!doctype html><title>admin</title>",
+        )
+        .unwrap();
+        std::fs::write(
+            web.join("verify.html"),
+            "<!doctype html><title>verify</title>",
+        )
+        .unwrap();
+        let app = crate::api::testing::build(directory.path());
+        for path in ["/", "/verify"] {
+            let response = router(app.clone())
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("cross-origin-opener-policy")
+                    .and_then(|value| value.to_str().ok()),
+                Some("same-origin"),
+                "{path}"
+            );
+            assert!(
+                response
+                    .headers()
+                    .get("cross-origin-embedder-policy")
+                    .is_none(),
+                "{path}"
+            );
+            // The body is still the served page, so the header layer did not
+            // replace the response.
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(!body.is_empty(), "{path}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5356,6 +5426,17 @@ async fn api_response_policy(request: Request<axum::body::Body>, next: Next) -> 
     response
 }
 
+/// Everything the pages and their workers load is same-origin (fonts are
+/// self-hosted in /assets/fonts). wasm-unsafe-eval is what lets the browser
+/// compile the verification engine; there is no JS eval anywhere. The same
+/// policy also rides on the /assets nest: a dedicated worker's policy comes
+/// from its own response, so hash-worker.js would otherwise run with none
+/// (audit finding 517).
+const CSP: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; \
+    style-src 'self'; font-src 'self'; connect-src 'self'; \
+    img-src 'self'; worker-src 'self'; \
+    frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+
 pub fn router(app: Arc<App>) -> Router {
     let web_root = app.config.web_root.clone();
     let admin_page = web_root.join("index.html");
@@ -5363,13 +5444,6 @@ pub fn router(app: Arc<App>) -> Router {
     let outbound_page = web_root.join("send.html");
     let page = |name: &str| web_root.join(format!("{name}.html"));
 
-    // Everything the pages load is same-origin (fonts are self-hosted in
-    // /assets/fonts). wasm-unsafe-eval is what lets the browser compile the
-    // verification engine; there is no JS eval anywhere.
-    const CSP: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; \
-        style-src 'self'; font-src 'self'; connect-src 'self'; \
-        img-src 'self'; worker-src 'self'; \
-        frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
     // Request pages carry the secret link token in the URL; never let the
     // browser forward it as a referrer.
     const REFERRER_POLICY: &str = "no-referrer";
@@ -5476,6 +5550,17 @@ pub fn router(app: Arc<App>) -> Router {
                                 (axum::http::header::CONTENT_SECURITY_POLICY, CSP),
                                 (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
                                 (axum::http::header::REFERRER_POLICY, REFERRER_POLICY),
+                                // Audit finding 518: a popup holding a
+                                // cross-origin window handle to the login or a
+                                // recipient page is an XS-Leak; same-origin
+                                // severs it. COEP stays off: nothing here uses
+                                // SharedArrayBuffer.
+                                (
+                                    axum::http::HeaderName::from_static(
+                                        "cross-origin-opener-policy",
+                                    ),
+                                    "same-origin",
+                                ),
                                 // Admin pages contain the current identity; shared
                                 // caches must never retain them.
                                 (
@@ -5535,6 +5620,14 @@ pub fn router(app: Arc<App>) -> Router {
                         .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
                             axum::http::header::REFERRER_POLICY,
                             axum::http::HeaderValue::from_static("no-referrer"),
+                        ))
+                        // Audit finding 517: hash-worker.js hashes every
+                        // sender's and recipient's file bytes inside a
+                        // dedicated worker, whose policy comes from its own
+                        // response; without this the worker ran with none.
+                        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+                            axum::http::header::CONTENT_SECURITY_POLICY,
+                            axum::http::HeaderValue::from_static(CSP),
                         ))
                         .layer(axum::middleware::from_fn_with_state(
                             Arc::clone(&app),

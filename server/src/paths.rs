@@ -35,7 +35,11 @@ pub fn stored_components(tenant: &str, stored_as: &str) -> Vec<String> {
 }
 
 pub fn portable_tenant_key(key: &str) -> bool {
+    // Audit finding 516: the 128-byte segment cap also lives here so the
+    // helper stays self-contained instead of depending on admit_dest's cap
+    // having been applied first.
     if key.is_empty()
+        || key.len() > 128
         || !key.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
         })
@@ -783,6 +787,15 @@ mod tests {
             assert!(!portable_tenant_key(key), "{key}");
         }
         assert!(portable_tenant_key("com0"));
+    }
+
+    #[test]
+    fn portable_tenant_key_enforces_the_length_bound_itself() {
+        // Audit finding 516: the 128-byte cap used to come from admit_dest
+        // via admit_tenant_ref, so calling the helper alone admitted an
+        // over-long key.
+        assert!(portable_tenant_key(&"a".repeat(128)));
+        assert!(!portable_tenant_key(&"a".repeat(129)));
     }
 
     #[test]
