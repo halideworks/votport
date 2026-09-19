@@ -68,6 +68,19 @@ test('the shipped card carries proof the sender can copy', () => {
   assert.match(script, /status: formatBytes\(file\.bytes\) \+ \(file\.receipt \? ' · receipt ✓' : ''\)/);
 });
 
+test('503: the plan collision check folds full Unicode, not per character', () => {
+  // toLowerCase alone leaves the final sigma, the long s and sharp s
+  // distinct while macOS, SMB3 and NTFS collapse them; the shared fold
+  // applies the CaseFolding remainder before both plan checks.
+  assert.match(script, /FOLDS_FULL\.get\(character\.codePointAt\(0\)\)/);
+  assert.match(script, /\[0x3c2, \[0x3c3\]\]/, 'final sigma folds to sigma');
+  assert.match(script, /\[0x17f, \[0x73\]\]/, 'long s folds to s');
+  assert.match(script, /\[0xdf, \[0x73, 0x73\]\]/, 'sharp s folds to ss');
+  // The pick-time check and the package plan both key on the folded form.
+  assert.match(script, /const key = pathKeyString\(components\);/);
+  assert.match(script, /key: pathKeyBytes\(components\)/);
+});
+
 test('a large file is hashed as leaf-aligned segments across the pool and assembled on its owner', async () => {
   const worker = await readFile(new URL('../web/assets/hash-worker.js', import.meta.url), 'utf8');
   assert.match(script, /segments\(file\.size, proofLeafBytes, hashWorkers\.length, MIN_SEGMENT_BYTES\)/);

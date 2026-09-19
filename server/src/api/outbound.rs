@@ -8297,6 +8297,22 @@ mod tests {
             .unwrap()
             .ends_with(&format!("filename*=UTF-8''{name}")));
     }
+
+    /// Audit finding 507: downloads keep the extension at any name length.
+    /// The retired safe_filename truncated the whole name to 180 characters
+    /// after the extension, so a 204-character name downloaded with none.
+    #[test]
+    fn long_names_keep_their_extension() {
+        let name = format!("{}.mov", "a".repeat(200));
+        assert_eq!(name.len(), 204);
+        let header = attachment_filename(&name).unwrap();
+        let header = header.to_str().unwrap();
+        assert!(
+            header.ends_with(&format!("filename*=UTF-8''{name}")),
+            "{header}"
+        );
+        assert!(header.contains(&format!("filename=\"{name}\"")), "{header}");
+    }
     #[test]
     fn bundle_paths_are_relative_and_normalized() {
         assert_eq!(

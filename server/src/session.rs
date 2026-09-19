@@ -1121,6 +1121,17 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
             .checked_add(entry.object_id().length)
             .ok_or_else(|| SessionError::bad("total upload size overflows"))?;
     }
+    // Full-fold collision guard (audit finding 503): the pinned manifest
+    // folds keys per character, so one package can carry two spellings a
+    // case-insensitive recipient collapses (ς/σ, ſ/s, ß/SS) and the second
+    // publish overwrites the first. Write-time claims already key on the
+    // full fold, so this only moves the refusal ahead of the transfer.
+    let names: Vec<String> = entries
+        .iter()
+        .map(|entry| entry.path().collect::<Vec<_>>().join("/"))
+        .collect();
+    crate::paths::admit_portable_paths(names.iter().map(String::as_str))
+        .map_err(SessionError::bad)?;
     if total > setup.max_total_bytes {
         return Err(SessionError::bad(format!(
             "upload of {total} bytes exceeds the {} byte limit for this link",
@@ -3869,6 +3880,10 @@ fn validate_push_manifest(
             .ok_or_else(|| SessionError::bad("total upload size overflows"))?;
         validated.push((components, object));
     }
+    // Same full-fold collision guard as the HTTP admission (finding 503).
+    let names: Vec<String> = validated.iter().map(|(path, _)| path.join("/")).collect();
+    crate::paths::admit_portable_paths(names.iter().map(String::as_str))
+        .map_err(SessionError::bad)?;
     if total != summary.logical_length {
         return Err(SessionError::bad(
             "manifest logical length does not match its entries",
@@ -6087,6 +6102,62 @@ mod push_tests {
         assert_eq!(error.status, 422);
         assert!(error.message.contains("1..=512"), "{}", error.message);
         assert!(std::fs::read_dir(&setup.dest_dir).unwrap().next().is_none());
+        assert!(app.store.load_upload_sessions().unwrap().is_empty());
+    }
+
+    /// Audit finding 503: the pinned manifest folds keys per character, so a
+    /// package can carry two spellings a case-insensitive recipient collapses
+    /// (final sigma, long s). Both admission seams refuse the pair before a
+    /// byte moves.
+    #[tokio::test]
+    async fn fold_collisions_are_refused_at_http_and_native_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        app.store
+            .insert_link(crate::store::tests::test_link("link"))
+            .unwrap();
+        // Sorted by the pinned manifest's per-character keys, so the builder
+        // itself accepts the package; the admission guard must refuse it.
+        for (first, second) in [("σίσυφος.mov", "ΣΊΣΥΦΟΣ.mov"), ("straße.mov", "ſtraße.mov")]
+        {
+            let payload = object(Suite::Blake3Bao64, b"payload");
+            let mut builder = PackageBuilder::new().unwrap();
+            for name in [first, second] {
+                let entry = PackageEntry::direct(vec![name.to_string()], &payload).unwrap();
+                assert!(builder.push(&entry).unwrap().is_none());
+            }
+            let (summary, final_page, mut finalizer) = builder.finish().unwrap().into_parts();
+            let page = finalizer.push(final_page).unwrap().into_bytes();
+            let seal = finalizer.finish().unwrap().into_bytes();
+            let setup = setup_with_app(directory.path(), summary.object_id().clone(), &app);
+
+            let mut phase = Phase::AwaitSeal;
+            handle_seal(&setup, &mut phase, &seal).unwrap();
+            handle_page(&mut phase, &page).unwrap();
+            let error = handle_begin(&setup, &mut phase).unwrap_err();
+            assert!(error.message.contains("collide"), "{}", error.message);
+
+            let error = validate_push_manifest(
+                &setup,
+                vot_cli::PackageSummary {
+                    root: summary.object_id().root,
+                    logical_length: 2 * payload.length,
+                    entries: 2,
+                },
+                &[
+                    record(
+                        vot_manifest::PackagePath::portable([first]).unwrap(),
+                        &payload,
+                    ),
+                    record(
+                        vot_manifest::PackagePath::portable([second]).unwrap(),
+                        &payload,
+                    ),
+                ],
+            )
+            .unwrap_err();
+            assert!(error.message.contains("collide"), "{}", error.message);
+        }
         assert!(app.store.load_upload_sessions().unwrap().is_empty());
     }
 
