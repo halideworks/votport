@@ -6732,15 +6732,15 @@ mod push_tests {
     #[test]
     fn pending_names_preserve_destination_policy_and_manifest_depth() {
         for (destination, components) in [
-            ("AUX", vec!["frame".to_owned()]),
-            ("archive.", vec!["frame".to_owned()]),
-            ("project", vec!["x".to_owned(); 256]),
+            ("m".repeat(128), vec!["frame".to_owned()]),
+            ("archive 1".to_owned(), vec!["frame".to_owned()]),
+            ("project".to_owned(), vec!["x".to_owned(); 256]),
         ] {
             let directory = tempfile::tempdir().unwrap();
             let expected = object(Suite::Blake3Bao64, b"frame");
             let application = crate::api::testing::build(directory.path());
             let mut first = setup_with_app(directory.path(), expected.clone(), &application);
-            first.dest_rel = paths::admit_dest(destination).unwrap();
+            first.dest_rel = paths::admit_dest(&destination).unwrap();
             first.dest_dir.push(destination);
             vot_manifest::PackagePath::portable(components.clone()).unwrap();
             let (files, allocation) =
