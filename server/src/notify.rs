@@ -64,6 +64,36 @@ fn title_brand(app: &App, tenant: &str) -> String {
         .unwrap_or_else(|| "VOTPort".to_owned())
 }
 
+/// The written subject for a trade-route event: the labels the notification
+/// settings page shows (web/assets/notifications.js), never the wire name.
+fn trade_event_label(event: &str) -> Cow<'_, str> {
+    match event {
+        "route_approval_requested" => "Route approval requested".into(),
+        "route_approved" => "Route approved".into(),
+        "route_identity_changed" => "Port identity changed".into(),
+        "route_failed" => "Route failed or unreachable".into(),
+        "route_recovered" => "Route recovered".into(),
+        "route_received" => "Route received and verified".into(),
+        other => other.replace('_', " ").into(),
+    }
+}
+
+/// The written form of a route's state: the words the trade-routes page
+/// shows as badges (web/assets/page-trade-routes.js), so a body never ends
+/// in a wire word.
+fn trade_state_label(state: &str) -> Cow<'_, str> {
+    match state {
+        "active" => "Active".into(),
+        "pending_approval" => "Pending approval".into(),
+        "paused" => "Paused".into(),
+        "revoked" => "Revoked".into(),
+        "unreachable" => "Unreachable".into(),
+        "identity_mismatch" => "Identity mismatch".into(),
+        "enrolling" => "Enrollment incomplete".into(),
+        other => other.into(),
+    }
+}
+
 static TRADE_ROUTE_WARN: OnceLock<Mutex<crate::api::outbound::ErrorDeduper>> = OnceLock::new();
 
 /// The route alert is best-effort, but a store error that suppresses it must
@@ -142,13 +172,15 @@ pub async fn uploaded(
         "{}: files received for \"{label}\"",
         title_brand(&app, &tenant)
     );
+    // One name per line: the total above carries the size, and the
+    // structured payload keeps the per-file byte counts for automations.
     let mut body = format!(
         "{count} {}, {}\n{}",
         if count == 1 { "file" } else { "files" },
         human_bytes(total),
         files
             .iter()
-            .map(|file| format!("{} ({})", file.stored_as, human_bytes(file.bytes)))
+            .map(|file| file.stored_as.as_str())
             .collect::<Vec<_>>()
             .join("\n")
     );
@@ -239,9 +271,9 @@ pub async fn outbound_downloaded(
     );
     for (_, event, transition) in transitions.into_iter().filter(|(send, _, _)| *send) {
         let title = format!(
-            "{}: outbound {transition} for \"{}\"",
-            title_brand(&app, &grant.tenant),
-            grant.label
+            "\"{}\": {transition} · {}",
+            grant.label,
+            title_brand(&app, &grant.tenant)
         );
         let body = format!(
             "{}\n{transition}: {file_count} {}, {}",
@@ -283,10 +315,10 @@ pub async fn outbound_downloaded(
 pub async fn upload_ended(app: Arc<App>, ended: crate::session::SessionEnded) {
     let event = &ended.event;
     let title = format!(
-        "{}: upload {} for \"{}\"",
-        title_brand(&app, &ended.tenant),
+        "\"{}\": upload {} · {}",
+        ended.label,
         event.outcome,
-        ended.label
+        title_brand(&app, &ended.tenant)
     );
     let body = format!(
         "{}\n{} of {} received",
@@ -337,14 +369,14 @@ pub async fn workflow_failed(app: Arc<App>, job: crate::workflow::Job) {
         .or(job.project.notifications.as_ref());
     let retrying = job.state == "retrying";
     let title = format!(
-        "{}: delivery {} for \"{}\"",
-        title_brand(&app, &job.tenant),
+        "\"{}\": delivery {} · {}",
+        job.request.label,
         if retrying {
             "retry scheduled"
         } else {
             "needs attention"
         },
-        job.request.label
+        title_brand(&app, &job.tenant)
     );
     let body = format!(
         "{}\n{}",
@@ -778,14 +810,12 @@ pub async fn trade_event(
     let title = format!(
         "{}: {}",
         title_brand(app, &route.tenant),
-        event.replace('_', " ")
+        trade_event_label(event)
     );
+    let state = trade_state_label(&route.state);
     let body = match detail {
-        Some(detail) => format!(
-            "{} · {} · {}\n{detail}",
-            route.name, route.peer_name, route.state
-        ),
-        None => format!("{} · {} · {}", route.name, route.peer_name, route.state),
+        Some(detail) => format!("{} · {} · {state}\n{detail}", route.name, route.peer_name),
+        None => format!("{} · {} · {state}", route.name, route.peer_name),
     };
     let mut payload = json!({"event":event,"tenant":&route.tenant,"route_id":route.id,"name":route.name,"peer":route.peer_key,"state":route.state});
     if let Some(detail) = detail {
@@ -1015,6 +1045,36 @@ pub(crate) mod tests {
         Arc::get_mut(&mut application).unwrap().config.public_url = public_url.map(str::to_owned);
         test_destination_config(&application, "webhook", format!("http://{addr}/outbound"));
         (application, directory, rx, thread)
+    }
+
+    /// An app whose one destination posts to a local listener the test
+    /// accepts once per notification, so a test reads the exact title and
+    /// body a channel receives.
+    fn channel_app(
+        channel: &str,
+        public_url: Option<&str>,
+    ) -> (Arc<App>, tempfile::TempDir, std::net::TcpListener) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut application = app::build(testing::config(directory.path())).unwrap();
+        Arc::get_mut(&mut application).unwrap().config.public_url = public_url.map(str::to_owned);
+        test_destination_config(&application, channel, format!("http://{address}/hook"));
+        (application, directory, listener)
+    }
+
+    /// The next request the destination accepts, answered and returned as
+    /// text.
+    fn next_request(listener: &std::net::TcpListener) -> String {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut buf = vec![0u8; 64 * 1024];
+        let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
+        let _ = std::io::Write::write_all(
+            &mut stream,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        String::from_utf8_lossy(&buf[..n]).into_owned()
     }
 
     fn http_stub(status: &'static str) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
@@ -1746,6 +1806,198 @@ pub(crate) mod tests {
             assert_no_secrets(&request);
             thread.join().unwrap();
         }
+    }
+
+    /// Audit finding 467: trade-route subjects carry the written event
+    /// labels the settings page shows, and the body names the state instead
+    /// of ending in the wire word.
+    #[tokio::test]
+    async fn trade_event_subjects_are_written_labels_with_a_mapped_state() {
+        for (event, state, label) in [
+            ("route_received", "active", "Route received and verified"),
+            (
+                "route_identity_changed",
+                "identity_mismatch",
+                "Port identity changed",
+            ),
+            (
+                "route_approval_requested",
+                "pending_approval",
+                "Route approval requested",
+            ),
+        ] {
+            let (application, _directory, listener) = channel_app("discord", None);
+            let policy = application.store.notification_defaults("").unwrap();
+            let mut route = test_trade_route(policy.clone());
+            route.state = state.to_owned();
+            trade_event(&application, &route, &policy, event, None).await;
+            let content = request_json(&next_request(&listener))["content"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let (title, body) = content.split_once('\n').unwrap();
+            let state_label = match state {
+                "active" => "Active",
+                "identity_mismatch" => "Identity mismatch",
+                _ => "Pending approval",
+            };
+            assert_eq!(title, format!("VOTPort: {label}"), "{event}");
+            assert_eq!(
+                body,
+                format!("Fixture route · Fixture peer · {state_label}")
+            );
+        }
+        for (event, label) in [
+            ("route_approval_requested", "Route approval requested"),
+            ("route_approved", "Route approved"),
+            ("route_identity_changed", "Port identity changed"),
+            ("route_failed", "Route failed or unreachable"),
+            ("route_recovered", "Route recovered"),
+            ("route_received", "Route received and verified"),
+        ] {
+            assert_eq!(trade_event_label(event), label);
+        }
+        for (state, label) in [
+            ("active", "Active"),
+            ("pending_approval", "Pending approval"),
+            ("paused", "Paused"),
+            ("revoked", "Revoked"),
+            ("unreachable", "Unreachable"),
+            ("identity_mismatch", "Identity mismatch"),
+            ("enrolling", "Enrollment incomplete"),
+        ] {
+            assert_eq!(trade_state_label(state), label);
+        }
+    }
+
+    /// Audit finding 468: the interrupted, outbound and delivery subjects
+    /// lead with the transfer's label and the port's name, and the body
+    /// links back to the owning page.
+    #[tokio::test]
+    async fn event_subjects_lead_with_the_label_and_bodies_link_back() {
+        let (application, _directory, listener) =
+            channel_app("discord", Some("https://notify.example"));
+        upload_ended(application.clone(), ended("interrupted", true)).await;
+        let content = request_json(&next_request(&listener))["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        // Discord escapes markdown punctuation in titles and bodies; the
+        // fixtures carry no literal backslashes, so strip the escapes.
+        let unescaped = content.replace('\\', "");
+        assert!(
+            unescaped.starts_with(
+                "\"shoot\": upload interrupted · VOTPort\n\
+                 https://notify.example/receive?search=link-1#link-link-1\n"
+            ),
+            "{content}"
+        );
+
+        let grant = test_grant(vec![test_file("one.txt", 10), test_file("two.txt", 20)]);
+        application.store.insert_outbound_grant(grant).unwrap();
+        let result = application
+            .store
+            .record_outbound_download("grant-id", &[0], now_unix())
+            .unwrap();
+        let grant = application
+            .store
+            .outbound_grant_by_id("grant-id")
+            .unwrap()
+            .unwrap();
+        outbound_downloaded(application.clone(), grant, result).await;
+        let content = request_json(&next_request(&listener))["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let unescaped = content.replace('\\', "");
+        assert!(
+            unescaped.starts_with(
+                "\"delivery-label\": first file requested · VOTPort\n\
+                 https://notify.example/deliver#grant-grant-id\n"
+            ),
+            "{content}"
+        );
+
+        let mut request = crate::workflow::tests::request();
+        request.notifications = Some(test_policy());
+        let job = crate::workflow::Job {
+            id: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6".to_owned(),
+            tenant: String::new(),
+            token_generation: 0,
+            actor: "sender".to_owned(),
+            credential_version: 0,
+            automation_token_id: None,
+            actor_human: None,
+            request,
+            project: crate::workflow::tests::project(),
+            state: "failed".to_owned(),
+            manifest: None,
+            approved_by: None,
+            attempts: 1,
+            created_at: 1,
+            updated_at: 2,
+            error: Some("A destination did not complete".to_owned()),
+            checks: serde_json::json!({}),
+            received: None,
+            reprocessed_from: None,
+            reprocessed_as: None,
+        };
+        workflow_failed(application, job).await;
+        let content = request_json(&next_request(&listener))["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let unescaped = content.replace('\\', "");
+        assert!(
+            unescaped.starts_with(
+                "\"Final delivery\": delivery needs attention · VOTPort\n\
+                 https://notify.example/workflows#job-a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6\n"
+            ),
+            "{content}"
+        );
+    }
+
+    /// Audit finding 469: the received-files summary says the total in
+    /// human units and lists plain names, without per-file byte counts.
+    #[tokio::test]
+    async fn received_file_lines_name_files_without_byte_counts() {
+        let (application, _directory, listener) = channel_app("ntfy", None);
+        uploaded(
+            application,
+            String::new(),
+            "link-id".to_owned(),
+            "upload-label".to_owned(),
+            100,
+            FinishReport {
+                received: 0,
+                upload_id: "up-sizes".to_owned(),
+                files: vec![
+                    FileRecord {
+                        path: "one.txt".into(),
+                        stored_as: "one.txt".into(),
+                        bytes: 1,
+                        suite: "blake3".into(),
+                        root: "fixture".into(),
+                        receipt: false,
+                        deleted: false,
+                    },
+                    FileRecord {
+                        path: "two.mov".into(),
+                        stored_as: "two.mov".into(),
+                        bytes: 2_000_000_001,
+                        suite: "blake3".into(),
+                        root: "fixture".into(),
+                        receipt: false,
+                        deleted: false,
+                    },
+                ],
+            },
+            Some(test_policy()),
+        )
+        .await;
+        let request = next_request(&listener);
+        let (_, body) = request.split_once("\r\n\r\n").unwrap();
+        assert_eq!(body, "ID: up-sizes\n2 files, 2.0 GB\none.txt\ntwo.mov");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
