@@ -43,6 +43,14 @@ test('drop zones are named and keyboard controls are not nested', () => {
   assert.match(verifyScript, /dropZone\.addEventListener\('keydown',[\s\S]+e\.preventDefault\(\);[\s\S]+\$\('payload-input'\)\.click\(\)/);
 });
 
+// The setup guide link follows the channel help sentence; a leading space in
+// its text once leaked into the accessible name.
+test('the setup guide link has an accessible name without padding', () => {
+  assert.match(notificationsScript, /node\('a', 'Setup guide'\)/);
+  assert.doesNotMatch(notificationsScript, /node\('a', ' Setup guide'\)/);
+  assert.match(notificationsScript, /\$\('nd-guide'\)\.append\(' ', link\)/);
+});
+
 test('upload progress exposes its current percentage', () => {
   assert.match(request, /id="meter" class="meter" role="progressbar"[\s\S]+aria-valuenow="0"/);
   assert.match(uploadScript, /const percent = Math\.min\(100, Math\.round\(fraction \* 100\)\);/);
