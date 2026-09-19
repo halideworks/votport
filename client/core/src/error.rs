@@ -150,6 +150,14 @@ pub enum Error {
     #[error("filesystem error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// A filesystem error at a named path, so a destination failure says
+    /// where it happened instead of a bare "Permission denied".
+    #[error("{path}: {source}")]
+    IoAt {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
     #[error("building the package: {0:?}")]
     Package(vot_cli::Error),
 
@@ -254,7 +262,7 @@ impl Error {
                 human_bytes(*needed),
                 human_bytes(*available)
             ),
-            Self::Io(_) => "A file could not be written.".to_owned(),
+            Self::Io(_) | Self::IoAt { .. } => "A file could not be written.".to_owned(),
             Self::Package(vot_cli::Error::SourceMutation) => {
                 "A file changed while it was being read. Send it again.".to_owned()
             }

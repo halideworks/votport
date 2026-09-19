@@ -60,6 +60,15 @@ fn receive_buffer(total: u64) -> Vec<u8> {
     vec![0; (total.min(READ_CHUNK as u64) as usize).max(1)]
 }
 
+/// Names the path an io error came from, so a destination permission
+/// failure says where instead of a bare "Permission denied" (audit 482).
+pub(crate) fn io_at(path: &Path, error: std::io::Error) -> Error {
+    Error::IoAt {
+        path: path.to_path_buf(),
+        source: error,
+    }
+}
+
 /// Fetches `delivery` from `base` into `dest`, over QUIC when the delivery
 /// offers a fetch endpoint and the serve answers, over HTTP otherwise.
 ///
@@ -243,7 +252,7 @@ fn receive_over_http_inner(
 
     observer.event(Event::Transport(Transport::Http));
 
-    fs::create_dir_all(dest)?;
+    fs::create_dir_all(dest).map_err(|error| io_at(dest, error))?;
     let cookie = cookie.as_deref();
     let mut files = Vec::with_capacity(planned.len());
     for (index, (file, path, object, complete)) in planned.into_iter().enumerate() {
@@ -252,7 +261,8 @@ fn receive_over_http_inner(
         }
         if !complete {
             validate_parent(dest, &path)?;
-            fs::create_dir_all(path.parent().unwrap_or(dest))?;
+            fs::create_dir_all(path.parent().unwrap_or(dest))
+                .map_err(|error| io_at(path.parent().unwrap_or(dest), error))?;
             let lease_path = part_path(&path).with_extension("lease");
             let mut lease_file = open_journal(&lease_path)?;
             let mut saved = Vec::new();
@@ -405,7 +415,7 @@ pub(crate) fn prepare_verified(
         suite: announced.suite.to_string(),
     })?;
     if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(|error| io_at(parent, error))?;
     }
     let temporary = part_path(destination);
     let mut journal = open_journal(&temporary)?;
@@ -580,7 +590,11 @@ fn decode_identity(bytes: &[u8]) -> Option<ObjectId> {
 fn read_identity(path: &Path) -> Result<(Option<File>, Option<ObjectId>)> {
     let mut file = match open_existing_identity(path) {
         Ok(file) => file,
-        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+        // The companion is normally absent on a fresh receive; the open is
+        // wrapped, so the expected miss can arrive as either variant.
+        Err(Error::Io(error) | Error::IoAt { source: error, .. })
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
             return Ok((None, None));
         }
         Err(error) => return Err(error),
@@ -665,7 +679,7 @@ fn open_receive_file_with_options(path: &Path, mut options: fs::OpenOptions) -> 
         use std::os::windows::fs::OpenOptionsExt;
         options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    Ok(options.open(path)?)
+    options.open(path).map_err(|error| io_at(path, error))
 }
 
 fn open_journal(path: &Path) -> Result<File> {
@@ -798,7 +812,8 @@ fn verify_and_rename(
             "receive journal changed before publication".to_owned(),
         ));
     }
-    let mut path = tempfile::TempPath::try_from_path(temporary)?;
+    let mut path =
+        tempfile::TempPath::try_from_path(temporary).map_err(|error| io_at(temporary, error))?;
     path.disable_cleanup(true);
     path.persist_noclobber(destination).map_err(|error| {
         if error.error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -806,7 +821,7 @@ fn verify_and_rename(
                 path: destination.to_owned(),
             }
         } else {
-            error.error.into()
+            io_at(destination, error.error)
         }
     })?;
     Ok(())
@@ -1727,7 +1742,11 @@ mod tests {
             &mut crate::progress::Silent,
         );
         assert!(
-            matches!(result, Err(Error::Io(ref error)) if error.kind() == std::io::ErrorKind::AlreadyExists),
+            matches!(
+                result,
+                Err(Error::Io(ref error) | Error::IoAt { source: ref error, .. })
+                    if error.kind() == std::io::ErrorKind::AlreadyExists
+            ),
             "{result:?}"
         );
         assert_eq!(fs::read(&journal).unwrap(), b"aa");
@@ -1926,5 +1945,39 @@ mod tests {
             local_path(dest, "/etc/passwd").unwrap(),
             Path::new("/out/etc/passwd")
         );
+    }
+
+    /// Audit 482: a destination permission failure must name the path it
+    /// happened at, not render as a bare "Permission denied".
+    #[cfg(unix)]
+    #[test]
+    fn destination_permission_failures_name_the_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "votport-receive-perm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root writes anywhere; there the case cannot be made, so it skips.
+        let refused = std::fs::create_dir_all(locked.join("child")).err();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let Some(error) = refused else {
+            return;
+        };
+        let named = io_at(&locked, error);
+        assert!(
+            named.to_string().contains(&locked.display().to_string()),
+            "{named}"
+        );
+        assert_eq!(named.headline(), "A file could not be written.");
     }
 }

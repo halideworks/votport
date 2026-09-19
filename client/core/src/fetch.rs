@@ -788,7 +788,7 @@ fn materialize_entries(
             Ok((*index, &entry.path, path, &entry.object, complete))
         })
         .collect::<Result<Vec<_>>>()?;
-    fs::create_dir_all(dest)?;
+    fs::create_dir_all(dest).map_err(|error| crate::receive::io_at(dest, error))?;
     let mut files = Vec::with_capacity(planned.len());
     #[cfg(target_os = "macos")]
     let mut pending = Vec::<(usize, std::path::PathBuf, crate::receive::PendingFile)>::new();
@@ -935,7 +935,14 @@ fn link_verified_object_during_fetch(
         return Err(Error::Other("the staged object disappeared".to_owned()));
     }
     crate::receive::validate_parent(destination_root, destination)?;
-    fs::create_dir_all(destination.parent().unwrap_or_else(|| Path::new(".")))?;
+    fs::create_dir_all(destination.parent().unwrap_or_else(|| Path::new("."))).map_err(
+        |error| {
+            crate::receive::io_at(
+                destination.parent().unwrap_or_else(|| Path::new(".")),
+                error,
+            )
+        },
+    )?;
     crate::receive::validate_parent(destination_root, destination)?;
     match vot_platform_fs::link_file_handle(&held, source, destination) {
         Ok(()) => Ok(true),
