@@ -66,6 +66,13 @@ test('461: one decimal size formatter and one duration formatter per language', 
   assert.equal(formatDuration(45.7), '46s');
 });
 
+test('506: the one duration formatter never rolls minutes over at 60', () => {
+  // The retired per-call rounding printed 60m at 3599s and 1h 60m at 7199s.
+  assert.equal(formatDuration(3599), '59m 59s');
+  assert.equal(formatDuration(7199), '1h 59m');
+  assert.equal(formatDuration(86399), '23h 59m');
+});
+
 test('462: stamps drop seconds and relative ages carry the absolute nearby', async () => {
   const common = await read('web/assets/admin-common.js');
   assert.match(common, /month: 'short',/);

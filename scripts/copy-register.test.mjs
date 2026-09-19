@@ -197,3 +197,14 @@ test('uploader failures speak to the sender, not about proofs and ranges (458)',
   assert.match(upload, /failed an upload check; retry the upload/);
   assert.doesNotMatch(upload, /unexpected range/, 'the internal range wording survives');
 });
+
+test('504: the browser refuses the same reserved list before hashing', async () => {
+  const upload = await read('../web/assets/upload.js');
+  // protocol/paths.rs refuses these case-insensitively at begin; the sender
+  // mirrors the list so the refusal costs nothing hashed.
+  assert.ok(upload.includes('/^\\.votport-(lease|workflows)$/i'), 'lease and workflows');
+  assert.ok(upload.includes('/^\\.vot-stage$/i'), 'vot-stage');
+  assert.ok(upload.includes('/^\\.vot-tenants\\.stage$/i'), 'tenant storage');
+  assert.ok(upload.includes('/^\\.vot-push-[0-9a-f]{32}$/'), 'push staging');
+  assert.ok(upload.includes('/^\\.vot-.*\\.(stage|journal)$/'), 'staging suffixes');
+});
