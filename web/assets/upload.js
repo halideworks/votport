@@ -2,6 +2,7 @@
 // streams proven ranges to the server. VOTPORT PROPRIETARY LICENSE.
 
 import { applyBranding } from '/assets/branding.js';
+import { nameHasForbiddenCharacter } from '/assets/outbound-download.js';
 import { appendObjectCard, appLink, copyToClipboard, fieldError, formatBytes, formatDuration } from '/assets/object-card.js';
 import { entryFiles, runUploadBatch } from '/assets/upload-entries.js';
 import {
@@ -330,11 +331,6 @@ function fail(message) {
 // ------------------------------------------------- portable path validation
 // Mirrors VOT's portable path profile (vot-manifest) so problems surface
 // before hashing starts. The server re-checks everything.
-
-const FORBIDDEN = new RegExp(
-  '[\\x00-\\x1f/\\\\<>:"|?*~\\u200c\\u200d\\u202a-\\u202e\\u2066-\\u2069\\ufeff]',
-  'u',
-);
 const utf8 = new TextEncoder();
 
 // Full Unicode case folding for the spellings toLowerCase leaves alone while
@@ -549,7 +545,7 @@ function validateComponent(component) {
   if (!component || utf8.encode(component).length > 255) {
     return 'name is empty or longer than 255 bytes';
   }
-  if (FORBIDDEN.test(component)) {
+  if (nameHasForbiddenCharacter(component)) {
     return 'name contains a character that does not travel well (\\ / < > : " | ? * ~ or control characters)';
   }
   if (component.endsWith('.') || component.endsWith(' ')) {

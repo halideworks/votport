@@ -418,7 +418,7 @@ impl Destinations {
 
     pub fn push_directory(&self, key: &str) -> Result<PathBuf, String> {
         self.check_live()?;
-        if key.len() != 32 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if !crate::auth::valid_hex(key, 32) {
             return Err("invalid push control key".to_owned());
         }
         self.root

@@ -150,3 +150,21 @@ test('the tray indicators separate failure from idle and show moved over total',
   assert.match(indicate, /Taskbar\.SetProgressValue\(hwnd, moved, total\)/);
   assert.match(indicate, /TaskbarState\.NoProgress/);
 });
+
+test('every link entry path admits only a bare http or https origin (audit finding 511)', async () => {
+  // The macOS and Windows shells parse votport:// links with their platform
+  // URL parser; the core's split_link must hold the same line for hand
+  // entered and stored links, because the base is what the transfer talks to.
+  const mac = await read('client/macos/Votport/VotportApp.swift');
+  assert.match(mac, /scheme == "https" \|\| scheme == "http", origin\.host != nil,/);
+  assert.match(mac, /origin\.path\.isEmpty \|\| origin\.path == "\/", origin\.query == nil,/);
+  assert.match(mac, /origin\.fragment == nil, origin\.user == nil, origin\.password == nil/);
+  const win = await read('client/windows/Votport/WebLink.cs');
+  assert.match(win, /parsed\.Scheme != "https" && parsed\.Scheme != "http"/);
+  assert.match(win, /parsed\.AbsolutePath != "" && parsed\.AbsolutePath != "\/"\)/);
+  assert.match(win, /parsed\.Query\.Length != 0 \|\| parsed\.Fragment\.Length != 0 \|\| parsed\.UserInfo\.Length != 0/);
+  const core = await read('client/core/src/api.rs');
+  assert.match(core, /fn bare_origin\(base: &str\) -> bool \{[\s\S]*reqwest::Url::parse\(base\)/);
+  assert.match(core, /matches!\(url\.scheme\(\), "http" \| "https"\)[\s\S]*url\.query\(\)\.is_none\(\)[\s\S]*url\.fragment\(\)\.is_none\(\)/);
+  assert.match(core, /!bare_origin\(base\)/);
+});

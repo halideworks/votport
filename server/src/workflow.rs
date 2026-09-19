@@ -206,6 +206,16 @@ pub fn valid_path(value: &str) -> bool {
             .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
+/// One admission policy for the names people type (port and route names,
+/// project and job labels): counted in characters, not UTF-8 bytes, with a
+/// non-blank requirement and control characters refused. These labels reach
+/// notification titles, where a newline would break the ntfy title request.
+pub fn admit_label(value: &str, limit: usize) -> bool {
+    !value.trim().is_empty()
+        && value.chars().count() <= limit
+        && value.chars().all(|ch| !ch.is_control())
+}
+
 fn is_zero(value: &u64) -> bool {
     *value == 0
 }
@@ -218,11 +228,7 @@ impl Project {
         policy == *other
     }
     pub fn validate(&self) -> Result<(), String> {
-        if !valid_id(&self.id)
-            || self.label.trim().is_empty()
-            || self.label.len() > 200
-            || !valid_path(&self.directory)
-        {
+        if !valid_id(&self.id) || !admit_label(&self.label, 200) || !valid_path(&self.directory) {
             return Err("project needs a valid ID, label and relative library directory".into());
         }
         if self.members.len() > 500
@@ -328,8 +334,7 @@ impl Project {
     pub fn validate_job(&self, request: &JobRequest, now: u64) -> Result<(), String> {
         if !valid_id(&request.operation_id)
             || request.project_id != self.id
-            || request.label.trim().is_empty()
-            || request.label.len() > 200
+            || !admit_label(&request.label, 200)
             || !(1..=365).contains(&request.expires_days)
             || request
                 .not_before
@@ -498,6 +503,29 @@ pub(crate) mod tests {
                 "{expected}: {actual}"
             );
         }
+    }
+
+    #[test]
+    fn labels_admit_chars_and_refuse_controls() {
+        // The shared admission for port and route names, project and job
+        // labels: characters not bytes, non-blank, no control characters.
+        assert!(admit_label("Final delivery", 200));
+        // Characters, not UTF-8 bytes: 200 two-byte characters fit.
+        assert!(admit_label("界".repeat(200).as_str(), 200));
+        assert!(!admit_label("界".repeat(201).as_str(), 200));
+        // A newline would reach the ntfy title request.
+        assert!(!admit_label("two\nlines", 200));
+        assert!(!admit_label("\u{9}", 200));
+        assert!(!admit_label("   ", 200));
+        assert!(!admit_label("", 200));
+        // The project and job label checks route through the helper.
+        let mut labelled = project();
+        labelled.label = "two\nlines".into();
+        assert!(labelled.validate().is_err());
+        let job = project();
+        let mut request = request();
+        request.label = "two\nlines".into();
+        assert!(job.validate_job(&request, 0).is_err());
     }
 
     #[test]

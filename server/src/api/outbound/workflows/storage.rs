@@ -108,8 +108,7 @@ pub(crate) fn receive_url(value: &str) -> Result<(String, String), String> {
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
-        || token.len() != 32
-        || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !crate::auth::valid_hex(token, 32)
     {
         return Err(error.into());
     }

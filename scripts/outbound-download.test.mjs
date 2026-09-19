@@ -296,6 +296,25 @@ test('sanitizes flattened unsafe and reserved filenames', () => {
   assert.equal(sanitizeFilename('../'), 'download');
 });
 
+test('the batch save shares the uploader refusal set (audit finding 509)', async () => {
+  // Zero-width, bidi and byte-order marks cannot be sent through the
+  // uploader; the batch save must not write them verbatim either.
+  assert.equal(sanitizeFilename('report\u202e.txt'), 'report_.txt');
+  assert.equal(sanitizeFilename('re\u200cport\u2066x\u2069.txt'), 're_port_x_.txt');
+  assert.equal(sanitizeFilename('rec\ufefford.mov'), 'rec_ord.mov');
+  const uploader = await readFile(new URL('../web/assets/upload.js', import.meta.url), 'utf8');
+  assert.match(
+    uploader,
+    /import \{ nameHasForbiddenCharacter \} from '\/assets\/outbound-download\.js';/,
+  );
+  assert.doesNotMatch(uploader, /const FORBIDDEN = new RegExp/);
+  const download = await readFile(
+    new URL('../web/assets/outbound-download.js', import.meta.url),
+    'utf8',
+  );
+  assert.match(download, /const FORBIDDEN_SOURCE =/);
+});
+
 test('deduplicates case-insensitive names before extensions', () => {
   assert.deepEqual(
     dedupeFilenames(['dir/report.txt', 'report.txt', 'REPORT.TXT', 'report (2).txt']),
