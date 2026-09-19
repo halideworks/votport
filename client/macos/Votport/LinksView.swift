@@ -46,7 +46,7 @@ struct LinksView: View {
                     .frame(width: 160)
             }
             HStack(alignment: .bottom) {
-                NumberField("Closes after", unit: "days", placeholder: "Never", text: $expiresDays)
+                NumberField("Expires after", unit: "days", placeholder: "Never", text: $expiresDays)
                 NumberField("Accepts up to", unit: "GB", placeholder: "Port default", text: $maxGigabytes, decimal: true)
                 Button("Create request link") { issue() }
                     .buttonStyle(.borderedProminent)

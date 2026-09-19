@@ -295,7 +295,7 @@ async function refreshJobs(more = false, background = false, discardEdits = fals
       leg.append(node('p', `${name}: ${status}`, result?.error ? 'error' : 'connection-meta'));
       const cancelled = job.state === 'cancelled' || Number.isFinite(job.checks.source_revoked_at) || (['retiring', 'retired'].includes(job.state) && job.checks.retired_from === 'cancelled');
       if (job.state !== 'suspended' && (revoked || (receipt && cancelled))) {
-        leg.append(node('p', revoked?.state === 'acknowledged' ? 'Revocation acknowledged by the destination port.' : `Revocation awaiting destination acknowledgment.${revoked?.error ? ` Reason: ${revoked.error}.` : ''}${revoked?.retry_at ? ` Next attempt ${formatWhen(revoked.retry_at)}.` : ''}`, 'field-help'));
+        leg.append(node('p', revoked?.state === 'acknowledged' ? 'Revocation acknowledged by the destination port.' : `Revocation awaiting destination acknowledgement.${revoked?.error ? ` Reason: ${revoked.error}.` : ''}${revoked?.retry_at ? ` Next attempt ${formatWhen(revoked.retry_at)}.` : ''}`, 'field-help'));
       }
       if (receipt) leg.append(button('Download custody evidence', 'tiny ghost', () => download(`trade-route-${job.id}-${id}.json`, {
         format: 'votport-route-evidence-v1', receipt, ancestors: [...(job.checks.source_ancestry || []), ...(job.checks.source_receipt ? [job.checks.source_receipt] : [])], revocation: revoked?.acknowledgement || null,
@@ -307,7 +307,7 @@ async function refreshJobs(more = false, background = false, discardEdits = fals
     if (nextStep) card.append(node('p', nextStep, 'workflow-next'));
     if (job.error) card.append(node('p', job.error, 'error'));
     const detail = document.createElement('details'); detail.append(node('summary', 'Package and recipient verification'));
-    detail.append(node('p', job.manifest ? `Manifest: ${job.manifest}` : 'The manifest will be available after preparation.', 'mono'));
+    detail.append(node('p', job.manifest ? `Delivery fingerprint: ${job.manifest}` : 'The delivery fingerprint will be available after preparation.', 'mono'));
     const evidence = node('div', '', 'evidence-records'); let after = 0;
     const load = button('Load recipient evidence', 'ghost', () => guard(async () => {
       load.disabled = true;
@@ -327,7 +327,7 @@ async function refreshJobs(more = false, background = false, discardEdits = fals
     const actions = node('div', '', 'actions');
     if (url) actions.append(button('Copy delivery link', '', (element) => copyToClipboard(element, url)));
     if (job.state === 'awaiting_approval' && canApprove) actions.append(button('Approve delivery', '', () => guard(async () => {
-      if (await confirmModal('Approve delivery', `Release “${job.request.label}” with manifest ${job.manifest}?`, 'Approve delivery')) {
+      if (await confirmModal('Approve delivery', `Release “${job.request.label}” with delivery fingerprint ${job.manifest} (a 64-character hash of the files)?`, 'Approve delivery')) {
         await api(`/api/workflows/jobs/${job.id}`, { method: 'POST', body: JSON.stringify({ action: 'approve', manifest: job.manifest }) }); await refreshJobs();
       }
     })));
@@ -427,7 +427,7 @@ async function loadEvents() {
       content.append(node('strong', event.kind.replaceAll('_', ' ')), node('p', `${formatWhen(event.created_at)}${event.grant_id ? ` · Delivery ${event.grant_id}` : ''}`, 'muted'));
       row.append(content, node('span', `#${event.id}`, 'mono')); $('workflow-events').append(row);
     }
-    if (!$('workflow-events').children.length) $('workflow-events').append(empty('No activity yet', 'Delivery actions and recipient acknowledgments will appear here.'));
+    if (!$('workflow-events').children.length) $('workflow-events').append(empty('No activity yet', 'Delivery actions and recipient acknowledgements will appear here.'));
     $('workflow-events-export').disabled = !eventPage.length;
     $('workflow-events-next').textContent = page.events.length ? 'Load more activity' : 'Check for new activity';
   } finally { loadingEvents = false; $('workflow-events-next').disabled = false; }

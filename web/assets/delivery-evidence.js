@@ -97,7 +97,7 @@ async function manifestDigest(files) {
   }
   parts.push(integer(files.length));
   const length = parts.reduce((sum, part) => sum + part.length, 0);
-  if (length > 64 * 1024 * 1024) throw new Error('Use the desktop app to acknowledge this very large manifest.');
+  if (length > 64 * 1024 * 1024) throw new Error('Use the desktop app to acknowledge a delivery this large.');
   const bytes = new Uint8Array(length);
   let offset = 0;
   for (const part of parts) { bytes.set(part, offset); offset += part.length; }
@@ -167,14 +167,16 @@ export function initDeliveryEvidence(getMetadata, savedNames) {
       const accepted = records.find((item) => item.evidence.kind === 'accepted' && item.evidence.authorization.signature === record.evidence.authorization.signature);
       const row = document.createElement('div'); row.className = 'verification-record';
       const manifest = document.createElement('span'); manifest.className = 'mono';
-      manifest.textContent = `Manifest ${record.evidence.authorization.challenge.manifest}`;
+      manifest.textContent = `Delivery fingerprint ${record.evidence.authorization.challenge.manifest}`;
       const result = document.createElement('p'); result.textContent = `Files verified on this device. ${record.status === 'recorded' ? 'Verification reported to the sender.' : 'Verification report: ' + record.status + '.'} ${accepted ? (accepted.status === 'recorded' ? 'Delivery accepted and reported to the sender.' : 'Delivery accepted on this device; report: ' + accepted.status + '.') : 'Ready for your acceptance.'}`;
       const expires = document.createElement('p'); expires.className = 'field-help';
       const stale = record.evidence.authorization.challenge.expires_at <= Date.now() / 1000;
       expires.textContent = stale
         ? `Acceptance authorization expired ${new Date(record.evidence.authorization.challenge.expires_at * 1000).toLocaleString()}; verify the saved files again to request a fresh one.`
         : `Acceptance authorization expires ${new Date(record.evidence.authorization.challenge.expires_at * 1000).toLocaleString()}.`;
-      const detail = document.createElement('details'), caption = document.createElement('summary'); caption.textContent = 'Signed delivery fingerprint'; detail.append(caption, manifest); row.append(result, expires, detail);
+      const detail = document.createElement('details'), caption = document.createElement('summary'); caption.textContent = 'Signed delivery fingerprint';
+      const fingerprintHelp = document.createElement('p'); fingerprintHelp.className = 'field-help'; fingerprintHelp.textContent = 'A delivery fingerprint is a 64-character hash of the exact files, so everyone can confirm the same files were reviewed.';
+      detail.append(caption, manifest, fingerprintHelp); row.append(result, expires, detail);
       if (!accepted) {
         const button = document.createElement('button'); button.type = 'button'; button.textContent = 'Accept verified delivery'; button.disabled = stale;
         button.onclick = () => run(async () => {

@@ -27,7 +27,7 @@
           <NumberBox x:Name="ExpiresBox" PlaceholderText="Never" Minimum="1"
               SpinButtonPlacementMode="Inline" Width="190">
             <NumberBox.Header>
-              <TextBlock Text="Closes after (days)" FontSize="12" Foreground="{ThemeResource VotMutedBrush}" />
+              <TextBlock Text="Expires after (days)" FontSize="12" Foreground="{ThemeResource VotMutedBrush}" />
             </NumberBox.Header>
           </NumberBox>
           <NumberBox x:Name="CapBox" Grid.Column="1" PlaceholderText="Port default"

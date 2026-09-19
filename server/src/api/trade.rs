@@ -222,7 +222,7 @@ pub async fn invite(
         .ok_or_else(ApiError::not_found)?;
     if !matches!(body.expires_in, 3600 | 86400 | 604800) {
         return Err(unprocessable(
-            "choose an invitation expiry of one hour, one day or seven days",
+            "choose an expiry of one hour, one day or seven days",
         ));
     }
     let expires = now() + body.expires_in;

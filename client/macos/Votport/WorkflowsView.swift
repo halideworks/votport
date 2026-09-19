@@ -64,7 +64,7 @@ struct WorkflowsView: View {
                         GroupBox {
                             VStack(alignment: .leading, spacing: 8) {
                                 Text("\(job.label) · \(job.project) · \(human(job.state))")
-                                if let manifest = job.manifest { Text("Manifest: \(manifest)").font(Type.monoBody).textSelection(.enabled) }
+                                if let manifest = job.manifest { Text("Delivery fingerprint: \(manifest)").font(Type.monoBody).textSelection(.enabled) }
                                 if job.received { Text("Incoming reception workflow").font(Type.caption) }
                                 ForEach(job.destinations, id: \.self) { Text($0).font(Type.caption) }
                                 if job.url != nil && job.state != "ready" { Text("Local download link released; destination copies are pending.").font(Type.caption) }
@@ -74,7 +74,7 @@ struct WorkflowsView: View {
                                 if let error = job.error { Text(error).foregroundStyle(Tokens.danger) }
                                 HStack {
                                     if let url = job.url { Button("Copy download link") { copy(url) } }
-                                    if job.state == "awaiting_approval" { Button("Approve this manifest") { confirmation = Confirmation(id: job.id, action: "approve", manifest: job.manifest) } }
+                                    if job.state == "awaiting_approval" { Button("Approve this delivery") { confirmation = Confirmation(id: job.id, action: "approve", manifest: job.manifest) } }
                                     if ["failed", "retrying"].contains(job.state) { Button("Retry job") { change(job.id, "retry", job.manifest) } }
                                     if !["cancelled", "retired", "retiring"].contains(job.state) { Button("Cancel job") { confirmation = Confirmation(id: job.id, action: "cancel", manifest: job.manifest) } }
                                 }.disabled(busy)
@@ -84,7 +84,7 @@ struct WorkflowsView: View {
                     if cursor != nil { Button("Load more jobs") { loadJobs(more: true) }.disabled(busy) }
                 }
                 Text("Recipient verification and acceptance").font(Type.sans(18, .semibold, relativeTo: .headline))
-                Text("Accept a delivery only after reviewing the verified files. Acceptance signs the exact manifest shown here.")
+                Text("Accept a delivery only after reviewing the verified files. Acceptance signs the delivery fingerprint shown here: a 64-character hash of the exact files.")
                 HStack {
                     Button("Copy this device's public key") { run({ try recipientDeviceKey() }) { copy($0) } }
                     Button("Retry pending reports") { run({ _ = retryEvidence(); return deliveryVerifications() }) { records = $0 } }
@@ -94,7 +94,7 @@ struct WorkflowsView: View {
                     GroupBox {
                         VStack(alignment: .leading, spacing: 8) {
                             Text("\(record.server) · Delivery \(record.grantId)")
-                            Text("Manifest: \(record.manifest)").font(Type.monoBody).textSelection(.enabled)
+                            Text("Delivery fingerprint: \(record.manifest)").font(Type.monoBody).textSelection(.enabled)
                             Text("Verification: \(human(record.verificationStatus)) · Acceptance: \(human(record.acceptanceStatus))")
                             Text("Authorization expires \(Date(timeIntervalSince1970: Double(record.expiresAt)).formatted())").font(Type.caption)
                             if record.acceptanceStatus == "not_accepted" {
@@ -116,7 +116,7 @@ struct WorkflowsView: View {
             }
             Button("Back", role: .cancel) { confirmation = nil }
         } message: { action in
-            Text(action.action == "cancel" ? "Stop downloads here and request revocation at connected ports? Downloaded files and independent copies remain." : "Confirm you reviewed and \(action.action) manifest \(action.manifest ?? "")?")
+            Text(action.action == "cancel" ? "Stop downloads here and request revocation at connected ports? Downloaded files and independent copies remain." : "Confirm you reviewed the files and \(action.action) this delivery (fingerprint \(action.manifest ?? ""))?")
         }
     }
 
