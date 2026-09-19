@@ -34,8 +34,15 @@ use crate::identity::{state_dir, write_private};
 const FILE: &str = "watches.json";
 /// The subfolder a shipped drop is moved into.
 pub const SHIPPED: &str = "shipped";
-/// How long a drop must hold still before it ships.
-pub const SETTLE: Duration = Duration::from_secs(10);
+/// How long a drop must hold still before it ships. A writer that pauses
+/// between two writes looks exactly like a finished one, so the window has
+/// to outlast that pause: two appends 15 s apart split the previous 10 s
+/// window and shipped as two half-drops. The live-confirmed pause is the
+/// floor; the headroom keeps a slower pause from landing on the boundary.
+/// ponytail: a pause longer than the window still splits; telling a live
+/// writer from a finished one needs open-handle detection, not more
+/// polling.
+pub const SETTLE: Duration = Duration::from_secs(30);
 /// How often a watched folder is scanned.
 pub const POLL: Duration = Duration::from_secs(2);
 
@@ -556,6 +563,17 @@ fn release_watch(watch_id: &str) {
     }
 }
 
+/// Whether `path` sits at the top of a watched folder, as a watch drop
+/// does: a resumed send of such a path parks it the way [`ship`] does,
+/// so the next watch run does not ship what the run delivered.
+pub(crate) fn is_watched_drop(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let dir = parent.to_string_lossy().into_owned();
+    load().iter().any(|stored| stored.dir == dir)
+}
+
 /// The link and password of a watch, for the send.
 pub(crate) fn credentials(watch_id: &str) -> Result<(String, Option<String>)> {
     load()
@@ -1020,6 +1038,20 @@ mod tests {
             handed.as_ref(),
         );
         assert_eq!(handed.0.lock().unwrap().len(), 2);
+    }
+
+    /// The live confirmation of the settle defect: two 1 MiB appends
+    /// 15 s apart let the previous 10 s window settle the first half while
+    /// the writer was still pausing, and the drop shipped twice. The hold
+    /// and age rules can only cover a pause the window outlasts, so the
+    /// window must stay past the live-confirmed one.
+    #[test]
+    fn the_settle_window_outlasts_the_live_confirmed_append_pause() {
+        let pause = Duration::from_secs(15);
+        assert!(
+            SETTLE > pause,
+            "a {pause:?} pause between appends must not settle as a finished drop"
+        );
     }
 
     fn watch_in(dir: &Path) -> Stored {
