@@ -348,6 +348,12 @@ pub fn admit_dest(dest: &str) -> Result<String, String> {
                 "destination segment {component:?}: use letters, digits, '-', '_', '.', ' '"
             ));
         }
+        // Audit finding 512: a Windows-exported SMB3 receive tree refuses
+        // device names and strips trailing dots, so the configured folder
+        // would silently not be the one created. The portable profile
+        // decides per segment.
+        vot_manifest::PackagePath::portable([component])
+            .map_err(|_| format!("destination segment {component:?} is not portable; rename it"))?;
         parts.push(component);
     }
     Ok(parts.join("/"))
@@ -679,7 +685,13 @@ mod tests {
         assert!(admit_component(".vot-notes.txt", true).is_ok());
         assert!(admit_component(TENANT_STORAGE_DIR, true).is_err());
         assert!(admit_component(".VOT-TENANTS.STAGE", true).is_err());
-        assert!(admit_component(".VOT-TENANTſ.STAGE", true).is_err());
+        // Audit finding 514: the tenant reservation folds ASCII case only,
+        // so a long-s variant never matches it. This refusal comes from the
+        // non-ASCII hidden-name rule; pin that rule by its message so a
+        // mutant deleting it no longer survives.
+        assert!(admit_component(".VOT-TENANTſ.STAGE", true)
+            .unwrap_err()
+            .contains("non-ASCII hidden names"));
         assert!(admit_component("VOTTEN~1", true).is_err());
         for name in [
             "report.vot-receipt",
@@ -715,6 +727,27 @@ mod tests {
         assert!(admit_dest("a/../b").is_err());
         assert!(admit_dest(".hidden").is_err());
         assert!(admit_dest("a//b").is_err());
+    }
+
+    #[test]
+    fn dest_refuses_segments_a_windows_share_strips_or_refuses() {
+        // Audit finding 512: device names are refused outright and trailing
+        // dots (which SMB3 exports strip) are refused before admission.
+        for dest in [
+            "con",
+            "clients/con",
+            "notes.",
+            "clients/notes.",
+            "COM1",
+            "nul.txt",
+        ] {
+            assert!(
+                admit_dest(dest).unwrap_err().contains("is not portable"),
+                "{dest:?}"
+            );
+        }
+        assert_eq!(admit_dest("notes").unwrap(), "notes");
+        assert_eq!(admit_dest("notes backup").unwrap(), "notes backup");
     }
 
     #[test]
