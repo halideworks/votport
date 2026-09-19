@@ -1843,7 +1843,7 @@ pub async fn delete_tenant(
     use crate::store::TenantRemoval;
     let row_deleted = match app.store.remove_tenant(&key) {
         Ok(TenantRemoval::HasRoutes) => {
-            return Err(ApiError::new(StatusCode::CONFLICT, "cancel this tenant's trade routes and wait for destination acknowledgments before deleting it"));
+            return Err(ApiError::new(StatusCode::CONFLICT, "cancel this tenant's trade routes and wait for destination acknowledgements before deleting it"));
         }
         Ok(TenantRemoval::Deleted) => true,
         Ok(TenantRemoval::HasLinks) => {
@@ -3115,7 +3115,7 @@ pub async fn check_receiving_storage(
             let nas = storage_is_nas(Some(&request.storage));
             if nas && (!request.enable || !request.stable_acknowledgments || !request.private_namespace) {
                 return Err(ApiError::new(StatusCode::UNPROCESSABLE_ENTITY,
-                    "Review the NAS server's stable acknowledgments and private namespace before enabling receiving."));
+                    "Review the NAS server's stable acknowledgements and private namespace before enabling receiving."));
             }
             if app.lease_lost.load(std::sync::atomic::Ordering::Relaxed) || app.sessions.total() != 0 {
                 return Err(conflict("Receiving ownership changed or transfers are active. Restart before reconfiguring storage."));

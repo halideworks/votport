@@ -44,7 +44,7 @@
       <main id="main-content" tabindex="-1">
       <div class="page-heading"><div><p class="eyebrow">Managed delivery</p><div class="field-heading"><h1>Deliveries</h1><button type="button" class="hint-button" aria-label="Help about deliveries" data-hint="A project holds reusable rules. Each delivery follows those rules for file checks, approvals and storage connections. Start with a project, then create a delivery.">?</button></div><p class="page-lead">Prepare, approve and track deliveries using reusable project rules.</p></div><button id="workflow-new" type="button">New delivery</button></div>
       <nav class="page-tabs" aria-label="Page sections">
-        <a href="#jobs" aria-current="page" data-hint="Track each delivery from preparation through release and recipient acceptance.">Delivery jobs</a><a href="#projects" data-hint="Set reusable checks, team access and storage connections for a library folder.">Projects</a><a href="#webhooks" data-hint="Send signed delivery events to another application.">Webhooks</a><a href="#activity" data-hint="Review the signed history of delivery actions and recipient acknowledgments.">Activity</a>
+        <a href="#jobs" aria-current="page" data-hint="Track each delivery from preparation through release and recipient acceptance.">Delivery jobs</a><a href="#projects" data-hint="Set reusable checks, team access and storage connections for a library folder.">Projects</a><a href="#webhooks" data-hint="Send signed delivery events to another application.">Webhooks</a><a href="#activity" data-hint="Review the signed history of delivery actions and recipient acknowledgements.">Activity</a>
       </nav>
       <p id="workflow-error" class="error feedback" role="alert" hidden></p>
       <p id="workflow-notice" class="feedback" role="status" hidden></p>
@@ -59,7 +59,7 @@
           <div id="workflow-metadata" class="grid"></div>
           <fieldset id="workflow-recipients"><legend>Recipients</legend><button type="button" class="hint-button" aria-label="Help about enrolled recipients" data-hint="An enrolled recipient proves access using a device key, not email alone. Ask them for the public key from the browser or desktop app they will use. With no enrolled recipients, anyone holding the link can download.">?</button></fieldset>
 <div class="form-advanced-with-hint"><details class="form-advanced"><summary>Timing, source and notifications</summary>          <fieldset><legend>Timing</legend><div class="grid grid-three">
-            <label>Link expires after (days)<input id="workflow-days" type="number" min="1" max="365" value="7" required /></label>
+            <label>Expires after (days)<input id="workflow-days" type="number" min="1" max="365" value="7" required /></label>
             <label>Scheduled start<input id="workflow-start" type="datetime-local" /><span class="field-help">Leave blank to start now. Times use your time zone.</span></label>
             <label>Acceptance deadline<input id="workflow-deadline" type="datetime-local" /><span class="field-help">Optional. Record a missed deadline if recipients have not accepted.</span></label>
           </div></fieldset>

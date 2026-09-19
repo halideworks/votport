@@ -142,12 +142,12 @@ try {
   await receiving.locator('#trade-endpoint-form button[type=submit]').click(); await receiving.locator('#confirm-ok').click();
   await receiving.locator('#trade-endpoints').getByRole('heading', { name: endpointName }).waitFor();
   const endpointCard = receiving.locator('#trade-endpoints > .card').filter({ has: receiving.getByRole('heading', { name: endpointName, exact: true }) });
-  await endpointCard.getByText('Invitation expiry and preapproval', { exact: true }).click();
-  await endpointCard.getByLabel('Invitation expiry', { exact: true }).selectOption('3600');
+  await endpointCard.getByText('Invitation options and preapproval', { exact: true }).click();
+  await endpointCard.getByLabel('Expires after', { exact: true }).selectOption('3600');
   const refreshed = receiving.waitForResponse((response) => response.url().endsWith('/api/trade-routes'));
   await receiving.click('#trade-refresh'); await refreshed;
   await receiving.waitForLoadState('networkidle');
-  assert.equal(await endpointCard.getByLabel('Invitation expiry', { exact: true }).inputValue(), '3600', 'Refresh preserves unfinished invitation options');
+  assert.equal(await endpointCard.getByLabel('Expires after', { exact: true }).inputValue(), '3600', 'Refresh preserves unfinished invitation options');
   await endpointCard.getByRole('button', { name: 'Create invitation', exact: true }).click();
   await receiving.locator('#trade-invitation-result').waitFor({ state: 'visible' });
   const invitation = await receiving.locator('#trade-issued-invitation').inputValue();

@@ -125,7 +125,7 @@ async function refresh() {
     if (admin) {
       const form = node('form'), key = input('text'); form.setAttribute('data-unsaved', ''); key.maxLength = 64; key.placeholder = 'Optional: exact sending port fingerprint';
       const expiry = select([['3600', '1 hour'], ['86400', '24 hours'], ['604800', '7 days']], '86400');
-      const advanced = node('details', '', 'trade-advanced'); advanced.append(node('summary', 'Invitation expiry and preapproval'), field('Invitation expiry', expiry), field('Preapproved sender fingerprint', key), node('p', 'Leave the fingerprint blank to review and approve the sender after they connect. Enter a verified fingerprint only if you want that port approved automatically.', 'field-help'));
+      const advanced = node('details', '', 'trade-advanced'); advanced.append(node('summary', 'Invitation options and preapproval'), field('Expires after', expiry), field('Preapproved sender fingerprint', key), node('p', 'Leave the fingerprint blank to review and approve the sender after they connect. Enter a verified fingerprint only if you want that port approved automatically.', 'field-help'));
       form.append(node('p', 'The sender will need your approval after accepting this invitation.', 'field-help'), advanced);
       const submit = node('button', 'Create invitation'); submit.type = 'submit'; form.append(submit);
       form.addEventListener('submit', (event) => { event.preventDefault(); if (form.inert) return; form.inert = true;
