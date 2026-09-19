@@ -297,7 +297,7 @@ async function refreshJobs(more = false, background = false, discardEdits = fals
       if (job.state !== 'suspended' && (revoked || (receipt && cancelled))) {
         leg.append(node('p', revoked?.state === 'acknowledged' ? 'Revocation acknowledged by the destination port.' : `Revocation awaiting destination acknowledgement.${revoked?.error ? ` Reason: ${revoked.error}.` : ''}${revoked?.retry_at ? ` Next attempt ${formatWhen(revoked.retry_at)}.` : ''}`, 'field-help'));
       }
-      if (receipt) leg.append(button('Download custody evidence', 'tiny ghost', () => download(`trade-route-${job.id}-${id}.json`, {
+      if (receipt) leg.append(button('Download route evidence', 'tiny ghost', () => download(`trade-route-${job.id}-${id}.json`, {
         format: 'votport-route-evidence-v1', receipt, ancestors: [...(job.checks.source_ancestry || []), ...(job.checks.source_receipt ? [job.checks.source_receipt] : [])], revocation: revoked?.acknowledgement || null,
       })));
       card.append(leg);

@@ -222,8 +222,9 @@ function routeCard(route, savedEditor) {
       const policy = notificationEditor({ events: tradeEvents, policy: route.notifications });
       details.destroy = () => policy.destroy();
       const state = select([...(route.state === 'pending_approval' ? [['pending_approval', 'Keep pending approval']] : []), ...(route.state !== 'revoked' ? [['active', route.state === 'pending_approval' && route.direction === 'incoming' ? 'Approve route' : 'Active'], ['paused', 'Paused']] : []), ['revoked', 'Revoked']], route.state);
-      const active = select([['finish', 'Let admitted transfers finish'], ['cancel', 'Cancel admitted transfers']], route.cancel_active ? 'cancel' : 'finish');
-      const inFlight = field('When pausing or revoking', active); inFlight.hidden = !['paused', 'revoked'].includes(state.value);
+      const active = select([['finish', 'Let them finish'], ['cancel', 'Cancel them']], route.cancel_active ? 'cancel' : 'finish');
+      const inFlight = node('div'); inFlight.append(field('Transfers already under way', active), node('p', 'Cancelling discards transfers that have not finished; no partial data is published.', 'field-help'));
+      inFlight.hidden = !['paused', 'revoked'].includes(state.value);
       state.onchange = () => { inFlight.hidden = !['paused', 'revoked'].includes(state.value); };
       form.setAttribute('data-unsaved', '');
       form.append(field('Permission on this port', state), inFlight, policy.element);

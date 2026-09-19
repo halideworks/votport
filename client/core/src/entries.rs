@@ -150,17 +150,21 @@ mod tests {
                 "reserved for signed receipts",
             ),
             (".vot-receipt", true, "reserved for signed receipts"),
-            (".VOTPORT-LEASE", true, "reserved for the instance lease"),
-            (".vot-tenants.stage", true, "reserved for tenant storage"),
+            (".VOTPORT-LEASE", true, "reserved for the port's own files"),
+            (
+                ".vot-tenants.stage",
+                true,
+                "reserved for the port's own files",
+            ),
             (
                 ".vot-push-00112233445566778899aabbccddeeff",
                 true,
-                "reserved for votport staging",
+                "reserved for the port's own files",
             ),
             (
                 ".vot-anything.journal",
                 true,
-                "reserved for votport staging",
+                "reserved for the port's own files",
             ),
         ];
         for (path, allow_hidden, needle) in cases {

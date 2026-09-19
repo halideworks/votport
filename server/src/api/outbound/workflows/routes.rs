@@ -287,14 +287,13 @@ pub(super) async fn export(app: &Arc<App>, job: &Job, config: &storage::Storage)
     visited.push(app.signer.public_hex.clone());
     let mut metadata = job.request.metadata.clone();
     if trade.is_some() {
-        let allowed: Vec<String> =
-            serde_json::from_value(job.checks["trade_routes"][&config.id]["metadata_keys"].clone())
-                .map_err(|_| {
-                    conflict(
-                        "this job's saved metadata allowlist is missing; submit a new delivery"
-                            .into(),
-                    )
-                })?;
+        let keys = job.checks["trade_routes"][&config.id]["metadata_keys"].clone();
+        let allowed: Vec<String> = serde_json::from_value(keys).map_err(|_| {
+            conflict(
+                "this job's saved accepted metadata fields are missing; submit a new delivery"
+                    .into(),
+            )
+        })?;
         if ancestry.iter().any(|receipt| {
             receipt
                 .document
@@ -304,7 +303,7 @@ pub(super) async fn export(app: &Arc<App>, job: &Job, config: &storage::Storage)
                 .keys()
                 .any(|key| !allowed.contains(key))
         }) {
-            return Err(conflict("custody ancestry contains metadata outside this route's allowlist; forwarding held".into()));
+            return Err(conflict("a receipt from an earlier port carries metadata fields this route does not accept; forwarding held".into()));
         }
         metadata.retain(|key, _| allowed.contains(key));
     }

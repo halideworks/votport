@@ -10,6 +10,13 @@
 // 453: the VOT fetch block stays a plain purpose sentence plus limitation.
 // 454: the 64-character hash reads "Delivery fingerprint", with an
 // explanation, never "Manifest".
+// 455: the pause or revoke control speaks of "Transfers already under way"
+// with plain choices and a discard hint, never "admitted".
+// 456: operator copy avoids "custody evidence", "custody ancestry" and
+// "allowlist"; route evidence and accepted metadata fields instead.
+// 457: reserved-name refusals stay plain on both ends and never name server
+// internals (tenant storage, instance lease, staging files).
+// 458: uploader failures speak to the sender, never about proofs and ranges.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
@@ -145,4 +152,48 @@ test('the 64-character hash reads Delivery fingerprint, with an explanation (454
   assert.match(swift, /Approve this delivery/);
   assert.match(swift, /Confirm you reviewed the files and \\\(action\.action\) this delivery \(fingerprint/);
   assert.doesNotMatch(swift, /Manifest:|Approve this manifest|\(action\.action\) manifest/);
+});
+
+test('pause or revoke control offers plain choices for transfers under way (455)', async () => {
+  const page = await read('../web/assets/page-trade-routes.js');
+  assert.match(page, /field\('Transfers already under way', active\)/);
+  assert.match(page, /\['finish', 'Let them finish'\]/);
+  assert.match(page, /\['cancel', 'Cancel them'\]/);
+  assert.match(page, /Cancelling discards transfers that have not finished; no partial data is published\./);
+  assert.doesNotMatch(page, /admitted/i, 'the admitted wording survives');
+});
+
+test('operator copy avoids custody and allowlist jargon (456)', async () => {
+  const receive = await read('../web/assets/page-receive.js');
+  const workflows = await read('../web/assets/page-workflows.js');
+  assert.match(receive, /Could not load route evidence/);
+  assert.doesNotMatch(receive, /custody evidence/i);
+  assert.match(workflows, /Download route evidence/);
+  assert.doesNotMatch(workflows, /custody evidence/i);
+  const routes = await read('../server/src/api/outbound/workflows/routes.rs');
+  assert.match(routes, /accepted metadata fields are missing; submit a new delivery/);
+  assert.match(routes, /a receipt from an earlier port carries metadata fields this route does not accept; forwarding held/);
+  assert.doesNotMatch(routes, /custody ancestry|allowlist/, 'custody and allowlist jargon survives in route copy');
+  const trade = await read('../server/src/store/trade.rs');
+  assert.match(trade, /invalid endpoint name, category or accepted metadata fields/);
+  assert.doesNotMatch(trade, /metadata allowlist/);
+});
+
+test('reserved-name refusals stay plain on both ends (457)', async () => {
+  const paths = await read('../protocol/paths.rs');
+  assert.match(paths, /name is reserved for the port's own files/);
+  assert.doesNotMatch(
+    paths,
+    /reserved for tenant storage|reserved for the instance lease|reserved for votport staging files/,
+    'a refusal still names server internals',
+  );
+  const upload = await read('../web/assets/upload.js');
+  assert.match(upload, /this name is reserved for the port's own files/);
+  assert.doesNotMatch(upload, /reserved for the server/);
+});
+
+test('uploader failures speak to the sender, not about proofs and ranges (458)', async () => {
+  const upload = await read('../web/assets/upload.js');
+  assert.match(upload, /failed an upload check; retry the upload/);
+  assert.doesNotMatch(upload, /unexpected range/, 'the internal range wording survives');
 });
