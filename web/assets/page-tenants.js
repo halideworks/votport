@@ -338,8 +338,13 @@ function renderTenant(tenant, usage) {
 
 function grantText(grants) {
   if (!Array.isArray(grants) || !grants.length) return 'no grants';
+  // Grants read as words, never the wire form "acme/auditor"; an admin grant
+  // on a tenant names the tenant admin role (audit item 445).
   return grants
-    .map((grant) => `${grant.tenant === '' ? 'default' : grant.tenant}/${grant.role}`)
+    .map((grant) => {
+      const role = grant.role === 'admin' && grant.tenant !== '' ? 'tenant admin' : grant.role;
+      return grant.tenant === '' ? role : `${grant.tenant} ${role}`;
+    })
     .join(', ');
 }
 

@@ -40,8 +40,8 @@ function showError(message) {
 function reportIgnored(count) {
   showError(
     count === 1
-      ? 'One extra file was ignored; only a file and its receipt are checked.'
-      : `${count} extra files were ignored; only a file and its receipt are checked.`,
+      ? 'One extra file was ignored; only a file and its receipt are verified.'
+      : `${count} extra files were ignored; only a file and its receipt are verified.`,
   );
 }
 
@@ -92,7 +92,7 @@ function takeFiles(files) {
 
 function setChecking(active) {
   checking = active;
-  $('check').textContent = active ? 'Checking…' : 'Check receipt';
+  $('check').textContent = active ? 'Verifying…' : 'Verify receipt';
   renderSlots();
 }
 
@@ -185,7 +185,7 @@ async function check() {
 async function runCheck() {
   const key = await receiptKey;
   if (!key) {
-    showError('This server’s receipt key is unavailable. Reload the page and try again.');
+    showError('This port’s receipt key is unavailable. Reload the page and try again.');
     return;
   }
   wasmReady ??= init();
@@ -206,7 +206,7 @@ async function runCheck() {
     showError(
       error?.code === ErrorCode.Malformed
         ? 'This is not a vot-receipt.'
-        : 'This receipt was not signed by the receipt key this server publishes.',
+        : 'This receipt was not signed by the receipt key this port publishes.',
     );
     return;
   }
@@ -223,7 +223,7 @@ async function runCheck() {
       file: sidecarFile.name,
       bytes: signedLength,
       observedAt: receipt.observedAt,
-      next: 'This receipt carries this server’s signature. Pick the file too if you also want its bytes checked.',
+      next: 'This receipt carries this port’s signature. Pick the file too if you also want its bytes verified.',
     });
     return;
   }

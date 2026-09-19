@@ -1331,7 +1331,7 @@ if (refusedShare.status() !== 403) throw new Error("browse-only token created a 
 const agentCard = page.locator("#automation-tokens .card").filter({ has: page.getByRole("heading", { name: `browser agent ${run}`, exact: true }) });
 await agentCard.getByRole("button", { name: "Revoke", exact: true }).click();
 await page.click("#confirm-ok");
-await agentCard.locator(".badge").filter({ hasText: "revoked" }).waitFor();
+await agentCard.locator(".badge").filter({ hasText: "Revoked" }).waitFor();
 const issuedTokenCards = await page.locator("#automation-tokens .card").count();
 await page.waitForFunction((count) => document.getElementById("automation-token-status").textContent
   === `${count} automation token${count === 1 ? "" : "s"} issued.`, issuedTokenCards);

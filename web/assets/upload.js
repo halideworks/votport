@@ -43,7 +43,7 @@ async function reloadIfServerUpdated() {
   try {
     const info = await apiJson(`/api/r/${token}`);
     if (info.web_build && info.web_build !== webBuild) {
-      $('subtitle').textContent = 'The site was updated. Reloading to resume…';
+      $('subtitle').textContent = 'The port was updated. Reloading to resume…';
       reloading = true;
       window.location.reload();
       // The page is going away; never let the caller carry on with old code.

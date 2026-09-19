@@ -284,12 +284,12 @@ const NAV_ITEMS = [
   ['receive', '/receive', 'Receive', 'Invite someone to ship files to this port.'],
   ['deliver', '/deliver', 'Deliver', 'Share files with a private delivery link.'],
   ['workflows', '/workflows', 'Deliveries', 'Prepare deliveries with reusable checks, approvals and storage connections.'],
-  ['trade-routes', '/trade-routes', 'Trade routes', 'Connect ports to move files between your sites and partners.'],
+  ['trade-routes', '/trade-routes', 'Trade routes', 'Connect ports to move files between organizations.'],
   ['storage', '/storage', 'Storage', 'Manage receiving storage, S3 buckets and shared folders.'],
   ['automation', '/automation', 'Automation', 'Connect agents and scripts with limited access.'],
   ['notifications', '/notifications', 'Notifications', 'Choose notification channels, recipients and shared defaults.'],
   ['tenants', '/tenants', 'Tenants', 'Manage separate workspaces, each with its own users and files.'],
-  ['audit', '/audit', 'Audit', 'Review who did what on this port.'],
+  ['audit', '/audit', 'Audit', 'Review who did what on this port. An auditor session sees only this page.'],
   ['system', '/system', 'System', 'Manage branding, sign-in, email, backups and port settings.'],
 ];
 

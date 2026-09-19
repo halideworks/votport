@@ -121,7 +121,7 @@ async function refresh() {
   $('trade-endpoints-section').hidden = !catalog.endpoints.length && setup !== 'receive';
   for (const endpoint of catalog.endpoints) {
     const row = node('div', '', 'card'); row.id = `endpoint-${endpoint.id}`; row.tabIndex = -1;
-    row.append(node('h3', endpoint.name), node('p', `${endpoint.category === 'internal' ? 'Internal site' : 'External partner'} · ${endpoint.forwarding ? 'Forwarding allowed' : 'Forwarding prohibited'}`, 'field-help'), link('Receiving folder, limits and project →', `/receive?search=${endpoint.id}#link-${endpoint.id}`));
+    row.append(node('h3', endpoint.name), node('p', `${endpoint.category === 'internal' ? 'Internal port' : 'External partner'} · ${endpoint.forwarding ? 'Forwarding allowed' : 'Forwarding prohibited'}`, 'field-help'), link('Receiving folder, limits and project →', `/receive?search=${endpoint.id}#link-${endpoint.id}`));
     if (admin) {
       const form = node('form'), key = input('text'); form.setAttribute('data-unsaved', ''); key.maxLength = 64; key.placeholder = 'Optional: exact sending port fingerprint';
       const expiry = select([['3600', '1 hour'], ['86400', '24 hours'], ['604800', '7 days']], '86400');
@@ -166,7 +166,7 @@ function routeCard(route, savedEditor) {
   card.id = `route-${route.id}`; card.tabIndex = -1;
   const current = routeState(route);
   head.append(node('h4', route.name), node('span', statusNames[current] || 'Status unavailable', `badge ${current === 'active' ? 'on' : 'off'}`)); card.append(head);
-  card.append(node('p', `${route.direction === 'incoming' ? 'Incoming → this port' : 'Outgoing → partner'} · ${route.category === 'internal' ? 'Internal site' : 'External partner'}`, 'field-help'));
+  card.append(node('p', `${route.direction === 'incoming' ? 'Incoming → this port' : 'Outgoing → partner'} · ${route.category === 'internal' ? 'Internal port' : 'External partner'}`, 'field-help'));
   card.append(node('p', `Receiving endpoint: ${route.endpoint_name}`), node('p', `Managed forwarding: ${route.forwarding ? 'allowed' : 'prohibited'}`, 'field-help'));
   const next = {
     pending_approval: route.direction === 'incoming' ? (admin ? 'Your approval is needed. Check the sending port’s fingerprint above, then approve this route.' : 'A port administrator needs to approve this sender.') : 'Waiting for the receiving team. Ask them to approve your route on their Trade routes page, then check the connection.',
@@ -269,7 +269,7 @@ $('trade-inspect').onclick = () => guard(async () => {
     const result = await api('/api/trade-routes/inspect', { method: 'POST', body: JSON.stringify({ invitation }) });
     if (ticket !== previewRevision) return;
     preview = invitation; const endpoint = invitation.document.body.endpoint;
-    $('trade-preview').replaceChildren(node('h3', result.document.body.name), node('p', invitation.document.body.address, 'trade-key'), node('p', 'Port identity fingerprint', 'field-help'), node('code', result.document.issuer, 'trade-key'), node('p', `Files arrive at: ${endpoint.name}`), node('p', `${endpoint.category === 'internal' ? 'Internal site' : 'External partner'} · Forwarding ${endpoint.forwarding ? 'allowed' : 'prohibited'}`, 'field-help'), node('p', `Accepted metadata fields: ${endpoint.metadata_keys.join(', ') || 'none'}`, 'field-help'), node('p', `Invitation expires ${formatWhen(invitation.document.expires_at)}`, 'field-help'));
+    $('trade-preview').replaceChildren(node('h3', result.document.body.name), node('p', invitation.document.body.address, 'trade-key'), node('p', 'Port identity fingerprint', 'field-help'), node('code', result.document.issuer, 'trade-key'), node('p', `Files arrive at: ${endpoint.name}`), node('p', `${endpoint.category === 'internal' ? 'Internal port' : 'External partner'} · Forwarding ${endpoint.forwarding ? 'allowed' : 'prohibited'}`, 'field-help'), node('p', `Accepted metadata fields: ${endpoint.metadata_keys.join(', ') || 'none'}`, 'field-help'), node('p', `Invitation expires ${formatWhen(invitation.document.expires_at)}`, 'field-help'));
     $('trade-accept-details').hidden = $('trade-accept-details').disabled = false; $('trade-accept').disabled = false;
     if (!$('trade-name').value) $('trade-name').value = endpoint.name;
     $('trade-review-title').focus();
