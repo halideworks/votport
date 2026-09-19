@@ -630,6 +630,7 @@ function addNamed(pairs) {
     // One package holds the whole drop, so two names that fold to the same
     // key would be refused at the manifest; catch it before hashing.
     const key = pathKeyString(components);
+    pathKeyMemo.set(joined, key);
     const other = keys.get(key);
     if (other !== undefined && other !== joined) {
       fail(`"${other}" and "${joined}" collide once case is folded; rename one`);
@@ -650,6 +651,18 @@ function addNamed(pairs) {
 let rows = new Map();
 // folded path key -> path, rebuilt with the rows, for the collision check.
 let pickedKeys = new Map();
+// Folded keys by path: the list render refolds every picked path on every
+// add, so the memo keeps each path folding once across the whole drop
+// (finding 537).
+const pathKeyMemo = new Map();
+function pickedPathKey(path) {
+  let key = pathKeyMemo.get(path);
+  if (key === undefined) {
+    key = pathKeyString(path.split('/'));
+    pathKeyMemo.set(path, key);
+  }
+  return key;
+}
 let sizeLimitError = false;
 
 function sizeLimitMessage(total) {
@@ -666,12 +679,14 @@ function renderPicked() {
   const list = $('file-list');
   list.replaceChildren();
   rows = new Map();
+  // Fresh row elements know nothing of what the old ones showed.
+  shownState.clear();
   pickedKeys = new Map();
   let total = 0;
   let visible = 0;
   for (const [path, file] of picked) {
     total += file.size;
-    pickedKeys.set(pathKeyString(path.split('/')), path);
+    pickedKeys.set(pickedPathKey(path), path);
     if (visible >= MAX_VISIBLE_FILE_ROWS) continue;
     visible += 1;
     const item = document.createElement('li');
@@ -705,19 +720,26 @@ function renderPicked() {
 // Each row carries the honest state of that file: hashing before anything
 // is sent, sending with its own meter, paused while the pool or network
 // recovers, verified once the server has published it with a receipt.
+// A recovery round re-sweeps every row with the same words; the shown-state
+// memo turns those repeat sweeps into no-ops instead of DOM rewrites
+// (finding 538).
+const shownState = new Map();
 function setStatus(path, text, done = false, fraction = null) {
   if (done) deliveredPaths.add(path);
   else deliveredPaths.delete(path);
   const item = rows.get(path);
   if (!item) return;
-  item.querySelector('.status').textContent = text;
-  item.classList.toggle('done', done);
   // data-state is the one source of truth; the stylesheet colours by it.
   const state = done ? 'verified'
     : text === 'Preparing' ? 'hashing'
       : text === 'Paused' ? 'paused'
         : text === 'Ready' ? 'ready'
           : 'sending';
+  const shown = shownState.get(path);
+  if (shown && shown.text === text && shown.done === done && shown.state === state && shown.fraction === fraction) return;
+  shownState.set(path, { text, done, state, fraction });
+  item.querySelector('.status').textContent = text;
+  item.classList.toggle('done', done);
   item.dataset.state = state;
   let badge = item.querySelector('.state');
   if (!badge) {
@@ -1459,6 +1481,7 @@ $('file-input').addEventListener('change', (event) => addFiles(event.target.file
 $('clear-files').addEventListener('click', () => {
   if (uploading) return;
   picked.clear();
+  pathKeyMemo.clear();
   deliveredPaths.clear();
   $('file-input').value = '';
   $('folder-input').value = '';

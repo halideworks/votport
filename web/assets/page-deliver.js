@@ -802,6 +802,20 @@ function deliverFormValues() {
     throw new Error('Max downloads must be between 1 and 10000.');
   }
   const label = $('deliver-label').value;
+  // A selection that is exactly one ticked folder shares the way the folder
+  // itself does: one directory field instead of a body of every path
+  // (finding 539). Anything mixed or partial still sends its paths.
+  const folder = [...libraryFolderSelections].find(([directory, known]) => known.size === paths.length && paths.every((path) => known.has(path)));
+  if (folder) {
+    return {
+      directory: folder[0],
+      label,
+      expires_days: expires,
+      password: $('deliver-password').value || null,
+      max_downloads: maxDownloads,
+      notifications: createNotifications.read(),
+    };
+  }
   return {
     paths,
     label,

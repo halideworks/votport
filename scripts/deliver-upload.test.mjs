@@ -21,6 +21,20 @@ test('Deliver exposes file and folder pickers with an accessible drop zone', () 
   assert.match(deliverScript, /An upload is already in progress\./);
 });
 
+test('a whole-folder selection shares the folder, not every path', () => {
+  // Ticking a folder used to POST every selected path back (1.14 MB at
+  // scale); the grant API already takes one directory field, like the
+  // folder share flow (finding 539).
+  assert.match(
+    deliverScript,
+    /const folder = \[\.\.\.libraryFolderSelections\]\.find\(\(\[directory, known\]\) => known\.size === paths\.length && paths\.every\(\(path\) => known\.has\(path\)\)\);/,
+  );
+  assert.match(deliverScript, /if \(folder\) \{[\s\S]+?directory: folder\[0\],/);
+  // Mixed and partial selections still send their paths.
+  assert.match(deliverScript, /return \{\s*\n\s*paths,\s*\n\s*label,/);
+  assert.match(deliverScript, /!paths\.length[\s\S]{0,80}Select at least one file\./);
+});
+
 test('dropped entries drain directory readers and preserve relative paths', async () => {
   const file = (path) => ({
     isFile: true,

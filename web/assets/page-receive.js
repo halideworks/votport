@@ -891,9 +891,21 @@ async function refreshLinksInner({ append, fromPoll }) {
   const container = $('links');
   const previousCards = [...container.querySelectorAll('[data-link-id]')];
   const evicted = append ? previousCards.slice(0, Math.max(0, previousCards.length + links.length - 100)) : [];
-  const edits = new Map([...container.querySelectorAll('[data-link-id]')].map((card) => [card.dataset.linkId, [...card.querySelectorAll('[data-unsaved]')].filter(isFormDirty)]).filter(([, editors]) => editors.length));
+  const evictedIds = new Set(evicted.map((card) => card.dataset.linkId));
+  const listedIds = new Set(links.map((link) => link.id));
+  // One shared scan groups dirty forms by card; the nested per-card
+  // querySelectorAll made every Load more walk the whole page (finding 536).
+  const edits = new Map();
+  for (const editor of container.querySelectorAll('[data-unsaved]')) {
+    if (!isFormDirty(editor)) continue;
+    const card = editor.closest('[data-link-id]');
+    if (!card) continue;
+    const editors = edits.get(card.dataset.linkId);
+    if (editors) editors.push(editor);
+    else edits.set(card.dataset.linkId, [editor]);
+  }
   {
-    const omittedEntries = [...edits].filter(([id]) => append ? evicted.some((card) => card.dataset.linkId === id) : !links.some((link) => link.id === id));
+    const omittedEntries = [...edits].filter(([id]) => append ? evictedIds.has(id) : !listedIds.has(id));
     const omitted = omittedEntries.flatMap(([, editors]) => editors);
     if (omitted.length && !window.confirm('Discard unsaved edits on requests outside these results?')) return;
     for (const [id, editors] of omittedEntries) { for (const editor of editors) markFormSaved(editor); edits.delete(id); }

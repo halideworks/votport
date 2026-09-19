@@ -81,6 +81,36 @@ test('503: the plan collision check folds full Unicode, not per character', () =
   assert.match(script, /key: pathKeyBytes\(components\)/);
 });
 
+test('picking folds each selected path once, not once per add', () => {
+  // renderPicked rebuilds the list and its collision keys on every add; the
+  // memoized keys keep the 20,000th add from refolding the 19,999 paths
+  // before it (finding 537).
+  assert.match(script, /function pickedPathKey\(path\) \{/);
+  assert.match(script, /pathKeyMemo\.set\(joined, key\);/, 'the batch check seeds the memo with the key it already folded');
+  assert.match(script, /pickedKeys\.set\(pickedPathKey\(path\), path\);/);
+  assert.doesNotMatch(script, /pickedKeys\.set\(pathKeyString\(/);
+  // Clearing the selection must not leave stale keys for reused paths.
+  assert.match(script, /picked\.clear\(\);\s*\n\s*pathKeyMemo\.clear\(\);/);
+});
+
+test('a recovery round skips rows already showing its state', () => {
+  // Every re-begin sweeps all rows with the same words; the shown-state memo
+  // turns the repeat sweeps into no-ops instead of full-page DOM rewrites
+  // (finding 538).
+  assert.match(script, /const shownState = new Map\(\);/);
+  assert.match(
+    script,
+    /if \(shown && shown\.text === text && shown\.done === done && shown\.state === state && shown\.fraction === fraction\) return;/,
+  );
+  // Rebuilt row elements must not inherit what the old ones showed.
+  assert.match(script, /rows = new Map\(\);\s*\n\s*\/\/ Fresh row elements know nothing of what the old ones showed\.\s*\n\s*shownState\.clear\(\);/);
+  // The sweep itself keeps its delivered-mark authority.
+  assert.match(
+    script,
+    /if \(!deliveredPaths\.has\(item\.path\)\) \{\s*\n\s*setStatus\(item\.path, 'Continuing'\);/,
+  );
+});
+
 test('a large file is hashed as leaf-aligned segments across the pool and assembled on its owner', async () => {
   const worker = await readFile(new URL('../web/assets/hash-worker.js', import.meta.url), 'utf8');
   assert.match(script, /segments\(file\.size, proofLeafBytes, hashWorkers\.length, MIN_SEGMENT_BYTES\)/);

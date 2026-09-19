@@ -38,6 +38,19 @@ test('receive and deliver pages keep transfer concerns separate', () => {
   assert.match(receiveScript, /notification-details\[open\]/);
 });
 
+test('loading more requests scans the page once for unsaved forms', () => {
+  // Refresh used to run a querySelectorAll inside a walk over every card on
+  // screen, so each Load more redid the whole page per click (finding 536).
+  assert.match(
+    receiveScript,
+    /for \(const editor of container\.querySelectorAll\('\[data-unsaved\]'\)\) \{[\s\S]+?editor\.closest\('\[data-link-id\]'\)/,
+  );
+  assert.doesNotMatch(receiveScript, /map\(\(card\) => \[card\.dataset\.linkId, \[\.\.\.card\.querySelectorAll/);
+  // The omitted-edit decision reads membership sets, not a rescan per entry.
+  assert.match(receiveScript, /append \? evictedIds\.has\(id\) : !listedIds\.has\(id\)/);
+  assert.doesNotMatch(receiveScript, /evicted\.some\(\(card\) => card\.dataset\.linkId === id\)/);
+});
+
 test('issued request status filter uses the shared form control styling', () => {
   assert.match(receive, /<div class="grid">[\s\S]*id="links-status"/);
   assert.match(style, /input,\s*textarea,\s*\.card select\s*\{[\s\S]*display: block;[\s\S]*width: 100%;[\s\S]*background: var\(--ink-3\);/);
