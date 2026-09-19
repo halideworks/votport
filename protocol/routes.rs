@@ -184,7 +184,22 @@ fn message(domain: &[u8], document: &impl Serialize) -> Vec<u8> {
     bytes
 }
 
+/// The lowercase-hex spelling every statement field is held to (audit
+/// finding 544): `digest` and `id` already force it, but a signature was
+/// only hex-decoded, so one logical statement verified under many casings,
+/// stored differently each time, and a resend in another casing was refused
+/// as a different delivery. `hex::encode` only ever mints the lowercase
+/// form, so nothing a peer implementation signed is refused here.
+fn lower_hex(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn verify(key: &str, signature: &str, message: &[u8]) -> bool {
+    if !lower_hex(signature) {
+        return false;
+    }
     let key = hex::decode(key)
         .ok()
         .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
@@ -381,6 +396,51 @@ impl RouteRevoked {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn statements_verify_under_one_lowercase_hex_spelling() {
+        // Audit finding 544: the signature is decoded rather than digested,
+        // so an uppercased spelling used to verify as the same statement
+        // while storing different JSON and a different digest.
+        let origin = SigningKey::from_bytes(&[31; 32]);
+        let receiver = SigningKey::from_bytes(&[32; 32]);
+        let source_key = hex::encode(origin.verifying_key().as_bytes());
+        let receiver_key = hex::encode(receiver.verifying_key().as_bytes());
+        let source = SignedRoute::sign(
+            RouteDocument {
+                issuer: source_key,
+                operation_id: "job".into(),
+                manifest: "ab".repeat(32),
+                label: "Delivery".into(),
+                metadata: BTreeMap::new(),
+                parent_receipt: None,
+                visited: vec![hex::encode(origin.verifying_key().as_bytes())],
+                permission: None,
+            },
+            &origin,
+        );
+        assert!(source.verify());
+        let mut upper = source.clone();
+        upper.signature = source.signature.to_ascii_uppercase();
+        assert!(!upper.verify());
+        // The same rule covers the port message family, which shares the
+        // one verify helper.
+        let port = SignedPortMessage::sign(
+            PortMessage {
+                issuer: String::new(),
+                audience: receiver_key,
+                purpose: "status".into(),
+                nonce: "nonce-1".into(),
+                expires_at: 1_800_000_000,
+                body: serde_json::json!({"grant": "grant"}),
+            },
+            &origin,
+        );
+        assert!(port.verify("status", &port.document.audience, 0));
+        let mut upper = port.clone();
+        upper.signature = port.signature.to_ascii_uppercase();
+        assert!(!upper.verify("status", &port.document.audience, 0));
+    }
 
     #[test]
     fn port_messages_pair_across_clock_skew_and_name_a_failed_window() {

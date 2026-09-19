@@ -7,6 +7,7 @@
 
 use crate::protocol_paths::is_push_staging_name;
 use crate::protocol_paths::is_receipt_name;
+use crate::protocol_paths::MAX_PAYLOAD_NAME_BYTES;
 use std::path::{Path, PathBuf};
 
 pub use crate::protocol_paths::{admit_component, TENANT_STORAGE_DIR};
@@ -431,12 +432,28 @@ pub fn with_suffix(name: &str, attempt: u32) -> String {
     if attempt == 0 {
         return name.to_owned();
     }
-    match name.rsplit_once('.') {
-        Some((stem, extension)) if !stem.is_empty() => {
-            format!("{stem}-{attempt}.{extension}")
-        }
-        _ => format!("{name}-{attempt}"),
+    let (stem, extension) = match name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => (stem, Some(extension)),
+        _ => (name, None),
+    };
+    let suffix = match extension {
+        Some(extension) => format!("-{attempt}.{extension}"),
+        None => format!("-{attempt}"),
+    };
+    // Audit finding 540: the collision suffix must not push a name that
+    // fills the payload budget past it, where the staged file would exceed
+    // the on-disk name cap, the create would fail NameTooLong, and every
+    // retry would report a permanent internal error. The stem gives up
+    // bytes on a char boundary; the suffix keeps the extension. A leaf
+    // whose extension alone overflows the budget still refuses at the
+    // payload-length check.
+    let mut keep = stem
+        .len()
+        .min(MAX_PAYLOAD_NAME_BYTES.saturating_sub(suffix.len()));
+    while !stem.is_char_boundary(keep) {
+        keep -= 1;
     }
+    format!("{}{}", &stem[..keep], suffix)
 }
 
 /// Removes staging files orphaned by a crash or kill. The idle sweep only
@@ -448,15 +465,20 @@ pub fn with_suffix(name: &str, attempt: u32) -> String {
 /// `keep` names staging and journal files a re-attached upload session
 /// still owns; everything else VOT-staged under `root` is an orphan.
 pub fn clean_staging(root: &Path, keep: &std::collections::HashSet<PathBuf>) {
+    // Audit finding 542: the sweep used to match exact case while admission
+    // folded it only for some reservations, so an uppercased staging shape
+    // could be admitted and then never swept. Lowercase once, like
+    // [`crate::protocol_paths::admit_component`] now does.
     #[cfg(unix)]
     fn is_staging_file(name: &str) -> bool {
-        name.starts_with(".vot-") && (name.ends_with(".stage") || name.ends_with(".journal"))
+        let lower = name.to_ascii_lowercase();
+        lower.starts_with(".vot-") && (lower.ends_with(".stage") || lower.ends_with(".journal"))
     }
     #[cfg(not(unix))]
     let _ = (root, keep);
     #[cfg(unix)]
     walk(root, &mut |path, name, is_dir| {
-        if is_dir && is_push_staging_name(name) {
+        if is_dir && is_push_staging_name(&name.to_ascii_lowercase()) {
             // `walk` only labels entries as directories using `file_type`, so
             // symlinks are never handed to `remove_dir_all` and never followed.
             if !keep.contains(path) {
@@ -614,6 +636,27 @@ mod tests {
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 
+    #[test]
+    fn staging_sweep_folds_case_like_admission() {
+        // Audit finding 542: the sweep matched exact case while admission
+        // admitted some uppercased spellings, so those files were never
+        // swept. Admission now refuses every casing, and the sweep deletes
+        // every casing, so the two rules cannot drift apart again.
+        let directory = tempfile::tempdir().unwrap();
+        for name in [".VOT-PROBE-ABC.STAGE", ".VOT-PROBE-ABC.JOURNAL"] {
+            std::fs::write(directory.path().join(name), b"x").unwrap();
+        }
+        // Push staging sweeps as a directory, like the real sessions create.
+        std::fs::create_dir(
+            directory
+                .path()
+                .join(".VOT-PUSH-0123456789ABCDEF0123456789ABCDEF"),
+        )
+        .unwrap();
+        super::clean_staging(directory.path(), &std::collections::HashSet::new());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
     use super::*;
 
     #[cfg(unix)]
@@ -755,6 +798,20 @@ mod tests {
     }
 
     #[test]
+    fn admin_dest_segments_decide_through_the_portable_profile() {
+        // Audit finding 545, pinned: the portable profile decides per
+        // destination segment, so device names and dot-trailing segments
+        // cannot be configured as a link's receive folder even though the
+        // segment rules above them would admit the characters.
+        for dest in ["con", "nul", "prn", "aux", "com1", "lpt1", "a.", "a.."] {
+            assert!(
+                admit_dest(dest).unwrap_err().contains("is not portable"),
+                "{dest:?}"
+            );
+        }
+    }
+
+    #[test]
     fn portable_payload_names_leave_space_for_receipts() {
         let parent = "p".repeat(255);
         assert!(admit_component(&parent, false).is_ok());
@@ -774,6 +831,38 @@ mod tests {
         assert_eq!(with_suffix("report.pdf", 2), "report-2.pdf");
         assert_eq!(with_suffix("README", 1), "README-1");
         assert_eq!(with_suffix(".env", 1), ".env-1");
+    }
+
+    #[test]
+    fn collision_suffixes_stay_within_the_payload_budget() {
+        // Audit finding 540: a name that fills the budget used to get a
+        // collision suffix past the cap, where the create failed
+        // NameTooLong and the session reported a permanent internal error.
+        // The suffix now truncates the stem instead, so the retry succeeds.
+        let long = "a".repeat(MAX_PAYLOAD_NAME_BYTES);
+        let wide = format!("{}ab", "ア".repeat(80));
+        let dotted = format!("{}.exr", "a".repeat(MAX_PAYLOAD_NAME_BYTES - 4));
+        for name in [&long, &wide, &dotted] {
+            for attempt in 1..100u32 {
+                let suffixed = with_suffix(name, attempt);
+                assert!(suffixed.len() <= MAX_PAYLOAD_NAME_BYTES, "{suffixed:?}");
+                assert!(suffixed.is_char_boundary(suffixed.len()), "{suffixed:?}");
+                assert_ne!(suffixed, *name);
+            }
+        }
+        // The extension survives truncation.
+        assert!(with_suffix(&dotted, 1).ends_with(".exr"));
+        // Short names keep the whole stem.
+        assert_eq!(with_suffix(&long, 0), long);
+        let short = with_suffix("ab", 1);
+        assert_eq!(short, "ab-1");
+        // A stem that is not a whole number of characters still truncates
+        // on a char boundary.
+        let mixed = format!("{}b", "ア".repeat(80));
+        let suffixed = with_suffix(&mixed, 9);
+        assert!(suffixed.len() <= MAX_PAYLOAD_NAME_BYTES);
+        assert!(suffixed.starts_with("ア"));
+        assert!(suffixed.is_char_boundary(suffixed.len()));
     }
 
     #[test]
@@ -839,7 +928,9 @@ mod tests {
         assert!(admit_component(".vot-push-0123456789abcdef0123456789abcdef", true).is_err());
         assert!(admit_component(".vot-push-sender", true).is_ok());
         assert!(admit_component(".vot-push-0123456789abcdef0123456789abcde", true).is_ok());
-        assert!(admit_component(".vot-push-0123456789ABCDEF0123456789abcdef", true).is_ok());
+        // Audit finding 542: the push shape folds case like every other
+        // reservation, so an uppercased key is refused too.
+        assert!(admit_component(".vot-push-0123456789ABCDEF0123456789abcdef", true).is_err());
     }
 
     #[cfg(unix)]

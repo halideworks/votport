@@ -142,7 +142,26 @@ impl Evidence {
     }
 }
 
+/// The lowercase-hex spelling every statement field is held to (audit
+/// finding 544): identities are forced lowercase by their digests, but the
+/// holder and the signature were only hex-decoded, so one logical
+/// statement verified under many casings and each spelling stored its own
+/// evidence JSON. `hex::encode` only ever mints the lowercase form, so
+/// nothing a peer implementation signed is refused here.
+fn lower_hex(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn verify_signature(holder: &str, message: &[u8], signature: &str) -> bool {
+    // Audit finding 544: the holder and the signature are decoded, not
+    // digested, so any casing verified and each spelling stored its own
+    // evidence JSON. Both are held to the lowercase-hex rule the identity
+    // fields already follow.
+    if !lower_hex(holder) || !lower_hex(signature) {
+        return false;
+    }
     let Some(key) = hex::decode(holder)
         .ok()
         .and_then(|v| <[u8; 32]>::try_from(v).ok())
@@ -162,6 +181,71 @@ fn verify_signature(holder: &str, message: &[u8], signature: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evidence_verifies_under_one_lowercase_hex_spelling() {
+        // Audit finding 544: the holder and the signature are decoded
+        // rather than digested, so an uppercased spelling used to verify as
+        // the same statement while storing different evidence JSON.
+        let server = SigningKey::from_bytes(&[1; 32]);
+        let device = SigningKey::from_bytes(&[2; 32]);
+        let issuer = hex::encode(server.verifying_key().to_bytes());
+        let holder = hex::encode(device.verifying_key().to_bytes());
+        let sign_evidence = |holder: String| {
+            Evidence::sign(
+                SignedChallenge::issue(
+                    Challenge {
+                        origin: "https://drop.example".into(),
+                        grant_id: "delivery-1".into(),
+                        manifest: manifest_digest([("file", "blake3", "abcd", 7)]),
+                        holder,
+                        nonce: "nonce-1".into(),
+                        issued_at: 1,
+                        expires_at: 2,
+                    },
+                    &server,
+                ),
+                EvidenceKind::Verified,
+                &device,
+            )
+        };
+        let original = sign_evidence(holder.clone());
+        assert!(original.verify(&issuer));
+        let mut upper = original.clone();
+        upper.signature = original.signature.to_ascii_uppercase();
+        assert!(!upper.verify(&issuer));
+        let mut upper = original.clone();
+        upper.authorization.signature = original.authorization.signature.to_ascii_uppercase();
+        assert!(!upper.verify(&issuer));
+        // An uppercase holder can only come from a minter that minted it
+        // that way (the holder is inside the signed challenge), so mint one
+        // by hand, signatures and all, to pin the rule at the decode site
+        // itself.
+        let mut hand_minted = sign_evidence(holder);
+        hand_minted.authorization.challenge.holder = hand_minted
+            .authorization
+            .challenge
+            .holder
+            .to_ascii_uppercase();
+        hand_minted.authorization.signature = hex::encode(
+            server
+                .sign(&message(
+                    b"votport-evidence-challenge-v1\0",
+                    &hand_minted.authorization.challenge,
+                ))
+                .to_bytes(),
+        );
+        hand_minted.signature = hex::encode(
+            device
+                .sign(&message(
+                    b"votport-evidence-statement-v1\0",
+                    &(&hand_minted.authorization, hand_minted.kind),
+                ))
+                .to_bytes(),
+        );
+        assert!(hand_minted.authorization.verify(&issuer));
+        assert!(!hand_minted.verify(&issuer));
+    }
 
     #[test]
     fn statements_bind_issuer_device_manifest_and_explicit_acceptance() {

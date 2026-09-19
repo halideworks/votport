@@ -6314,14 +6314,29 @@ mod push_tests {
             let private = destination.join(".vot-stage");
             let before = fs::read_dir(&private).unwrap().count();
             let other = self::object(Suite::Blake3Bao64, b"other");
-            let error = prepare_files(&setup, &[(entries[0].0.clone(), other)], || true)
-                .err()
-                .expect("oversized collision candidate admitted");
-            assert!(error.message.contains("242 UTF-8 bytes; shorten"));
+            // Audit finding 540: the collision suffix used to push a
+            // cap-filling name past the budget, refusing every retry as a
+            // permanent error. The stem now gives up bytes, so the sibling
+            // stages beside the published pair instead.
+            let (mut siblings, allocation) =
+                prepare_files(&setup, &[(entries[0].0.clone(), other.clone())], || true).unwrap();
+            drop(allocation);
+            let sibling = &mut siblings[0];
+            let sibling_source = directory.path().join("sibling");
+            fs::write(&sibling_source, b"other").unwrap();
+            reprove_staging(&sibling_source, &other, vec![sibling], || true).unwrap();
+            publish_file(&setup, sibling, || true).unwrap();
+            let sibling_name = paths::with_suffix(&name, 1);
+            assert!(
+                crate::protocol_paths::check_payload_name_length(&sibling_name).is_ok(),
+                "{sibling_name:?}"
+            );
+            assert_eq!(fs::read(destination.join(&sibling_name)).unwrap(), b"other");
             assert_eq!(fs::read(destination.join(&name)).unwrap(), bytes);
             assert_eq!(fs::read(&sidecar).unwrap(), receipt);
-            assert!(!destination.join(paths::with_suffix(&name, 1)).exists());
-            assert_eq!(fs::read_dir(&private).unwrap().count(), before);
+            // Each published file retains its staged journal until commit,
+            // so the sibling adds one to the one the first file left.
+            assert_eq!(fs::read_dir(&private).unwrap().count(), before + 1);
         }
     }
 
