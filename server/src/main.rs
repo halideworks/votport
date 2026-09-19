@@ -440,7 +440,7 @@ async fn share(arguments: Vec<String>) -> Result<(), ShareFailure> {
     let request = parse_share_args(arguments).map_err(ShareFailure::refused)?;
     let token = std::env::var("VOTPORT_AUTOMATION_TOKEN")
         .map_err(|_| ShareFailure::refused("VOTPORT_AUTOMATION_TOKEN is required".to_owned()))?;
-    if token.len() != 32 || !token.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+    if !votport::auth::valid_hex(&token, 32) {
         return Err(ShareFailure::refused(
             "VOTPORT_AUTOMATION_TOKEN is invalid".to_owned(),
         ));

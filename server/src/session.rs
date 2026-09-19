@@ -1573,7 +1573,7 @@ pub(crate) fn discard_refused_session(
     session: &crate::store::PersistedUploadSession,
 ) -> Result<(), String> {
     if let Some(key) = &session.push_key {
-        if key.len() != 32 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if !crate::auth::valid_hex(key, 32) {
             return Err("invalid push staging key".to_owned());
         }
         let directory = session

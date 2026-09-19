@@ -246,9 +246,24 @@ export function publicMetadataPageUrl(token, offset = 0, limit = METADATA_PAGE_S
   return `/api/s/${encodeURIComponent(token)}?${query}`;
 }
 
+// ------------------------------------------------- portable name validation
+// The one portable name policy, shared with the uploader (audit finding 509):
+// the characters that do not travel (controls, separators, DOS marks,
+// zero-width and bidi marks, byte-order mark) are replaced on the way into a
+// batch save and refused on the way into an upload, so a name the browser
+// cannot send never comes back verbatim from the batch save.
+const FORBIDDEN_SOURCE =
+  '[\\x00-\\x1f\\x7f/\\\\<>:"|?*~\\u200c\\u200d\\u202a-\\u202e\\u2066-\\u2069\\ufeff]';
+const FORBIDDEN_EVERYWHERE = new RegExp(FORBIDDEN_SOURCE, 'gu');
+const FORBIDDEN_ONCE = new RegExp(FORBIDDEN_SOURCE, 'u');
+
+export function nameHasForbiddenCharacter(value) {
+  return FORBIDDEN_ONCE.test(value);
+}
+
 export function sanitizeFilename(name) {
   let value = String(name ?? '').split(/[\\/]/).pop();
-  value = value.replace(/[<>:"|?*\u0000-\u001f\u007f]/g, '_').trim();
+  value = value.replace(FORBIDDEN_EVERYWHERE, '_').trim();
   value = value.replace(/[. ]+$/g, '');
   if (!value || value === '.' || value === '..') value = 'download';
   if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i.test(value)) value = `_${value}`;

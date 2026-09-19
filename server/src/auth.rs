@@ -44,6 +44,17 @@ pub(crate) fn hash_token(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
 
+/// One admission for the hex identifiers this port mints (`hex::encode`,
+/// always lowercase) and compares case-sensitively: a hash lookup or a
+/// staging path. Requiring the minted form here turns an uppercase lookalike
+/// away at the door instead of answering a bare not-found after the compare.
+pub fn valid_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 /// Loads or creates the 32-byte cookie-signing secret in the data directory.
 pub fn load_secret(data_dir: &std::path::Path) -> Result<[u8; 32], String> {
     let path = data_dir.join("secret");
@@ -550,6 +561,15 @@ pub fn cookie_value<'header>(header: &'header str, name: &str) -> Option<&'heade
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn valid_hex_requires_the_minted_lowercase_form() {
+        assert!(valid_hex(&"0123456789abcdef".repeat(2), 32));
+        assert!(valid_hex("", 0));
+        assert!(!valid_hex(&"A".repeat(32), 32));
+        assert!(!valid_hex(&"g".repeat(32), 32));
+        assert!(!valid_hex(&"a".repeat(31), 32));
+    }
 
     #[test]
     fn admin_token_ttl_bounds_verification() {

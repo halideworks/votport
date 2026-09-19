@@ -35,7 +35,7 @@ use super::{ApiError, ApiResult};
 use crate::api::admin;
 use crate::app::App;
 use crate::auth;
-use crate::auth::hash_token;
+use crate::auth::{hash_token, valid_hex};
 use crate::session::{OutboundOperation, OwnedOutboundOperation};
 use crate::store::{
     now_unix, AutomationToken, OutboundDownloadResult, OutboundGrant, OutboundGrantFile, Store,
@@ -961,10 +961,7 @@ pub(crate) fn sweep_upload_stages(app: &App, now: std::time::SystemTime) {
             else {
                 return true;
             };
-            if stripe.len() != 2
-                || !stripe.bytes().all(|byte| byte.is_ascii_hexdigit())
-                || !valid_outbound_upload_id(digest)
-            {
+            if !valid_hex(stripe, 2) || !valid_outbound_upload_id(digest) {
                 return true;
             }
             let Some(lock) = usize::from_str_radix(stripe, 16)
@@ -998,7 +995,7 @@ pub(crate) fn sweep_upload_stages(app: &App, now: std::time::SystemTime) {
 }
 
 fn valid_outbound_upload_id(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    valid_hex(value, 64)
 }
 
 fn parse_outbound_content_range(headers: &HeaderMap) -> ApiResult<(u64, u64, u64)> {
@@ -5251,7 +5248,7 @@ fn receipt_path(path: &Path) -> PathBuf {
     value.into()
 }
 fn valid_token(token: &str) -> bool {
-    token.len() == 32 && token.as_bytes().iter().all(u8::is_ascii_hexdigit)
+    valid_hex(token, 32)
 }
 pub(super) fn attachment_filename(name: &str) -> ApiResult<HeaderValue> {
     use std::fmt::Write as _;
@@ -7869,6 +7866,11 @@ mod tests {
         assert!(valid_token(&"a".repeat(32)));
         assert!(!valid_token("x"));
         assert!(!valid_token(&"g".repeat(32)));
+        // Tokens are minted lowercase and hashed case-sensitively, so an
+        // uppercase lookalike is refused here instead of answering a bare
+        // not-found after the hash compare (audit finding 510).
+        assert!(!valid_token(&"A".repeat(32)));
+        assert!(!valid_token("0123456789abcdef0123456789ABCDEF"));
     }
 
     #[test]

@@ -109,10 +109,7 @@ pub async fn settings(
             "platform administrator required",
         ));
     }
-    if body.name.trim().is_empty()
-        || body.name.len() > 200
-        || body.name.chars().any(char::is_control)
-    {
+    if !crate::workflow::admit_label(&body.name, 200) {
         return Err(unprocessable("enter a port name of at most 200 characters"));
     }
     let origin = address(&body.address).map_err(unprocessable)?;
@@ -372,7 +369,7 @@ pub async fn accept(
 ) -> ApiResult<Response> {
     let actor = write(&app, &headers)?;
     let (origin, endpoint) = invitation(&body.invitation)?;
-    if body.name.trim().is_empty() || body.name.len() > 200 {
+    if !crate::workflow::admit_label(&body.name, 200) {
         return Err(unprocessable("enter a route name"));
     }
     super::notifications::validate_policy(&app, &actor.tenant, &body.notifications, &TRADE_EVENTS)?;

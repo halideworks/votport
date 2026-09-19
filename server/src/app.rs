@@ -1685,7 +1685,7 @@ fn resume_upload_session(
         checkpoint_warn: session::CheckpointWarnPacer::new(),
     };
     if let Some(key) = &session.push_key {
-        if key.len() != 32 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if !crate::auth::valid_hex(key, 32) {
             return Err("invalid push staging key".to_owned());
         }
         let control = session::PushControl::resumable(key.clone(), None);
@@ -2287,11 +2287,7 @@ fn canonical_catalog_name(name: &str) -> bool {
     let Some((root, length)) = rest.rsplit_once('-') else {
         return false;
     };
-    if root.len() != 64
-        || !root
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
+    if !crate::auth::valid_hex(root, 64) {
         return false;
     }
     let Ok(length_value) = length.parse::<u64>() else {
@@ -2308,11 +2304,7 @@ fn owned_catalog_stage_name(name: &str) -> bool {
     let Some((catalog, token)) = name.rsplit_once(".stage-") else {
         return false;
     };
-    canonical_proof_name(catalog)
-        && token.len() == 32
-        && token
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    canonical_proof_name(catalog) && crate::auth::valid_hex(token, 32)
 }
 
 fn clean_outbound_proofs(data_dir: &std::path::Path, store: &Store, now: u64) {

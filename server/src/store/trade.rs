@@ -196,7 +196,7 @@ impl Store {
         let secret = body["secret"].as_str().ok_or("missing invitation secret")?;
         let credential = body["credential"]
             .as_str()
-            .filter(|v| v.len() == 32 && v.bytes().all(|b| b.is_ascii_hexdigit()))
+            .filter(|v| crate::auth::valid_hex(v, 32))
             .ok_or("invalid route credential")?;
         let peer_name = body["name"]
             .as_str()
@@ -548,7 +548,7 @@ impl Store {
         next: &str,
         actor: &str,
     ) -> Result<(), String> {
-        if next.len() != 32 || !next.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if !crate::auth::valid_hex(next, 32) {
             return Err("invalid credential".into());
         }
         let mut connection = self.connection.lock().expect("store poisoned");

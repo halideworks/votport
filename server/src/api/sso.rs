@@ -351,7 +351,7 @@ impl StartParams {
                     .ok()
                     .and_then(|bytes| bytes.try_into().ok())
                     .ok_or("invalid desktop challenge")?;
-                if state.len() != 32 || !state.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                if !crate::auth::valid_hex(&state, 32) {
                     return Err("invalid desktop state");
                 }
                 Ok(Some(DesktopFlow { challenge, state }))
