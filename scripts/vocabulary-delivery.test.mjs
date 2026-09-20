@@ -53,10 +53,13 @@ test('retired delivery vocabulary is gone from web user text', () => {
 test('password refusal sentinel stays in lockstep with the server', async () => {
   const web = await read('../web/assets/outbound.js');
   const server = await read('../server/src/api/outbound.rs');
+  const serverTests = await read('../server/src/api/outbound/tests.rs');
   assert.equal(web.split("'delivery password required'").length - 1, 2,
     'outbound.js must throw and match the server sentinel');
   assert.match(web, /if \(error\.message === 'delivery password required'\) return;/);
-  assert.equal(server.split('"delivery password required"').length - 1, 3,
-    'outbound.rs: two handlers plus the integration test assertion');
+  assert.equal(server.split('"delivery password required"').length - 1, 2,
+    'outbound.rs: the two handlers');
+  assert.equal(serverTests.split('"delivery password required"').length - 1, 1,
+    'outbound tests: the integration test assertion');
   assert.ok(!server.includes('outbound grant password required'));
 });
