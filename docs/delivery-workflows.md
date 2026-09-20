@@ -242,8 +242,11 @@ own revocation requests. Archived jobs keep their retirement state; jobs held af
 restore remain suspended. The UI distinguishes pending and acknowledged status;
 an offline port retries with capped backoff until it responds. Already-downloaded
 files, S3 exports, shared-folder copies and independent manual copies cannot be
-recalled. Deleting a source tenant requires acknowledgments for incomplete legs
-and explicit revocations, but completed legs alone do not block deletion.
+recalled. Votport never deletes exported copies: no cancel, retirement,
+revocation or tenant deletion removes them. Deleting a source tenant requires acknowledgments for incomplete legs
+and explicit revocations, but completed legs alone do not block deletion;
+the deletion writes a `tenant_export_inventory` audit row naming the
+buckets and prefixes that still hold the tenant's completed exports.
 If a destination tenant was deleted first, its port can sign that the exact
 route is absent without retaining the deleted tenant's metadata.
 
