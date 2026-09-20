@@ -1,13 +1,12 @@
 import { isFormDirty, markFormSaved } from '/assets/form-drafts.js';
 import { api, requireSession, button, copyToClipboard, confirmModal, formatWhen, revealHash } from '/assets/admin-common.js';
 import { notificationEditor, tradeEvents } from '/assets/notifications.js';
+import { $, node } from '/assets/object-card.js';
 
-const $ = (id) => document.getElementById(id);
 const session = await requireSession(), admin = session.role === 'admin';
 let catalog, preview = null, previewRevision = 0, refreshTicket = 0, setup = null;
 const INVITATION_GUIDANCE = 'Paste the complete route invitation from the receiving team. A port address or connection ID cannot be used here.';
 const returnRequest = new URLSearchParams(window.location.search).get('receive');
-function node(tag, text = '', className = '') { const el = document.createElement(tag); el.textContent = text; el.className = className; return el; }
 async function guard(action) { $('trade-error').hidden = true; try { await action(); } catch (error) { $('trade-error').textContent = error.message; $('trade-error').hidden = false; $('trade-error').focus(); } }
 function field(text, input) { input.setAttribute('aria-label', text); const label = node('label', text); label.append(input); return label; }
 function input(type, value = '') { const el = document.createElement('input'); el.type = type; el.value = value; return el; }

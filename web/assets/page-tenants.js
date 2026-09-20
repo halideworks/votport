@@ -13,9 +13,8 @@ import {
   formatWhen,
   requireSession,
 } from '/assets/admin-common.js';
-import { fieldError } from '/assets/object-card.js';
+import { $, fieldError } from '/assets/object-card.js';
 
-const $ = (id) => document.getElementById(id);
 const PRINCIPAL_PAGE_SIZE = 50;
 // Page size follows the server convention (50 default, 100 max); the list
 // follows `tenants_next` until it runs out, like the workflows page.

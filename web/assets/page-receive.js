@@ -3,7 +3,7 @@ import { notificationEditor, notificationDetails, uploadEvents, workflowEvents }
 // votport receive page: issue request links and manage received files.
 // VOTPORT PROPRIETARY LICENSE.
 
-import { appendObjectCard, fieldError } from '/assets/object-card.js';
+import { $, appendObjectCard, fieldError } from '/assets/object-card.js';
 import { deleteStoredFiles } from '/assets/delete-stored-files.js';
 import { narrate, outcomeWords, summarize } from '/assets/timeline.js';
 import { startStatusPoll } from '/assets/status-strip.js';
@@ -25,7 +25,6 @@ import {
   undoable,
 } from '/assets/admin-common.js';
 
-const $ = (id) => document.getElementById(id);
 const createError = fieldError($('create-label'), $('create-error'));
 const creatingRoute = new URLSearchParams(window.location.search).get('trade-route') === '1';
 $('trade-return-guide').hidden = !creatingRoute;

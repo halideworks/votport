@@ -1,8 +1,7 @@
 import { discardForm, markFormSaved } from '/assets/form-drafts.js';
 import { api, button, confirmModal, requireSession } from '/assets/admin-common.js';
-const $ = (id) => document.getElementById(id);
+import { $, node } from '/assets/object-card.js';
 const value = (id) => $(id).value.trim();
-const node = (tag, text, className = '') => { const element = document.createElement(tag); element.textContent = text; element.className = className; return element; };
 let connections = [], tenants = [], current = null, autoId = true, editorGeneration = 0;
 const session = await requireSession();
 const admin = session.role === 'admin' && !session.tenant;

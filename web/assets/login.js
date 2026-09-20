@@ -3,9 +3,8 @@
 import { api } from '/assets/admin-common.js';
 import { collapseLocalPassword } from '/assets/login-disclosure.js';
 import { ssoErrorMessage } from '/assets/login-errors.js';
-import { fieldError } from '/assets/object-card.js';
+import { $, fieldError } from '/assets/object-card.js';
 
-const $ = (id) => document.getElementById(id);
 const loginError = fieldError($('login-password'), $('login-error'));
 
 $('login-form').addEventListener('submit', async (event) => {

@@ -2,7 +2,7 @@
 
 import { deliveryMetadata, initDeliveryEvidence } from '/assets/delivery-evidence.js';
 import { applyBranding } from '/assets/branding.js';
-import { appLink, appendObjectCard, fieldError, formatBytes } from '/assets/object-card.js';
+import { $, appLink, appendObjectCard, fieldError, formatBytes } from '/assets/object-card.js';
 import {
   appendMetadataPage,
   batchDownloadEligible,
@@ -20,7 +20,6 @@ import {
   summarizeFailures,
 } from '/assets/outbound-download.js';
 
-const $ = (id) => document.getElementById(id);
 const votFetchError = fieldError($('vot-fetch-key'), $('vot-fetch-error'));
 const token = window.location.pathname.split('/').filter(Boolean).pop();
 let metadataHasPassword = false;

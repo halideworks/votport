@@ -27,6 +27,13 @@ const MAX_PASSWORD_BYTES: usize = 256;
 const PRINCIPAL_PAGE_DEFAULT: usize = 50;
 const PRINCIPAL_PAGE_MAX: usize = 100;
 
+/// The session behind `require_admin` for sibling test modules, which
+/// cannot destructure the opaque `AuditorIdentity` newtype.
+#[cfg(test)]
+pub(crate) fn test_require_admin(app: &App, headers: &HeaderMap) -> ApiResult<AdminSession> {
+    require_admin_session(app, headers).map(|(session, _)| session)
+}
+
 /// Signed admin cookie for a test identity; the shared body behind each
 /// test module's `cookie_for`.
 #[cfg(test)]
@@ -89,9 +96,18 @@ fn tenant_operation(
         .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "tenant deletion is in progress"))
 }
 
-/// Returns the authenticated principal, or unauthorized.
-pub(crate) fn require_admin(app: &App, headers: &HeaderMap) -> ApiResult<AdminSession> {
-    require_admin_session(app, headers).map(|(identity, _)| identity)
+/// An authenticated admin principal whose auditor status is unchecked. The
+/// field is private, so no code outside this module can reach the session
+/// at all, and only the two gates below unwrap it inside the module: a
+/// handler that calls bare `require_admin` gets a value it cannot use.
+/// Compile-time replacement for the old source-scanning lint.
+pub(crate) struct AuditorIdentity(AdminSession);
+
+/// Returns the authenticated principal, or unauthorized. The result is an
+/// opaque [`AuditorIdentity`]; unwrap it only through `require_operator`
+/// or `require_platform_admin`, which enforce the auditor restrictions.
+pub(crate) fn require_admin(app: &App, headers: &HeaderMap) -> ApiResult<AuditorIdentity> {
+    require_admin_session(app, headers).map(|(identity, _)| AuditorIdentity(identity))
 }
 
 fn require_admin_session(app: &App, headers: &HeaderMap) -> ApiResult<(AdminSession, u64)> {
@@ -166,7 +182,7 @@ fn require_admin_session(app: &App, headers: &HeaderMap) -> ApiResult<(AdminSess
 /// link, file, grant, and settings route goes through this gate instead of
 /// bare `require_admin`.
 pub(crate) fn require_operator(app: &App, headers: &HeaderMap) -> ApiResult<AdminSession> {
-    let identity = require_admin(app, headers)?;
+    let AuditorIdentity(identity) = require_admin(app, headers)?;
     if identity.role == "auditor" {
         return Err(ApiError::new(StatusCode::FORBIDDEN, "audit-only session"));
     }
@@ -190,7 +206,7 @@ fn local_admin_grants(tenants: &[crate::store::Tenant]) -> Vec<auth::TenantGrant
 /// Default-tenant admin only. Same gate as database backup: viewers and
 /// named-tenant admins cannot read platform configuration.
 fn require_platform_admin(app: &App, headers: &HeaderMap) -> ApiResult<AdminSession> {
-    let identity = require_admin(app, headers)?;
+    let AuditorIdentity(identity) = require_admin(app, headers)?;
     if !identity.tenant.is_empty() || identity.role != "admin" {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
@@ -351,7 +367,7 @@ pub async fn admin_login(
 pub async fn admin_logout(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Response> {
     // A cross-site form POST can force a logout (denial of convenience, not
     // of security); the CSRF header closes even that.
-    let identity = require_admin(&app, &headers)?;
+    let (identity, _) = require_admin_session(&app, &headers)?;
     require_csrf_header(&headers)?;
     tracing::info!(
         target: "audit", event = "admin_signed_out", subject = %identity.subject,
@@ -386,7 +402,7 @@ pub async fn admin_audit_export(
     headers: HeaderMap,
     Query(query): Query<AuditQuery>,
 ) -> ApiResult<Response> {
-    let identity = require_admin(&app, &headers)?;
+    let (identity, _) = require_admin_session(&app, &headers)?;
     if query.before_rowid.is_some() && (query.since.is_some() || query.after_rowid.is_some()) {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1405,12 +1421,14 @@ pub async fn admin_session(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_admin(&app, &headers)?;
+    let (identity, _) = require_admin_session(&app, &headers)?;
     Ok(Json(admin_session_view(&identity)))
 }
 
 pub(crate) fn admin_page_session(app: &App, headers: &HeaderMap) -> Option<AdminSession> {
-    require_admin(app, headers).ok()
+    require_admin_session(app, headers)
+        .ok()
+        .map(|(session, _)| session)
 }
 
 pub(crate) fn admin_session_view(identity: &auth::AdminIdentity) -> serde_json::Value {
@@ -6410,86 +6428,24 @@ mod tenant_authz_tests {
         }
     }
 
-    /// A new handler that calls bare `require_admin` silently reopens the
-    /// audit-only surface; the allow-list below is every function that may
-    /// serve an auditor. Extend it deliberately or use `require_operator`.
+    /// The `AuditorIdentity` newtype makes a bare `require_admin` result
+    /// unusable without destructuring; this pin keeps the destructuring
+    /// sites to the definition, the construction in `require_admin`, and
+    /// the two gates, including here in admin.rs, which could otherwise
+    /// reach its own private field. Raise the count only for a deliberate
+    /// new gate.
     #[test]
-    fn bare_require_admin_stays_on_the_allow_list() {
-        let allowed = [
-            "require_operator",
-            "require_platform_admin",
-            "admin_logout",
-            "admin_audit_export",
-            "admin_session",
-            "admin_page_session",
-            "switch_tenant",
-        ];
-        for file in [
-            "src/api/admin.rs",
-            "src/api/outbound.rs",
-            "src/api/sso.rs",
-            "src/api/upload.rs",
-            "src/api/verify.rs",
-            "src/api/mod.rs",
-            "src/api/session_rate.rs",
-            "src/app.rs",
-            "src/api/trade.rs",
-            "src/api/notifications.rs",
-            "src/api/outbound/workflows.rs",
-            "src/api/outbound/workflows/storage.rs",
-            "src/api/outbound/workflows/routes.rs",
-            "src/api/evidence.rs",
-            "src/api/scim.rs",
-        ] {
-            let text = std::fs::read_to_string(file).unwrap();
-            let mut current_fn = String::new();
-            // Test modules exercise require_admin directly; skip them by
-            // brace-tracking from each #[cfg(test)] marker. Approximate
-            // (string literals with braces would confuse it) but the lint
-            // only needs to be right about handler code.
-            let mut test_depth = 0usize;
-            let mut pending_test_mod = false;
-            for (number, line) in text.lines().enumerate() {
-                if test_depth == 0 && line.trim_start().starts_with("#[cfg(test)]") {
-                    pending_test_mod = true;
-                }
-                if test_depth > 0 || pending_test_mod {
-                    let opens = line.matches('{').count();
-                    let closes = line.matches('}').count();
-                    if pending_test_mod && opens > 0 {
-                        pending_test_mod = false;
-                        test_depth = 1 + opens.saturating_sub(1);
-                    } else if test_depth > 0 {
-                        test_depth += opens;
-                    }
-                    test_depth = test_depth.saturating_sub(closes);
-                    continue;
-                }
-                if let Some(rest) = line.trim_start().strip_prefix("pub async fn ").or_else(|| {
-                    line.trim_start()
-                        .strip_prefix("async fn ")
-                        .or_else(|| line.trim_start().strip_prefix("pub(crate) fn "))
-                        .or_else(|| line.trim_start().strip_prefix("pub fn "))
-                        .or_else(|| line.trim_start().strip_prefix("fn "))
-                }) {
-                    current_fn = rest.split(['(', '<']).next().unwrap_or_default().to_owned();
-                }
-                // Split so this test's own source cannot match the needle.
-                let bare = ["require_admin", "require_admin_session"]
-                    .iter()
-                    .any(|name| line.contains(&format!("{name}(")))
-                    && !line.contains("fn require_admin")
-                    && !line.contains("require_admin_write");
-                if bare && current_fn != "require_admin" {
-                    assert!(
-                        allowed.contains(&current_fn.as_str()),
-                        "{file}:{}: bare require_admin in fn {current_fn}; \
-                         use require_operator or extend the allow-list",
-                        number + 1
-                    );
-                }
-            }
-        }
+    fn auditor_identity_is_unwrapped_only_by_the_two_gates() {
+        let text = std::fs::read_to_string(file!()).unwrap();
+        // Split so this test's own source cannot match the needle.
+        let needle = concat!("AuditorIdentity", "(");
+        assert_eq!(
+            text.matches(needle).count(),
+            4,
+            "AuditorIdentity must appear only as the struct definition, the \
+             construction in require_admin, and the unwraps in \
+             require_operator and require_platform_admin"
+        );
     }
 
     #[tokio::test]
@@ -7611,7 +7567,7 @@ mod tenant_offboard_tests {
         );
         headers.insert(header::COOKIE, inactive.parse().unwrap());
         headers.insert("x-votport", "1".parse().unwrap());
-        let authenticated = require_admin(&application, &headers).unwrap();
+        let authenticated = test_require_admin(&application, &headers).unwrap();
         assert_eq!(authenticated.tenant, "other");
         assert!(branding_tenant(&application, "acme", &authenticated).is_err());
         assert!(switch_tenant(
@@ -7626,7 +7582,7 @@ mod tenant_offboard_tests {
         let local = super::test_admin_cookie(&application, &auth::AdminIdentity::local_admin());
         let mut headers = HeaderMap::new();
         headers.insert(header::COOKIE, local.parse().unwrap());
-        assert!(require_admin(&application, &headers)
+        assert!(test_require_admin(&application, &headers)
             .unwrap()
             .grants
             .iter()
@@ -7655,7 +7611,7 @@ mod tenant_offboard_tests {
                 .parse()
                 .unwrap(),
         );
-        let admitted = require_admin(&application, &headers).unwrap();
+        let admitted = test_require_admin(&application, &headers).unwrap();
         let local = super::test_admin_cookie(&application, &auth::AdminIdentity::local_admin());
         assert_eq!(
             delete_tenant_req(application.clone(), &local, "acme")

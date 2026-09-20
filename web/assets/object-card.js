@@ -47,6 +47,19 @@ export function appLink(kind, token) {
   return `votport://${kind}/${encodeURIComponent(token)}?base=${encodeURIComponent(window.location.origin)}`;
 }
 
+/// The shared getElementById lookup and text-content element builder, so
+/// the pages stop repeating the same one-liners.
+export function $(id) {
+  return document.getElementById(id);
+}
+
+export function node(tag, text = '', className = '') {
+  const element = document.createElement(tag);
+  element.textContent = text;
+  element.className = className;
+  return element;
+}
+
 /// Binds an error alert to the field that must change: the field's
 /// aria-describedby names the alert and aria-invalid holds while it shows.
 /// Alerts with no owning field stay standalone role=alerts.

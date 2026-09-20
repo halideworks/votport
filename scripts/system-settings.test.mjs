@@ -192,7 +192,10 @@ test('filesystem notices follow detected profiles and clear stale warnings', () 
     } },
     formatBytes: String,
   };
-  runInNewContext(script.slice(script.indexOf('const $ ='), script.indexOf('function gibValue')), context);
+  // The shared $ lives in object-card.js now, so the fragment gets the same
+  // lookup bound to the stub document.
+  context.$ = (id) => context.document.getElementById(id);
+  runInNewContext(script.slice(script.indexOf('function sourceLabel'), script.indexOf('function gibValue')), context);
   for (const profile of ['fast', 'balanced', null]) {
     context.fillDeployment({ deployment: { receive_commit_profile: profile, outbound_filesystem_profile: profile } });
     for (const kind of ['receive', 'outbound']) {

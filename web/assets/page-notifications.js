@@ -1,10 +1,8 @@
 import { discardForm, markFormSaved } from '/assets/form-drafts.js';
 import { api, button, confirmModal, formatWhen, requireSession } from '/assets/admin-common.js';
 import { loadNotificationSettings, notificationEditor, notificationServices } from '/assets/notifications.js';
-import { fieldError } from '/assets/object-card.js';
+import { $, fieldError, node } from '/assets/object-card.js';
 
-const $ = (id) => document.getElementById(id);
-const node = (tag, text, className = '') => { const element = document.createElement(tag); element.textContent = text; element.className = className; return element; };
 const session = await requireSession(), admin = session.role === 'admin';
 let editing = null, defaultsEditor, testAttempt = 0;
 const testingDestinations = new Set();

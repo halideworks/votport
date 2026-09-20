@@ -1134,7 +1134,7 @@ mod tests {
         let cookie = payload["cookie"].as_str().unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(header::COOKIE, cookie.parse().unwrap());
-        let session = super::super::admin::require_admin(&application, &headers).unwrap();
+        let session = super::super::admin::test_require_admin(&application, &headers).unwrap();
         assert_eq!(session.tenant, "");
         assert_eq!(session.role, "viewer");
         assert_eq!(session.grants.len(), 1);
@@ -1608,7 +1608,7 @@ mod tests {
                         .unwrap();
                     let mut headers = HeaderMap::new();
                     headers.insert(header::COOKIE, cookie.clone());
-                    let identity = super::super::admin::require_admin(&app, &headers).unwrap();
+                    let identity = super::super::admin::test_require_admin(&app, &headers).unwrap();
                     assert_eq!(identity.subject, case);
                     assert_eq!(identity.role, role, "{case}");
                     assert_eq!(
@@ -1834,7 +1834,7 @@ mod tests {
                         .unwrap();
                     let mut headers = HeaderMap::new();
                     headers.insert(header::COOKIE, cookie.clone());
-                    let identity = super::super::admin::require_admin(&app, &headers).unwrap();
+                    let identity = super::super::admin::test_require_admin(&app, &headers).unwrap();
                     assert_eq!(identity.subject, "clock-test");
                     assert_eq!(identity.role, "admin");
                 }

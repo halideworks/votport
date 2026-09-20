@@ -3,7 +3,7 @@
 
 import { applyBranding } from '/assets/branding.js';
 import { nameHasForbiddenCharacter } from '/assets/outbound-download.js';
-import { appendObjectCard, appLink, copyToClipboard, fieldError, formatBytes, formatDuration } from '/assets/object-card.js';
+import { $, appendObjectCard, appLink, copyToClipboard, fieldError, formatBytes, formatDuration } from '/assets/object-card.js';
 import { entryFiles, runUploadBatch } from '/assets/upload-entries.js';
 import {
   clearResumeRecord,
@@ -25,7 +25,6 @@ import init, {
   proofLeafSize,
 } from '/assets/vendor/vot_wasm.js';
 
-const $ = (id) => document.getElementById(id);
 const token = window.location.pathname.split('/').filter(Boolean).pop();
 
 const UPLOADS_IN_FLIGHT = 8;
