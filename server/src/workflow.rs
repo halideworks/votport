@@ -206,6 +206,39 @@ pub fn valid_path(value: &str) -> bool {
             .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
+/// Audit finding 563: an import prefix is a relative object prefix, so accept
+/// the spellings people copy in: surrounding whitespace, leading and trailing
+/// slashes, empty and `.` segments are trimmed before the valid_path gate.
+/// `..` segments survive and are refused by name.
+pub fn normalise_import_prefix(prefix: &str) -> String {
+    prefix
+        .trim()
+        .trim_matches('/')
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Audit finding 563: name the refused import shape instead of a bare
+/// refusal. The prefix is expected normalised, so the shapes left to refuse
+/// are empty, a dot-dot segment, a backslash or NUL, and an over-long prefix.
+fn import_refusal_cause(storage_id: &str, prefix: &str) -> String {
+    if !valid_id(storage_id) {
+        "the storage ID must be 1-100 letters, digits, dashes or underscores".into()
+    } else if prefix.is_empty() {
+        "the prefix is empty after trimming whitespace, slashes and dot segments".into()
+    } else if prefix.split('/').any(|part| part == "..") {
+        "the prefix contains a dot-dot segment".into()
+    } else if prefix.contains(['\\', '\0']) {
+        "the prefix contains a backslash or NUL".into()
+    } else if prefix.len() > 1024 {
+        "the prefix exceeds 1024 bytes".into()
+    } else {
+        "the prefix must be a relative path with 1-1024 bytes and no empty or dot segments".into()
+    }
+}
+
 /// One admission policy for the names people type (port and route names,
 /// project and job labels): counted in characters, not UTF-8 bytes, with a
 /// non-blank requirement and control characters refused. These labels reach
@@ -369,12 +402,13 @@ impl Project {
         {
             return Err("choose enrolled project recipients".into());
         }
-        if request
-            .import
-            .as_ref()
-            .is_some_and(|import| !valid_id(&import.storage_id) || !valid_path(&import.prefix))
-        {
-            return Err("invalid storage import".into());
+        if let Some(import) = &request.import {
+            if !valid_id(&import.storage_id) || !valid_path(&import.prefix) {
+                return Err(format!(
+                    "invalid storage import ({})",
+                    import_refusal_cause(&import.storage_id, &import.prefix)
+                ));
+            }
         }
         Ok(())
     }
@@ -503,6 +537,67 @@ pub(crate) mod tests {
                 "{expected}: {actual}"
             );
         }
+    }
+
+    /// Audit finding 563: import prefixes are trimmed and normalised before
+    /// the valid_path gate, and a refusal names the rejected shape instead of
+    /// a bare "invalid storage import" that could be empty, trailing-slash,
+    /// leading-slash or dot-prefixed alike.
+    #[test]
+    fn import_prefixes_are_normalised_and_refusals_name_the_shape() {
+        assert_eq!(
+            normalise_import_prefix(" incoming/episode-08 "),
+            "incoming/episode-08"
+        );
+        assert_eq!(
+            normalise_import_prefix("/incoming/episode-08/"),
+            "incoming/episode-08"
+        );
+        assert_eq!(
+            normalise_import_prefix("./incoming//episode-08/./"),
+            "incoming/episode-08"
+        );
+        assert_eq!(normalise_import_prefix("/./"), "");
+
+        let mut request = request();
+        request.import = Some(Import {
+            storage_id: "source".into(),
+            prefix: "incoming/episode-08".into(),
+        });
+        project()
+            .validate_job(&request, 0)
+            .expect("a relative prefix is valid");
+
+        let oversized = "a".repeat(1025);
+        for (prefix, cause) in [
+            (
+                "",
+                "the prefix is empty after trimming whitespace, slashes and dot segments",
+            ),
+            ("../escape", "the prefix contains a dot-dot segment"),
+            ("incoming\\file", "the prefix contains a backslash or NUL"),
+            (oversized.as_str(), "the prefix exceeds 1024 bytes"),
+        ] {
+            request.import = Some(Import {
+                storage_id: "source".into(),
+                prefix: prefix.into(),
+            });
+            let error = project()
+                .validate_job(&request, 0)
+                .expect_err("the shape is refused");
+            assert_eq!(error, format!("invalid storage import ({cause})"));
+        }
+        request.import = Some(Import {
+            storage_id: "bad id!".into(),
+            prefix: "incoming".into(),
+        });
+        let error = project()
+            .validate_job(&request, 0)
+            .expect_err("the storage ID is refused");
+        assert_eq!(
+            error,
+            "invalid storage import (the storage ID must be 1-100 letters, digits, dashes or underscores)"
+        );
     }
 
     #[test]

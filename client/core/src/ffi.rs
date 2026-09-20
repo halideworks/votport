@@ -1247,13 +1247,11 @@ impl Model {
             self.view.eta_seconds = None;
             return;
         }
-        // Fetch exposes placed bytes live and exact attempt bytes only at completion.
-        // Keep its live rate until the dependency exposes attempt progress.
-        let rate_bytes = if self.view.transport == Some(Transport::Fetch) {
-            self.view.moved_bytes
-        } else {
-            self.attempt_bytes
-        };
+        // Audit finding 567: the rate samples this attempt's bytes only.
+        // The carrier's live count includes the retained prefix of a resumed
+        // fetch, and crediting that inside the window read as hundreds of
+        // MB/s; attempt_bytes tracks this attempt alone.
+        let rate_bytes = self.attempt_bytes;
         self.samples.push_back((now, rate_bytes));
         // Keep the newest sample older than the window as the floor, so a
         // stall reads as a rate falling to zero rather than no rate.
@@ -1865,8 +1863,11 @@ mod tests {
         assert_eq!(model.view.rate_bytes_per_second, None);
     }
 
+    /// Audit finding 567: a resumed fetch's carrier progress credits the
+    /// retained prefix inside the rate window, so the window must read this
+    /// attempt's bytes, not the prefix-jumping carrier count.
     #[test]
-    fn fetch_carrier_progress_keeps_a_positive_live_rate_with_a_retained_prefix() {
+    fn resumed_fetch_rate_counts_this_attempt_not_the_retained_prefix() {
         let t0 = Instant::now();
         let mut model = Model::new(journal::Kind::Receive);
         model.apply(planned(&[10_000]), t0);
@@ -1879,30 +1880,27 @@ mod tests {
             t0 + Duration::from_millis(500),
         );
         assert_eq!(model.view.rate_bytes_per_second, None, "under a second");
+        // 8.15 KB of retained prefix lands inside the window; the attempt has
+        // transferred nothing the dependency reports yet, so the window must
+        // not read the prefix as a 603 MB/s-class jump.
         model.apply(
             Event::Bytes {
-                moved: 8_200,
+                moved: 9_500,
                 total: Some(10_000),
             },
             t0 + Duration::from_secs(2),
         );
-        assert!(
-            model
-                .view
-                .rate_bytes_per_second
-                .is_some_and(|rate| rate > 0),
-            "the pinned Fetch progress callback must keep the live rate visible"
-        );
-        let rate_before_terminal = model.view.rate_bytes_per_second;
+        assert_eq!(model.view.rate_bytes_per_second, Some(0));
+        // The completion reports exact attempt bytes; the rate follows them,
+        // never the carrier total that includes the prefix. The window runs
+        // from the Transport event's seeded sample at t0, so 1450 bytes over
+        // 2 s reads as 725.
         model.apply(
-            Event::Transferred { bytes: 150 },
+            Event::Transferred { bytes: 1_450 },
             t0 + Duration::from_secs(2),
         );
-        assert_eq!(
-            model.view.rate_bytes_per_second, rate_before_terminal,
-            "the terminal Fetch total must not be counted as another live transfer"
-        );
-        assert_eq!(model.view.moved_bytes, 8_200);
+        assert_eq!(model.view.rate_bytes_per_second, Some(725));
+        assert_eq!(model.view.moved_bytes, 9_500);
     }
 
     #[test]

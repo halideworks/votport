@@ -185,6 +185,13 @@ pub async fn create(
             crate::workflow::permission_refusal("sender"),
         ));
     }
+    // Audit finding 563: the prefix is normalised at the edge so the stored
+    // request, the valid_path gate and the S3 listing all see one canonical
+    // relative shape.
+    let mut request = request;
+    if let Some(import) = &mut request.import {
+        import.prefix = crate::workflow::normalise_import_prefix(&import.prefix);
+    }
     // Resolve the import source against the authorized storage set now so a
     // guessed or non-S3 id fails here with 422 instead of minutes later in
     // preparation.

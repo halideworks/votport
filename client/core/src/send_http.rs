@@ -624,6 +624,144 @@ mod tests {
         exercise_rebegin("resume");
     }
 
+    /// Audit finding 573: the journal marks the session at begin, before any
+    /// payload is accepted, so a send killed in its first seconds still
+    /// carries the session its server-side status can recover. The fixture
+    /// raises the cancel flag as it answers begin, the earliest kill a
+    /// caller can race, and the boundary must still have journalled.
+    #[test]
+    fn a_kill_at_begin_still_journals_the_session_before_any_payload() {
+        use serde_json::json;
+        use std::io::{BufRead as _, Write as _};
+        use std::sync::atomic::AtomicBool;
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("frame");
+        std::fs::write(&source, vec![7; 7]).unwrap();
+        let prepared = crate::package::build(
+            vec![crate::entries::Entry {
+                path: vot_manifest::PackagePath::portable(["frame".to_owned()]).unwrap(),
+                source,
+            }],
+            &directory.path().join("manifest"),
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let server_cancel = std::sync::Arc::clone(&cancel);
+        let server = std::thread::spawn(move || {
+            let mut begins = 0;
+            let mut offsets = Vec::new();
+            for _ in 0..200 {
+                let mut stream = (0..2000)
+                    .find_map(|_| match listener.accept() {
+                        Ok((stream, _)) => Some(stream),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                            None
+                        }
+                        Err(error) => panic!("{error}"),
+                    })
+                    .expect("HTTP upload fixture did not receive a request");
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(&stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let path = first.split_whitespace().nth(1).unwrap().to_owned();
+                let mut body_length = 0;
+                for _ in 0..64 {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        body_length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                reader.read_exact(&mut vec![0; body_length]).unwrap();
+                let (status, body, done) = if path == "/api/r/token/session" {
+                    (
+                        200,
+                        json!({"session":"0123456789abcdef0123456789abcdef", "chunk_bytes":65536, "resume":true}),
+                        false,
+                    )
+                } else if path.ends_with("/begin") {
+                    begins += 1;
+                    // The earliest kill a caller can race: the cancel lands
+                    // while begin is answered, before any chunk is requested.
+                    server_cancel.store(true, Ordering::SeqCst);
+                    (
+                        200,
+                        json!({"entries":[{"index":0, "path":"frame", "stored_as":"frame", "bytes":7,
+                        "complete":false, "covered_bytes":0}]}),
+                        true,
+                    )
+                } else {
+                    assert!(path.contains("/chunk?"), "unexpected request: {path}");
+                    offsets.push(path);
+                    (200, json!({"accepted":true}), true)
+                };
+                let body = body.to_string();
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                if done {
+                    return (begins, offsets);
+                }
+            }
+            panic!("HTTP upload fixture exhausted its request bound");
+        });
+
+        struct CancelledAtBegin {
+            flag: std::sync::Arc<AtomicBool>,
+        }
+        impl Observer for CancelledAtBegin {
+            fn event(&mut self, _event: Event) {}
+            fn cancelled(&self) -> bool {
+                self.flag.load(Ordering::SeqCst)
+            }
+            fn paused(&self) -> bool {
+                // A user pause retains the session instead of aborting it.
+                true
+            }
+        }
+
+        let client = Client::with_timeout(&url, Some(Duration::from_secs(2))).unwrap();
+        let journalled = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let journal_sink = std::sync::Arc::clone(&journalled);
+        let result = send_with_session(
+            &client,
+            "token",
+            None,
+            &prepared,
+            &mut CancelledAtBegin { flag: cancel },
+            None,
+            |session, _, _| {
+                // What the FFI layer's journal mark does at begin.
+                *journal_sink.lock().unwrap() = Some(session.to_owned());
+                Ok(true)
+            },
+        );
+        let (begins, offsets) = server.join().unwrap();
+        assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+        assert_eq!(begins, 1);
+        assert!(
+            offsets.is_empty(),
+            "no payload may follow the journalled begin: {offsets:?}"
+        );
+        assert_eq!(
+            journalled.lock().unwrap().as_deref(),
+            Some("0123456789abcdef0123456789abcdef"),
+            "the kill at begin still journals the session"
+        );
+    }
+
     #[test]
     fn an_existing_resume_skips_the_journal_callback() {
         exercise_rebegin("existing");
