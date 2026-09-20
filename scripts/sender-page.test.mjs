@@ -100,7 +100,7 @@ test('picking folds each selected path once, not once per add', () => {
   // memoized keys keep the 20,000th add from refolding the 19,999 paths
   // before it (finding 537).
   assert.match(script, /function pickedPathKey\(path\) \{/);
-  assert.match(script, /pathKeyMemo\.set\(joined, key\);/, 'the batch check seeds the memo with the key it already folded');
+  assert.match(script, /pathKeyMemo\.set\(path, key\);/, 'the batch check seeds the memo with the key it already folded');
   assert.match(script, /pickedKeys\.set\(pickedPathKey\(path\), path\);/);
   assert.doesNotMatch(script, /pickedKeys\.set\(pathKeyString\(/);
   // Clearing the selection must not leave stale keys for reused paths.

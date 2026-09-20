@@ -3256,7 +3256,16 @@ pub async fn switch_tenant(
         tenant: grant.tenant.clone(),
         role: grant.role.clone(),
         credential_version: identity.credential_version,
-        grants: identity.grants.clone(),
+        // The local admin's grants are recomputed from the store on every
+        // request, so the cookie never needs to carry them; with many tenants
+        // they push the cookie past the 4096-byte limit browsers accept and
+        // the switch silently no-ops. Non-local identities keep their
+        // self-contained grants because the incarnation checks read them.
+        grants: if identity.subject == "local" {
+            Vec::new()
+        } else {
+            identity.grants.clone()
+        },
         subject: identity.subject.clone(),
     };
     tracing::info!(

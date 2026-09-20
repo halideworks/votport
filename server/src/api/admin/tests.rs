@@ -6595,6 +6595,72 @@ mod principals_api_tests {
     }
 
     #[tokio::test]
+    async fn local_switch_cookie_stays_under_browser_limit_with_many_tenants() {
+        // Browsers refuse cookies over 4096 bytes; the local admin's grants
+        // are recomputed from the store on every request, so the reissued
+        // switch cookie must not carry them or the switch silently no-ops
+        // once the tenant count grows.
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        for index in 0..60 {
+            application
+                .store
+                .insert_tenant(crate::store::Tenant {
+                    retention_days: None,
+                    incarnation: format!("{:024x}", index),
+                    key: format!("tenant-{index:02}"),
+                    label: String::new(),
+                    admin_group: None,
+                    max_total_bytes: None,
+                    max_links: None,
+                    max_sessions: None,
+                    created_at: 0,
+                })
+                .unwrap();
+        }
+        let cookie = test_admin_cookie(&application, &auth::AdminIdentity::local_admin());
+        let (status, _, set_cookie) = send(
+            application.clone(),
+            Request::post("/api/admin/tenant")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"tenant": "tenant-07"}).to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let set_cookie = set_cookie.expect("switch reissues a cookie");
+        assert!(
+            set_cookie.len() < 4096,
+            "local switch cookie must stay under the 4096-byte browser limit"
+        );
+        let (switched, _) = auth::verify_admin_token(
+            &application.secret,
+            &admin_token_phc(&application).unwrap(),
+            cookie_token(&set_cookie),
+        )
+        .unwrap();
+        assert_eq!(switched.tenant, "tenant-07");
+        assert!(switched.grants.is_empty());
+        // The trimmed grants are recomputed per request, so the switched
+        // cookie resolves to the switched tenant scope on the next request.
+        let follow = send(
+            application,
+            Request::get("/api/admin/session")
+                .header(
+                    "cookie",
+                    format!("votport_admin={}", cookie_token(&set_cookie)),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(follow.0, StatusCode::OK);
+        assert_eq!(follow.1["tenant"], "tenant-07");
+    }
+
+    #[tokio::test]
     async fn local_identity_sees_named_tenant_grants() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
