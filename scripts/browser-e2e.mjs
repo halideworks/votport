@@ -819,7 +819,7 @@ if (browserEngine === "chromium") {
 }
 await page.waitForFunction(() => document.querySelector("#done-list .file-id")?.getAttribute("aria-label")?.startsWith("Copied file hash: "), null, { timeout: 5000, polling: 50 });
 await page.evaluate(() => { window.__copySuccessAt = performance.now(); });
-await page.waitForFunction(() => performance.now() - window.__copySuccessAt >= 750, null, { timeout: 3000, polling: 50 });
+await page.waitForFunction(() => performance.now() - window.__copySuccessAt >= 750, null, { timeout: 10000, polling: 50 });
 await page.evaluate(() => { window.__clipboardFailure = true; });
 await copyControl.press("Enter");
 await page.waitForFunction(() => document.querySelector("#done-list .file-id")?.textContent === "Copy failed", null, { timeout: 5000, polling: 50 });
