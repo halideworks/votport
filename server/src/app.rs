@@ -3241,6 +3241,25 @@ mod health_tests {
         );
     }
 
+    /// Audit finding 564: SIGTERM drains HTTP but does not cancel an
+    /// in-flight storage export, so the compose stop grace period carries
+    /// the line tying the deadline to the export time of the largest single
+    /// file; a SIGKILL at the deadline is what orphans the multipart upload.
+    #[test]
+    fn the_stop_grace_period_doc_ties_the_deadline_to_the_largest_single_file() {
+        let compose = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../docker-compose.yml"
+        ));
+        let grace = compose
+            .find("stop_grace_period")
+            .expect("the compose stop grace period stays configured");
+        assert!(
+            compose[..grace].contains("largest single file"),
+            "the comment above the grace period must tie it to the largest single file"
+        );
+    }
+
     #[test]
     fn receiving_checks_do_not_hold_ownership_state_or_delay_renewal() {
         use std::time::{Duration, Instant};

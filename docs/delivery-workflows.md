@@ -161,8 +161,12 @@ votport agent events --limit 100
 
 Optional `not_before` and `deadline` values are Unix seconds. Optional
 `import: { "storage_id": "source", "prefix": "incoming/episode-08" }` selects
-S3 objects instead of the project's library files. MCP `create_job` accepts the
-same information using `import_storage_id` and `import_prefix` together.
+S3 objects instead of the project's library files. The HTTP job body takes only
+this nested `import` object; `import_storage_id` and `import_prefix` together
+are the MCP `create_job` field names, translated by the CLI before submission.
+The prefix is relative: surrounding whitespace, leading and trailing slashes
+and `.` segments are trimmed, while a `..` segment or an empty result is
+refused.
 Follow returned cursors even when a filtered job/event page is empty.
 
 ## Reception workflows and trade routes

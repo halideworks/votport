@@ -1220,12 +1220,45 @@ fn guard_folder_key(config: &Storage, key: &ObjectPath) -> ApiResult<()> {
     Ok(())
 }
 
+/// Class of a storage multipart failure: object_store Display strings carry
+/// the object path and endpoint URL, so only the failure class reaches the
+/// job-visible message. A rotated policy reads differently from a dropped
+/// connection, and neither is confounded with a key the store refused
+/// (audit finding 560, matching backup's abort failure classes).
+fn multipart_failure_class(error: &object_store::Error) -> &'static str {
+    match error {
+        object_store::Error::NotFound { .. }
+        | object_store::Error::AlreadyExists { .. }
+        | object_store::Error::NotModified { .. }
+        | object_store::Error::Precondition { .. } => {
+            "the store answered with a conflicting object state"
+        }
+        object_store::Error::PermissionDenied { .. }
+        | object_store::Error::Unauthenticated { .. } => "the store refused the credentials",
+        object_store::Error::InvalidPath { .. } => "the store refused the object key",
+        object_store::Error::NotSupported { .. } | object_store::Error::NotImplemented { .. } => {
+            "the store cannot multipart-upload"
+        }
+        _ => "the store request failed",
+    }
+}
+
 async fn upload_file(
     store: &dyn ObjectStore,
     key: &ObjectPath,
     path: &Path,
     expected: &ObjectId,
 ) -> ApiResult<()> {
+    // Audit finding 560: an assembled key over the store's 1024-byte limit is
+    // named here, before the put, instead of surfacing as the anonymous
+    // multipart failure that shares a 120 s backoff with refused credentials
+    // and dropped connections.
+    if key.as_ref().len() > 1024 {
+        return Err(conflict(format!(
+            "the assembled object key is {} bytes, over the store's 1024-byte limit",
+            key.as_ref().len()
+        )));
+    }
     let part_size = expected.length.div_ceil(10_000).max(8 * 1024 * 1024);
     // ponytail: at most 128 MiB per part; larger than 1.25 TiB needs a streaming multipart adapter.
     if part_size > 128 * 1024 * 1024 {
@@ -1242,10 +1275,12 @@ async fn upload_file(
         expected.length,
     )
     .map_err(|_| conflict("build export verifier failed".into()))?;
-    let mut upload = store
-        .put_multipart(key)
-        .await
-        .map_err(|_| conflict("start storage multipart upload failed".into()))?;
+    let mut upload = store.put_multipart(key).await.map_err(|error| {
+        conflict(format!(
+            "start storage multipart upload failed ({})",
+            multipart_failure_class(&error)
+        ))
+    })?;
     let result = async {
         let mut total = 0u64;
         loop {
@@ -1275,7 +1310,12 @@ async fn upload_file(
             upload
                 .put_part(bytes.into())
                 .await
-                .map_err(|_| conflict("storage multipart upload interrupted".into()))?;
+                .map_err(|error| {
+                    conflict(format!(
+                        "storage multipart upload interrupted ({})",
+                        multipart_failure_class(&error)
+                    ))
+                })?;
             if used == 0 {
                 break;
             }
@@ -1291,7 +1331,12 @@ async fn upload_file(
         upload
             .complete()
             .await
-            .map_err(|_| conflict("complete storage multipart upload failed".into()))?;
+            .map_err(|error| {
+                conflict(format!(
+                    "complete storage multipart upload failed ({})",
+                    multipart_failure_class(&error)
+                ))
+            })?;
         Ok(())
     }
     .await;
@@ -1304,6 +1349,35 @@ async fn upload_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit finding 560: an assembled key over the store's 1024-byte limit
+    /// is refused by name before the put, so an in-memory store that would
+    /// happily accept it never sees the upload and the refusal cannot be
+    /// confused with the anonymous multipart failures.
+    #[tokio::test]
+    async fn an_oversized_assembled_key_is_refused_before_the_multipart_put() {
+        let directory = tempfile::tempdir().unwrap();
+        let expected = ObjectId {
+            suite: 1,
+            root: [9; 32],
+            length: 8,
+        };
+        let source = directory.path().join("payload.bin");
+        std::fs::write(&source, vec![0u8; 8]).unwrap();
+        let key = ObjectPath::parse(format!("deliveries/{}", "k".repeat(1020))).unwrap();
+        assert!(key.as_ref().len() > 1024);
+        let store = object_store::memory::InMemory::new();
+        let error = upload_file(&store, &key, &source, &expected)
+            .await
+            .expect_err("an oversized assembled key is refused");
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(
+            error.message,
+            "the assembled object key is 1031 bytes, over the store's 1024-byte limit"
+        );
+        let listed = store.list(None).next().await;
+        assert!(listed.is_none(), "the put never happened: {listed:?}");
+    }
 
     /// Audit finding 557: a 0-byte directory marker (console, aws s3 sync,
     /// rclone) is listed without its trailing delimiter, so it must be

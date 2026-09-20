@@ -22,6 +22,9 @@ services:
     # Docker's default 10s SIGKILL cuts off streaming downloads mid-transfer.
     # No value covers a 500 GiB upload; for upgrades, drain first (stop
     # admitting sessions, watch votport_sessions_active reach 0).
+    # A stop does not cancel an in-flight storage export either, so keep this
+    # above the export time of the largest single file: the SIGKILL at the
+    # deadline orphans its unfinished multipart upload.
     stop_grace_period: 5m
     # Bound the json-file log driver: without it the container log grows
     # without limit. Log lines are human-readable by default; set
