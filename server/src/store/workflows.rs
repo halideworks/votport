@@ -1518,6 +1518,71 @@ impl Store {
         release_in(&connection, grant_id)
     }
 
+    /// Removes one enrolled recipient device from a live job (audit finding
+    /// 370). job.request.recipients is frozen at submit, so un-enrolling in
+    /// the project alone never reached a submitted delivery; removing the
+    /// holder here invalidates its recipient cookie and challenges at once
+    /// without revoking the delivery for everyone.
+    pub fn remove_delivery_recipient(
+        &self,
+        tenant: &str,
+        id: &str,
+        actor: &str,
+        administrator: bool,
+        holder: &str,
+    ) -> Result<Job, WorkflowMutationError> {
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let tx = connection.transaction().map_err(|e| e.to_string())?;
+        let mut job = job_in(&tx, id)
+            .map_err(|e| e.to_string())?
+            .filter(|job| job.tenant == tenant)
+            .ok_or_else(|| WorkflowMutationError::conflict("job missing"))?;
+        let project = project_in(&tx, tenant, &job.project.id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| WorkflowMutationError::conflict("project missing"))?;
+        if job.state == "suspended" {
+            return Err(WorkflowMutationError::conflict(
+                "delivery is held after restore; create a new job",
+            ));
+        }
+        if !project.allows(actor, "sender", administrator) && actor != job.actor {
+            return Err(WorkflowMutationError::conflict(
+                crate::workflow::permission_refusal("sender"),
+            ));
+        }
+        if ["cancelled", "retiring", "retired"].contains(&job.state.as_str()) {
+            return Err(WorkflowMutationError::conflict(format!(
+                "a {} delivery cannot change recipients",
+                job.state
+            )));
+        }
+        if !job
+            .request
+            .recipients
+            .iter()
+            .any(|enrolled| enrolled == holder)
+        {
+            return Err(WorkflowMutationError::conflict(
+                "that device is not enrolled on this delivery",
+            ));
+        }
+        job.request.recipients.retain(|enrolled| enrolled != holder);
+        job.updated_at = now_unix();
+        save_job(&tx, &job).map_err(|e| e.to_string())?;
+        evidence::delivery_event(
+            &tx,
+            &self.event_signer,
+            tenant,
+            &job.id,
+            "recipient_removed",
+            &serde_json::json!({"actor": actor, "holder": holder}),
+            job.updated_at,
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(job)
+    }
+
     pub(crate) fn delivery_job_token(&self, tenant: &str, id: &str) -> Result<String, String> {
         self.with(|connection| {
             connection.query_row(
@@ -1777,6 +1842,129 @@ pub(super) fn release_in(connection: &Connection, grant_id: &str) -> Result<Opti
 mod tests {
     use super::*;
     use crate::workflow::tests::{project, request};
+
+    #[test]
+    fn owner_removes_a_live_holder_and_purges_grant_evidence() {
+        // Audit finding 370: job.request.recipients froze at submit and
+        // delivery_evidence rows were deleted only by remove_tenant, so a
+        // recipient device could never be un-enrolled or erased once a job
+        // was submitted and the only remedy was revoking the whole delivery.
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let holder_a = store.event_signer.public_hex.clone();
+        let holder_b = hex::encode(
+            ed25519_dalek::SigningKey::from_bytes(&[9u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let mut project = crate::workflow::tests::project();
+        project.require_approval = false;
+        project.recipients = vec![
+            crate::workflow::Recipient {
+                email: "a@example.com".into(),
+                holder: holder_a.clone(),
+            },
+            crate::workflow::Recipient {
+                email: "b@example.com".into(),
+                holder: holder_b.clone(),
+            },
+        ];
+        let project = store.save_delivery_project("", "admin", project).unwrap();
+        let mut request = crate::workflow::tests::request();
+        request.recipients = vec![holder_a.clone(), holder_b.clone()];
+        let job = store
+            .enqueue_delivery_job("", "sender", 1, None, project, request)
+            .unwrap();
+
+        // A principal without sender access cannot remove a holder.
+        assert!(store
+            .remove_delivery_recipient("", &job.id, "stranger", false, &holder_a)
+            .unwrap_err()
+            .contains("sender access"));
+        // Only an enrolled holder can be removed.
+        assert!(store
+            .remove_delivery_recipient("", &job.id, "sender", false, "ff")
+            .unwrap_err()
+            .contains("not enrolled"));
+
+        let updated = store
+            .remove_delivery_recipient("", &job.id, "sender", false, &holder_a)
+            .unwrap();
+        assert_eq!(updated.request.recipients, vec![holder_b.clone()]);
+        assert!(
+            !store
+                .delivery_job(&job.id)
+                .unwrap()
+                .unwrap()
+                .request
+                .recipients
+                .contains(&holder_a),
+            "the removed holder must leave the frozen request"
+        );
+        let events = store.delivery_events("", 0, 100).unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "recipient_removed" && event.payload["holder"] == holder_a.as_str()
+        }));
+
+        // A cancelled delivery no longer takes recipient changes.
+        store
+            .change_delivery_job("", &job.id, "sender", false, "cancel", None)
+            .unwrap();
+        assert!(store
+            .remove_delivery_recipient("", &job.id, "sender", false, &holder_b)
+            .unwrap_err()
+            .contains("cannot change recipients"));
+
+        // The per-grant evidence purge erases the delivery's rows and only
+        // its rows, and the purge itself lands in the hash chain.
+        store
+            .with(|c| {
+                for (id, grant, kind) in [
+                    ("ev-1", job.id.as_str(), "verified"),
+                    ("ev-2", job.id.as_str(), "accepted"),
+                    ("ev-3", "other-grant", "verified"),
+                ] {
+                    c.execute(
+                        "INSERT INTO delivery_evidence(id,grant_id,holder,kind,received_at,document)
+                         VALUES (?1,?2,'holder',?3,1,'{}')",
+                        rusqlite::params![id, grant, kind],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .purge_delivery_evidence("", &job.id, "sender")
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .with(|c| {
+                    c.query_row(
+                        "SELECT COUNT(*) FROM delivery_evidence WHERE grant_id='other-grant'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                })
+                .unwrap(),
+            1,
+            "another grant's evidence must survive"
+        );
+        assert!(store
+            .delivery_events("", 0, 100)
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "evidence_purged"
+                && event.grant_id == job.id
+                && event.payload["purged"] == 2));
+        // A delivery that does not exist refuses.
+        assert_eq!(
+            store.purge_delivery_evidence("", "missing", "sender"),
+            Err("delivery not found".into())
+        );
+    }
 
     #[test]
     fn a_project_cannot_name_two_routes_to_one_receiving_endpoint() {

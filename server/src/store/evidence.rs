@@ -422,6 +422,49 @@ impl Store {
         })
     }
 
+    /// Erases every evidence row of one grant (audit finding 370): the rows
+    /// hold the holder's raw public key and signed statements and used to be
+    /// deleted only by remove_tenant, so a device could never be erased
+    /// while its delivery lived. The hash chain keeps a record that the
+    /// evidence was purged, by whom, and how many rows went.
+    pub fn purge_delivery_evidence(
+        &self,
+        tenant: &str,
+        grant_id: &str,
+        actor: &str,
+    ) -> Result<u64, String> {
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let tx = connection.transaction().map_err(|e| e.to_string())?;
+        let known: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM delivery_jobs WHERE id=?1 AND tenant=?2)",
+                params![grant_id, tenant],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !known {
+            return Err("delivery not found".into());
+        }
+        let purged: usize = tx
+            .execute(
+                "DELETE FROM delivery_evidence WHERE grant_id=?1",
+                [grant_id],
+            )
+            .map_err(|e| e.to_string())?;
+        delivery_event(
+            &tx,
+            &self.event_signer,
+            tenant,
+            grant_id,
+            "evidence_purged",
+            &serde_json::json!({"actor": actor, "purged": purged}),
+            now_unix(),
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(purged as u64)
+    }
+
     pub fn delivery_evidence(
         &self,
         grant_id: &str,

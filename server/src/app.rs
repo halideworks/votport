@@ -5946,7 +5946,8 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route(
             "/api/workflows/jobs/{id}/evidence",
-            get(api::outbound::workflows::evidence),
+            get(api::outbound::workflows::evidence)
+                .delete(api::outbound::workflows::purge_evidence),
         )
         .route(
             "/api/workflows/events",

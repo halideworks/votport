@@ -1973,6 +1973,27 @@ fn prepare_files<'a>(
     let existing = prepare_parallel(entries, |_, (components, object)| {
         find_delivered(setup, object, components, &active)
     })?;
+    // Audit finding 373: a live record can still claim one of these stored
+    // names under a different object identity, most often because a restore
+    // resurrected it after a later upload reused the freed name. Treat such
+    // names as taken so the new file takes a suffixed one instead of sharing
+    // a stored path with the stale claim.
+    let fresh: Vec<(String, String, String)> = entries
+        .iter()
+        .zip(&existing)
+        .filter(|(_, existing)| existing.is_none())
+        .map(|((components, object), _)| {
+            (
+                stored_rel(&setup.dest_rel, &components.join("\0")),
+                suite_name(object.suite),
+                hex::encode(object.root),
+            )
+        })
+        .collect();
+    let conflicts = setup
+        .store
+        .conflicting_stored_claims(&setup.tenant, &fresh)
+        .map_err(SessionError::internal)?;
     // ponytail: large NAS manifests serialize metadata allocation; temporary claims can narrow it.
     let allocation = setup
         .store
@@ -2002,6 +2023,10 @@ fn prepare_files<'a>(
     }
     let mut claimed = pending;
     claimed.extend(parents);
+    for name in &conflicts {
+        let components: Vec<String> = name.split('/').map(str::to_owned).collect();
+        claimed.insert(stored_path_key("", &components)?);
+    }
     let claimed = Mutex::new(claimed);
     let files = prepare_parallel(entries, |index, (components, object)| {
         if !active() {
@@ -6282,6 +6307,48 @@ mod push_tests {
                 assert_eq!(fs::read(second_path).unwrap(), b"second");
             }
         }
+    }
+
+    /// Audit finding 373: a live record resurrected by a restore can still
+    /// claim a stored name under different content; preparation must take a
+    /// suffixed name instead of reusing the claimed one, while a record of
+    /// the same identity leaves the name reusable.
+    #[test]
+    fn preparation_avoids_stored_names_claimed_by_other_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let fresh = object(Suite::Blake3Bao64, b"fresh bytes");
+        let old = object(Suite::Blake3Bao64, b"old bytes..");
+        let suite = suite_name(fresh.suite);
+        let app = crate::api::testing::build(directory.path());
+        let setup = setup_with_app(directory.path(), fresh.clone(), &app);
+        let insert = |link: &str, stored_as: &str, root: &str| {
+            let suite = suite.clone();
+            app.store.with(move |connection| {
+                connection.execute(
+                    "INSERT INTO files(link_id,tenant,upload_id,file_index,bytes_hi,bytes_lo,
+                        deleted,stored_as,path,suite,root,receipt)
+                     VALUES (?1,'','old',0,0,11,0,?2,?2,?3,?4,0)",
+                    rusqlite::params![link, stored_as, suite, root],
+                )
+            })
+        };
+        insert("link-a", "frame", &hex::encode(old.root)).unwrap();
+        let entries = [(vec!["frame".into()], fresh.clone())];
+        let (files, allocation) = prepare_files(&setup, &entries, || true).unwrap();
+        drop(allocation);
+        assert_eq!(
+            files[0].stored_components, "frame-1",
+            "a name claimed by a different root must be skipped"
+        );
+        drop(files);
+        insert("link-b", "take", &hex::encode(fresh.root)).unwrap();
+        let entries = [(vec!["take".into()], fresh)];
+        let (files, allocation) = prepare_files(&setup, &entries, || true).unwrap();
+        drop(allocation);
+        assert_eq!(
+            files[0].stored_components, "take",
+            "a same-identity record leaves the name reusable"
+        );
     }
 
     #[test]

@@ -1551,34 +1551,64 @@ pub(crate) fn record_applied_restore(store: &crate::store::Store, applied: &Appl
 /// 498): a restore rolls the database back, so payloads and receipts
 /// published after the backup stay on disk with no record, while live
 /// records can name payloads removed since the backup. Stats the live
-/// records after install and reports both gaps in one audit row so holdings
+/// records after install, tombstones the records whose payload is gone
+/// (audit finding 373) and reports both gaps in one audit row so holdings
 /// and disk can be reconciled deliberately instead of silently disagreeing.
 pub(crate) fn survey_restored_payloads(store: &crate::store::Store, receive_dir: &Path) {
     if !receive_dir.try_exists().unwrap_or(false) {
         return;
     }
-    let referenced: HashSet<String> = match store.with(|connection| {
+    let records: Vec<(String, String)> = match store.with(|connection| {
         connection
             .prepare("SELECT tenant, stored_as FROM files WHERE deleted = 0 AND stored_as <> ''")?
-            .query_map([], |row| {
-                Ok(crate::paths::stored_components(
-                    &row.get::<_, String>(0)?,
-                    &row.get::<_, String>(1)?,
-                )
-                .join("/"))
-            })?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()
     }) {
-        Ok(rows) => rows.into_iter().collect(),
+        Ok(rows) => rows,
         Err(error) => {
             tracing::warn!(%error, "restored payload survey could not read records");
             return;
         }
     };
+    let referenced: HashSet<String> = records
+        .iter()
+        .map(|(tenant, stored_as)| crate::paths::stored_components(tenant, stored_as).join("/"))
+        .collect();
     let mut on_disk = HashSet::new();
     collect_payload_files(receive_dir, "", &mut on_disk);
     let missing: Vec<&String> = referenced.difference(&on_disk).collect();
     let unreferenced: Vec<&String> = on_disk.difference(&referenced).collect();
+    // Audit finding 373: a restored record whose payload is gone would stay
+    // listed, charged against quota and targeted by retention on a path that
+    // no longer holds its bytes. Tombstone the stat-misses now, while the
+    // restored database is still closed to sessions.
+    let mut tombstoned = 0usize;
+    if !missing.is_empty() {
+        let missing_set: HashSet<&String> = missing.iter().copied().collect();
+        let stale: Vec<(&String, &String)> = records
+            .iter()
+            .filter(|(tenant, stored_as)| {
+                missing_set.contains(&crate::paths::stored_components(tenant, stored_as).join("/"))
+            })
+            .map(|(tenant, stored_as)| (tenant, stored_as))
+            .collect();
+        tombstoned = match store.with(|connection| {
+            let mut statement = connection.prepare(
+                "UPDATE files SET deleted=1, path='' WHERE tenant=?1 AND stored_as=?2 AND deleted=0",
+            )?;
+            let mut changed = 0usize;
+            for (tenant, stored_as) in stale {
+                changed += statement.execute(rusqlite::params![tenant, stored_as])?;
+            }
+            Ok(changed)
+        }) {
+            Ok(changed) => changed,
+            Err(error) => {
+                tracing::warn!(%error, "restored payload survey could not tombstone missing records");
+                0
+            }
+        };
+    }
     if missing.is_empty() && unreferenced.is_empty() {
         return;
     }
@@ -1587,12 +1617,14 @@ pub(crate) fn survey_restored_payloads(store: &crate::store::Store, receive_dir:
         "missing": sample_names(&missing),
         "unreferenced_count": unreferenced.len(),
         "unreferenced": sample_names(&unreferenced),
+        "tombstoned": tombstoned,
     });
     tracing::warn!(
         target: "audit",
         event = "restore_payload_mismatch",
         missing = missing.len(),
         unreferenced = unreferenced.len(),
+        tombstoned,
         "restored records and receive tree disagree"
     );
     store.audit("", "", "restore_payload_mismatch", "", &detail);
@@ -2664,6 +2696,79 @@ mod tests {
                 .count(),
             1,
             "an agreeing tree writes no further row"
+        );
+    }
+
+    /// Audit finding 373: the survey must tombstone the live records whose
+    /// payload did not survive the restore, so nothing lists, charges or
+    /// retires against a path that no longer holds the record's bytes,
+    /// while a record whose payload stats stays live.
+    #[test]
+    fn restored_payload_survey_tombstones_records_missing_from_disk() {
+        let (root, store) = initialized_root();
+        let receive = root.path().join("received");
+        store
+            .with(|connection| {
+                connection.execute(
+                    "INSERT INTO files(link_id,tenant,upload_id,file_index,bytes_hi,bytes_lo,
+                        deleted,stored_as,path,suite,root,receipt)
+                     VALUES ('link-gone','','upload-gone',0,0,20,0,'gone.bin','gone.bin','md5','root-old',0)",
+                    [],
+                )?;
+                connection.execute(
+                    "INSERT INTO files(link_id,tenant,upload_id,file_index,bytes_hi,bytes_lo,
+                        deleted,stored_as,path,suite,root,receipt)
+                     VALUES ('link-kept','','upload-kept',0,0,64,0,'kept.bin','kept.bin','md5','root-new',0)",
+                    [],
+                )
+            })
+            .unwrap();
+        std::fs::create_dir_all(&receive).unwrap();
+        fs::write(receive.join("kept.bin"), [0u8; 64]).unwrap();
+
+        survey_restored_payloads(&store, &receive);
+
+        let (deleted, path): (i64, String) = store
+            .with(|connection| {
+                connection.query_row(
+                    "SELECT deleted, path FROM files WHERE stored_as='gone.bin'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            (deleted, path.as_str()),
+            (1, ""),
+            "the miss must be tombstoned"
+        );
+        let kept: i64 = store
+            .with(|connection| {
+                connection.query_row(
+                    "SELECT deleted FROM files WHERE stored_as='kept.bin'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(kept, 0, "a record whose payload stats must stay live");
+        let rows = store.audit_export(None, 0, 0, 100).unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.event == "restore_payload_mismatch")
+            .expect("one mismatch row");
+        assert_eq!(row.detail["missing"][0], "gone.bin", "{}", row.detail);
+        assert_eq!(row.detail["tombstoned"], 1, "{}", row.detail);
+
+        // The reconciled tree agrees on a further survey.
+        survey_restored_payloads(&store, &receive);
+        let rows = store.audit_export(None, 0, 0, 100).unwrap();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.event == "restore_payload_mismatch")
+                .count(),
+            1,
+            "a tombstoned record stops being reported"
         );
     }
 

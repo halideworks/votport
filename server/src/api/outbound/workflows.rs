@@ -417,6 +417,44 @@ pub async fn evidence(
         .into_response())
 }
 
+/// Erases the grant's evidence rows (audit finding 370): a project sender
+/// can purge the device statements and raw public keys a delivery holds,
+/// which previously only tenant deletion did.
+pub async fn purge_evidence(
+    State(app): State<Arc<App>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> ApiResult<Response> {
+    let actor = actor(&app, &headers, peer, "jobs:cancel", true)?;
+    let job = app
+        .store
+        .delivery_job(&id)
+        .map_err(crate::api::store_unavailable)?
+        .filter(|j| j.tenant == actor.identity.tenant)
+        .ok_or_else(ApiError::not_found)?;
+    let project = app
+        .store
+        .delivery_project(&job.tenant, &job.project.id)
+        .map_err(crate::api::store_unavailable)?
+        .ok_or_else(ApiError::not_found)?;
+    if !actor.allows(&project, "sender") {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            crate::workflow::permission_refusal("sender"),
+        ));
+    }
+    let purged = app
+        .store
+        .purge_delivery_evidence(&job.tenant, &job.id, &actor.identity.subject)
+        .map_err(crate::api::store_unavailable)?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({"purged": purged})),
+    )
+        .into_response())
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reprocess {
@@ -487,6 +525,7 @@ pub async fn reprocess(
 pub struct Action {
     action: String,
     manifest: Option<String>,
+    holder: Option<String>,
 }
 
 pub async fn change(
@@ -507,6 +546,19 @@ pub async fn change(
             StatusCode::FORBIDDEN,
             "automation cannot approve deliveries",
         ));
+    }
+    // Audit finding 370: removing a holder needs the device key to remove.
+    if action.action == "remove_recipient" {
+        let valid = action
+            .holder
+            .as_deref()
+            .is_some_and(crate::workflow::valid_holder);
+        if !valid {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "name the enrolled recipient device to remove",
+            ));
+        }
     }
     let job = app
         .store
@@ -536,17 +588,26 @@ pub async fn change(
             }),
         ));
     }
-    let job = app
-        .store
-        .change_delivery_job(
+    let administrator = actor.token.is_none() && actor.identity.role == "admin";
+    let job = if action.action == "remove_recipient" {
+        app.store.remove_delivery_recipient(
             &job.tenant,
             &id,
             &actor.identity.subject,
-            actor.token.is_none() && actor.identity.role == "admin",
+            administrator,
+            action.holder.as_deref().expect("validated above"),
+        )
+    } else {
+        app.store.change_delivery_job(
+            &job.tenant,
+            &id,
+            &actor.identity.subject,
+            administrator,
             &action.action,
             action.manifest.as_deref(),
         )
-        .map_err(workflow_store_error)?;
+    }
+    .map_err(workflow_store_error)?;
     app.workflow_ready.notify_one();
     Ok((
         [(header::CACHE_CONTROL, "no-store")],

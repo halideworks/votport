@@ -1776,6 +1776,53 @@ impl Store {
         self.with(|connection| read_upload(connection, tenant, link_id, upload_id))
     }
 
+    /// Stored names among `candidates` that a live record still claims under
+    /// a different object identity (audit finding 373). After a restore a
+    /// resurrected record can hold a name whose bytes a later upload
+    /// replaced, so an upload must not reuse the name and leave two live
+    /// records on one stored path. ponytail: one scan over the tenant's live
+    /// rows per preparation; a stored_as index would tighten it if sessions
+    /// ever pay for it.
+    pub(crate) fn conflicting_stored_claims(
+        &self,
+        tenant: &str,
+        candidates: &[(String, String, String)],
+    ) -> Result<std::collections::HashSet<String>, String> {
+        if candidates.is_empty() {
+            return Ok(Default::default());
+        }
+        let names: Vec<String> = candidates.iter().map(|(name, _, _)| name.clone()).collect();
+        let names = serde_json::to_string(&names).map_err(|e| e.to_string())?;
+        let claimed: Vec<String> = self.with(|connection| {
+            connection
+                .prepare(
+                    "SELECT DISTINCT stored_as FROM files
+                     WHERE tenant=?1 AND deleted=0
+                       AND stored_as IN (SELECT value FROM json_each(?2))",
+                )?
+                .query_map(rusqlite::params![tenant, names], |row| row.get(0))?
+                .collect()
+        })?;
+        let mut conflicts = std::collections::HashSet::new();
+        for (name, suite, root) in candidates {
+            if !claimed.contains(name) {
+                continue;
+            }
+            let foreign: bool = self.with(|connection| {
+                connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM files WHERE tenant=?1 AND stored_as=?2
+                     AND deleted=0 AND NOT (suite=?3 AND root=?4))",
+                    rusqlite::params![tenant, name, suite, root],
+                    |row| row.get(0),
+                )
+            })?;
+            if foreign {
+                conflicts.insert(name.clone());
+            }
+        }
+        Ok(conflicts)
+    }
+
     pub(crate) fn delivered_candidates(
         &self,
         tenant: &str,
@@ -2365,6 +2412,31 @@ impl Store {
             }
         };
         if matches!(removal, TenantRemoval::Deleted | TenantRemoval::Absent) {
+            // Audit finding 374: exported copies survive every votport
+            // action, and this transaction erases the only record of which
+            // bucket or prefix holds them. Write the inventory into the
+            // audit log before the job rows go.
+            match completed_export_inventory(&transaction, key) {
+                Ok(exports) if !exports.is_empty() => {
+                    let detail =
+                        serde_json::json!({"job_count": exports.len(), "exports": exports});
+                    if let Err(error) = insert_audit_row(
+                        &transaction,
+                        now_unix(),
+                        key,
+                        "",
+                        "tenant_export_inventory",
+                        key,
+                        &detail,
+                    ) {
+                        tracing::warn!(%error, "tenant export inventory audit row failed");
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "tenant export inventory could not be read");
+                }
+            }
             transaction
                 .execute(
                     "UPDATE tenant_quota_usage SET state=2 WHERE tenant=?1",
@@ -6243,6 +6315,81 @@ impl Store {
             connection.execute(&sql, rusqlite::params_from_iter(parameters))
         })
     }
+}
+
+/// The completed storage exports of a tenant (audit finding 374): jobs
+/// whose destination reached `complete` hold copies on external storage
+/// that no votport action removes, and tenant deletion erases the only
+/// record of where those copies live. One entry per job naming the
+/// destination storages (kind, bucket, prefix) that still hold its copy.
+fn completed_export_inventory(
+    connection: &Connection,
+    tenant: &str,
+) -> rusqlite::Result<Vec<serde_json::Value>> {
+    let mut storages = std::collections::BTreeMap::new();
+    {
+        let mut statement = connection.prepare(
+            "SELECT id,
+                    COALESCE(json_extract(document,'$.label'),''),
+                    COALESCE(json_extract(document,'$.kind'),'s3'),
+                    COALESCE(json_extract(document,'$.bucket'),''),
+                    COALESCE(json_extract(document,'$.prefix'),'')
+             FROM delivery_storage",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, label, kind, bucket, prefix) = row?;
+            storages.insert(id, (label, kind, bucket, prefix));
+        }
+    }
+    let mut statement = connection.prepare(
+        "SELECT id,
+                COALESCE(json_extract(document,'$.project.label'),''),
+                COALESCE(json_extract(document,'$.checks.destinations'),'{}')
+         FROM delivery_jobs
+         WHERE tenant=?1
+           AND EXISTS (SELECT 1 FROM json_each(COALESCE(json_extract(document,'$.checks.destinations'),'{}')) d
+                       WHERE json_extract(d.value,'$.state')='complete')",
+    )?;
+    let jobs = statement.query_map([tenant], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut inventory = Vec::new();
+    for job in jobs {
+        let (id, label, destinations) = job?;
+        let destinations: serde_json::Value =
+            serde_json::from_str(&destinations).unwrap_or(serde_json::json!({}));
+        let mut complete = Vec::new();
+        if let Some(map) = destinations.as_object() {
+            for (destination, spec) in map {
+                if spec.get("state").and_then(|state| state.as_str()) != Some("complete") {
+                    continue;
+                }
+                let storage = storages.get(destination);
+                complete.push(serde_json::json!({
+                    "id": destination,
+                    "label": storage.map_or(String::new(), |(label, _, _, _)| label.clone()),
+                    "kind": storage.map_or("unknown".into(), |(_, kind, _, _)| kind.clone()),
+                    "bucket": storage.map_or(String::new(), |(_, _, bucket, _)| bucket.clone()),
+                    "prefix": storage.map_or(String::new(), |(_, _, _, prefix)| prefix.clone()),
+                }));
+            }
+        }
+        inventory.push(serde_json::json!({"job": id, "project": label, "destinations": complete}));
+    }
+    Ok(inventory)
 }
 
 /// Outcome of [`Store::remove_tenant`].

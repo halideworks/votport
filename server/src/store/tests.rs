@@ -1260,6 +1260,113 @@ fn remove_tenant_cleans_outbound_credentials_atomically() {
         .is_none());
 }
 
+/// Audit finding 374: exported copies are never removed and the tenant
+/// delete used to erase the only record of the buckets holding them, so
+/// the removal must first write an export inventory naming each completed
+/// destination into the audit log, which survives tenant deletion.
+#[test]
+fn remove_tenant_writes_an_export_inventory_before_erasing_jobs() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    store.insert_tenant(test_tenant("acme")).unwrap();
+    let storage = r#"{
+        "id": "archive",
+        "revision": 1,
+        "label": "Cold archive",
+        "kind": "s3",
+        "directory": "",
+        "endpoint": "https://archive.example",
+        "bucket": "kept-copies",
+        "region": "us-east-1",
+        "prefix": "acme/",
+        "path_style": true,
+        "kms_key_id": null,
+        "tenants": [],
+        "enabled": true
+    }"#;
+    let destinations =
+        r#"{"archive":{"state":"complete","bytes":120},"mirror":{"state":"pending","bytes":0}}"#;
+    let destinations_incomplete = r#"{"archive":{"state":"exporting","bytes":10}}"#;
+    let document = |checks: &str| {
+        format!(r#"{{"project":{{"label":"Handoff"}},"checks":{{"destinations":{checks}}}}}"#)
+    };
+    let now = now_unix();
+    store
+        .with(|connection| {
+            connection.execute(
+                "INSERT INTO delivery_storage(id,revision,document) VALUES ('archive',1,?1)",
+                [storage],
+            )?;
+            for (id, operation, state, checks) in [
+                ("job-complete", "op-1", "ready", destinations),
+                ("job-incomplete", "op-2", "queued", destinations_incomplete),
+            ] {
+                connection.execute(
+                    "INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,
+                        owner,not_before,deadline,escalated,token,document,created_at,snapshot_bytes)
+                     VALUES (?1,'acme','sender',?2,'proj',?3,'',0,NULL,0,'',?4,?5,0)",
+                    rusqlite::params![id, operation, state, document(checks), now as i64],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(store.remove_tenant("acme").unwrap(), TenantRemoval::Deleted);
+
+    let rows = store.audit_export(Some("acme"), 0, 0, 100).unwrap();
+    let inventory = rows
+        .iter()
+        .find(|row| row.event == "tenant_export_inventory")
+        .expect("one inventory row must survive the tenant");
+    assert_eq!(inventory.detail["job_count"], 1, "{}", inventory.detail);
+    let export = &inventory.detail["exports"][0];
+    assert_eq!(export["job"], "job-complete");
+    assert_eq!(export["project"], "Handoff");
+    assert_eq!(export["destinations"][0]["bucket"], "kept-copies");
+    assert_eq!(export["destinations"][0]["prefix"], "acme/");
+    assert_eq!(export["destinations"][0]["kind"], "s3");
+    assert_eq!(
+        export["destinations"].as_array().unwrap().len(),
+        1,
+        "only complete destinations belong in the inventory: {}",
+        inventory.detail
+    );
+    assert_eq!(
+        store
+            .with(|connection| connection.query_row(
+                "SELECT COUNT(*) FROM delivery_jobs WHERE tenant='acme'",
+                [],
+                |row| row.get::<_, i64>(0),
+            ))
+            .unwrap(),
+        0,
+        "the job rows themselves must still be erased"
+    );
+
+    // A tenant without completed exports writes no inventory row.
+    store.insert_tenant(test_tenant("bare")).unwrap();
+    store
+        .with(|connection| {
+            connection.execute(
+                "INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,
+                    owner,not_before,deadline,escalated,token,document,created_at,snapshot_bytes)
+                 VALUES ('job-bare','bare','sender','op-1','proj','queued','',0,NULL,0,'',?1,?2,0)",
+                rusqlite::params![document(destinations_incomplete), now as i64],
+            )
+        })
+        .unwrap();
+    assert_eq!(store.remove_tenant("bare").unwrap(), TenantRemoval::Deleted);
+    let rows = store.audit_export(Some("bare"), 0, 0, 100).unwrap();
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.event == "tenant_export_inventory"),
+        "{}",
+        serde_json::to_string(&rows).unwrap()
+    );
+}
+
 #[test]
 fn automation_token_authentication_updates_last_used_atomically() {
     let directory = tempfile::tempdir().unwrap();
