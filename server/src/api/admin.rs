@@ -2559,7 +2559,7 @@ pub async fn get_backups(
         .local_root(&app.config.data_dir)
         .map_err(ApiError::internal)?;
     let (mut inventory, mut inventory_error) =
-        match crate::backup::inventory_local_root(&local_root) {
+        match crate::backup::inventory_local_root(&local_root, &app.config.data_dir) {
             Ok(inventory) => (inventory, None),
             Err(error) => (Vec::new(), Some(error)),
         };
@@ -2582,6 +2582,7 @@ pub async fn get_backups(
     status.running = busy;
     Ok(Json(json!({
         "config": config.public(&secrets),
+        "schema_version": crate::store::SCHEMA_VERSION,
         "inventory": inventory,
         "inventory_error": inventory_error.map(|error| error.chars().take(512).collect::<String>()),
         "status": status,
@@ -2923,7 +2924,16 @@ async fn restore_backup_operation(
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?
-    .map_err(ApiError::internal)?;
+    .map_err(|_| {
+        // Findings 551 and 555: an unreadable archive (raw tar-parser text)
+        // and a newer-schema or archive-format refusal are the caller's
+        // input, not server faults, so one fixed sentence answers 422
+        // instead of a retryable 500 quoting the parser.
+        ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "This file is not a votport backup this server can restore.",
+        )
+    })?;
     crate::backup::write_pending_restore(
         &app.config.data_dir,
         stage_cleanup,
@@ -8917,6 +8927,102 @@ mod backup_tests {
         .expect("scheduler must exit after shutdown");
     }
 
+    /// Audit finding 551: a non-archive offered to the restore endpoint
+    /// answers one fixed 422, retryable false, instead of a retryable 500
+    /// quoting the tar parser.
+    #[tokio::test]
+    async fn restore_refuses_a_non_archive_with_one_fixed_422() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = login(application.clone()).await;
+        let backups = crate::backup::ensure_backups_dir(&application.config.data_dir).unwrap();
+        let id = "votport-backup-v2-notanarchive.tar";
+        std::fs::write(backups.join(id), b"this is not a tar archive").unwrap();
+        let response = app::router(application)
+            .oneshot(
+                Request::post("/api/admin/backups/restore")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .body(Body::from(
+                        serde_json::json!({ "source": "local", "id": id }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["retryable"], false);
+        assert_eq!(
+            body["error"],
+            "This file is not a votport backup this server can restore."
+        );
+    }
+
+    /// Audit finding 555: a newer-schema archive is refused with the same
+    /// fixed 422 instead of a 500, and the backup inventory names the server
+    /// schema so an operator can compare an archive before restoring it.
+    #[tokio::test]
+    async fn restore_refuses_a_newer_schema_archive_without_a_500_and_the_inventory_names_the_schema(
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = login(application.clone()).await;
+        let backups = crate::backup::ensure_backups_dir(&application.config.data_dir).unwrap();
+        let stage = application
+            .config
+            .data_dir
+            .join(".votport-test-newer-schema.tar");
+        crate::backup::create_archive(
+            &application.store,
+            &application.config.data_dir,
+            &stage,
+            crate::store::SCHEMA_VERSION + 1,
+        )
+        .unwrap();
+        let id = "votport-backup-v2-newer-schema.tar";
+        std::fs::rename(&stage, backups.join(id)).unwrap();
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::post("/api/admin/backups/restore")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .body(Body::from(
+                        serde_json::json!({ "source": "local", "id": id }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["retryable"], false);
+        assert_eq!(
+            body["error"],
+            "This file is not a votport backup this server can restore."
+        );
+        let response = app::router(application)
+            .oneshot(
+                Request::get("/api/admin/backups")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["schema_version"], crate::store::SCHEMA_VERSION);
+    }
+
     #[tokio::test]
     async fn backup_pause_reports_current_restore_blocker_without_replacing_history() {
         use crate::backup::{BackupConfig, BackupSecrets, BackupStatus, Destination};
@@ -8926,7 +9032,8 @@ mod backup_tests {
         let cookie = login(application.clone()).await;
         let data_dir = &application.config.data_dir;
         let backup_dir = crate::backup::ensure_backups_dir(data_dir).unwrap();
-        let local_inventory_error = crate::backup::inventory_local_root(&backup_dir).err();
+        let local_inventory_error =
+            crate::backup::inventory_local_root(&backup_dir, data_dir).err();
         let history = serde_json::to_vec(&BackupStatus {
             last_attempt_at: Some(123),
             last_success_at: Some(100),

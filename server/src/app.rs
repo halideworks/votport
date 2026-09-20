@@ -3221,6 +3221,26 @@ mod health_tests {
     use axum::http::Request;
     use tower::ServiceExt as _;
 
+    /// Audit finding 553: main binds the listener before app::build opens
+    /// the store, so a long migration holds connections in the listen
+    /// backlog instead of leaving healthz refusing connections for the
+    /// whole startup. The startup sequence lives in main, so the order is
+    /// pinned against the binary source itself.
+    #[test]
+    fn startup_binds_the_listener_before_the_store_opens() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let bind = source
+            .find("TcpListener::bind")
+            .expect("the http listener still binds");
+        let build = source
+            .find("app::build(config)")
+            .expect("startup still builds the app");
+        assert!(
+            bind < build,
+            "the listener must bind before app::build opens the store"
+        );
+    }
+
     #[test]
     fn receiving_checks_do_not_hold_ownership_state_or_delay_renewal() {
         use std::time::{Duration, Instant};

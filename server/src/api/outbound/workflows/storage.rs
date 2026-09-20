@@ -725,6 +725,30 @@ struct SourceInventory {
     objects: Vec<SourceObject>,
 }
 
+fn skip_directory_markers(
+    mut listed: Vec<(object_store::ObjectMeta, String)>,
+) -> Vec<(object_store::ObjectMeta, String)> {
+    // Audit finding 557: object_store normalises keys without the trailing
+    // delimiter, so a 0-byte directory marker (what the AWS console, aws s3
+    // sync and rclone create) survives the `ends_with('/')` filter and the
+    // inventory would store a key that does not exist; the conditional GET
+    // then 404s and the whole job fails blaming the source. A 0-byte object
+    // whose key is a directory prefix of a sibling key is such a marker, the
+    // sibling naming the directory: skip it. A lone 0-byte file is a real
+    // object and stays.
+    let keys: Vec<String> = listed
+        .iter()
+        .map(|(object, _)| object.location.as_ref().to_owned())
+        .collect();
+    listed.retain(|(object, _)| {
+        object.size != 0
+            || !keys
+                .iter()
+                .any(|key| key.starts_with(&format!("{}/", object.location.as_ref())))
+    });
+    listed
+}
+
 pub(super) async fn import(app: &Arc<App>, job: &Job) -> ApiResult<Option<u64>> {
     let Some(import) = &job.request.import else {
         return Ok(None);
@@ -757,8 +781,7 @@ pub(super) async fn import(app: &Arc<App>, job: &Job) -> ApiResult<Option<u64>> 
         let prefix = config.key(&import.prefix)?;
         let prefix_string = format!("{}/", prefix.as_ref().trim_end_matches('/'));
         let mut list = store.list(Some(&prefix));
-        let mut objects = vec![];
-        let mut total = 0u64;
+        let mut listed: Vec<(object_store::ObjectMeta, String)> = Vec::new();
         while let Some(object) = list.next().await {
             let object = object.map_err(|_| conflict("S3 object listing failed".into()))?;
             let Some(name) = object
@@ -766,10 +789,16 @@ pub(super) async fn import(app: &Arc<App>, job: &Job) -> ApiResult<Option<u64>> 
                 .as_ref()
                 .strip_prefix(&prefix_string)
                 .filter(|name| !name.is_empty() && !name.ends_with('/'))
+                .map(str::to_owned)
             else {
                 continue;
             };
-            payload_path(app, &job.tenant, &job.id, name)?;
+            listed.push((object, name));
+        }
+        let mut objects = vec![];
+        let mut total = 0u64;
+        for (object, name) in skip_directory_markers(listed) {
+            payload_path(app, &job.tenant, &job.id, &name)?;
             if object.e_tag.is_none() && object.version.is_none() {
                 return Err(conflict(
                     "S3 source must provide an ETag or version for conditional reads".into(),
@@ -780,7 +809,7 @@ pub(super) async fn import(app: &Arc<App>, job: &Job) -> ApiResult<Option<u64>> 
                 .filter(|total| *total <= app.config.max_upload_bytes)
                 .ok_or_else(|| conflict("S3 source exceeds delivery size limit".into()))?;
             objects.push(SourceObject {
-                name: name.into(),
+                name,
                 key: object.location.to_string(),
                 size: object.size,
                 etag: object.e_tag,
@@ -1275,6 +1304,31 @@ async fn upload_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit finding 557: a 0-byte directory marker (console, aws s3 sync,
+    /// rclone) is listed without its trailing delimiter, so it must be
+    /// recognised by being a directory prefix of a sibling key instead of by
+    /// its delimiter, while a lone 0-byte file stays in the inventory.
+    #[test]
+    fn zero_byte_directory_markers_are_skipped_from_the_source_inventory() {
+        let meta = |key: &str, size: u64| object_store::ObjectMeta {
+            location: ObjectPath::parse(key).unwrap(),
+            last_modified: chrono::Utc::now(),
+            size,
+            e_tag: Some("test-etag".into()),
+            version: None,
+        };
+        let kept = skip_directory_markers(vec![
+            (meta("source/folder", 0), "folder".into()),
+            (meta("source/folder/file.mov", 5), "folder/file.mov".into()),
+            (meta("source/empty.mov", 0), "empty.mov".into()),
+        ]);
+        let keys: Vec<&str> = kept
+            .iter()
+            .map(|(object, _)| object.location.as_ref())
+            .collect();
+        assert_eq!(keys, ["source/folder/file.mov", "source/empty.mov"]);
+    }
 
     /// Audit 436: delivery-card refusals never name the internal artefacts
     /// (frozen manifest, snapshot, inventory); each refusal is one

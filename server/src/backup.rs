@@ -307,6 +307,14 @@ impl BackupSecrets {
     }
 }
 
+/// Audit finding 558: both local-root validators stop the writable-ancestor
+/// walk at data_dir. Ancestors above it are outside votport's control (a
+/// group-writable operator home is normal under Ubuntu's umask 002), and the
+/// inventory must not refuse archives that writes and prunes accept.
+fn local_root_ancestry_stop<'a>(root: &Path, data_dir: &'a Path) -> Option<&'a Path> {
+    root.starts_with(data_dir).then_some(data_dir)
+}
+
 fn validate_local_root(root: &Path, data_dir: &Path, require_existing: bool) -> Result<(), String> {
     if root == data_dir {
         return Err("local backup path must not be the data directory".into());
@@ -314,8 +322,7 @@ fn validate_local_root(root: &Path, data_dir: &Path, require_existing: bool) -> 
     if require_existing && !root.exists() {
         return Err("custom local backup path must already exist".into());
     }
-    let trusted = root.starts_with(data_dir).then_some(data_dir);
-    validate_private_ancestry(root, trusted)
+    validate_private_ancestry(root, local_root_ancestry_stop(root, data_dir))
 }
 
 fn validate_private_ancestry(root: &Path, stop: Option<&Path>) -> Result<(), String> {
@@ -2075,8 +2082,8 @@ pub async fn delete_s3_backup(
     }
 }
 
-pub fn inventory_local_root(root: &Path) -> Result<Vec<InventoryItem>, String> {
-    validate_private_ancestry(root, None)?;
+pub fn inventory_local_root(root: &Path, data_dir: &Path) -> Result<Vec<InventoryItem>, String> {
+    validate_private_ancestry(root, local_root_ancestry_stop(root, data_dir))?;
     let mut result = Vec::new();
     for (id, bytes, created_at, _) in local_files(root)? {
         let created_at = created_at
@@ -4256,7 +4263,39 @@ mod tests {
         assert!(root.path().join(first).exists());
         assert!(root.path().join(second).exists());
         prune_local_root(root.path(), 0, 1).unwrap();
-        assert_eq!(inventory_local_root(root.path()).unwrap().len(), 1);
+        assert_eq!(
+            inventory_local_root(root.path(), root.path())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// Audit finding 558: the inventory stops the writable-ancestor walk at
+    /// data_dir, exactly like validate_local_root, so a group-writable
+    /// ancestor above the data directory (Ubuntu's umask 002 makes operator
+    /// directories 0775) cannot empty an inventory whose archives write and
+    /// prune without complaint.
+    #[test]
+    fn inventory_local_root_stops_the_ancestor_walk_at_the_data_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let mut permissions = fs::metadata(directory.path()).unwrap().permissions();
+        permissions.set_mode(0o775);
+        fs::set_permissions(directory.path(), permissions).unwrap();
+        let data_dir = directory.path().join("data");
+        let root = data_dir.join("backups");
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let id = "votport-backup-v2-20260101T000000Z.tar";
+        fs::write(root.join(id), b"archive").unwrap();
+        let inventory = inventory_local_root(&root, &data_dir).unwrap();
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].id, id);
     }
 
     #[test]

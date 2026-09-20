@@ -89,6 +89,17 @@ async fn main() {
         }
     };
     let bind = config.bind;
+    // Audit finding 553: bind before app::build opens the store. A long
+    // migration then holds connections in the listen backlog and healthz
+    // answers as soon as serving starts, instead of the port refusing
+    // connections for the whole startup.
+    let listener = match tokio::net::TcpListener::bind(bind).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::error!("bind {bind}: {error}");
+            std::process::exit(2);
+        }
+    };
     let application = match app::build(config) {
         Ok(application) => application,
         Err(error) => {
@@ -113,13 +124,6 @@ async fn main() {
         application.clone(),
     ));
     let router = app::router(application.clone());
-    let listener = match tokio::net::TcpListener::bind(bind).await {
-        Ok(listener) => listener,
-        Err(error) => {
-            tracing::error!("bind {bind}: {error}");
-            std::process::exit(2);
-        }
-    };
     tracing::info!(
         "votport listening on {bind}; receiving into {}",
         application.config.receive_dir.display()
