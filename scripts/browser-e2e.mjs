@@ -593,6 +593,12 @@ const previewFiles = Array.from({ length: 100_000 }, (_, index) => ({
   buffer: Buffer.from("x"),
 }));
 await page.setInputFiles("#file-input", previewFiles, { timeout: 180000 });
+// Admission now settles in slices after the change dispatch, so poll for
+// the settled state instead of sampling synchronously.
+await page.waitForFunction(() => {
+  const totals = document.getElementById("totals").textContent.replaceAll(",", "");
+  return totals.includes("100000 files") && !document.getElementById("send").disabled;
+}, undefined, { timeout: 60000, polling: 100 });
 const pickedPreview = await page.evaluate(() => ({
   totals: document.getElementById("totals").textContent,
   rows: document.querySelectorAll("#file-list > li").length,
@@ -612,6 +618,11 @@ await page.setInputFiles("#file-input", Array.from({ length: 201 }, (_, index) =
   mimeType: "application/octet-stream",
   buffer: Buffer.from("x"),
 })));
+// The batch settles in slices now; wait for the last file before sampling.
+await page.waitForFunction(() => {
+  const totals = document.getElementById("totals").textContent;
+  return totals.includes("201 files") && !document.getElementById("send").disabled;
+}, undefined, { timeout: 60000, polling: 100 });
 const countPreview = await page.evaluate(() => {
   window.__votportPreviewTest.setStatus("count-001.exr", "Sending", false, -0.2);
   const sendingMeter = document.querySelector('[data-path="count-001.exr"] .row-meter');

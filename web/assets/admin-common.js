@@ -6,6 +6,7 @@ import { mountDrafts, confirmLeave } from '/assets/form-drafts.js';
 // public pages need not import this admin module for it.
 import { copyToClipboard, formatAgo, formatBytes, formatDuration } from '/assets/object-card.js';
 import { createUndoQueue } from '/assets/undo.js';
+import { searchDebounce } from '/assets/search-debounce.js';
 export { copyToClipboard };
 
 export async function api(path, options = {}) {
@@ -26,6 +27,19 @@ export async function api(path, options = {}) {
     throw error;
   }
   return body;
+}
+
+/// The switch reply reissues the session cookie, but a reload started in
+/// the same breath can race the browser's cookie commit and land back in
+/// the old tenant scope, which re-renders and re-persists stale state. Poll
+/// the session endpoint - each request carries the committed cookie - until
+/// it answers with the switched tenant, then the reload is safe.
+export async function confirmSwitchedTenant(target, { session = () => api('/api/admin/session'), attempts = 20 } = {}) {
+  for (let remaining = attempts; ; remaining -= 1) {
+    if ((await session()).tenant === target) return;
+    if (remaining <= 1) throw new Error('The tenant switch did not stick. Reload the page.');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
 }
 
 /// Redirects to the sign-in page unless a session exists; resolves with it.
@@ -76,7 +90,6 @@ function mountSearch(session) {
     status.setAttribute('aria-live', 'polite');
     form.append(status);
   }
-  let timer = null;
   let latest = 0;
   let activeIndex = -1;
   const options = () => [...results.querySelectorAll('[role="option"]')];
@@ -98,7 +111,7 @@ function mountSearch(session) {
   // Closing also retires any request still in flight so it cannot reopen
   // the panel with stale rows.
   const close = () => {
-    clearTimeout(timer);
+    scheduleSearch.cancel();
     latest += 1;
     setActive(-1);
     setExpanded(false);
@@ -201,12 +214,12 @@ function mountSearch(session) {
       ? `${resultCount} search result${resultCount === 1 ? '' : 's'}.`
       : 'No search results.';
   };
+  const scheduleSearch = searchDebounce(60, run);
   input.addEventListener('input', () => {
-    clearTimeout(timer);
     latest += 1;
     setActive(-1);
     status.textContent = input.value.trim().length >= 2 ? 'Searching…' : '';
-    timer = setTimeout(run, 180);
+    scheduleSearch();
   });
   input.addEventListener('focus', () => { if (results.firstChild) setExpanded(true); });
   input.addEventListener('keydown', (event) => {
@@ -339,8 +352,10 @@ function buildNav(session) {
         try {
           if (await confirmLeave(() => api('/api/admin/tenant', {
             method: 'POST', body: JSON.stringify({ tenant: switcher.value }),
-          }))) window.location.reload();
-          else switcher.value = session.tenant;
+          }))) {
+            await confirmSwitchedTenant(switcher.value);
+            window.location.reload();
+          } else switcher.value = session.tenant;
         } catch (error) { switcher.value = session.tenant; alertModal(error.message); }
         finally { switcher.disabled = false; }
       });

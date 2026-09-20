@@ -26,6 +26,7 @@ import {
   showGrantResult,
 } from '/assets/admin-common.js';
 import { startStatusPoll } from '/assets/status-strip.js';
+import { searchDebounce } from '/assets/search-debounce.js';
 import { $, fieldError } from '/assets/object-card.js';
 
 const deliverError = fieldError($('deliver-label'), $('deliver-error'));
@@ -306,7 +307,7 @@ const libraryPageHistory = [];
 let libraryLoading = false;
 let libraryError = '';
 let libraryRequestGeneration = 0;
-let librarySearchTimer;
+const scheduleLibrarySearch = searchDebounce(60, () => refreshLibrary());
 let libraryLastSuccessfulView;
 let libraryUploading = false;
 const libraryProjectSuggestions = new Set();
@@ -388,7 +389,7 @@ function updateProjectSuggestions(directories) {
 }
 
 async function browseLibrary(directory) {
-  clearTimeout(librarySearchTimer);
+  scheduleLibrarySearch.cancel();
   $('library-search').value = '';
   libraryDirectory = directory;
   libraryAfter = null;
@@ -732,8 +733,7 @@ $('library-search').addEventListener('input', () => {
   libraryAfter = null;
   libraryNextCursor = null;
   libraryPageHistory.length = 0;
-  clearTimeout(librarySearchTimer);
-  librarySearchTimer = setTimeout(() => refreshLibrary(), 200);
+  scheduleLibrarySearch();
 });
 
 $('deliver-upload-form').addEventListener('submit', (event) => event.preventDefault());

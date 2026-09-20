@@ -4,6 +4,7 @@
 import { applyBranding } from '/assets/branding.js';
 import { nameHasForbiddenCharacter } from '/assets/outbound-download.js';
 import { $, appendObjectCard, appLink, copyToClipboard, fieldError, formatBytes, formatDuration } from '/assets/object-card.js';
+import { admitPickBatch } from '/assets/upload-pick.js';
 import { entryFiles, runUploadBatch } from '/assets/upload-entries.js';
 import {
   clearResumeRecord,
@@ -611,44 +612,40 @@ function addFiles(files) {
   addNamed([...files].map((file) => ({ path: relativePath(file), file })));
 }
 
+// A large pick admits in slices (upload-pick.js), so the first preview rows
+// paint without waiting on the whole fold. The chain serializes batches so a
+// second pick cannot interleave with a running one; clear-files retires the
+// batch in flight by bumping the generation.
+let pickChain = Promise.resolve();
+let pickGeneration = 0;
+
 function addNamed(pairs) {
   if (uploading) return;
-  // Validate the whole batch before touching `picked`, so a refusal leaves
-  // the selection, its rows, and the collision keys consistent.
-  const keys = new Map(pickedKeys);
-  const accepted = [];
-  for (const { path, file } of pairs) {
-    const components = path.split('/').filter(Boolean);
-    for (const component of components) {
-      const problem = validateComponent(component);
-      if (problem) {
-        fail(`"${path}": ${problem}`);
-        return;
-      }
-    }
-    if (utf8.encode(components.at(-1) ?? '').length > 242) {
-      fail(`"${path}": filename exceeds 242 UTF-8 bytes; shorten it to leave room for its signed receipt and receive journal`);
-      return;
-    }
-    const joined = components.join('/');
-    // One package holds the whole drop, so two names that fold to the same
-    // key would be refused at the manifest; catch it before hashing.
-    const key = pathKeyString(components);
-    pathKeyMemo.set(joined, key);
-    const other = keys.get(key);
-    if (other !== undefined && other !== joined) {
-      fail(`"${other}" and "${joined}" collide once case is folded; rename one`);
-      return;
-    }
-    keys.set(key, joined);
-    accepted.push([joined, file]);
-  }
-  for (const [joined, file] of accepted) {
-    picked.set(joined, file);
-    deliveredPaths.delete(joined);
-  }
-  $('upload-error').hidden = true;
-  renderPicked();
+  pickChain = pickChain.then(() => {
+    const batchGeneration = ++pickGeneration;
+    return admitPickBatch(pairs, {
+      picked,
+      deliveredPaths,
+      keys: new Map(pickedKeys),
+      validate: validateComponent,
+      // Same fold this function always used, memoized so each path folds
+      // once across the whole drop (finding 537).
+      keyOf: (path, components) => {
+        const key = pathKeyString(components);
+        pathKeyMemo.set(path, key);
+        return key;
+      },
+      render: (settled) => {
+        if (settled) $('upload-error').hidden = true;
+        renderPicked();
+        // Mid-batch the selection is still growing; hold the send button
+        // until the final render settles it.
+        if (!settled) $('send').disabled = true;
+      },
+      fail,
+      aborted: () => uploading || pickGeneration !== batchGeneration,
+    });
+  }).catch((error) => console.error(error));
 }
 
 // path -> its list row, so per-chunk status updates skip the O(files) scan.
@@ -1484,6 +1481,9 @@ $('folder-input').addEventListener('change', (event) => addFiles(event.target.fi
 $('file-input').addEventListener('change', (event) => addFiles(event.target.files));
 $('clear-files').addEventListener('click', () => {
   if (uploading) return;
+  // Retire any pick batch still admitting, so no slice lands after the
+  // clear.
+  pickGeneration += 1;
   picked.clear();
   pathKeyMemo.clear();
   deliveredPaths.clear();

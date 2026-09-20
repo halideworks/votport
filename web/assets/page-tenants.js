@@ -13,6 +13,7 @@ import {
   formatWhen,
   requireSession,
 } from '/assets/admin-common.js';
+import { searchDebounce } from '/assets/search-debounce.js';
 import { $, fieldError } from '/assets/object-card.js';
 
 const PRINCIPAL_PAGE_SIZE = 50;
@@ -25,7 +26,7 @@ let principalHasMore = false;
 let principalTotal = 0;
 let principalLoading = false;
 let principalReloadPending = false;
-let principalSearchTimer;
+let principalRequestGeneration = 0;
 let tenantRows = [], tenantNext = null, tenantLoading = false;
 
 function quotaText(tenant) {
@@ -510,6 +511,7 @@ async function refreshPrincipals(reset = false) {
   }
   principalLoading = true;
   $('principal-load-more').disabled = true;
+  const generation = ++principalRequestGeneration;
   try {
     const params = new URLSearchParams({
       limit: String(PRINCIPAL_PAGE_SIZE),
@@ -518,6 +520,7 @@ async function refreshPrincipals(reset = false) {
     const search = $('principal-search').value.trim();
     if (search) params.set('q', search);
     const page = await api(`/api/admin/principals?${params}`);
+    if (generation !== principalRequestGeneration) return;
     principalRows = reset ? page.principals : principalRows.concat(page.principals);
     principalOffset += page.principals.length;
     principalHasMore = page.has_more;
@@ -563,12 +566,14 @@ $('tenant-form').addEventListener('submit', async (event) => {
   } finally { form.inert = false; }
 });
 
+const schedulePrincipalSearch = searchDebounce(60, () =>
+  refreshPrincipals(true).catch((error) => alertModal(error.message)),
+);
 $('principal-search').addEventListener('input', () => {
-  clearTimeout(principalSearchTimer);
-  principalSearchTimer = setTimeout(
-    () => refreshPrincipals(true).catch((error) => alertModal(error.message)),
-    200,
-  );
+  // Retire any principal request in flight so a slow response for an older
+  // query cannot paint its rows after newer keystrokes.
+  principalRequestGeneration += 1;
+  schedulePrincipalSearch();
 });
 $('principal-load-more').addEventListener('click', () =>
   refreshPrincipals().catch((error) => alertModal(error.message)),

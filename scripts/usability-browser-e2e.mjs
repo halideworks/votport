@@ -310,6 +310,8 @@ try {
   await api('admin/tenants', { key: id, label: id });
   await page.goto(`${base}/tenants`);
   const tenant = page.locator(`#tenants [data-tenant="${id}"]`);
+  // The tenant list renders async after goto; wait for the row before counting.
+  await tenant.waitFor();
   assert.equal(await tenant.locator('summary[aria-label^="Edit namespace: "]').count(), 1, 'Tenant edit control names its namespace');
   await tenant.getByText('Branding', { exact: true }).click();
   await page.waitForFunction((id) => !document.querySelector(`[data-tenant="${id}"]`).querySelectorAll('form')[1].inert, id);

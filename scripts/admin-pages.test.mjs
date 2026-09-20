@@ -103,7 +103,7 @@ test('tenant principals use a bounded searchable page', () => {
   assert.match(tenants, /id="principal-load-more"[^>]+hidden/);
   assert.match(tenantsScript, /api\(`\/api\/admin\/principals\?\$\{params\}`\)/);
   assert.match(tenantsScript, /limit: String\(PRINCIPAL_PAGE_SIZE\)/);
-  assert.match(tenantsScript, /setTimeout\([\s\S]*refreshPrincipals\(true\)[\s\S]*200/);
+  assert.match(tenantsScript, /searchDebounce\(60, \(\) =>\s*\n\s*refreshPrincipals\(true\)/);
   assert.match(tenantsScript, /principalRows\.concat\(page\.principals\)/);
   assert.match(tenantsScript, /refreshPrincipals\(true\)/);
 });
@@ -321,4 +321,18 @@ test('the receive-link transfer limit is decimal GB on the web like the desktops
   assert.doesNotMatch(receiveScript, /1024 \*\* 3/);
   assert.match(receiveScript, /function formatLimit\(bytes\) \{[\s\S]*?bytes \/ 1000 \*\* 3[\s\S]*? GB`/);
   assert.match(receiveScript, /limit \$\{formatLimit\(link\.max_bytes\)\}/);
+});
+
+test('the tenant switcher proves the reissued cookie before reloading', () => {
+  // A reload started in the same breath as the switch POST can race the
+  // browser's cookie commit and land back in the old tenant scope, so the
+  // handler polls the session endpoint - each request carries the committed
+  // cookie - until it answers with the switched tenant.
+  assert.match(commonScript, /export async function confirmSwitchedTenant\(target/);
+  assert.match(commonScript, /api\('\/api\/admin\/session'\)/);
+  assert.match(commonScript, /\(await session\(\)\)\.tenant === target/);
+  assert.match(
+    commonScript,
+    /await confirmSwitchedTenant\(switcher\.value\);\s*\n\s*window\.location\.reload\(\);/,
+  );
 });
