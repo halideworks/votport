@@ -2,12 +2,11 @@ import { isFormDirty, discardForm, markFormSaved, markFormChanged } from '/asset
 import { notificationEditor, notificationDetails, workflowEvents } from '/assets/notifications.js';
 /* global URL, Blob, Option, sessionStorage, crypto */
 import { api, button, confirmModal, copyToClipboard, formatBytes, formatWhen, requireSession, revealHash } from '/assets/admin-common.js';
+import { $, node } from '/assets/object-card.js';
 
-const $ = (id) => document.getElementById(id);
 const value = (id) => $(id).value.trim();
 const optionalNumber = (id) => value(id) ? Number(value(id)) : null;
 const localTime = (id) => value(id) ? Math.floor(new Date(value(id)).getTime() / 1000) : null;
-const node = (tag, content, className = '') => { const element = document.createElement(tag); element.textContent = content; element.className = className; return element; };
 const stateNames = { queued: 'Scheduled', preparing: 'Preparing files', awaiting_approval: 'Needs approval', exporting: 'Delivering copies', retrying: 'Retry scheduled', ready: 'Ready to share', failed: 'Needs attention', cancelled: 'Cancelled', retiring: 'Cleaning up', retired: 'Archived', suspended: 'Held after restore' };
 let projectNotifications, jobNotifications;
 let projects = [], storage = [], jobs = [], cursor = null, eventCursor = 0, attemptCursor = 0, jobsRevision = 0;

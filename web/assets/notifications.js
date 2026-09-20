@@ -1,5 +1,6 @@
 import { markFormSaved } from '/assets/form-drafts.js';
 import { api, button } from '/assets/admin-common.js';
+import { node } from '/assets/object-card.js';
 
 export const notificationEvents = {
   route_approval_requested: 'Route approval requested', route_approved: 'Route approved', route_identity_changed: 'Port identity changed', route_failed: 'Route failed or unreachable', route_recovered: 'Route recovered', route_received: 'Route received and verified',
@@ -17,7 +18,6 @@ export function loadNotificationSettings(refresh = false) {
   if (!pending || refresh) pending = api('/api/notifications').catch((error) => { pending = null; throw error; });
   return pending;
 }
-const node = (tag, text = '', className = '') => { const element = document.createElement(tag); element.textContent = text; element.className = className; return element; };
 
 export function notificationEditor({ policy = null, events = Object.keys(notificationEvents), inherit, inheritLabel = 'Use project settings', defaults = false, readOnly = false, settings } = {}) {
   const element = node('fieldset', '', 'notification-editor'), legend = node('legend', 'Notifications');

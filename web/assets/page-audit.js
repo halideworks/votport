@@ -2,8 +2,8 @@
 // VOTPORT PROPRIETARY LICENSE.
 
 import { formatAgo, formatWhen, requireSession } from '/assets/admin-common.js';
+import { $ } from '/assets/object-card.js';
 
-const $ = (id) => document.getElementById(id);
 const PAGE_SIZE = 250;
 const MAX_RENDERED_ROWS = 1000;
 const INITIAL_CURSOR = '18446744073709551615';

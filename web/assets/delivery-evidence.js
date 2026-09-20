@@ -1,6 +1,6 @@
 /* global crypto, indexedDB, DataView, AbortSignal */
 import { dedupeFilenames } from '/assets/outbound-download.js';
-import { appLink, copyToClipboard } from '/assets/object-card.js';
+import { $, appLink, copyToClipboard } from '/assets/object-card.js';
 
 const encode = new TextEncoder();
 const hex = (bytes) => [...new Uint8Array(bytes)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
@@ -150,7 +150,6 @@ function hashFile(file) {
 }
 
 export function initDeliveryEvidence(getMetadata, savedNames) {
-  const $ = (id) => document.getElementById(id);
   const token = window.location.pathname.split('/').filter(Boolean).pop();
   const status = $('evidence-status');
   let busy = false;

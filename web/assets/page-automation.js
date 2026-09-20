@@ -1,7 +1,6 @@
 import { markFormSaved } from '/assets/form-drafts.js';
 import { api, button, confirmModal, copyToClipboard, formatWhen, requireSession } from '/assets/admin-common.js';
-import { fieldError } from '/assets/object-card.js';
-const $ = (id) => document.getElementById(id);
+import { $, fieldError } from '/assets/object-card.js';
 // Page size follows the server convention (50 default, 100 max); the list
 // follows `next` until it runs out, like the workflows page.
 const TOKEN_PAGE_SIZE = 50;

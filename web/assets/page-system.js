@@ -4,9 +4,8 @@ import { isFormDirty, markFormChanged, markFormSaved } from '/assets/form-drafts
 
 import { api, colorPair, confirmModal, defaultAccent, formatBytes, formatWhen, requireSession } from '/assets/admin-common.js';
 import { applyFooter } from '/assets/branding.js';
-import { fieldError } from '/assets/object-card.js';
+import { $, fieldError } from '/assets/object-card.js';
 
-const $ = (id) => document.getElementById(id);
 
 function sourceLabel(key, overriddenKeys) {
   return overriddenKeys.includes(key) ? 'saved' : 'from environment';

@@ -26,9 +26,8 @@ import {
   showGrantResult,
 } from '/assets/admin-common.js';
 import { startStatusPoll } from '/assets/status-strip.js';
-import { fieldError } from '/assets/object-card.js';
+import { $, fieldError } from '/assets/object-card.js';
 
-const $ = (id) => document.getElementById(id);
 const deliverError = fieldError($('deliver-label'), $('deliver-error'));
 const createNotifications = notificationEditor({ events: downloadEvents });
 $('deliver-notifications').append(createNotifications.element);

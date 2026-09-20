@@ -4,13 +4,11 @@
 // the same worker the sender uses. The payload never leaves the tab and the
 // verdict here never comes from a server answer. VOTPORT PROPRIETARY LICENSE.
 
-import { appendObjectCard, formatBytes } from '/assets/object-card.js';
+import { $, appendObjectCard, formatBytes } from '/assets/object-card.js';
 import init, {
   ErrorCode,
   verifyReceiptEd25519,
 } from '/assets/vendor/vot_wasm.js';
-
-const $ = (id) => document.getElementById(id);
 
 let payloadFile = null;
 let sidecarFile = null;
