@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import IOKit
+import IOKit.pwr_mgt
 import OSLog
 import VotportCore
 
@@ -280,7 +281,10 @@ final class TransferStore: ObservableObject {
             moved += item.view?.movedBytes ?? 0
             total += item.view?.totalBytes ?? 0
         }
-        NSApp.dockTile.progress = total > 0 ? Double(moved) / Double(total) : 0
+        // The progress dock tile is macOS 15; the deployment floor is 14.
+        if #available(macOS 15.0, *) {
+            NSApp.dockTile.progress = total > 0 ? Double(moved) / Double(total) : 0
+        }
         NSApp.dockTile.display()
     }
 
