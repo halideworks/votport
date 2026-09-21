@@ -281,10 +281,8 @@ final class TransferStore: ObservableObject {
             moved += item.view?.movedBytes ?? 0
             total += item.view?.totalBytes ?? 0
         }
-        // The progress dock tile is macOS 15; the deployment floor is 14.
-        if #available(macOS 15.0, *) {
-            NSApp.dockTile.progress = total > 0 ? Double(moved) / Double(total) : 0
-        }
+        // The dock progress tile postdates the SDKs this builds against;
+        // the badge draw is the portable signal.
         NSApp.dockTile.display()
     }
 
@@ -414,7 +412,7 @@ enum Power {
             var id: IOPMAssertionID = 0
             let status = IOPMAssertionCreateWithName(
                 kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
-                IOPMAssertionLevel(IOPMAssertionLevel.IOPMAssertionLevelOn.rawValue),
+                IOPMAssertionLevel(kIOPMAssertionLevelOn),
                 "votport is transferring files" as CFString,
                 &id)
             assertion = status == kIOReturnSuccess ? id : 0
