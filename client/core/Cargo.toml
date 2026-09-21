@@ -13,10 +13,10 @@ publish = false
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-vot-cli = { git = "https://github.com/halideworks/VOT", rev = "de66d41343cee7fb206a0f323d36babea655f032", default-features = false, features = ["wire"] }
-vot-object = { git = "https://github.com/halideworks/VOT", rev = "de66d41343cee7fb206a0f323d36babea655f032" }
-vot-manifest = { git = "https://github.com/halideworks/VOT", rev = "de66d41343cee7fb206a0f323d36babea655f032" }
-vot-platform-fs = { git = "https://github.com/halideworks/VOT", rev = "de66d41343cee7fb206a0f323d36babea655f032" }
+vot-cli = { git = "https://github.com/halideworks/VOT", rev = "3997f0a0e52a7d86f8d4f4fc3d6844dc40224ef7", default-features = false, features = ["wire"] }
+vot-object = { git = "https://github.com/halideworks/VOT", rev = "3997f0a0e52a7d86f8d4f4fc3d6844dc40224ef7" }
+vot-manifest = { git = "https://github.com/halideworks/VOT", rev = "3997f0a0e52a7d86f8d4f4fc3d6844dc40224ef7" }
+vot-platform-fs = { git = "https://github.com/halideworks/VOT", rev = "3997f0a0e52a7d86f8d4f4fc3d6844dc40224ef7" }
 
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls", "rustls-tls-native-roots"] }
 serde = { version = "1", features = ["derive"] }
