@@ -143,6 +143,10 @@ const PREPARATION_FAILED: u8 = 2;
 // Terminal preparations stay queryable for a few minutes so a page reload or
 // a slow poll still finds the finished link, then the sweep drops them.
 const PREPARATION_TTL_SECS: u64 = 15 * 60;
+// A preparation that never settles (a hash walk hung on dead NAS I/O, say)
+// would otherwise pin its registry entry and the session's one-in-flight 409
+// slot forever; past this age the sweep drops it and the session can retry.
+const PREPARATION_STALE_SECS: u64 = 60 * 60;
 const PREPARATION_LOST_MESSAGE: &str =
     "This preparation is no longer available; the server may have restarted. Create the link again.";
 
@@ -155,6 +159,7 @@ pub(crate) struct GrantPreparation {
     bytes_total: std::sync::atomic::AtomicU64,
     bytes_done: std::sync::atomic::AtomicU64,
     finished_at: std::sync::atomic::AtomicU64,
+    created_at: std::sync::atomic::AtomicU64,
     outcome: Mutex<Option<Result<CreatedGrant, (u16, String)>>>,
 }
 
@@ -173,6 +178,7 @@ impl GrantPreparation {
             bytes_total: std::sync::atomic::AtomicU64::new(PREPARATION_UNKNOWN),
             bytes_done: std::sync::atomic::AtomicU64::new(0),
             finished_at: std::sync::atomic::AtomicU64::new(0),
+            created_at: std::sync::atomic::AtomicU64::new(now_unix()),
             outcome: Mutex::new(None),
         }
     }
@@ -258,13 +264,33 @@ pub(crate) struct GrantPreparationRegistry {
 }
 
 fn sweep_preparations(registry: &mut GrantPreparationRegistry) {
-    let cutoff = now_unix().saturating_sub(PREPARATION_TTL_SECS);
+    let now = now_unix();
+    let finished_cutoff = now.saturating_sub(PREPARATION_TTL_SECS);
+    let stale_cutoff = now.saturating_sub(PREPARATION_STALE_SECS);
     registry.by_id.retain(|_, preparation| {
-        !preparation.is_terminal() || preparation.finished_at.load(Ordering::Relaxed) > cutoff
+        if preparation.is_terminal() {
+            preparation.finished_at.load(Ordering::Relaxed) > finished_cutoff
+        } else {
+            preparation.created_at.load(Ordering::Relaxed) > stale_cutoff
+        }
     });
     registry
         .in_flight
         .retain(|_, id| registry.by_id.contains_key(id));
+}
+
+/// Frees a settled job's one-in-flight slot, but only while it is still that
+/// job's own: the stale sweep can drop a hung preparation and let the session
+/// start a new one, and the zombie's late cleanup must not delete the new
+/// preparation's slot with it.
+fn release_preparation_slot(
+    registry: &mut GrantPreparationRegistry,
+    key: &(String, String),
+    id: &str,
+) {
+    if registry.in_flight.get(key).is_some_and(|slot| slot == id) {
+        registry.in_flight.remove(key);
+    }
 }
 
 fn begin_grant_preparation(
@@ -332,7 +358,7 @@ async fn run_grant_preparation(
         .grant_preparations
         .lock()
         .expect("grant preparations poisoned");
-    registry.in_flight.remove(&(tenant, subject));
+    release_preparation_slot(&mut registry, &(tenant, subject), &preparation.id);
     sweep_preparations(&mut registry);
 }
 
