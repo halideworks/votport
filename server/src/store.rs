@@ -256,6 +256,11 @@ pub struct Link {
     /// window for this link's uploads; None defers to tenant and platform.
     #[serde(default)]
     pub retention_days: Option<u64>,
+    /// Requested publication verification (finding 24): "default" follows
+    /// the platform choice, "balanced" and "strict" force the named profile
+    /// when the destination's filesystem honors it.
+    #[serde(default = "default_verification")]
+    pub verification: String,
     #[serde(default)]
     pub uploads: Vec<UploadRecord>,
     #[serde(default)]
@@ -277,6 +282,10 @@ impl Link {
     pub fn usable_now(&self) -> bool {
         self.active && self.expires_at.is_none_or(|at| now_unix() < at)
     }
+}
+
+fn default_verification() -> String {
+    "default".to_owned()
 }
 
 /// A tenant namespace: its own links, receive subtree, and quotas.
@@ -497,7 +506,7 @@ struct ValidatedSettings {
     draining: Option<bool>,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 47;
+pub(crate) const SCHEMA_VERSION: u64 = 48;
 pub(crate) const DELIVERED_CANDIDATE_PAGE: usize = 128;
 pub(crate) const RETENTION_CLOCK_KEY: &str = "retention_clock_trusted_at";
 
@@ -816,7 +825,8 @@ CREATE TABLE IF NOT EXISTS links (
     events_json TEXT NOT NULL DEFAULT '[]',
     legal_hold INTEGER NOT NULL DEFAULT 0,
     notifications_json TEXT,
-    retention_days INTEGER
+    retention_days INTEGER,
+    verification TEXT NOT NULL DEFAULT 'default' CHECK (verification IN ('default', 'balanced', 'strict'))
 );
 CREATE INDEX links_tenant ON links(tenant);
 CREATE INDEX links_tenant_created ON links(tenant, created_at DESC, id DESC);
@@ -1384,7 +1394,7 @@ impl Store {
             let mut statement = connection.prepare(
                 "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
                         active, legal_hold, events_json, notifications_json,
-                        retention_days
+                        retention_days, verification
                  FROM links WHERE tenant = ?1 ORDER BY rowid",
             )?;
             let rows =
@@ -1638,7 +1648,7 @@ impl Store {
             let mut statement = connection.prepare(
                 "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
                         active, legal_hold, events_json, notifications_json,
-                        retention_days
+                        retention_days, verification
                  FROM links
                  WHERE tenant = ?1
                    AND (?2 = '' OR lower(label) LIKE '%' || ?2 || '%' ESCAPE '\\'
@@ -1702,7 +1712,7 @@ impl Store {
                 .query_row(
                     "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
                             active, legal_hold, events_json, notifications_json,
-                        retention_days
+                        retention_days, verification
                      FROM links WHERE tenant = ?1 AND id = ?2",
                     rusqlite::params![tenant, id],
                     |row| row_to_link_with_uploads(connection, row),
@@ -1720,7 +1730,7 @@ impl Store {
                 .query_row(
                     "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
                             active, legal_hold, events_json, notifications_json,
-                        retention_days
+                        retention_days, verification
                      FROM links WHERE id = ?1",
                     [id],
                     |row| row_to_link_with_uploads(connection, row),
@@ -1736,7 +1746,7 @@ impl Store {
                 .prepare_cached(
                     "SELECT id, tenant, label, dest, password_hash, created_at, expires_at,
                             max_bytes, active, legal_hold, '[]' AS events_json, notifications_json,
-                            retention_days
+                            retention_days, verification
                      FROM links WHERE id = ?1",
                 )?
                 .query_row([id], row_to_link)
@@ -3404,7 +3414,7 @@ impl Store {
             let mut statement = connection.prepare(
                 "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
                         active, legal_hold, events_json, notifications_json,
-                        retention_days
+                        retention_days, verification
                  FROM links ORDER BY rowid",
             )?;
             let rows = statement.query_map([], |row| row_to_link_with_uploads(connection, row))?;
@@ -5028,8 +5038,8 @@ fn insert_link_row(connection: &Connection, link: &Link) -> rusqlite::Result<()>
     connection.execute(
         "INSERT INTO links (id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
                             active, legal_hold, events_json, notifications_json,
-                        retention_days)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                        retention_days, verification)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         link_params(link),
     )?;
     for upload in &link.uploads {
@@ -5053,7 +5063,7 @@ fn write_link_row(connection: &Connection, link: &Link) -> rusqlite::Result<()> 
         "UPDATE links SET label = ?3, dest = ?4, password_hash = ?5, created_at = ?6,
                           expires_at = ?7, max_bytes = ?8, active = ?9,
                           legal_hold = ?10, events_json = ?11, notifications_json = ?12,
-                          retention_days = ?13
+                          retention_days = ?13, verification = ?14
          WHERE id = ?1 AND tenant = ?2",
         link_params(link),
     )?;
@@ -5676,7 +5686,7 @@ fn decode_quota(value: Option<String>, column: usize) -> rusqlite::Result<Option
         .transpose()
 }
 
-fn link_params(link: &Link) -> [rusqlite::types::Value; 13] {
+fn link_params(link: &Link) -> [rusqlite::types::Value; 14] {
     use rusqlite::types::Value as V;
     let events = serde_json::to_string(&link.events).unwrap_or_else(|_| "[]".to_owned());
     [
@@ -5701,6 +5711,7 @@ fn link_params(link: &Link) -> [rusqlite::types::Value; 13] {
             .map(|days| i64::try_from(days).unwrap_or(i64::MAX))
             .map(V::from)
             .unwrap_or(V::Null),
+        V::from(link.verification.clone()),
     ]
 }
 
@@ -5730,6 +5741,7 @@ fn row_to_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<Link> {
         retention_days: row
             .get::<_, Option<i64>>("retention_days")?
             .and_then(|value| u64::try_from(value).ok()),
+        verification: row.get("verification")?,
         uploads: Vec::new(),
         events: parse_json(&events_json, row.as_ref().column_index("events_json")?)?,
     })
@@ -5897,7 +5909,7 @@ fn read_link_metadata(
         .query_row(
             "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
                         active, legal_hold, events_json, notifications_json,
-                        retention_days
+                        retention_days, verification
              FROM links WHERE tenant = ?1 AND id = ?2",
             rusqlite::params![tenant, id],
             row_to_link,
@@ -6524,6 +6536,28 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
                     "ALTER TABLE tenants ADD COLUMN retention_days INTEGER;
                      ALTER TABLE links ADD COLUMN retention_days INTEGER;
                      UPDATE meta SET value='47' WHERE key='schema_version';",
+                )
+                .map_err(|e| e.to_string())?;
+            transaction.commit().map_err(|e| e.to_string())?;
+        }
+        if stored == 47
+            || stored == 46
+            || stored == 45
+            || stored == 44
+            || stored == 41
+            || stored == 42
+            || stored == 43
+        {
+            validate_schema(connection, 47)?;
+            // One transaction keeps the bump atomic: a restart mid-migration
+            // rolls back to 47 and the next open reruns the whole step.
+            // Finding 24: existing links keep today's mount-based choice.
+            let transaction = connection.transaction().map_err(|e| e.to_string())?;
+            transaction
+                .execute_batch(
+                    "ALTER TABLE links ADD COLUMN verification TEXT NOT NULL DEFAULT 'default'
+                         CHECK (verification IN ('default', 'balanced', 'strict'));
+                     UPDATE meta SET value='48' WHERE key='schema_version';",
                 )
                 .map_err(|e| e.to_string())?;
             transaction.commit().map_err(|e| e.to_string())?;

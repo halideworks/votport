@@ -92,6 +92,75 @@ fn profile_for_mount(remote: bool) -> vot_sdk_file::CommitProfile {
     }
 }
 
+/// The verification levels a request link creator can pick (finding 24).
+/// These strings are the API and storage spelling; the CHECK constraint on
+/// `links.verification` pins them.
+pub const VERIFICATION_LEVELS: [&str; 3] = ["default", "balanced", "strict"];
+
+/// Resolves a link's requested verification level against a mount class.
+/// "default" keeps today's receive choice (Balanced on local storage and on
+/// explicitly qualified Linux CIFS/SMB or NFS, docs/deployment.md); "strict"
+/// is documented local-only, so a NAS destination refuses the level instead
+/// of silently downgrading.
+pub fn verification_for_mount(
+    remote: bool,
+    requested: &str,
+) -> Result<vot_sdk_file::CommitProfile, String> {
+    match requested {
+        "default" | "balanced" => Ok(vot_sdk_file::CommitProfile::Balanced),
+        "strict" if !remote => Ok(vot_sdk_file::CommitProfile::Strict),
+        "strict" => {
+            Err("strict verification is not offered for network storage destinations".to_owned())
+        }
+        other => Err(format!("unknown verification level {other:?}")),
+    }
+}
+
+/// One capability decision for a link's verification level (finding 24),
+/// consulted by link creation (422 refusal) and by session publication.
+/// The mount probe mirrors [`commit_profile`].
+pub fn verification_profile(
+    destination: &Path,
+    requested: &str,
+) -> Result<vot_sdk_file::CommitProfile, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let parent = destination
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let remote = mount_remote(parent)?;
+        verification_for_mount(remote, requested)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = destination;
+        verification_for_mount(false, requested)
+    }
+}
+
+/// Whether the nearest existing ancestor of `destination` sits on SMB/CIFS or
+/// NFS. Link creation runs before the destination directories exist, so the
+/// probe walks up to the first existing directory, which shares the mount.
+#[cfg(target_os = "linux")]
+fn mount_remote(destination: &Path) -> Result<bool, String> {
+    let mut probe = destination.to_path_buf();
+    loop {
+        match std::fs::File::open(&probe) {
+            Ok(file) => {
+                return vot_platform_fs::is_smb_or_nfs(&file)
+                    .map_err(|error| format!("inspect {}: {error}", probe.display()));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !probe.pop() {
+                    return Ok(false);
+                }
+            }
+            Err(error) => return Err(format!("inspect {}: {error}", probe.display())),
+        }
+    }
+}
+
 /// Drops group/other write bits on a directory files are received into. VOT
 /// stages next to the destination and refuses a group-writable parent, so a
 /// mount created 0775 (umask 002 hosts) would fail every upload into it.
@@ -1000,4 +1069,50 @@ fn mounted_share_profile_preserves_local_assurance() {
     );
     #[cfg(target_os = "linux")]
     assert!(commit_profile(&directory.path().join("missing/file")).is_err());
+}
+
+#[cfg(test)]
+#[test]
+fn verification_levels_resolve_per_documented_qualification() {
+    // Finding 24: "default" keeps today's receive choice, "balanced" pins
+    // it, and "strict" is refused on NAS instead of silently downgrading.
+    for level in ["default", "balanced"] {
+        assert_eq!(
+            verification_for_mount(false, level).unwrap(),
+            vot_sdk_file::CommitProfile::Balanced
+        );
+        assert_eq!(
+            verification_for_mount(true, level).unwrap(),
+            vot_sdk_file::CommitProfile::Balanced
+        );
+    }
+    assert_eq!(
+        verification_for_mount(false, "strict").unwrap(),
+        vot_sdk_file::CommitProfile::Strict
+    );
+    assert_eq!(
+        verification_for_mount(true, "strict").unwrap_err(),
+        "strict verification is not offered for network storage destinations"
+    );
+    assert!(verification_for_mount(false, "fast").is_err());
+}
+
+#[cfg(test)]
+#[test]
+fn verification_profile_probes_the_destination_mount() {
+    let directory = tempfile::tempdir().unwrap();
+    // A local destination honors strict, including through directories that
+    // do not exist yet (link creation runs before any session).
+    assert_eq!(
+        verification_profile(&directory.path().join("new/file"), "strict").unwrap(),
+        vot_sdk_file::CommitProfile::Strict
+    );
+    assert_eq!(
+        verification_profile(&directory.path().join("new/file"), "default").unwrap(),
+        vot_sdk_file::CommitProfile::Balanced
+    );
+    assert_eq!(
+        verification_profile(directory.path(), "nonsense").unwrap_err(),
+        "unknown verification level \"nonsense\""
+    );
 }

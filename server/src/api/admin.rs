@@ -3411,6 +3411,8 @@ struct LinkView {
     notifications: Option<crate::store::NotificationPolicy>,
     /// Finding 378: link-scoped upload retention in days, if any.
     retention_days: Option<u64>,
+    /// Finding 24: requested publication verification level.
+    verification: String,
     usable: bool,
     upload_count: u64,
     upload_bytes: u64,
@@ -3528,6 +3530,7 @@ fn link_view(
         legal_hold: link.legal_hold,
         notifications: link.notifications,
         retention_days: link.retention_days,
+        verification: link.verification,
         upload_count: totals.0,
         upload_bytes: totals.1,
         events: link.events,
@@ -3859,6 +3862,10 @@ pub struct CreateLinkRequest {
     /// Finding 378: optional link-scoped upload retention in days.
     #[serde(default)]
     retention_days: Option<u64>,
+    /// Finding 24: requested publication verification level; absent means
+    /// "default", the platform's mount-based choice.
+    #[serde(default)]
+    verification: String,
     #[serde(default)]
     notifications: Option<crate::store::NotificationPolicy>,
     workflow: Option<crate::workflow::ReceiveWorkflow>,
@@ -3912,6 +3919,23 @@ pub async fn create_link(
             format!("retention_days must be between 1 and {MAX_REQUEST_LINK_EXPIRY_DAYS}"),
         ));
     }
+    // Finding 24: an absent level (serialized as empty) means "default",
+    // and anything outside the known names is a bad request, never a silent
+    // substitution.
+    let verification = if request.verification.is_empty() {
+        "default".to_owned()
+    } else {
+        request.verification.clone()
+    };
+    if !paths::VERIFICATION_LEVELS.contains(&verification.as_str()) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "verification must be one of {}",
+                paths::VERIFICATION_LEVELS.join(", ")
+            ),
+        ));
+    }
     let password_hash = match request.password.as_deref().filter(|p| !p.is_empty()) {
         Some(password) if password.len() <= MAX_PASSWORD_BYTES => {
             Some(auth::hash_password(password).map_err(ApiError::internal)?)
@@ -3927,18 +3951,23 @@ pub async fn create_link(
     let tenant = identity.tenant.clone();
     // A cookie can outlive its tenant's deletion; without this check the
     // link would be created under a namespace nothing manages anymore.
-    if !tenant.is_empty()
-        && app
+    let tenant_row = if tenant.is_empty() {
+        None
+    } else {
+        match app
             .store
             .tenant(&tenant)
             .map_err(super::store_unavailable)?
-            .is_none()
-    {
-        return Err(ApiError::new(
-            StatusCode::GONE,
-            "this session's tenant no longer exists; sign in again",
-        ));
-    }
+        {
+            Some(tenant) => Some(tenant),
+            None => {
+                return Err(ApiError::new(
+                    StatusCode::GONE,
+                    "this session's tenant no longer exists; sign in again",
+                ));
+            }
+        }
+    };
     let (_, max_links, _) = app
         .store
         .quotas_for(&tenant, &app.config)
@@ -3973,6 +4002,21 @@ pub async fn create_link(
             &super::notifications::WORKFLOW_EVENTS,
         )?;
     }
+    // Finding 24: refuse a level the destination's filesystem cannot honor
+    // instead of silently downgrading at publication time. The destination
+    // resolves exactly as a session's will (tenant prefix, then dest).
+    let mut dest_components = tenant_row
+        .as_ref()
+        .map_or_else(Vec::new, |tenant| tenant.path_prefix());
+    dest_components.extend(
+        dest.split('/')
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned),
+    );
+    let destination =
+        paths::join_under(&app.config.receive_dir, &dest_components).map_err(ApiError::internal)?;
+    paths::verification_profile(&destination, &verification)
+        .map_err(|message| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, message))?;
     let created_at = now_unix();
     let link = Link {
         id: auth::random_token(),
@@ -3989,6 +4033,7 @@ pub async fn create_link(
         legal_hold: false,
 
         retention_days: request.retention_days,
+        verification,
         notifications,
         uploads: Vec::new(),
         events: Vec::new(),
@@ -4020,6 +4065,7 @@ pub async fn create_link(
             "expires_at": view.expires_at,
             "max_bytes": view.max_bytes,
             "retention_days": view.retention_days,
+            "verification": view.verification,
         }),
     );
     Ok(Json(json!({ "link": view })))

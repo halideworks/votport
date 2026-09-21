@@ -582,6 +582,7 @@ function formatLimit(bytes) {
 // filter's word for a link an administrator closed, so a closed card says
 // "Closed", never "off".
 const linkStatusNames = { open: 'Open', closed: 'Closed', expired: 'Expired' };
+const verificationNames = { default: 'Automatic', balanced: 'Balanced rehash', strict: 'Strict rehash' };
 
 function renderLink(link) {
   // A change inside its undo window shows as if the server had it.
@@ -664,6 +665,7 @@ function renderLink(link) {
   if (link.expires_at) parts.push(`expires ${formatWhen(link.expires_at)}`);
   if (link.max_bytes) parts.push(`limit ${formatLimit(link.max_bytes)}`);
   if (link.retention_days) parts.push(`kept ${link.retention_days}d`);
+  if (link.verification && link.verification !== 'default') parts.push(`${verificationNames[link.verification] || link.verification} verification`);
   meta.textContent = parts.join(' · ');
   card.append(meta);
   if (link.workflow) {
@@ -989,6 +991,7 @@ $('create-form').addEventListener('submit', async (event) => {
         expires_days: Number.isFinite(expires) ? expires : null,
         max_bytes: Number.isFinite(maxGb) ? maxGb * 1000 ** 3 : null,
         retention_days: Number.isFinite(retention) ? retention : null,
+        verification: $('create-verification').value,
         notifications: creatingRoute ? { mode: 'off', rules: [] } : createNotifications.read(),
         workflow: createWorkflow?.read() || null,
       }),
@@ -1001,9 +1004,10 @@ $('create-form').addEventListener('submit', async (event) => {
     createWorkflow = workflowEditor(); $('create-workflow').replaceChildren(createWorkflow.element);
     $('new-link').hidden = false;
     $('new-link-url').textContent = link.url;
-    $('new-link-note').textContent = link.has_password
-      ? 'Send the access password by a separate channel.'
-      : '';
+    $('new-link-note').textContent = [
+      link.has_password ? 'Send the access password by a separate channel.' : '',
+      `Verification: ${verificationNames[link.verification] || verificationNames.default}.`,
+    ].filter(Boolean).join(' ');
     created = true;
     announce('links-action-status', 'Request link created.');
     $('new-link-copy').onclick = async () => {

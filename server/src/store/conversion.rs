@@ -176,7 +176,7 @@ fn convert(data: &Path, public_url: &str) -> Result<Conversion> {
         &transaction,
         &target,
         "tenants",
-        &["incarnation", "retention_days"],
+        &[("incarnation", "''"), ("retention_days", "''")],
         |connection| {
             let mut rows = connection.prepare("SELECT key FROM tenants ORDER BY key")?;
             for key in rows.query_map([], |row| row.get::<_, String>(0))? {
@@ -394,7 +394,9 @@ fn rebuild(
     connection: &Connection,
     target: &Connection,
     table: &str,
-    added: &[&str],
+    // Columns the source may predate, with the select expression that
+    // satisfies the target column while `fill` runs its backfill.
+    backfill: &[(&str, &str)],
     fill: impl FnOnce(&Connection) -> Result<()>,
 ) -> Result<()> {
     target_table(connection, target, table, true)?;
@@ -405,11 +407,10 @@ fn rebuild(
     let select = columns
         .iter()
         .map(|name| {
-            if added.contains(&name.as_str()) {
-                "''"
-            } else {
-                name
-            }
+            backfill
+                .iter()
+                .find(|(column, _)| column == &name.as_str())
+                .map_or_else(|| name.clone(), |(_, expression)| (*expression).to_owned())
         })
         .collect::<Vec<_>>()
         .join(",");
@@ -538,11 +539,13 @@ fn normalize_uploads(connection: &Connection, target: &Connection) -> Result<()>
     target_indexes(connection, target, "link_uploads")?;
     // Finding 378: the source predates scoped link retention; converted
     // links defer to tenant and platform windows.
+    // Finding 24: the source may predate link verification levels; converted
+    // links keep the mount-based choice, which the CHECK accepts.
     rebuild(
         connection,
         target,
         "links",
-        &["retention_days"],
+        &[("retention_days", "''"), ("verification", "'default'")],
         |connection| {
             connection.execute("UPDATE conversion_links SET retention_days=NULL", [])?;
             Ok(())
@@ -553,7 +556,7 @@ fn normalize_uploads(connection: &Connection, target: &Connection) -> Result<()>
         connection,
         target,
         "automation_tokens",
-        &["created_by"],
+        &[("created_by", "''")],
         |_| Ok(()),
     )
 }
@@ -571,7 +574,11 @@ fn convert_jobs(
         connection,
         target,
         "delivery_jobs",
-        &["token", "created_at", "snapshot_bytes"],
+        &[
+            ("token", "''"),
+            ("created_at", "''"),
+            ("snapshot_bytes", "''"),
+        ],
         |connection| {
             let mut statement = connection.prepare("SELECT id,tenant,actor,operation_id,project_id,state,document FROM delivery_jobs ORDER BY rowid")?;
             let mut rows = statement.query([])?;

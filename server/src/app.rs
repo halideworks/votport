@@ -1684,6 +1684,7 @@ fn resume_upload_session(
         expected_package: session.package.clone(),
         max_total_bytes: session.max_total_bytes.unwrap_or(u64::MAX),
         allow_hidden: config.allow_hidden,
+        verification: link.verification.clone(),
         signer: Arc::clone(signer),
         session_id,
         started_at: session.started_at,
