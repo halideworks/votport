@@ -405,6 +405,7 @@ mod persistence_tests {
             store
                 .insert_link(Link {
                     retention_days: None,
+                    verification: "default".to_owned(),
                     id: id.into(),
                     tenant: String::new(),
                     label: id.into(),

@@ -194,6 +194,7 @@ fn delivered_candidates_match_full_identity_and_seek_past_aliases() {
 pub(crate) fn test_link(id: &str) -> Link {
     Link {
         retention_days: None,
+        verification: "default".to_owned(),
         id: id.to_owned(),
         tenant: String::new(),
         label: "test".to_owned(),
@@ -1883,6 +1884,7 @@ fn schema41_upgrade_preserves_existing_grants_and_can_store_new_addresses() {
              ALTER TABLE delivery_jobs DROP COLUMN created_at;
                  ALTER TABLE tenants DROP COLUMN retention_days;
                  ALTER TABLE links DROP COLUMN retention_days;
+                 ALTER TABLE links DROP COLUMN verification;
              ALTER TABLE delivery_jobs DROP COLUMN snapshot_bytes;
              ALTER TABLE automation_tokens DROP COLUMN created_by;
              UPDATE meta SET value='41' WHERE key='schema_version';",
@@ -1983,6 +1985,7 @@ fn schema45_upgrade_backfills_delivery_job_snapshot_and_created_columns() {
                  ALTER TABLE automation_tokens DROP COLUMN created_by;
                  ALTER TABLE tenants DROP COLUMN retention_days;
                  ALTER TABLE links DROP COLUMN retention_days;
+                 ALTER TABLE links DROP COLUMN verification;
                  UPDATE meta SET value='44' WHERE key='schema_version';",
             )
         })
@@ -2091,6 +2094,7 @@ fn schema46_upgrade_backfills_automation_token_creator() {
                  ALTER TABLE automation_tokens DROP COLUMN created_by;
                  ALTER TABLE tenants DROP COLUMN retention_days;
                  ALTER TABLE links DROP COLUMN retention_days;
+                 ALTER TABLE links DROP COLUMN verification;
                  UPDATE meta SET value='45' WHERE key='schema_version';",
             )
         })
@@ -2171,6 +2175,7 @@ fn schema47_upgrade_adds_scoped_upload_retention_columns() {
                  VALUES ('link','acme','Link','work',10,NULL,1,'[]',0);
                  ALTER TABLE tenants DROP COLUMN retention_days;
                  ALTER TABLE links DROP COLUMN retention_days;
+                 ALTER TABLE links DROP COLUMN verification;
                  UPDATE meta SET value='46' WHERE key='schema_version';",
             )
         })
@@ -2205,6 +2210,71 @@ fn schema47_upgrade_adds_scoped_upload_retention_columns() {
     assert_eq!(
         store.link("acme", "link").unwrap().unwrap().retention_days,
         Some(30)
+    );
+}
+
+#[test]
+fn schema48_upgrade_adds_link_verification_level() {
+    let directory = tempfile::tempdir().unwrap();
+    // Fresh databases stamp 48 and default every link to "default".
+    let store = Store::open(directory.path()).unwrap();
+    assert_eq!(
+        store
+            .with(|connection| {
+                connection.query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap(),
+        SCHEMA_VERSION.to_string()
+    );
+    // Seed rows the way schema 47 stored them (one link with an explicit
+    // retention scope), then strip the 48 column and stamp the old version.
+    store
+        .with(|connection| {
+            connection.execute_batch(
+                "INSERT INTO links(id,tenant,label,dest,created_at,expires_at,active,events_json,legal_hold,retention_days)
+                 VALUES ('link','','Link','work',10,NULL,1,'[]',0,30);
+                 ALTER TABLE links DROP COLUMN verification;
+                 UPDATE meta SET value='47' WHERE key='schema_version';",
+            )
+        })
+        .unwrap();
+    drop(store);
+    // The upgrade runs inside one transaction, so a restart mid-migration
+    // presents exactly as this 47 database does and the next open reruns
+    // the whole step. Existing links keep the mount-based choice.
+    let store = Store::open(directory.path()).unwrap();
+    assert_eq!(
+        store
+            .with(|connection| {
+                connection.query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap(),
+        SCHEMA_VERSION.to_string()
+    );
+    let link = store.link("", "link").unwrap().unwrap();
+    assert_eq!(link.retention_days, Some(30));
+    assert_eq!(link.verification, "default");
+    // A chosen level survives a reopen, and the CHECK holds the stored
+    // names to the three the API accepts.
+    assert!(store
+        .update_link("", "link", |link| link.verification = "strict".to_owned())
+        .unwrap());
+    assert!(store
+        .with(|connection| connection.execute("UPDATE links SET verification='fast'", [],))
+        .is_err());
+    drop(store);
+    let store = Store::open(directory.path()).unwrap();
+    assert_eq!(
+        store.link("", "link").unwrap().unwrap().verification,
+        "strict"
     );
 }
 
@@ -5793,6 +5863,7 @@ mod settings_tests {
                  ALTER TABLE automation_tokens DROP COLUMN created_by;
                  ALTER TABLE tenants DROP COLUMN retention_days;
                  ALTER TABLE links DROP COLUMN retention_days;
+                 ALTER TABLE links DROP COLUMN verification;
                  UPDATE meta SET value='43' WHERE key='schema_version';",
             )
             .unwrap();

@@ -2008,6 +2008,7 @@ pub(crate) mod tests {
             .store
             .insert_link(Link {
                 retention_days: None,
+                verification: "default".to_owned(),
                 id: "link-id".into(),
                 tenant: String::new(),
                 label: "upload-label".into(),

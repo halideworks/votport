@@ -592,6 +592,7 @@ mod push_tests {
             expected_package,
             max_total_bytes: u64::MAX,
             allow_hidden: false,
+            verification: "default".to_owned(),
             signer: Arc::clone(&app.signer),
             session_id: [7; 16],
             started_at: 1,
@@ -2458,6 +2459,7 @@ mod push_tests {
                 .store
                 .insert_link(crate::store::Link {
                     retention_days: None,
+                    verification: "default".to_owned(),
                     id: setup.link_id.clone(),
                     tenant: String::new(),
                     label: "checkpoint".into(),
@@ -3191,6 +3193,7 @@ mod push_tests {
             .store
             .insert_link(crate::store::Link {
                 retention_days: None,
+                verification: "default".to_owned(),
                 id: setup.link_id.clone(),
                 tenant: String::new(),
                 label: "recovery".into(),
@@ -3322,6 +3325,7 @@ mod push_tests {
                 .store
                 .insert_link(crate::store::Link {
                     retention_days: None,
+                    verification: "default".to_owned(),
                     id: "link".to_owned(),
                     tenant: String::new(),
                     label: "retry".to_owned(),
@@ -3469,6 +3473,7 @@ mod push_tests {
             .store
             .insert_link(crate::store::Link {
                 retention_days: None,
+                verification: "default".to_owned(),
                 id: "link".to_owned(),
                 tenant: String::new(),
                 label: "retry".to_owned(),
@@ -3605,6 +3610,7 @@ mod push_tests {
             .store
             .insert_link(crate::store::Link {
                 retention_days: None,
+                verification: "default".to_owned(),
                 id: "link".to_owned(),
                 tenant: String::new(),
                 label: "retry".to_owned(),
@@ -3949,6 +3955,46 @@ mod push_tests {
         assert_eq!(
             verified.receipt().sequence,
             baseline.publish_observation().unwrap().sequence
+        );
+    }
+
+    /// Finding 24: the link's verification level, not the mount alone,
+    /// picks the publication profile; the receipt records the actual one.
+    #[test]
+    fn link_verification_level_sets_the_publication_profile() {
+        let directory = tempfile::tempdir().unwrap();
+        let object = object(Suite::Blake3Bao64, b"");
+        let mut setup = setup(directory.path(), object.clone());
+        fs::create_dir_all(&setup.dest_dir).unwrap();
+        // On local storage "default" and "balanced" both resolve Balanced,
+        // matching the previous hardcoded behavior.
+        for (level, expected) in [
+            ("default", CommitProfile::Balanced),
+            ("balanced", CommitProfile::Balanced),
+        ] {
+            setup.verification = level.to_owned();
+            let mut file =
+                open_destination_for(&setup, vec![format!("{level}")], object.clone()).unwrap();
+            let staged = file.native.as_mut().unwrap();
+            staged.reopen().unwrap();
+            assert_eq!(staged.profile, expected, "level {level}");
+            staged.park();
+        }
+        // "strict" publishes Strict and the receipt records that profile.
+        setup.verification = "strict".to_owned();
+        let mut file = open_destination_for(&setup, vec!["vault".to_string()], object).unwrap();
+        let staged = file.native.as_mut().unwrap();
+        staged.reopen().unwrap();
+        assert_eq!(staged.profile, CommitProfile::Strict);
+        finish_publication(&setup, &mut file).unwrap();
+        assert!(file.receipt);
+        let bytes = fs::read(setup.dest_dir.join("vault.vot-receipt")).unwrap();
+        let decoded = vot_receipt::decode_authenticated(&bytes).unwrap();
+        let verified =
+            vot_receipt::verify_ed25519(&decoded, &setup.signer.verifying_key()).unwrap();
+        assert_eq!(
+            verified.receipt().profile,
+            vot_receipt::CommitProfile::Strict
         );
     }
 

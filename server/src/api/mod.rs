@@ -686,6 +686,7 @@ mod handler_tests {
         let application = testing::build(directory.path());
         let link = Link {
             retention_days: None,
+            verification: "default".to_owned(),
             id: "closed-link-id".to_owned(),
             tenant: String::new(),
             label: "tax documents".to_owned(),
@@ -723,6 +724,7 @@ mod handler_tests {
     fn test_link(id: &str, password_hash: Option<String>) -> Link {
         Link {
             retention_days: None,
+            verification: "default".to_owned(),
             id: id.to_owned(),
             tenant: String::new(),
             label: "quarterly docs".to_owned(),

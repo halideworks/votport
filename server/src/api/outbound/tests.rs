@@ -2111,6 +2111,7 @@ async fn fixture() -> (tempfile::TempDir, Arc<App>, String, Vec<u8>) {
     app.store
         .insert_link(crate::store::Link {
             retention_days: None,
+            verification: "default".to_owned(),
             id: "link".to_owned(),
             label: "link".to_owned(),
             tenant: String::new(),

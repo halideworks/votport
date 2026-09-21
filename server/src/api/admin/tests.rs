@@ -745,6 +745,7 @@ mod handler_tests {
             .store
             .insert_link(crate::store::Link {
                 retention_days: None,
+                verification: "default".to_owned(),
                 id: "held".to_owned(),
                 label: "held".to_owned(),
                 tenant: String::new(),
@@ -792,6 +793,7 @@ mod handler_tests {
             .store
             .insert_link(crate::store::Link {
                 retention_days: None,
+                verification: "default".to_owned(),
                 id: "link".to_owned(),
                 label: "link".to_owned(),
                 tenant: String::new(),
@@ -894,6 +896,7 @@ mod handler_tests {
                 .store
                 .insert_link(crate::store::Link {
                     retention_days: None,
+                    verification: "default".to_owned(),
                     id: id.to_owned(),
                     label: id.to_owned(),
                     tenant: String::new(),
@@ -1556,6 +1559,7 @@ mod handler_tests {
             .store
             .insert_link(crate::store::Link {
                 retention_days: None,
+                verification: "default".to_owned(),
                 id: "link".to_owned(),
                 label: "link".to_owned(),
                 tenant: String::new(),
@@ -1675,6 +1679,7 @@ mod handler_tests {
             app.store
                 .insert_link(crate::store::Link {
                     retention_days: None,
+                    verification: "default".to_owned(),
                     id: "crash-link".to_owned(),
                     tenant: String::new(),
                     label: "crash".to_owned(),
@@ -2094,6 +2099,7 @@ mod tenant_authz_tests {
                 tenant: "acme".to_owned(),
                 ..crate::store::Link {
                     retention_days: None,
+                    verification: "default".to_owned(),
                     id: "acme-link".to_owned(),
                     tenant: "acme".to_owned(),
                     label: "acme".to_owned(),
@@ -2934,6 +2940,7 @@ mod tenant_offboard_tests {
     fn default_link(id: &str, dest: &str) -> Link {
         Link {
             retention_days: None,
+            verification: "default".to_owned(),
             id: id.to_owned(),
             tenant: String::new(),
             label: id.to_owned(),
@@ -3895,6 +3902,119 @@ mod tenant_offboard_tests {
             assert_eq!(response.status(), StatusCode::OK, "dest {dest}");
         }
         assert_eq!(application.store.links("").unwrap().len(), 2);
+    }
+
+    /// Posts a link creation request and returns the status with the parsed
+    /// body, for verification-level tests (finding 24).
+    async fn post_link(
+        application: Arc<App>,
+        cookie: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        use http_body_util::BodyExt as _;
+        let response = app::router(application)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/links")
+                    .header("cookie", cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json = if body.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&body).unwrap()
+        };
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn create_link_records_the_requested_verification_level() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        let (status, body) = post_link(
+            application.clone(),
+            &cookie,
+            json!({"label":"vault","verification":"strict"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // The local destination honors strict, so creation accepts it and
+        // the view carries the chosen level.
+        assert_eq!(body["link"]["verification"], "strict");
+        let id = body["link"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            application
+                .store
+                .link("", &id)
+                .unwrap()
+                .unwrap()
+                .verification,
+            "strict"
+        );
+        let line = application
+            .store
+            .audit_recent_filtered(
+                None,
+                0,
+                10,
+                AuditFilters {
+                    event: Some("link_created"),
+                    query: None,
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(line.detail["verification"], "strict");
+    }
+
+    #[tokio::test]
+    async fn create_link_defaults_verification_when_the_field_is_absent() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        for payload in [
+            json!({"label":"plain"}),
+            json!({"label":"explicit","verification":"default"}),
+        ] {
+            let (status, body) = post_link(application.clone(), &cookie, payload).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["link"]["verification"], "default");
+        }
+        assert_eq!(application.store.links("").unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn create_link_refuses_unknown_verification_levels() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        let (status, body) = post_link(
+            application.clone(),
+            &cookie,
+            json!({"label":"typo","verification":"fast"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body["error"],
+            "verification must be one of default, balanced, strict"
+        );
+        // The refusal stores nothing.
+        assert!(application.store.links("").unwrap().is_empty());
     }
 
     #[test]
@@ -4970,6 +5090,7 @@ mod settings_api_tests {
             .store
             .insert_link(crate::store::Link {
                 retention_days: None,
+                verification: "default".to_owned(),
                 id: "resume".into(),
                 tenant: String::new(),
                 label: "resume".into(),
@@ -5841,6 +5962,7 @@ mod settings_api_tests {
             .store
             .insert_link(crate::store::Link {
                 retention_days: None,
+                verification: "default".to_owned(),
                 id: "acme-link".to_owned(),
                 tenant: "acme".to_owned(),
                 label: "open".to_owned(),
@@ -6043,6 +6165,7 @@ mod settings_api_tests {
             .store
             .insert_link(crate::store::Link {
                 retention_days: None,
+                verification: "default".to_owned(),
                 id: "default-link".to_owned(),
                 tenant: String::new(),
                 label: "open".to_owned(),

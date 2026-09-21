@@ -804,6 +804,7 @@ pub async fn create_session(
         expected_package: prepared.expected.clone(),
         max_total_bytes: prepared.cap,
         allow_hidden: app.config.allow_hidden,
+        verification: prepared.link.verification.clone(),
         signer: Arc::clone(&app.signer),
         session_id: session_bytes,
         started_at: now_unix(),
@@ -980,6 +981,7 @@ pub async fn create_push_session(
         expected_package: prepared.expected.clone(),
         max_total_bytes: prepared.cap,
         allow_hidden: app.config.allow_hidden,
+        verification: prepared.link.verification.clone(),
         signer: Arc::clone(&app.signer),
         session_id: session_bytes,
         started_at: now_unix(),
@@ -1394,6 +1396,7 @@ mod session_rate_tests {
     pub(super) fn open_link(id: &str) -> Link {
         Link {
             retention_days: None,
+            verification: "default".to_owned(),
             id: id.to_owned(),
             tenant: String::new(),
             label: "open".to_owned(),
@@ -2264,6 +2267,7 @@ mod push_preflight_tests {
     fn open_link(id: &str) -> Link {
         Link {
             retention_days: None,
+            verification: "default".to_owned(),
             id: id.to_owned(),
             tenant: String::new(),
             label: "open".to_owned(),

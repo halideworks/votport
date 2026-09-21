@@ -3159,6 +3159,7 @@ mod tests {
             };
             let link = crate::store::Link {
                 retention_days: None,
+                verification: "default".to_owned(),
                 id: "incoming".into(),
                 tenant: String::new(),
                 label: "Incoming".into(),
@@ -3771,6 +3772,7 @@ mod tests {
                 .store
                 .insert_link(crate::store::Link {
                     retention_days: None,
+                    verification: "default".to_owned(),
                     id: token.clone(),
                     tenant: "nyc".into(),
                     label: "NYC reception".into(),

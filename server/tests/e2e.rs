@@ -7151,6 +7151,7 @@ async fn mounted_nas_media_campaign() {
     );
     let link = votport::store::Link {
         retention_days: None,
+        verification: "default".to_owned(),
         id: "campaign".into(),
         tenant: String::new(),
         label: "NAS campaign".into(),

@@ -2411,6 +2411,7 @@ mod push_tests {
         app.store
             .insert_link(crate::store::Link {
                 retention_days: None,
+                verification: "default".to_owned(),
                 id: "resume".to_owned(),
                 tenant: String::new(),
                 label: "resume".to_owned(),
@@ -2737,6 +2738,7 @@ mod push_tests {
             expected_package: missing_setup.expected_package.clone(),
             max_total_bytes: 1,
             allow_hidden: false,
+            verification: "default".to_owned(),
             signer: Arc::clone(&application.signer),
             session_id: [79; 16],
             started_at: crate::store::now_unix(),
@@ -3639,6 +3641,7 @@ mod retention_tests {
             );
             Link {
                 retention_days: None,
+                verification: "default".to_owned(),
                 id: id.to_owned(),
                 tenant: String::new(),
                 label: id.to_owned(),
@@ -4053,6 +4056,7 @@ mod retention_tests {
 
         let held = Link {
             retention_days: None,
+            verification: "default".to_owned(),
             id: "held".to_owned(),
             tenant: String::new(),
             label: "held".to_owned(),
@@ -4833,6 +4837,7 @@ mod legal_hold_marker_tests {
         app.store
             .insert_link(Link {
                 retention_days: None,
+                verification: "default".to_owned(),
                 id: "held".to_owned(),
                 tenant: String::new(),
                 label: "held".to_owned(),

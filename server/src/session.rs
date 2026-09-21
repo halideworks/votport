@@ -183,6 +183,9 @@ pub struct WorkerSetup {
     pub expected_package: ObjectId,
     pub max_total_bytes: u64,
     pub allow_hidden: bool,
+    /// The link's requested verification level (finding 24): "default",
+    /// "balanced", or "strict"; resolved against the destination mount.
+    pub verification: String,
     pub signer: Arc<crate::receipt::ReceiptSigner>,
     /// The session id bytes, carried into issued receipts.
     pub session_id: [u8; 16],
@@ -2103,7 +2106,11 @@ fn open_destination_for(
         // only for creating intermediate directories.
         let destination =
             paths::join_under(&setup.dest_dir, &stored).map_err(SessionError::internal)?;
-        let profile = CommitProfile::Balanced;
+        // Finding 24: the link's verification level decides the publication
+        // profile; the same capability check that gated link creation gates
+        // publication, so a changed mount refuses rather than downgrades.
+        let profile = crate::paths::verification_profile(&destination, &setup.verification)
+            .map_err(SessionError::bad)?;
         match directory.create(
             &object,
             destination.file_name().expect("non-empty"),
