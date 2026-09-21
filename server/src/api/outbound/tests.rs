@@ -356,13 +356,18 @@ async fn cancelled_library_mutation_keeps_admission_until_worker_finishes() {
         let cookie = named_admin_cookie(&app, "acme");
 
         let (entered, release, _stall) = arm_library_mutation_stall(&root);
-        let (cancel_watchdog, watchdog_wait) = std::sync::mpsc::channel();
-        let watchdog_release = release.clone();
-        let watchdog = std::thread::spawn(move || {
-            if watchdog_wait.recv_timeout(Duration::from_secs(5)).is_err() {
-                let _ = watchdog_release.send(());
-            }
-        });
+        let watchdog = if deleting {
+            let (cancel_watchdog, watchdog_wait) = std::sync::mpsc::channel();
+            let watchdog_release = release.clone();
+            Some(std::thread::spawn(move || {
+                if watchdog_wait.recv_timeout(Duration::from_secs(5)).is_err() {
+                    let _ = watchdog_release.send(());
+                }
+                cancel_watchdog
+            }))
+        } else {
+            None
+        };
         let request = if deleting {
             Request::delete("/api/admin/outbound-files?path=held.bin")
                 .header("cookie", &cookie)
@@ -370,7 +375,7 @@ async fn cancelled_library_mutation_keeps_admission_until_worker_finishes() {
                 .body(Body::empty())
                 .unwrap()
         } else {
-            Request::post("/api/admin/outbound-grants")
+            Request::post("/api/admin/outbound-grants/preparations")
                 .header("cookie", &cookie)
                 .header("x-votport", "1")
                 .header("content-type", "application/json")
@@ -379,35 +384,68 @@ async fn cancelled_library_mutation_keeps_admission_until_worker_finishes() {
         };
         let serving = tokio::spawn(router(app.clone()).oneshot(request));
 
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if entered.try_recv().is_ok() {
-                    break;
+        if deleting {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if entered.try_recv().is_ok() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("library mutation worker did not enter its critical section");
-        let heartbeat_started = Instant::now();
-        let heartbeat = tokio::spawn(async {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            Instant::now()
-        });
-        let heartbeat_at = heartbeat.await.unwrap();
-        assert!(
-            !serving.is_finished(),
-            "mutation must still be held by the barrier"
-        );
-        assert!(
-            heartbeat_at.duration_since(heartbeat_started) < Duration::from_secs(1),
-            "the runtime stalled in the library mutation critical section"
-        );
-        serving.abort();
-        assert!(matches!(
-            serving.await,
-            Err(error) if error.is_cancelled()
-        ));
+            })
+            .await
+            .expect("library mutation worker did not enter its critical section");
+            let heartbeat_started = Instant::now();
+            let heartbeat = tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Instant::now()
+            });
+            let heartbeat_at = heartbeat.await.unwrap();
+            assert!(
+                !serving.is_finished(),
+                "mutation must still be held by the barrier"
+            );
+            assert!(
+                heartbeat_at.duration_since(heartbeat_started) < Duration::from_secs(1),
+                "the runtime stalled in the library mutation critical section"
+            );
+            serving.abort();
+            assert!(matches!(
+                serving.await,
+                Err(error) if error.is_cancelled()
+            ));
+        } else {
+            // The grant request answers 202 while its detached preparation
+            // job waits in the mutation critical section: the page gets its
+            // instant acknowledgement, and cancelling the request would not
+            // cancel the grant work.
+            let accepted = tokio::time::timeout(Duration::from_secs(3), serving)
+                .await
+                .expect("grant creation never returned its 202")
+                .unwrap()
+                .unwrap();
+            assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if entered.try_recv().is_ok() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("grant preparation did not enter its critical section");
+            let heartbeat_started = Instant::now();
+            let heartbeat = tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Instant::now()
+            });
+            let heartbeat_at = heartbeat.await.unwrap();
+            assert!(
+                heartbeat_at.duration_since(heartbeat_started) < Duration::from_secs(1),
+                "the runtime stalled in the library mutation critical section"
+            );
+        }
         assert_eq!(app.sessions.active_outbound_for_tenant("acme"), 1);
 
         release.send(()).unwrap();
@@ -418,8 +456,10 @@ async fn cancelled_library_mutation_keeps_admission_until_worker_finishes() {
         })
         .await
         .expect("cancelled mutation did not release admission after worker completion");
-        let _ = cancel_watchdog.send(());
-        watchdog.join().unwrap();
+        if let Some(watchdog) = watchdog {
+            let cancel_watchdog = watchdog.join().unwrap();
+            let _ = cancel_watchdog.send(());
+        }
         let grants = app.store.outbound_grants("acme").unwrap();
         assert_eq!(grants.len(), usize::from(!deleting));
         assert_eq!(root.join("held.bin").exists(), !deleting);
@@ -448,16 +488,27 @@ async fn stalled_library_validation_does_not_block_outbound_deletion() {
     let cookie = named_admin_cookie(&app, "acme");
 
     let (entered, release, _stall) = arm_library_mutation_stall(&root);
-    let create = tokio::spawn(
+    // Creation is answered 202 immediately; the validation walk runs in the
+    // detached preparation job.
+    let accepted = tokio::time::timeout(
+        Duration::from_secs(3),
         router(app.clone()).oneshot(
-            Request::post("/api/admin/outbound-grants")
+            Request::post("/api/admin/outbound-grants/preparations")
                 .header("cookie", &cookie)
                 .header("x-votport", "1")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"paths":["held.bin"],"expires_days":1}"#))
                 .unwrap(),
         ),
-    );
+    )
+    .await
+    .expect("grant creation never returned its 202")
+    .unwrap();
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let preparation_id = body(accepted).await["preparation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if entered.try_recv().is_ok() {
@@ -467,8 +518,7 @@ async fn stalled_library_validation_does_not_block_outbound_deletion() {
         }
     })
     .await
-    .expect("grant creation never reached its validation walk");
-    assert!(!create.is_finished());
+    .expect("grant preparation never reached its validation walk");
 
     // The stalled walk runs without the mutation lock, so the delete must
     // finish while the walk is still stuck instead of queueing behind it.
@@ -489,12 +539,9 @@ async fn stalled_library_validation_does_not_block_outbound_deletion() {
     assert!(!root.join("held.bin").exists());
 
     release.send(()).unwrap();
-    let response = tokio::time::timeout(Duration::from_secs(2), create)
-        .await
-        .expect("grant creation never finished after its stall was released")
-        .unwrap()
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let snapshot = settled_preparation(&app, &cookie, &preparation_id).await;
+    assert_eq!(snapshot["status"], "failed");
+    assert_eq!(snapshot["error_status"], 404);
     assert!(app.store.outbound_grants("acme").unwrap().is_empty());
 }
 
@@ -512,7 +559,7 @@ async fn library_deletion_and_validated_insert_are_strictly_ordered() {
     std::fs::write(root.join("held.bin"), b"library fixture").unwrap();
     let cookie = named_admin_cookie(&app, "acme");
     let create_request = || {
-        Request::post("/api/admin/outbound-grants")
+        Request::post("/api/admin/outbound-grants/preparations")
             .header("cookie", &cookie)
             .header("x-votport", "1")
             .header("content-type", "application/json")
@@ -534,7 +581,20 @@ async fn library_deletion_and_validated_insert_are_strictly_ordered() {
     // no longer exists.
     let (validated, validated_release, _stall) =
         arm_library_mutation_stall(&root.join(".validated"));
-    let create = tokio::spawn(router(app.clone()).oneshot(create_request()));
+    // The creation request returns 202 while its preparation job walks the
+    // validation-to-insert window.
+    let accepted = tokio::time::timeout(
+        Duration::from_secs(3),
+        router(app.clone()).oneshot(create_request()),
+    )
+    .await
+    .expect("grant creation never returned its 202")
+    .unwrap();
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let preparation_id = body(accepted).await["preparation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if validated.try_recv().is_ok() {
@@ -565,12 +625,9 @@ async fn library_deletion_and_validated_insert_are_strictly_ordered() {
         .unwrap()
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let response = tokio::time::timeout(Duration::from_secs(2), create)
-        .await
-        .expect("grant creation never finished after the delete released the lock")
-        .unwrap()
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let snapshot = settled_preparation(&app, &cookie, &preparation_id).await;
+    assert_eq!(snapshot["status"], "failed");
+    assert_eq!(snapshot["error_status"], 404);
     assert!(app.store.outbound_grants("acme").unwrap().is_empty());
     assert!(!root.join("held.bin").exists());
     let audit = app.store.audit_recent(Some("acme"), 0, 10).unwrap();
@@ -587,11 +644,10 @@ async fn library_deletion_and_validated_insert_are_strictly_ordered() {
     std::fs::write(root.join("held.bin"), b"library fixture").unwrap();
     let response = tokio::time::timeout(
         Duration::from_secs(2),
-        router(app.clone()).oneshot(create_request()),
+        settled_grant_response(app.clone(), &cookie, create_request()),
     )
     .await
-    .expect("grant creation stalled outside the mutation lock")
-    .unwrap();
+    .expect("grant creation stalled outside the mutation lock");
     assert_eq!(response.status(), StatusCode::OK);
     let response = tokio::time::timeout(
         Duration::from_secs(2),
@@ -607,6 +663,85 @@ async fn library_deletion_and_validated_insert_are_strictly_ordered() {
 
 async fn body(response: Response) -> serde_json::Value {
     serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+}
+
+/// Polls a preparation endpoint until its job reaches a terminal state and
+/// returns the final snapshot.
+async fn settled_preparation(
+    app: &std::sync::Arc<App>,
+    cookie: &str,
+    id: &str,
+) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "grant preparation {id} never settled"
+        );
+        let poll = router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/admin/outbound-grants/preparations/{id}"))
+                    .header("cookie", cookie)
+                    .header("x-votport", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(poll.status(), StatusCode::OK);
+        let snapshot = body(poll).await;
+        if snapshot["status"] != "preparing" {
+            return snapshot;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// POSTs a grant creation request and settles any 202 preparation: the
+/// handler answers immediately and hashes in a detached job, so this polls
+/// the progress endpoint to a terminal state and rebuilds the response the
+/// synchronous path used to return (200 with `grant`/`url`, or the job's
+/// error status with `{"error": ...}`). Non-202 replies pass through.
+async fn settled_grant_response(
+    app: std::sync::Arc<App>,
+    cookie: &str,
+    request: Request<Body>,
+) -> Response {
+    let response = router(app.clone()).oneshot(request).await.unwrap();
+    if response.status() != StatusCode::ACCEPTED {
+        return response;
+    }
+    let accepted: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let id = accepted["preparation_id"].as_str().unwrap().to_owned();
+    let snapshot = settled_preparation(&app, cookie, &id).await;
+    match snapshot["status"].as_str() {
+        Some("complete") => {
+            let payload = serde_json::json!({
+                "grant": snapshot["grant"],
+                "url": snapshot["url"],
+                "operation_id": serde_json::Value::Null,
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("cache-control", "no-store")
+                .body(Body::from(payload.to_string()))
+                .unwrap()
+        }
+        Some("failed") => {
+            let status =
+                StatusCode::from_u16(snapshot["error_status"].as_u64().unwrap_or(500) as u16)
+                    .unwrap();
+            Response::builder()
+                .status(status)
+                .header("cache-control", "no-store")
+                .body(Body::from(
+                    serde_json::json!({"error": snapshot["error"]}).to_string(),
+                ))
+                .unwrap()
+        }
+        _ => unreachable!("settled_preparation only returns terminal states"),
+    }
 }
 
 fn branding_grant(token: &str, password_hash: Option<String>) -> OutboundGrant {
@@ -981,19 +1116,19 @@ async fn revocation_stops_a_batch_stream_mid_body() {
         .map(|index| format!("\"cap/part-{index}.bin\""))
         .collect::<Vec<_>>()
         .join(",");
-    let created = router(app.clone())
-        .oneshot(
-            Request::post("/api/admin/outbound-grants")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(format!(
-                    "{{\"paths\":[{paths}],\"max_downloads\":1}}"
-                )))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let created = settled_grant_response(
+        app.clone(),
+        &cookie,
+        Request::post("/api/admin/outbound-grants")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                "{{\"paths\":[{paths}],\"max_downloads\":1}}"
+            )))
+            .unwrap(),
+    )
+    .await;
     assert_eq!(created.status(), StatusCode::OK);
     let created = body(created).await;
     let token = created["url"]
@@ -1068,19 +1203,19 @@ async fn interrupted_batch_leaves_unsent_files_downloadable() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
-    let created = router(app.clone())
-        .oneshot(
-            Request::post("/api/admin/outbound-grants")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"paths":["cap/a.bin","cap/b.bin"],"max_downloads":1}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let created = settled_grant_response(
+        app.clone(),
+        &cookie,
+        Request::post("/api/admin/outbound-grants")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"paths":["cap/a.bin","cap/b.bin"],"max_downloads":1}"#,
+            ))
+            .unwrap(),
+    )
+    .await;
     assert_eq!(created.status(), StatusCode::OK);
     let created = body(created).await;
     let token = created["url"]
@@ -1207,19 +1342,19 @@ async fn interrupted_batch_leaves_unsent_files_downloadable() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
-    let empty_created = router(app.clone())
-        .oneshot(
-            Request::post("/api/admin/outbound-grants")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"paths":["empty/a.bin","empty/b.bin"],"max_downloads":1}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let empty_created = settled_grant_response(
+        app.clone(),
+        &cookie,
+        Request::post("/api/admin/outbound-grants")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"paths":["empty/a.bin","empty/b.bin"],"max_downloads":1}"#,
+            ))
+            .unwrap(),
+    )
+    .await;
     assert_eq!(empty_created.status(), StatusCode::OK);
     let empty_token = body(empty_created).await["url"]
         .as_str()
@@ -1342,19 +1477,19 @@ async fn batch_integrity_failure_reports_the_corrupt_file() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
-    let created = router(app.clone())
-        .oneshot(
-            Request::post("/api/admin/outbound-grants")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"paths":["batch/first.bin","batch/second.bin"]}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let created = settled_grant_response(
+        app.clone(),
+        &cookie,
+        Request::post("/api/admin/outbound-grants")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"paths":["batch/first.bin","batch/second.bin"]}"#,
+            ))
+            .unwrap(),
+    )
+    .await;
     assert_eq!(created.status(), StatusCode::OK);
     let created = body(created).await;
     let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
@@ -1397,8 +1532,9 @@ async fn batch_integrity_failure_reports_the_corrupt_file() {
 async fn corrupt_received_receipt_reports_file_context() {
     let (_directory, app, cookie, _expected) = fixture().await;
     let created = body(
-        router(app.clone())
-            .oneshot(
+        settled_grant_response(
+            app.clone(),
+            &cookie,
                 Request::post("/api/admin/outbound-grants")
                     .header("cookie", &cookie)
                     .header("x-votport", "1")
@@ -1406,10 +1542,9 @@ async fn corrupt_received_receipt_reports_file_context() {
                     .body(Body::from(
                         r#"{"link_id":"link","upload_id":"upload","file_index":0,"expires_days":7,"max_downloads":1}"#,
                     ))
-                    .unwrap(),
+                .unwrap(),
             )
-            .await
-            .unwrap(),
+            .await,
     )
     .await;
     let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
@@ -1450,8 +1585,9 @@ async fn corrupt_received_receipt_reports_file_context() {
 async fn truncated_cached_catalog_source_reports_integrity_failure() {
     let (_directory, app, cookie, expected) = fixture().await;
     let created = body(
-        router(app.clone())
-            .oneshot(
+        settled_grant_response(
+            app.clone(),
+            &cookie,
                 Request::post("/api/admin/outbound-grants")
                     .header("cookie", &cookie)
                     .header("x-votport", "1")
@@ -1459,10 +1595,9 @@ async fn truncated_cached_catalog_source_reports_integrity_failure() {
                     .body(Body::from(
                         r#"{"link_id":"link","upload_id":"upload","file_index":0,"expires_days":7,"max_downloads":1}"#,
                     ))
-                    .unwrap(),
+                .unwrap(),
             )
-            .await
-            .unwrap(),
+            .await,
     )
     .await;
     let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
@@ -1889,19 +2024,19 @@ async fn batch_over_the_window_records_each_file_once() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
-    let created = router(app.clone())
-        .oneshot(
-            Request::post("/api/admin/outbound-grants")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"paths":["win/a.bin","win/b.bin","win/c.bin"],"max_downloads":2}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let created = settled_grant_response(
+        app.clone(),
+        &cookie,
+        Request::post("/api/admin/outbound-grants")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"paths":["win/a.bin","win/b.bin","win/c.bin"],"max_downloads":2}"#,
+            ))
+            .unwrap(),
+    )
+    .await;
     assert_eq!(created.status(), StatusCode::OK);
     let token = body(created).await["url"]
         .as_str()
@@ -2034,17 +2169,17 @@ async fn payload_gets_write_one_audit_row_per_request() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
-    let created = router(app.clone())
-        .oneshot(
-            Request::post("/api/admin/outbound-grants")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"paths":["audit/one.bin","audit/two.bin"]}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let created = settled_grant_response(
+        app.clone(),
+        &cookie,
+        Request::post("/api/admin/outbound-grants")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"paths":["audit/one.bin","audit/two.bin"]}"#))
+            .unwrap(),
+    )
+    .await;
     assert_eq!(created.status(), StatusCode::OK);
     let created = body(created).await;
     let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
@@ -2994,19 +3129,19 @@ async fn download_headers_preserve_unicode_file_and_receipt_names() {
             )
         })
         .unwrap();
-    let response = router(app.clone())
-        .oneshot(
-            Request::post("/api/admin/outbound-grants")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"link_id":"link","upload_id":"upload","file_index":0,"expires_days":7}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let response = settled_grant_response(
+        app.clone(),
+        &cookie,
+        Request::post("/api/admin/outbound-grants")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"link_id":"link","upload_id":"upload","file_index":0,"expires_days":7}"#,
+            ))
+            .unwrap(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
     let created = body(response).await;
     let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
@@ -3259,8 +3394,9 @@ async fn grant_flow_serves_verified_file_and_receipt_then_revokes() {
 async fn resumable_downloads_count_once_and_head_does_not_stage() {
     let (_directory, app, cookie, expected_bytes) = fixture().await;
     let created = body(
-        router(app.clone())
-            .oneshot(
+        settled_grant_response(
+            app.clone(),
+            &cookie,
                 Request::post("/api/admin/outbound-grants")
                     .header("cookie", &cookie)
                     .header("x-votport", "1")
@@ -3268,10 +3404,9 @@ async fn resumable_downloads_count_once_and_head_does_not_stage() {
                     .body(Body::from(
                         r#"{"link_id":"link","upload_id":"upload","file_index":0,"expires_days":7,"max_downloads":1}"#,
                     ))
-                    .unwrap(),
+                .unwrap(),
             )
-            .await
-            .unwrap(),
+            .await,
     )
     .await;
     let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
@@ -3495,19 +3630,19 @@ async fn resumable_downloads_count_once_and_head_does_not_stage() {
     assert_eq!(old_lease_after_rotation.status(), StatusCode::NOT_FOUND);
 
     let created = body(
-        router(app.clone())
-            .oneshot(
-                Request::post("/api/admin/outbound-grants")
-                    .header("cookie", &cookie)
-                    .header("x-votport", "1")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"link_id":"link","upload_id":"upload","file_index":0,"expires_days":7}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap(),
+        settled_grant_response(
+            app.clone(),
+            &cookie,
+            Request::post("/api/admin/outbound-grants")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"link_id":"link","upload_id":"upload","file_index":0,"expires_days":7}"#,
+                ))
+                .unwrap(),
+        )
+        .await,
     )
     .await;
     let revoke_token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
@@ -3557,19 +3692,19 @@ async fn resumable_downloads_count_once_and_head_does_not_stage() {
 async fn range_errors_and_if_range_mismatch_are_safe() {
     let (_directory, app, cookie, expected_bytes) = fixture().await;
     let created = body(
-        router(app.clone())
-            .oneshot(
-                Request::post("/api/admin/outbound-grants")
-                    .header("cookie", &cookie)
-                    .header("x-votport", "1")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"link_id":"link","upload_id":"upload","file_index":0,"expires_days":7}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap(),
+        settled_grant_response(
+            app.clone(),
+            &cookie,
+            Request::post("/api/admin/outbound-grants")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"link_id":"link","upload_id":"upload","file_index":0,"expires_days":7}"#,
+                ))
+                .unwrap(),
+        )
+        .await,
     )
     .await;
     let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
@@ -3623,19 +3758,19 @@ async fn range_errors_and_if_range_mismatch_are_safe() {
 #[tokio::test]
 async fn grant_lifecycle_rotation_and_extension_are_scoped() {
     let (_directory, app, cookie, _expected_bytes) = fixture().await;
-    let response = router(app.clone())
-        .oneshot(
-            Request::post("/api/admin/outbound-grants")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"link_id":"link","upload_id":"upload","file_index":0,"expires_days":7}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let response = settled_grant_response(
+        app.clone(),
+        &cookie,
+        Request::post("/api/admin/outbound-grants")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"link_id":"link","upload_id":"upload","file_index":0,"expires_days":7}"#,
+            ))
+            .unwrap(),
+    )
+    .await;
     let created = body(response).await;
     let old_url = created["url"].as_str().unwrap().to_owned();
     let old_token = old_url.rsplit('/').next().unwrap().to_owned();
@@ -3698,8 +3833,9 @@ async fn grant_lifecycle_rotation_and_extension_are_scoped() {
 #[tokio::test]
 async fn exhausted_grant_is_not_available_for_a_second_download() {
     let (_directory, app, cookie, expected_bytes) = fixture().await;
-    let response = router(app.clone())
-        .oneshot(
+    let response = settled_grant_response(
+        app.clone(),
+        &cookie,
             Request::post("/api/admin/outbound-grants")
                 .header("cookie", &cookie)
                 .header("x-votport", "1")
@@ -3707,10 +3843,9 @@ async fn exhausted_grant_is_not_available_for_a_second_download() {
                 .body(Body::from(
                     r#"{"link_id":"link","upload_id":"upload","file_index":0,"expires_days":7,"max_downloads":1}"#,
                 ))
-                .unwrap(),
+            .unwrap(),
         )
-        .await
-        .unwrap();
+        .await;
     let created = body(response).await;
     assert_eq!(created["grant"]["max_downloads"], 1);
     let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
@@ -3762,8 +3897,9 @@ async fn exhausted_grant_is_not_available_for_a_second_download() {
 #[tokio::test]
 async fn password_grant_gates_metadata_file_receipt_and_evidence() {
     let (_directory, app, cookie, expected_bytes) = fixture().await;
-    let response = router(app.clone())
-        .oneshot(
+    let response = settled_grant_response(
+        app.clone(),
+        &cookie,
             Request::post("/api/admin/outbound-grants")
                 .header("cookie", &cookie)
                 .header("x-votport", "1")
@@ -3771,10 +3907,9 @@ async fn password_grant_gates_metadata_file_receipt_and_evidence() {
                 .body(Body::from(
                     r#"{"link_id":"link","upload_id":"upload","file_index":0,"password":"correct horse","expires_days":7}"#,
                 ))
-                .unwrap(),
+            .unwrap(),
         )
-        .await
-        .unwrap();
+        .await;
     assert_eq!(response.status(), StatusCode::OK);
     let created = body(response).await;
     assert_eq!(created["grant"]["has_password"], true);
@@ -4024,17 +4159,17 @@ async fn indexed_file_downloads_charge_fractional_grant_units() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
-    let created = router(app.clone())
-        .oneshot(
-            Request::post("/api/admin/outbound-grants")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"paths":["rate/one.bin","rate/two.bin"]}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let created = settled_grant_response(
+        app.clone(),
+        &cookie,
+        Request::post("/api/admin/outbound-grants")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"paths":["rate/one.bin","rate/two.bin"]}"#))
+            .unwrap(),
+    )
+    .await;
     assert_eq!(created.status(), StatusCode::OK);
     let token = body(created).await["url"]
         .as_str()
@@ -4094,17 +4229,17 @@ async fn library_grants_reject_nonportable_names_before_source_access() {
                     std::fs::write(path, [index as u8]).unwrap();
                 }
             }
-            let response = router(app.clone())
-                .oneshot(
-                    Request::post("/api/admin/outbound-grants")
-                        .header("cookie", &cookie)
-                        .header("x-votport", "1")
-                        .header("content-type", "application/json")
-                        .body(Body::from(json!({"paths":names}).to_string()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
+            let response = settled_grant_response(
+                app.clone(),
+                &cookie,
+                Request::post("/api/admin/outbound-grants")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"paths":names}).to_string()))
+                    .unwrap(),
+            )
+            .await;
             assert_eq!(
                 response.status(),
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -4184,30 +4319,34 @@ async fn library_upload_list_multi_file_grant_and_mutation_failure() {
         StatusCode::CONFLICT
     );
 
-    let duplicate = router(app.clone())
-        .oneshot(
-            Request::post("/api/admin/outbound-grants")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"paths":["project/one.bin","project/one.bin"]}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let duplicate = settled_grant_response(
+        app.clone(),
+        &cookie,
+        Request::post("/api/admin/outbound-grants")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"paths":["project/one.bin","project/one.bin"]}"#,
+            ))
+            .unwrap(),
+    )
+    .await;
     assert_eq!(duplicate.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
-    let create = Request::post("/api/admin/outbound-grants")
-        .header("cookie", &cookie)
-        .header("x-votport", "1")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            r#"{"paths":["project/one.bin","project/two.bin"],"label":"project"}"#,
-        ))
-        .unwrap();
-    let response = router(app.clone()).oneshot(create).await.unwrap();
+    let response = settled_grant_response(
+        app.clone(),
+        &cookie,
+        Request::post("/api/admin/outbound-grants")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"paths":["project/one.bin","project/two.bin"],"label":"project"}"#,
+            ))
+            .unwrap(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
     let created = body(response).await;
     assert_eq!(created["grant"]["file_count"], 2);
@@ -4557,24 +4696,24 @@ async fn library_255_byte_directory_remains_browseable_and_selectable() {
     assert_eq!(selected.status(), StatusCode::OK);
     assert_eq!(body(selected).await["files"][0]["path"], file);
 
-    let grant = router(app)
-        .oneshot(
-            Request::post("/api/admin/outbound-grants")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "directory": directory,
-                        "label": "long directory",
-                        "expires_days": 1
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let grant = settled_grant_response(
+        app,
+        &cookie,
+        Request::post("/api/admin/outbound-grants")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "directory": directory,
+                    "label": "long directory",
+                    "expires_days": 1
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
     assert_eq!(grant.status(), StatusCode::OK);
 }
 
@@ -4583,17 +4722,17 @@ async fn library_grant_restore_requires_outbound_volume() {
     let (directory, app, cookie, expected) = fixture().await;
     let source = app.config.outbound_dir.join("restore.bin");
     std::fs::write(&source, &expected).unwrap();
-    let created = router(app.clone())
-        .oneshot(
-            Request::post("/api/admin/outbound-grants")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"paths":["restore.bin"],"label":"restore"}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let created = settled_grant_response(
+        app.clone(),
+        &cookie,
+        Request::post("/api/admin/outbound-grants")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"paths":["restore.bin"],"label":"restore"}"#))
+            .unwrap(),
+    )
+    .await;
     assert_eq!(created.status(), StatusCode::OK);
     let token = body(created).await["url"]
         .as_str()
@@ -4803,17 +4942,18 @@ async fn library_grant_caps_the_aggregate_selection_size() {
     Arc::get_mut(&mut app).unwrap().config.max_upload_bytes = 5;
     std::fs::write(app.config.outbound_dir.join("one.bin"), b"one").unwrap();
     std::fs::write(app.config.outbound_dir.join("two.bin"), b"two").unwrap();
-    let response = router(app.clone())
-        .oneshot(
-            Request::post("/api/admin/outbound-grants")
-                .header("cookie", admin_cookie(&app))
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"paths":["one.bin","two.bin"]}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let cookie = admin_cookie(&app);
+    let response = settled_grant_response(
+        app.clone(),
+        &cookie,
+        Request::post("/api/admin/outbound-grants")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"paths":["one.bin","two.bin"]}"#))
+            .unwrap(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
@@ -5992,8 +6132,9 @@ async fn admin_directory_grant_supports_large_projects_and_public_metadata() {
         json!({ "directory": "project", "paths": ["project/file-00.bin"] }),
         json!({ "directory": "a/".repeat(MAX_LIBRARY_DIRECTORY_INPUT_BYTES / 2 + 1) }),
     ] {
-        let response = router(app.clone())
-            .oneshot(
+        let response = settled_grant_response(
+            app.clone(),
+            &cookie,
                 Request::post("/api/admin/outbound-grants")
                     .header("cookie", &cookie)
                     .header("x-votport", "1")
@@ -6001,25 +6142,24 @@ async fn admin_directory_grant_supports_large_projects_and_public_metadata() {
                     .body(Body::from(
                         json!({ "expires_days": 1, "directory": payload["directory"], "paths": payload["paths"] }).to_string(),
                     ))
-                    .unwrap(),
+                .unwrap(),
             )
-            .await
-            .unwrap();
+            .await;
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
-    let response = router(app.clone())
-        .oneshot(
-            Request::post("/api/admin/outbound-grants")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({ "directory": "project", "expires_days": 1 }).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let response = settled_grant_response(
+        app.clone(),
+        &cookie,
+        Request::post("/api/admin/outbound-grants")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "directory": "project", "expires_days": 1 }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
     let created = body(response).await;
     assert_eq!(created["grant"]["file_count"], 1001);
@@ -6095,19 +6235,19 @@ async fn grant_admission_bounds_request_bodies_and_releases_for_valid_grants() {
             format!("admitted/file-{index:02}.bin")
         })
         .collect::<Vec<_>>();
-    let accepted = router(app)
-        .oneshot(
-            Request::post("/api/admin/outbound-grants")
-                .header("cookie", cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({ "paths": paths, "expires_days": 1 }).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let accepted = settled_grant_response(
+        app,
+        &cookie,
+        Request::post("/api/admin/outbound-grants")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "paths": paths, "expires_days": 1 }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
     assert_eq!(accepted.status(), StatusCode::OK);
     assert_eq!(body(accepted).await["grant"]["file_count"], 65);
 }
@@ -6120,29 +6260,31 @@ async fn grant_admission_permit_survives_parsing_while_hashers_wait() {
         .acquire_many(LIBRARY_HASH_CONCURRENCY as u32)
         .await
         .unwrap();
-    let request = Request::post("/api/admin/outbound-grants")
+    // The 202 lands without touching admission; the preparation job picks
+    // up the admission permit and keeps it while its hashers wait.
+    let request = Request::post("/api/admin/outbound-grants/preparations")
         .header("cookie", &cookie)
         .header("x-votport", "1")
         .header("content-type", "application/json")
         .body(Body::from(r#"{"paths":["held.bin"],"expires_days":1}"#))
         .unwrap();
-    let mut response = Box::pin(router(app.clone()).oneshot(request));
-    let waker = futures_util::task::noop_waker();
-    let mut context = std::task::Context::from_waker(&waker);
-    assert!(matches!(
-        std::future::Future::poll(response.as_mut(), &mut context),
-        std::task::Poll::Pending
-    ));
-    assert_eq!(
-        app.outbound_grant_permits.available_permits(),
-        LIBRARY_GRANT_CONCURRENCY - 1
-    );
+    let response = router(app.clone()).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let preparation_id = body(response).await["preparation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while app.outbound_grant_permits.available_permits() != LIBRARY_GRANT_CONCURRENCY - 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the preparation job never took its admission permit"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
     drop(hash_held);
-    let response = tokio::time::timeout(std::time::Duration::from_secs(1), response)
-        .await
-        .expect("grant hashing did not resume")
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    let snapshot = settled_preparation(&app, &cookie, &preparation_id).await;
+    assert_eq!(snapshot["status"], "complete");
     assert_eq!(
         app.outbound_grant_permits.available_permits(),
         LIBRARY_GRANT_CONCURRENCY
@@ -6171,23 +6313,23 @@ async fn large_selection_bodies_require_authentication_before_reading() {
     let paths = (0..100_001)
         .map(|index| format!("sequence/frame-{index:06}.exr"))
         .collect::<Vec<_>>();
-    let response = router(app)
-        .oneshot(
-            Request::post("/api/admin/outbound-grants")
-                .header("cookie", cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&json!({
-                        "paths": paths,
-                        "expires_days": 1,
-                    }))
-                    .unwrap(),
-                ))
+    let response = settled_grant_response(
+        app,
+        &cookie,
+        Request::post("/api/admin/outbound-grants")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "paths": paths,
+                    "expires_days": 1,
+                }))
                 .unwrap(),
-        )
-        .await
-        .unwrap();
+            ))
+            .unwrap(),
+    )
+    .await;
     // The selection passes count/body limits and reaches file validation.
     assert_eq!(
         response.status(),
@@ -6713,4 +6855,252 @@ async fn automation_token_shares_recursive_library_without_leaking_token() {
         .await
         .unwrap();
     assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// POST /outbound-grants with library paths answers 202 immediately, the
+/// detached job reports file and byte progress, the finished preparation
+/// stays readable for late polls, and an unknown id (a restarted server's
+/// registry is empty) answers 404 with a clear retry hint.
+#[tokio::test(flavor = "current_thread")]
+async fn grant_preparations_report_progress_then_terminal_outcomes() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = crate::api::testing::build(directory.path());
+    app.store
+        .insert_tenant(crate::store::tests::test_tenant("acme"))
+        .unwrap();
+    let root = library_root(&app, "acme");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.bin"), vec![9u8; 4096]).unwrap();
+    let cookie = named_admin_cookie(&app, "acme");
+
+    let response = router(app.clone())
+        .oneshot(
+            Request::post("/api/admin/outbound-grants/preparations")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"paths":["a.bin"],"expires_days":1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let accepted = body(response).await;
+    let id = accepted["preparation_id"].as_str().unwrap().to_owned();
+
+    let snapshot = settled_preparation(&app, &cookie, &id).await;
+    assert_eq!(snapshot["status"], "complete");
+    assert_eq!(snapshot["files_total"], 1);
+    assert_eq!(snapshot["files_done"], 1);
+    assert_eq!(snapshot["bytes_total"], 4096);
+    assert_eq!(snapshot["bytes_done"], 4096);
+    assert!(snapshot["url"].as_str().unwrap().contains("/s/"));
+    assert_eq!(snapshot["grant"]["files"][0]["bytes"], 4096);
+
+    // Late polls of a finished preparation still find it.
+    let again = router(app.clone())
+        .oneshot(
+            Request::get(format!("/api/admin/outbound-grants/preparations/{id}"))
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(again.status(), StatusCode::OK);
+    assert_eq!(body(again).await["status"], "complete");
+
+    // The registry lives on the App, so a restart (or any unknown id)
+    // answers 404 instead of pretending to still prepare.
+    let lost = router(app.clone())
+        .oneshot(
+            Request::get("/api/admin/outbound-grants/preparations/prep-lost")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(lost.status(), StatusCode::NOT_FOUND);
+    assert!(body(lost).await["error"]
+        .as_str()
+        .unwrap()
+        .contains("no longer available"));
+}
+
+/// While one preparation for a session is hashing (held by the mutation
+/// stall), a second POST is refused with 409; once the first settles the
+/// terminal entry is pruned and a new grant is accepted again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_second_library_grant_while_one_prepares_is_refused_until_it_settles() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = crate::api::testing::build(directory.path());
+    app.store
+        .insert_tenant(crate::store::tests::test_tenant("acme"))
+        .unwrap();
+    let root = library_root(&app, "acme");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.bin"), vec![3u8; 1024]).unwrap();
+    let cookie = named_admin_cookie(&app, "acme");
+    let make_request = || {
+        Request::builder()
+            .method("POST")
+            .uri("/api/admin/outbound-grants/preparations")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"paths":["a.bin"],"expires_days":1}"#))
+            .unwrap()
+    };
+
+    let (entered, release, _stall) = arm_library_mutation_stall(&root);
+    let first = router(app.clone()).oneshot(make_request()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    let id = body(first).await["preparation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if entered.try_recv().is_ok() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("preparation never reached the mutation stall");
+
+    let second = router(app.clone()).oneshot(make_request()).await.unwrap();
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+    assert!(body(second).await["error"]
+        .as_str()
+        .unwrap()
+        .contains("already running"));
+    release.send(()).unwrap();
+    let snapshot = settled_preparation(&app, &cookie, &id).await;
+    assert_eq!(snapshot["status"], "complete");
+
+    // The terminal preparation is pruned on the next attempt.
+    let third = router(app.clone()).oneshot(make_request()).await.unwrap();
+    assert_eq!(third.status(), StatusCode::ACCEPTED);
+    let third_body = body(third).await;
+    let snapshot = settled_preparation(
+        &app,
+        &cookie,
+        third_body["preparation_id"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(snapshot["status"], "complete");
+}
+
+/// Hashed library roots consult the sidecar cache: a first grant misses and
+/// populates it, an unchanged source (same size and mtime) hits, and a
+/// content rewrite with a bumped mtime misses again and stores the new root.
+#[tokio::test(flavor = "current_thread")]
+async fn hashed_library_roots_come_from_the_cache_until_the_source_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = crate::api::testing::build(directory.path());
+    app.store
+        .insert_tenant(crate::store::tests::test_tenant("acme"))
+        .unwrap();
+    let root = library_root(&app, "acme");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("a.bin");
+    std::fs::write(&file, vec![1u8; 64]).unwrap();
+    let cookie = named_admin_cookie(&app, "acme");
+    let create_request = || {
+        Request::post("/api/admin/outbound-grants/preparations")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"paths":["a.bin"],"expires_days":1}"#))
+            .unwrap()
+    };
+    let cached = || {
+        let stat = std::fs::symlink_metadata(&file).unwrap();
+        app.root_cache
+            .lookup("acme", &file, stat.len(), mtime_nanos(&stat))
+    };
+
+    assert!(cached().is_none(), "nothing hashed yet");
+    let first = settled_grant_response(app.clone(), &cookie, create_request()).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_root = body(first).await["grant"]["files"][0]["root"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        cached().unwrap(),
+        first_root,
+        "the first hash populates the cache"
+    );
+
+    // Same size, same mtime: the accepted heuristic hits the cache even
+    // though the bytes changed underneath (rsync-style ceiling), so the
+    // rewrite restores the original mtime before re-sharing.
+    let before = std::fs::symlink_metadata(&file).unwrap();
+    std::fs::write(&file, vec![2u8; 64]).unwrap();
+    std::fs::File::options()
+        .append(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(before.modified().unwrap())
+        .unwrap();
+    let second = settled_grant_response(app.clone(), &cookie, create_request()).await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body = body(second).await;
+    let second_root = second_body["grant"]["files"][0]["root"].as_str().unwrap();
+    assert_eq!(second_root, first_root, "unchanged stat reuses the root");
+    assert_eq!(cached().unwrap(), first_root);
+
+    // A content rewrite that also moves mtime must miss and re-hash.
+    std::fs::write(&file, vec![3u8; 64]).unwrap();
+    let bumped = std::time::SystemTime::now() + Duration::from_secs(120);
+    std::fs::File::options()
+        .append(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(bumped)
+        .unwrap();
+    assert!(cached().is_none(), "a changed source invalidates its entry");
+    let third = settled_grant_response(app.clone(), &cookie, create_request()).await;
+    assert_eq!(third.status(), StatusCode::OK);
+    let third_root = body(third).await["grant"]["files"][0]["root"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(third_root, first_root, "new bytes hash to a new root");
+    assert_eq!(cached().unwrap(), third_root);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn library_grant_creation_stays_synchronous_for_the_pinned_cli() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = crate::api::testing::build(directory.path());
+    app.store
+        .insert_tenant(crate::store::tests::test_tenant("acme"))
+        .unwrap();
+    let root = library_root(&app, "acme");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.bin"), vec![9u8; 512]).unwrap();
+    let cookie = named_admin_cookie(&app, "acme");
+    let response = router(app.clone())
+        .oneshot(
+            Request::post("/api/admin/outbound-grants")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"paths":["a.bin"],"expires_days":1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = body(response).await;
+    assert!(payload["preparation_id"].is_null());
+    assert_eq!(payload["grant"]["files"][0]["name"], "a.bin");
+    assert!(payload["url"].as_str().unwrap().contains("/s/"));
 }

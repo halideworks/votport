@@ -977,9 +977,10 @@ async fn prepare(app: &Arc<App>, mut job: Job) -> ApiResult<()> {
         grants: vec![],
         credential_version: job.credential_version,
     };
+    let base = crate::api::admin::base_url(app, &HeaderMap::new());
     create_library_grant(
         app,
-        &HeaderMap::new(),
+        &base,
         &identity,
         &paths,
         MAX_LIBRARY_PROJECT_FILES,
@@ -997,6 +998,7 @@ async fn prepare(app: &Arc<App>, mut job: Job) -> ApiResult<()> {
             automation: None,
             workflow: Some(job),
         },
+        None,
     )
     .await?;
     Ok(())

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { chromium } from 'playwright';
-import { apiClient, openAncestors } from './browser-helpers.mjs';
+import { apiClient, openAncestors, settleGrant } from './browser-helpers.mjs';
 
 const base = process.env.BASE_URL, root = process.env.WORKFLOW_TEST_ROOT;
 if (!base || !root || !process.env.ADMIN_PASSWORD) throw new Error('Use an isolated instance with BASE_URL, WORKFLOW_TEST_ROOT and ADMIN_PASSWORD.');
@@ -331,7 +331,7 @@ try {
   dismiss = false; await page.click('#storage-close'); assert.ok(await page.locator('#workflow-save-storage').isHidden());
 
   await fs.writeFile(path.join(root, 'library', `${id}.txt`), 'Verified cargo\n');
-  const download = await api('admin/outbound-grants', { paths: [`${id}.txt`], label: 'Cargo for review', expires_days: 1 });
+  const download = await settleGrant(context, base, { paths: [`${id}.txt`], label: 'Cargo for review', expires_days: 1 });
   const recipient = await context.newPage(); recipient.on('pageerror', (error) => errors.push(error.message));
   await recipient.goto(download.url); await recipient.locator('#download-content').waitFor();
   assert.ok(await recipient.evaluate(() => !!(document.querySelector('#download-content').compareDocumentPosition(document.querySelector('#delivery-evidence')) & Node.DOCUMENT_POSITION_FOLLOWING)));

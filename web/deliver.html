@@ -14,6 +14,7 @@
     <link rel="modulepreload" href="/assets/page-deliver.js" />
     <link rel="modulepreload" href="/assets/library-paths.js" />
     <link rel="modulepreload" href="/assets/upload-entries.js" />
+    <link rel="modulepreload" href="/assets/deliver-progress.js" />
     <link rel="modulepreload" href="/assets/status-strip.js" />
     <link rel="modulepreload" href="/assets/admin-common.js" />
     <link rel="modulepreload" href="/assets/search-debounce.js" />
@@ -133,7 +134,10 @@
           <button type="submit" id="deliver-submit">Create delivery link</button>
           </fieldset>
         </form>
-        <p id="deliver-progress" class="muted" role="status" tabindex="-1" hidden></p>
+        <p id="deliver-progress" class="muted" role="status" tabindex="-1" hidden>
+          <span id="deliver-progress-text"></span>
+          <span id="deliver-progress-bar" class="deliver-progress-bar" role="progressbar" aria-label="Share preparation progress" aria-valuemin="0" aria-valuemax="100" hidden><span id="deliver-progress-fill"></span></span>
+        </p>
         <p id="deliver-error" class="error" role="alert" tabindex="-1" hidden></p>
       </section>
 

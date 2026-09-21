@@ -7,6 +7,27 @@ export function apiClient(context, base) {
   };
 }
 
+// POSTs a library grant; when the server answers 202 with a preparation id,
+// polls the progress endpoint to a terminal state and returns the grant
+// payload (`grant`/`url`) the synchronous API used to give.
+export async function settleGrant(context, base, data) {
+  const fetch = (route, options) => context.request.fetch(`${base}/api/${route}`, { headers: { 'X-Votport': '1' }, ...options });
+  const response = await fetch('admin/outbound-grants/preparations', { method: 'POST', data });
+  if (response.status() !== 202) {
+    assert.ok(response.ok(), `admin/outbound-grants/preparations: ${response.status()} ${await response.text()}`);
+    return response.json();
+  }
+  const { preparation_id: id } = await response.json();
+  for (;;) {
+    const poll = await fetch(`admin/outbound-grants/preparations/${id}`, { method: 'GET' });
+    assert.ok(poll.ok(), `grant preparation ${id}: ${poll.status()} ${await poll.text()}`);
+    const snapshot = await poll.json();
+    assert.notEqual(snapshot.status, 'failed', `grant preparation failed: ${snapshot.error}`);
+    if (snapshot.status === 'complete') return { grant: snapshot.grant, url: snapshot.url };
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
 // One-shot page.route interceptions intermittently stall the next navigation forever on an idle keep-alive connection (Chromium/Playwright CDP Fetch race); a fresh page in the same context always loads.
 export async function reloadWithInterceptRetry(page, arm, navigate, { attempts = 2 } = {}) {
   for (let left = attempts; ; left -= 1) {

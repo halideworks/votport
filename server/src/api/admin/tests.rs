@@ -1098,7 +1098,7 @@ mod handler_tests {
         // (method, route template, query, JSON body). Bodies only need to
         // satisfy each handler's JSON extractor: the gate fires before any
         // validation, so a minimal well-formed value reaches the 403.
-        let covered: [(&str, &str, &str, &str); 49] = [
+        let covered: [(&str, &str, &str, &str); 50] = [
             ("POST", "/api/admin/logout", "", ""),
             ("PUT", "/api/admin/backups", "", "{}"),
             ("POST", "/api/admin/backups", "", ""),
@@ -1153,6 +1153,12 @@ mod handler_tests {
                 r#"{"subject":"pin"}"#,
             ),
             ("POST", "/api/admin/outbound-grants", "", ""),
+            (
+                "POST",
+                "/api/admin/outbound-grants/preparations",
+                "",
+                r#"{"paths":["a.bin"],"expires_days":1}"#,
+            ),
             ("PATCH", "/api/admin/outbound-grants/{id}", "", "{}"),
             ("DELETE", "/api/admin/outbound-grants/{id}", "", ""),
             (

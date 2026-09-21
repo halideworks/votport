@@ -326,6 +326,11 @@ pub struct App {
     /// Per-instance instead of a process-global static so a rebuilt App
     /// (tests) starts unpaced.
     push_staging_warn: Mutex<crate::api::outbound::ErrorDeduper>,
+    /// Reusable verified roots for unchanged outbound library files, backed
+    /// by a bounded sidecar under data_dir (outbound.proofs precedent).
+    pub(crate) root_cache: crate::api::outbound::RootCache,
+    /// In-flight async grant preparations (deliver-page progress handles).
+    pub(crate) grant_preparations: Mutex<crate::api::outbound::GrantPreparationRegistry>,
     health: HealthCache,
 }
 
@@ -1177,6 +1182,8 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         lease_lost_total: AtomicU64::new(0),
         mount_disqualified: AtomicBool::new(false),
         push_staging_warn: Mutex::new(crate::api::outbound::ErrorDeduper::new("push staging lock")),
+        root_cache: crate::api::outbound::RootCache::new(&config.data_dir),
+        grant_preparations: Mutex::default(),
         health: HealthCache::default(),
         config,
     }))
@@ -3343,6 +3350,16 @@ pub fn router(app: Arc<App>) -> Router {
             get(api::list_outbound_grants).merge(post(api::create_outbound_grant).layer(
                 DefaultBodyLimit::max(api::outbound::MAX_GRANT_REQUEST_BYTES),
             )),
+        )
+        .route(
+            "/api/admin/outbound-grants/preparations",
+            post(api::outbound::create_outbound_grant_preparation).layer(DefaultBodyLimit::max(
+                api::outbound::MAX_GRANT_REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/admin/outbound-grants/preparations/{id}",
+            get(api::outbound::outbound_grant_preparation),
         )
         .route(
             "/api/admin/outbound-grants/{id}",

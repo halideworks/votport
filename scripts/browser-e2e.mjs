@@ -51,6 +51,12 @@ const pattern = Buffer.alloc(253);
 for (let i = 0; i < pattern.length; i += 1) pattern[i] = (i * 7) % 253;
 for (let at = 0; at < big.length; at += pattern.length) pattern.copy(big, at, 0, Math.min(pattern.length, big.length - at));
 fs.writeFileSync(path.join(dir, "archive.tar"), big);
+const held = Buffer.alloc(256 * 1024 * 1024);
+for (let at = 0; at < held.length; at += pattern.length) pattern.copy(held, at, 0, Math.min(pattern.length, held.length - at));
+// A whole-folder library share of only tiny files prepares faster than the
+// operator can move focus; this file gives the share-result focus check a
+// preparation that takes a visible fraction of a second.
+fs.writeFileSync(path.join(folder, "nested", "held.bin"), held);
 
 // A UTF-8 locale is required for all engines to accept non-ASCII file names.
 const browser = await browserType.launch({
@@ -1741,7 +1747,7 @@ console.log("oversized library selection refusal keeps existing files and remain
 await page.fill("#deliver-project", FOLDER_PROJECT);
 await page.setInputFiles("#library-folder-input", folder);
 await page.waitForFunction(
-  () => document.getElementById("library-status").textContent.includes("1 file added"),
+  () => /files? added/.test(document.getElementById("library-status").textContent),
   { timeout: 30000 },
 );
 await page.getByRole("button", { name: "Library", exact: true }).click();
@@ -1817,7 +1823,7 @@ await page.fill("#deliver-label", "browser outbound e2e");
 let releasePreparation;
 const heldPreparation = new Promise((resolve) => { releasePreparation = resolve; });
 let preparationRequests = 0;
-await page.route("**/api/admin/outbound-grants", async (route) => {
+await page.route("**/api/admin/outbound-grants/preparations", async (route) => {
   if (route.request().method() !== "POST") return route.continue();
   preparationRequests += 1;
   await heldPreparation;
@@ -1845,21 +1851,16 @@ try {
   }
 } finally {
   releasePreparation();
-  await page.unroute("**/api/admin/outbound-grants");
+  await page.unroute("**/api/admin/outbound-grants/preparations");
 }
-let releaseGrant;
-const heldGrant = new Promise((resolve) => { releaseGrant = resolve; });
-await page.route("**/api/admin/outbound-grants", async (route) => {
-  if (route.request().method() === "POST") {
-    await heldGrant;
-    return route.continue();
-  }
-  return route.continue();
-}, { times: 1 });
+// The held.bin seed makes this whole-folder share prepare for a visible
+// fraction of a second, so the operator can move focus while the link is
+// still preparing. Interception is deliberately avoided: a one-shot
+// route.continue() stalls the preparation polls on the idle keep-alive
+// connection (the CDP Fetch race reloadWithInterceptRetry documents).
 await page.click("#deliver-submit");
 await page.locator("#deliver-progress").waitFor({ state: "visible" });
 await page.locator("#library-search").focus();
-releaseGrant();
 await page.waitForSelector("#outbound-result:not([hidden])", { timeout: 30000 });
 const outboundUrl = await page.inputValue("#outbound-url");
 if (!/^https?:\/\//.test(outboundUrl)) {
@@ -1868,7 +1869,6 @@ if (!/^https?:\/\//.test(outboundUrl)) {
 if (await page.evaluate(() => document.activeElement.id) !== "library-search") {
   throw new Error("a delayed download result must preserve focus moved by the operator");
 }
-await page.unroute("**/api/admin/outbound-grants");
 await page.reload();
 const savedGrant = page.locator('#outbound-grants .card').filter({ has: page.getByRole('heading', { name: 'browser outbound e2e', exact: true }) });
 await savedGrant.getByRole('button', { name: 'Copy link', exact: true }).click();

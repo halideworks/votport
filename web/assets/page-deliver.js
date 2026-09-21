@@ -25,6 +25,7 @@ import {
   selectText,
   showGrantResult,
 } from '/assets/admin-common.js';
+import { preparationProgress } from '/assets/deliver-progress.js';
 import { startStatusPoll } from '/assets/status-strip.js';
 import { searchDebounce } from '/assets/search-debounce.js';
 import { $, fieldError } from '/assets/object-card.js';
@@ -464,6 +465,9 @@ async function toggleLibraryFolder(directory, checkbox) {
   }
   checkbox.disabled = true;
   librarySelectionsPending += 1;
+  // Optimistic state: the tick shows the intent while the folder is
+  // enumerated; every path below ends in updateLibrarySelectionStatus().
+  $('library-selection-status').textContent = `Selecting folder ${directory.slice(directory.lastIndexOf('/') + 1)}…`;
   try {
     const response = await api(`/api/admin/outbound-files?selection=${encodeURIComponent(directory)}`);
     const files = (response.files || []).filter((file) => parseLibraryPath(file.path));
@@ -825,6 +829,40 @@ function deliverFormValues() {
   };
 }
 
+// Polls one preparation to a terminal state, rendering each in-flight
+// snapshot through `render`. The long ceiling matches the job's own idea
+// of a few minutes for big libraries; the 15-minute server TTL only
+// applies after a preparation reaches a terminal state.
+async function pollDeliverPreparation(id, render) {
+  const deadline = Date.now() + 15 * 60 * 1000;
+  for (;;) {
+    const snapshot = await api(
+      `/api/admin/outbound-grants/preparations/${encodeURIComponent(id)}`,
+    );
+    if (snapshot.status !== 'preparing') return snapshot;
+    render(snapshot);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    if (Date.now() > deadline) {
+      throw new Error(
+        'Preparing this link is taking unusually long. Keep the page open; the link also appears in Delivery links when it finishes.',
+      );
+    }
+  }
+}
+
+function renderDeliverProgress(snapshot) {
+  const bar = $('deliver-progress-bar');
+  const view = preparationProgress(snapshot);
+  $('deliver-progress-text').textContent = view.text;
+  bar.hidden = false;
+  bar.classList.toggle('indeterminate', Boolean(view.indeterminate));
+  if (view.indeterminate) bar.removeAttribute('aria-valuenow');
+  else {
+    bar.setAttribute('aria-valuenow', String(view.percent));
+    $('deliver-progress-fill').style.width = `${view.percent}%`;
+  }
+}
+
 async function submitDeliverGrant() {
   if (!deliverAdministrator || deliverGrantBusy) return;
   const error = $('deliver-error');
@@ -850,10 +888,16 @@ async function submitDeliverGrant() {
   progress.focus({ preventScroll: true });
   $('outbound-result').hidden = true;
   try {
-    const response = await api('/api/admin/outbound-grants', {
+    let response = await api('/api/admin/outbound-grants/preparations', {
       method: 'POST',
       body: JSON.stringify(request),
     });
+    if (response.preparation_id) {
+      // The server answered 202: hashing runs as a detached job and this
+      // page polls its progress until the link is ready (or it fails).
+      progress.dataset.live = 'true';
+      response = await pollDeliverPreparation(response.preparation_id, renderDeliverProgress);
+    }
     if (!response.url) throw new Error('server did not return a download URL');
     markFormSaved($('deliver-form'));
     const focusResult = document.activeElement === submittedFocus

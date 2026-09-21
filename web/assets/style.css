@@ -2325,3 +2325,15 @@ body:has(#nav) .notification-destination { margin-bottom: .5rem; padding: 1rem; 
  body:has(#nav) .nav-panel a { white-space: normal; overflow-wrap: anywhere; }
  .notification-add > button { width: 100%; }
 }
+.deliver-progress-bar { display: block; margin-top: .4rem; height: .4rem; background: var(--panel); border: 1px solid var(--border); border-radius: .25rem; overflow: hidden; }
+.deliver-progress-fill { display: block; height: 100%; width: 0; background: var(--progress); transition: width .3s ease; }
+@media (prefers-reduced-motion: no-preference) {
+ .deliver-progress-bar.indeterminate .deliver-progress-fill { width: 40%; animation: deliver-shimmer 1.2s ease-in-out infinite alternate; }
+}
+@media (prefers-reduced-motion: reduce) {
+ .deliver-progress-bar.indeterminate .deliver-progress-fill { width: 100%; }
+}
+@keyframes deliver-shimmer {
+ from { margin-left: -40%; }
+ to { margin-left: 100%; }
+}

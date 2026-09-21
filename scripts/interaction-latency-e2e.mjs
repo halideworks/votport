@@ -11,7 +11,7 @@
 // VOTPORT PROPRIETARY LICENSE.
 import fs from 'node:fs/promises';
 import http from 'node:http';
-import { apiClient } from './browser-helpers.mjs';
+import { apiClient, settleGrant } from './browser-helpers.mjs';
 import { chromium } from 'playwright';
 
 const base = process.env.BASE_URL, root = process.env.WORKFLOW_TEST_ROOT;
@@ -124,7 +124,7 @@ try {
   seedLog.push(['library files', libraryPaths.length]);
 
   console.log('Seeding: delivery links…');
-  await pooled(GRANTS, (i) => api2('admin/outbound-grants', {
+  await pooled(GRANTS, (i) => settleGrant(context, base, {
     paths: [libraryPaths[i]], label: `${stamp} delivery ${String(i).padStart(3, '0')}`,
     expires_days: 30, password: null, max_downloads: null, notifications: { mode: 'off', rules: [] },
   }));
@@ -383,6 +383,35 @@ try {
           setup: () => open('/deliver', `document.querySelectorAll('#outbound-grants .link-item').length === 50`),
           act: `document.getElementById('outbound-grants-load-more').click();`,
           expect: `document.querySelectorAll('#outbound-grants .link-item').length === 100`,
+        },
+        {
+          name: 'deliver: share ack (create click to live preparation)', page: '/deliver',
+          setup: async () => {
+            await open('/deliver', libraryRootReady);
+            await page.evaluate(() => {
+              document.getElementById('outbound-result').hidden = true;
+              const box = document.querySelector('#library-files input[value="tick-00/asset-0000.dat"]');
+              if (box && !box.checked) box.click();
+            });
+          },
+          act: `document.getElementById('deliver-submit').click();`,
+          expect: `document.getElementById('deliver-progress').dataset.live === 'true'`,
+          then: async () => {
+            await page.waitForFunction(() => !document.getElementById('outbound-result').hidden, undefined, { timeout: 30000, polling: 100 });
+          },
+        },
+        {
+          name: 'deliver: share one small file click-to-ready-link', page: '/deliver',
+          setup: async () => {
+            await open('/deliver', libraryRootReady);
+            await page.evaluate(() => {
+              document.getElementById('outbound-result').hidden = true;
+              const box = document.querySelector('#library-files input[value="tick-00/asset-0000.dat"]');
+              if (box && !box.checked) box.click();
+            });
+          },
+          act: `document.getElementById('deliver-submit').click();`,
+          expect: `!document.getElementById('outbound-result').hidden && !!document.getElementById('outbound-url').value`,
         },
       ],
     },
