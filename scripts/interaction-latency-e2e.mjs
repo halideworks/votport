@@ -37,8 +37,9 @@ async function pooled(count, worker, width = 8) {
         await worker(index);
         return;
       } catch (error) {
-        // Seeding bursts trip per-route rate limits; back off and retry.
-        if (tries < 12 && /429/.test(String(error.message))) {
+        // Seeding bursts trip per-route rate limits and grant-preparation
+        // contention; both answers say to back off and retry.
+        if (tries < 12 && (/429/.test(String(error.message)) || /already running/.test(String(error.message)))) {
           await new Promise((resolve) => setTimeout(resolve, 1500));
         } else { throw error; }
       }
@@ -160,6 +161,39 @@ try {
   seedLog.push(['stored files on big link', BIG_FILES]);
 
   const { link: pickLink } = await api2('admin/links', linkBody(`${stamp}-pick-link`, `${stamp}-pick`));
+  // Optional trade peer: TRADE_PEER_URL points at a second live Votport
+  // instance (TRADE_PEER_ADDRESS overrides its advertised address, both
+  // instances share ADMIN_PASSWORD unless TRADE_PEER_PASSWORD is set). The
+  // peer seeds a receive endpoint and one approved route, so the trade rows
+  // below measure real paired-port round trips; without a peer they report
+  // `skipped` like every other env-gated row.
+  const trade = { peerBase: process.env.TRADE_PEER_URL || '' };
+  const peerApi = trade.peerBase ? apiClient(context, trade.peerBase) : null;
+  if (peerApi) {
+    await peerApi('admin/login', { password: process.env.TRADE_PEER_PASSWORD || process.env.ADMIN_PASSWORD });
+    await peerApi('trade-routes/port', { name: `${stamp} peer port`, address: process.env.TRADE_PEER_ADDRESS || trade.peerBase }, 'PUT');
+    await api2('trade-routes/port', { name: `${stamp} sending port`, address: base }, 'PUT');
+    const { link: requestLink } = await peerApi('admin/links', linkBody(`${stamp} trade request`, `${stamp}-trade-in`));
+    const endpoint = await peerApi('trade-routes/endpoints', {
+      id: requestLink.id, name: `${stamp} trade endpoint`, category: 'external',
+      forwarding: false, metadata_keys: [], notifications: { mode: 'off', rules: [] },
+    });
+    trade.endpointId = endpoint.id;
+    trade.mintInvitation = async () => (await peerApi('trade-routes/invitations', { endpoint: endpoint.id, expires_in: 86400 })).invitation;
+    trade.approveNewIncoming = async () => {
+      const incoming = await untilApi(() => peerApi('trade-routes'), (list) => list.routes.find((r) => r.endpoint === endpoint.id && r.state === 'pending_approval'));
+      await peerApi(`trade-routes/${incoming.id}`, { revision: incoming.revision, state: 'active', cancel_active: false, notifications: incoming.notifications }, 'PUT');
+      await untilApi(() => peerApi('trade-routes'), (list) => list.routes.some((r) => r.id === incoming.id && r.state === 'active'));
+    };
+    const invitation = await trade.mintInvitation();
+    const accepted = await api2('trade-routes', { invitation: JSON.parse(invitation), name: `${stamp} standing route`, notifications: { mode: 'off', rules: [] } });
+    trade.routeId = accepted.id;
+    await trade.approveNewIncoming();
+    await api2('workflows/projects', { id: `${stamp}-tproj`, label: `${stamp} trade send`, directory: `${stamp}-tproj`, destinations: [trade.routeId] }, 'PUT');
+    trade.projectId = `${stamp}-tproj`;
+    seedLog.push(['trade peer routes', 1]);
+  }
+
   console.log('Seeding done:', seedLog.map(([k, v]) => `${k}=${v}`).join(' '), `notification=${sinkDestination?.id ?? '?'}`);
 
   // ----------------------------------------------------------- harness core
@@ -176,6 +210,15 @@ try {
   // In-page act sources run as one evaluation: t0 and the user gesture land in
   // the same task, so no CDP round trip sits inside the measured window.
   const actSource = (source) => page.evaluate(new Function(`window.__t0 = performance.now();\n${source}`));
+
+  const untilApi = async (read, predicate, tries = 120) => {
+    for (let n = 0; n < tries; n += 1) {
+      const value = await read();
+      if (predicate(value)) return value;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    throw new Error('Expected trade state was not reached');
+  };
 
   const rows = [];
   const specContext = {};
@@ -563,6 +606,83 @@ try {
         },
       ],
     },
+    {
+      page: '/trade-routes', list: [
+        {
+          name: 'trade: route create round-trip (inspect and accept)', page: '/trade-routes',
+          skip: peerApi ? undefined : 'no TRADE_PEER_URL, so no paired port exists',
+          setup: async () => {
+            await open('/trade-routes', `!document.getElementById('trade-start-send').disabled && !!document.getElementById('trade-start-send').offsetParent`);
+            const invitation = await trade.mintInvitation();
+            await page.evaluate((parsed) => {
+              window.__tradeAccepted = null;
+              window.__tradeInvitation = parsed;
+            }, JSON.parse(invitation));
+          },
+          act: `
+            const body = { invitation: window.__tradeInvitation, name: '${stamp} measured route', notifications: { mode: 'off', rules: [] } };
+            fetch('/api/trade-routes/inspect', { method: 'POST', headers: { 'X-Votport': '1' }, body: JSON.stringify({ invitation: window.__tradeInvitation }) })
+              .then((inspected) => { if (!inspected.ok) throw new Error('inspect ' + inspected.status); return inspected; })
+              .then(() => fetch('/api/trade-routes', { method: 'POST', headers: { 'X-Votport': '1' }, body: JSON.stringify(body) }))
+              .then((response) => { if (!response.ok) throw new Error('accept ' + response.status); return response.json(); })
+              .then((route) => { window.__tradeAccepted = route.id; });`,
+          expect: `!!window.__tradeAccepted`,
+          timeout: 30000,
+          then: () => trade.approveNewIncoming(),
+        },
+        {
+          name: 'trade: credential rotation round-trip', page: '/trade-routes',
+          skip: peerApi ? undefined : 'no TRADE_PEER_URL, so no paired port exists',
+          setup: async () => {
+            await open('/trade-routes', `document.querySelectorAll('.trade-route').length >= 1`);
+            await page.evaluate(() => { window.__tradeRotated = false; });
+          },
+          act: `
+            fetch('/api/trade-routes/${trade.routeId}/rotate', { method: 'POST', headers: { 'X-Votport': '1' }, body: '{}' })
+              .then((response) => { if (!response.ok) throw new Error('rotate ' + response.status); window.__tradeRotated = true; });`,
+          expect: `window.__tradeRotated`,
+          timeout: 30000,
+        },
+        {
+          name: 'trade: peer send round-trip (small file via route job)', page: '/workflows',
+          skip: peerApi ? undefined : 'no TRADE_PEER_URL, so no paired port exists',
+          setup: async () => {
+            // A fresh directory with exactly one small library file per run
+            // keeps the transfer a one-file send the peer verifies.
+            const run = `${stamp}-tsend-${Date.now().toString(36)}`;
+            const response = await context.request.fetch(`${base}/api/admin/outbound-files?path=${encodeURIComponent(`${run}/blob.bin`)}`, {
+              method: 'POST', headers: { 'X-Votport': '1', 'Content-Type': 'application/octet-stream' }, data: 'x',
+            });
+            if (!response.ok()) throw new Error(`trade library upload ${response.status()}`);
+            await api2('workflows/projects', { id: trade.projectId, label: `${stamp} trade send`, directory: run, destinations: [trade.routeId] }, 'PUT');
+            await open('/workflows#jobs', `document.querySelectorAll('.job-card').length >= 50`);
+            await page.evaluate(() => { window.__tradeJob = null; });
+          },
+          act: `
+            fetch('/api/workflows/jobs', { method: 'POST', headers: { 'X-Votport': '1' }, body: JSON.stringify({ operation_id: 'lat-' + crypto.randomUUID(), project_id: '${trade.projectId}', label: '${stamp} measured send', metadata: {}, expires_days: 1 }) })
+              .then((response) => { if (!response.ok) throw new Error('job ' + response.status); return response.json(); })
+              .then((issued) => { window.__tradeJob = issued.job.id; });`,
+          expect: `(async () => {
+            if (!window.__tradeJob) return false;
+            const response = await fetch('/api/workflows/jobs/' + window.__tradeJob, { headers: { 'X-Votport': '1' } });
+            return (await response.json()).job.state === 'ready';
+          })()`,
+          polling: 250,
+          timeout: 60000,
+        },
+        {
+          name: 'trade: receive request list load-more click', page: '/trade-routes',
+          skip: peerApi ? undefined : 'no TRADE_PEER_URL, so no paired port exists',
+          setup: async () => {
+            await open('/trade-routes', `!document.getElementById('trade-start-receive').disabled && !!document.getElementById('trade-start-receive').offsetParent`);
+            await page.click('#trade-start-receive');
+            await page.waitForFunction(() => document.querySelectorAll('#trade-request option').length >= 50, undefined, { polling: 100 });
+          },
+          act: `document.getElementById('trade-request-more').click();`,
+          expect: `document.getElementById('trade-request-more').hidden`,
+        },
+      ],
+    },
   ];
 
   const total = interactionGroups.reduce((n, group) => n + group.list.length, 0);
@@ -577,6 +697,7 @@ try {
     base_url: base, engine: 'chromium', browser: browser.version(),
     runs_per_interaction: RUNS, threshold_ms: 150, seeded: Object.fromEntries(seedLog),
     big_link_label: bigLabel,
+    trade_peer: trade.peerBase || null,
     note: 'wall-times include Playwright act dispatch + waitForFunction detection overhead; the picker act builds its 10k DataTransfer untimed and brackets from the in-page change dispatch',
     errors: errors.map((row) => ({ name: row.name, error: row.error })),
   };

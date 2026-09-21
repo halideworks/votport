@@ -75,21 +75,33 @@ struct PageReply {
     remaining_pages: u64,
 }
 
-/// One manifest entry as begin reports it: the resume authority.
+/// One manifest entry as begin reports it: the resume authority. Compact
+/// replies carry only the entries a sender cannot infer, so every field but
+/// `index` may be absent and falls back to the drop's own manifest.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EntryInfo {
     pub index: usize,
+    #[serde(default)]
     pub path: String,
+    #[serde(default)]
     pub stored_as: String,
+    #[serde(default)]
     pub bytes: u64,
+    #[serde(default)]
     pub complete: bool,
     /// Bytes verified contiguously from zero: where a resume restarts.
+    #[serde(default)]
     pub covered_bytes: u64,
 }
 
-#[derive(Debug, Deserialize)]
-struct BeginReply {
-    entries: Vec<EntryInfo>,
+/// The begin reply. `total` counts every entry and is present only in the
+/// compact shape; its absence means a dense legacy reply where `entries`
+/// already holds one entry per file.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BeginReply {
+    #[serde(default)]
+    pub total: Option<usize>,
+    pub entries: Vec<EntryInfo>,
 }
 
 /// What one chunk POST reports back.
@@ -573,14 +585,18 @@ impl Client {
         Ok(reply.remaining_pages)
     }
 
-    /// `POST /api/session/{sid}/begin`: the per-entry resume authority.
+    /// `POST /api/session/{sid}/begin`: the per-entry resume authority. The
+    /// compact request header keeps the reply small; an older server ignores
+    /// the header and answers with the dense shape, which parses the same.
     ///
     /// # Errors
     /// A network failure or a non-success status.
-    pub fn begin(&self, session: &str) -> Result<Vec<EntryInfo>> {
+    pub fn begin(&self, session: &str) -> Result<BeginReply> {
         let url = self.url(&format!("/api/session/{session}/begin"));
-        let reply: BeginReply = self.run("begin", true, || self.http.post(&url))?;
-        Ok(reply.entries)
+        let reply: BeginReply = self.run("begin", true, || {
+            self.http.post(&url).header("X-Votport-Begin", "compact")
+        })?;
+        Ok(reply)
     }
 
     /// `POST /api/session/{sid}/chunk?entry=&offset=`: one 64 KiB-aligned

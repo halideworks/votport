@@ -17,7 +17,7 @@ use vot_sdk::object::{ObjectId, Suite};
 use crate::app::{App, PushTicket};
 use crate::auth;
 use crate::paths;
-use crate::session::{self, Cmd, SessionError};
+use crate::session::{self, Cmd, EntryInfo, SessionError};
 use crate::store::{now_unix, Link};
 
 use super::{client_ip, cookie_attributes, ApiError, ApiResult};
@@ -1188,13 +1188,14 @@ pub async fn upload_page(
 pub async fn upload_begin(
     State(app): State<Arc<App>>,
     Path(sid): Path<String>,
+    headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     // A finished upload kept for proof: the begin a reconciling sender sends
     // after a lost finish reply is answered with every entry complete, so
     // the confirmation arrives without resending a byte. The worker behind
     // this id has exited, which is why the live dispatch cannot answer.
     if let Some(entries) = app.sessions.finished_entries(&sid) {
-        return Ok(Json(json!({ "entries": entries })));
+        return Ok(Json(begin_reply(&entries, begin_compact(&headers))));
     }
     let stopping = Arc::clone(&app.stopping);
     let entries = dispatch(&app, &sid, |reply, _lease| Cmd::Begin {
@@ -1203,7 +1204,48 @@ pub async fn upload_begin(
         stopping,
     })
     .await?;
-    Ok(Json(json!({ "entries": entries })))
+    Ok(Json(begin_reply(&entries, begin_compact(&headers))))
+}
+
+/// Clients that opt into the compact begin shape announce it per request:
+/// senders without this header (an older CLI binary, an old script) keep
+/// receiving the dense one-entry-per-file reply, so a sender never meets a
+/// shape it cannot parse. Server and web assets ship together, so the only
+/// sender that can lag the server is an installed CLI.
+fn begin_compact(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-votport-begin")
+        .and_then(|value| value.to_str().ok())
+        == Some("compact")
+}
+
+/// Compact replies list only the entries a sender cannot infer from its own
+/// manifest: a renamed admission (`stored_as`), progress (`covered_bytes`),
+/// or completion. `total` counts every entry, so the sender can check the
+/// reply against its drop and treat absence as "admitted as requested, no
+/// progress yet" — the wire stays small for the common 20k-file begin.
+fn begin_reply(entries: &[EntryInfo], compact: bool) -> serde_json::Value {
+    if !compact {
+        return json!({ "entries": entries });
+    }
+    let sparse: Vec<serde_json::Value> = entries
+        .iter()
+        .filter(|entry| entry.renamed || entry.complete || entry.covered_bytes > 0)
+        .map(|entry| {
+            let mut value = json!({ "index": entry.index });
+            if entry.renamed {
+                value["stored_as"] = json!(entry.stored_as);
+            }
+            if entry.complete {
+                value["complete"] = json!(true);
+            }
+            if entry.covered_bytes > 0 {
+                value["covered_bytes"] = json!(entry.covered_bytes);
+            }
+            value
+        })
+        .collect();
+    json!({ "total": entries.len(), "entries": sparse })
 }
 
 #[derive(Deserialize)]

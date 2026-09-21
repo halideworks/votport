@@ -3982,7 +3982,7 @@ mod tests {
                         for page in &package.page_bytes {
                             client.page(&session.session, page.clone()).unwrap();
                         }
-                        assert_eq!(client.begin(&session.session).unwrap()[0].covered_bytes, 0);
+                        assert!(client.begin(&session.session).unwrap().entries.is_empty());
                         let proof = package.objects[0]
                             .prover()
                             .unwrap()
@@ -3992,7 +3992,7 @@ mod tests {
                             .chunk(&session.session, 0, 0, proof.proof(), &vec![71; 65536])
                             .unwrap();
                         assert_eq!(
-                            client.begin(&session.session).unwrap()[0].covered_bytes,
+                            client.begin(&session.session).unwrap().entries[0].covered_bytes,
                             65536
                         );
                         (route_id, session.session)

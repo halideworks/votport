@@ -7516,3 +7516,129 @@ async fn tenant_list_pages_by_creation() {
     assert_eq!(keys, vec!["acme-3"]);
     assert!(page["tenants_next"].is_null());
 }
+
+/// The compact begin reply (requested with the `X-Votport-Begin: compact`
+/// gate) reports `total` plus only the entries a sender cannot infer: the
+/// two collision-renamed admissions and resume progress. A sender without
+/// the header still gets the dense per-entry reply, so an older CLI binary
+/// keeps working against this server.
+#[tokio::test(flavor = "multi_thread")]
+async fn compact_begin_names_only_renamed_and_progressed_entries() {
+    let server = start_server_with_cap(512 * 1024 * 1024).await;
+    let base = server.base;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    client
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    let token = client
+        .post(format!("{base}/api/admin/links"))
+        .header("x-votport", "1")
+        .json(&json!({ "label": "compact begin" }))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["link"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Manifest entries must stay in canonical path order: also.txt first.
+    let mut files = vec![
+        prepare(vec!["also.txt"], vec![2]),
+        prepare(vec!["big.bin"], vec![7; 3 * CHUNK as usize]),
+    ];
+    const UNIQUE: usize = 19_997;
+    for index in 0..UNIQUE {
+        files.push(prepare(vec![&format!("bulk{index:05}.bin")], vec![1]));
+    }
+    files.push(prepare(vec!["same.txt"], vec![1]));
+    assert_eq!(files.len(), 20_000);
+
+    // An earlier upload on the same link already stored both names, so this
+    // session's staging suffixes both admissions: the rename a sender cannot
+    // infer from its own manifest.
+    run_upload(
+        &client,
+        &base,
+        &token,
+        "",
+        &[
+            prepare(vec!["also.txt"], vec![9]),
+            prepare(vec!["same.txt"], vec![9]),
+        ],
+    )
+    .await;
+
+    let session = open_session_on(&client, &base, &token, &files).await;
+
+    let (status, legacy) = begin(&client, &base, &session).await;
+    assert_eq!(status, 200);
+    let legacy = legacy["entries"].as_array().unwrap();
+    assert_eq!(
+        legacy.len(),
+        20_000,
+        "the dense shape still lists every entry"
+    );
+    assert!(legacy[0].get("path").is_some() && legacy[0].get("stored_as").is_some());
+
+    // One chunk of entry 1 only: the resume progress a compact reply keeps.
+    let covered = upload_chunks_from(&client, &base, &session, 1, &files[1], 0, 1).await;
+    assert_eq!(covered, CHUNK);
+
+    let response = client
+        .post(format!("{base}/api/session/{session}/begin"))
+        .header("x-votport-begin", "compact")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let compact = response.json::<Value>().await.unwrap();
+    assert_eq!(compact["total"].as_u64(), Some(20_000));
+    let entries = compact["entries"].as_array().unwrap();
+    assert_eq!(
+        entries.len(),
+        3,
+        "only the renamed pair and the progressed entry may appear: {compact}"
+    );
+    let renamed: Vec<&Value> = entries
+        .iter()
+        .filter(|entry| entry.get("stored_as").is_some())
+        .collect();
+    assert_eq!(
+        renamed.len(),
+        2,
+        "exactly the collision suffixes: {entries:?}"
+    );
+    assert!(
+        renamed.iter().all(
+            |entry| entry["stored_as"].as_str().unwrap().ends_with("-1.txt")
+                || entry["stored_as"].as_str().unwrap().ends_with("-2.txt")
+        ),
+        "renamed entries carry the admitted name: {renamed:?}"
+    );
+    assert!(entries.iter().all(|entry| entry.get("path").is_none()));
+    let progressed: Vec<&Value> = entries
+        .iter()
+        .filter(|entry| entry.get("covered_bytes").is_some())
+        .collect();
+    assert_eq!(progressed.len(), 1);
+    assert_eq!(progressed[0]["index"].as_u64(), Some(1));
+    assert_eq!(progressed[0]["covered_bytes"].as_u64(), Some(CHUNK));
+    // Sparse entries omit `complete` unless it is true.
+    assert_eq!(progressed[0].get("complete"), None);
+    // The compact wire answers a 20k-entry drop without listing it.
+    let body = compact.to_string();
+    assert!(
+        body.len() < 4_096,
+        "the compact reply stays small: {} bytes",
+        body.len()
+    );
+}

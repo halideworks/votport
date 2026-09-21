@@ -140,6 +140,12 @@ pub struct EntryInfo {
     /// out of order, so this is the offset a resuming sender restarts from;
     /// the total accepted count would make it skip holes.
     pub covered_bytes: u64,
+    /// The admitted name differs from the requested one (collision suffix or
+    /// normalization), so the sender cannot infer `stored_as` from its own
+    /// manifest. Compact begin replies keep only entries a sender cannot
+    /// infer: this flag, progress, or completion.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub renamed: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1748,21 +1754,28 @@ fn entry_infos(setup: &WorkerSetup, files: &[FileState]) -> Vec<EntryInfo> {
     files
         .iter()
         .enumerate()
-        .map(|(index, file)| EntryInfo {
-            index,
-            path: file.display_path.clone(),
-            stored_as: stored_rel(&setup.dest_rel, &file.stored_components),
-            bytes: file.object.length,
-            complete: file.published,
-            // A published file has no live handle left to ask, and its
-            // coverage is by definition the whole object.
-            covered_bytes: if file.published {
-                file.object.length
-            } else {
-                file.native
-                    .as_ref()
-                    .map_or(0, |native| native.progress().prefix_bytes)
-            },
+        .map(|(index, file)| {
+            // Both sides share the destination prefix, so comparing through
+            // `stored_rel` isolates the admitted name from the requested one.
+            let renamed = stored_rel(&setup.dest_rel, &file.display_path)
+                != stored_rel(&setup.dest_rel, &file.stored_components);
+            EntryInfo {
+                index,
+                path: file.display_path.clone(),
+                stored_as: stored_rel(&setup.dest_rel, &file.stored_components),
+                bytes: file.object.length,
+                complete: file.published,
+                // A published file has no live handle left to ask, and its
+                // coverage is by definition the whole object.
+                covered_bytes: if file.published {
+                    file.object.length
+                } else {
+                    file.native
+                        .as_ref()
+                        .map_or(0, |native| native.progress().prefix_bytes)
+                },
+                renamed,
+            }
         })
         .collect()
 }
@@ -5063,6 +5076,9 @@ impl Sessions {
                 bytes: file.bytes,
                 complete: true,
                 covered_bytes: file.bytes,
+                // Every entry is complete, so compact replies include them
+                // all and the admitted name is never the open question.
+                renamed: false,
             })
             .collect();
         let mut inner = self.inner.lock().expect("sessions poisoned");

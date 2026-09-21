@@ -8,7 +8,7 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
-use crate::api::{Client, EntryInfo, FinishReport, PackageAnnouncement};
+use crate::api::{BeginReply, Client, EntryInfo, FinishReport, PackageAnnouncement};
 use crate::error::{Error, Result};
 use crate::package::Prepared;
 use crate::progress::{Event, Observer, Transport};
@@ -159,14 +159,8 @@ fn drive(
         if journal.journalled && observer.cancelled() {
             return Err(Error::Cancelled);
         }
-        let entries = client.begin(session)?;
-        if entries.len() != prepared.objects.len() {
-            return Err(Error::Other(format!(
-                "the server reported {} entries for a {}-entry drop",
-                entries.len(),
-                prepared.objects.len()
-            )));
-        }
+        let reply = client.begin(session)?;
+        let entries = expand_entries(reply, prepared)?;
         if !journal.journalled {
             journal.reconnectable = (journal.on_begin)(session, chunk_bytes, prepared)?;
             journal.journalled = true;
@@ -206,6 +200,49 @@ fn drive(
 enum Outcome {
     Sent,
     Rebegin,
+}
+
+/// Merges a begin reply onto the drop's own manifest. Compact replies carry
+/// `total` and only the entries a sender cannot infer: a renamed admission
+/// (`stored_as`) or resume state (`complete`, `covered_bytes`). Absent
+/// entries were admitted as requested with no progress, so their resume
+/// state comes from the manifest, and `bytes` always does. A reply without
+/// `total` is the dense legacy shape from an older server and already holds
+/// one entry per file.
+fn expand_entries(reply: BeginReply, prepared: &Prepared) -> Result<Vec<EntryInfo>> {
+    let total = reply.total.unwrap_or(reply.entries.len());
+    if total != prepared.objects.len() {
+        return Err(Error::Other(format!(
+            "the server reported {} entries for a {}-entry drop",
+            total,
+            prepared.objects.len()
+        )));
+    }
+    let mut entries: Vec<EntryInfo> = prepared
+        .objects
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| EntryInfo {
+            index,
+            path: entry.path.clone(),
+            stored_as: String::new(),
+            bytes: entry.object.length,
+            complete: false,
+            covered_bytes: 0,
+        })
+        .collect();
+    for info in reply.entries {
+        let entry = entries.get_mut(info.index).ok_or_else(|| {
+            Error::Other(format!("begin named entry {} the drop lacks", info.index))
+        })?;
+        if !info.path.is_empty() {
+            entry.path = info.path;
+        }
+        entry.stored_as = info.stored_as;
+        entry.complete = info.complete;
+        entry.covered_bytes = info.covered_bytes;
+    }
+    Ok(entries)
 }
 
 /// Sends every incomplete entry from its resume point. Returns [`Outcome::Rebegin`]
@@ -395,6 +432,69 @@ mod tests {
                 covered_bytes: 0,
             })
             .collect()
+    }
+
+    /// A compact begin reply names only the exceptions; the drop's own
+    /// manifest supplies the rest, and a total that disagrees with the drop
+    /// is refused exactly as a dense count mismatch was.
+    #[test]
+    fn a_compact_begin_reply_fills_absent_entries_from_the_manifest() {
+        use serde_json::json;
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = directory.path().join("manifest");
+        let prepared = crate::package::build(
+            ["alpha.bin", "beta.bin", "gamma.bin"]
+                .iter()
+                .map(|name| {
+                    let source = directory.path().join(name);
+                    std::fs::write(&source, vec![7; 7]).unwrap();
+                    crate::entries::Entry {
+                        path: vot_manifest::PackagePath::portable([name.to_owned()]).unwrap(),
+                        source,
+                    }
+                })
+                .collect(),
+            &manifest,
+        )
+        .unwrap();
+        let reply: BeginReply = serde_json::from_value(json!({
+            "total": 3,
+            "entries": [
+                {"index": 1, "stored_as": "beta-1.bin"},
+                {"index": 2, "complete": true}
+            ]
+        }))
+        .unwrap();
+        let entries = expand_entries(reply, &prepared).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries[0].path, "alpha.bin",
+            "absent means admitted as requested"
+        );
+        assert!(!entries[0].complete && entries[0].covered_bytes == 0);
+        assert_eq!(entries[1].stored_as, "beta-1.bin");
+        assert!(entries[2].complete);
+        assert!(
+            entries.iter().all(|entry| entry.bytes == 7),
+            "resume sizing always comes from the manifest: {entries:?}"
+        );
+        let reply: BeginReply = serde_json::from_value(json!({"total": 2, "entries": []})).unwrap();
+        let result = expand_entries(reply, &prepared);
+        assert!(
+            matches!(result, Err(Error::Other(ref message)) if message == "the server reported 2 entries for a 3-entry drop")
+        );
+        let reply: BeginReply = serde_json::from_value(json!({"entries": [
+            {"index": 0, "path": "alpha.bin", "stored_as": "alpha.bin", "bytes": 7,
+             "complete": true, "covered_bytes": 7},
+            {"index": 1, "path": "beta.bin", "stored_as": "beta.bin", "bytes": 7,
+             "complete": false, "covered_bytes": 0},
+            {"index": 2, "path": "gamma.bin", "stored_as": "gamma.bin", "bytes": 7,
+             "complete": false, "covered_bytes": 0}
+        ]}))
+        .unwrap();
+        let entries = expand_entries(reply, &prepared).unwrap();
+        assert!(entries[0].complete && entries[0].covered_bytes == 7);
+        assert!(!entries[1].complete);
     }
 
     fn exercise_rebegin(mode: &'static str) {
