@@ -168,9 +168,10 @@ jobs:
           .\build-core.ps1 -BuildProfile dev
           dotnet build Votport\Votport.csproj -c Release -p:Platform=x64 -p:WindowsPackageType=None
           if ($LASTEXITCODE -ne 0) { throw "unpackaged shell build failed" }
-          dotnet build RetentionTests\RetentionTests.csproj -c Release -r win-x64 -p:Platform=x64 -p:WindowsPackageType=None -p:TreatWarningsAsErrors=true
-          if ($LASTEXITCODE -ne 0) { throw "transfer retention test build failed" }
-          $retention = Start-Process dotnet -ArgumentList @('run', '--no-build', '-r', 'win-x64', '--project', 'RetentionTests\RetentionTests.csproj', '-c', 'Release', '-p:Platform=x64', '-p:WindowsPackageType=None') -NoNewWindow -PassThru
+          # dotnet run builds to its own output layout and runs from there:
+          # an explicit build plus --no-build guesses the RID-qualified path,
+          # which differs between the 8.x and 10.x SDKs.
+          $retention = Start-Process dotnet -ArgumentList @('run', '--project', 'RetentionTests\RetentionTests.csproj', '-c', 'Release', '-p:Platform=x64', '-p:WindowsPackageType=None', '-p:TreatWarningsAsErrors=true') -NoNewWindow -PassThru
           if (!$retention.WaitForExit(60000)) {
             $retention.Kill($true)
             $retention.WaitForExit()
