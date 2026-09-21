@@ -171,7 +171,7 @@ jobs:
           # dotnet run builds to its own output layout and runs from there:
           # an explicit build plus --no-build guesses the RID-qualified path,
           # which differs between the 8.x and 10.x SDKs.
-          $retention = Start-Process dotnet -ArgumentList @('run', '--project', 'RetentionTests\RetentionTests.csproj', '-c', 'Release', '-p:Platform=x64', '-p:WindowsPackageType=None', '-p:TreatWarningsAsErrors=true') -NoNewWindow -PassThru
+          $retention = Start-Process dotnet -ArgumentList @('run', '--project', 'RetentionTests\RetentionTests.csproj', '-c', 'Release', '-p:WindowsPackageType=None', '-p:TreatWarningsAsErrors=true') -NoNewWindow -PassThru
           if (!$retention.WaitForExit(60000)) {
             $retention.Kill($true)
             $retention.WaitForExit()
