@@ -48,7 +48,7 @@ RUN touch /src/server/src/main.rs /src/server/src/lib.rs \
     && cd /src/server \
     && cargo auditable build --release --locked
 
-FROM debian:stable-slim@sha256:04634311a8d5fc442b6eb06d792293c4f3e2268652ca7634e00ce8ef5cc0a28a
+FROM debian:stable-slim@sha256:5bc3287b25407c965a30f38e32603dc253a3869e1b12a21ac09bfc27fd8b13ce
 # curl serves the healthcheck; the installed CA roots are the OS trust store
 # that the webhook, OIDC, and SMTP clients load as native roots and that the
 # S3 client verifies against.
