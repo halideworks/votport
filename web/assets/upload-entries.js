@@ -32,6 +32,19 @@ export function entryFiles(entry) {
 
 const UPLOAD_CONCURRENCY = 8;
 
+// Begin replies are compact: `total` counts every manifest entry and
+// `entries` lists only the files the sender cannot infer (a renamed
+// admission, progress, or completion); absence means admitted as requested
+// with no progress. Replies without `total` are the dense legacy shape from
+// an older server, where every entry is present.
+export function expandBeginEntries(reply, count) {
+  const entries = Array.from({ length: reply.total ?? count }, (_, index) => ({
+    index, complete: false, covered_bytes: 0,
+  }));
+  for (const entry of reply.entries) entries[entry.index] = { ...entries[entry.index], ...entry };
+  return entries;
+}
+
 export async function runUploadBatch(items, upload, onProgress = () => {}, onComplete = () => {}) {
   let next = 0;
   let completed = 0;

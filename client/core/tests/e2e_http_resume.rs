@@ -184,7 +184,8 @@ fn a_paused_http_send_resumes_the_same_session_prefix() {
     let client = api::Client::new(&server.base).unwrap();
     let entries = client
         .begin(&http.session)
-        .expect("the paused session remains live");
+        .expect("the paused session remains live")
+        .entries;
     assert_eq!(entries.len(), 1);
     assert!(entries[0].covered_bytes > 0, "the pause retained a prefix");
     let retained = entries[0].covered_bytes;
@@ -208,7 +209,8 @@ fn a_paused_http_send_resumes_the_same_session_prefix() {
     // reconciles instead of re-sending.
     let completed = client
         .begin(&http.session)
-        .expect("the completed session answers from the finish cache");
+        .expect("the completed session answers from the finish cache")
+        .entries;
     assert!(
         completed.len() == 1 && completed[0].covered_bytes == http.length,
         "the cached completion covers the whole object: {completed:?}"

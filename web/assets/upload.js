@@ -5,7 +5,7 @@ import { applyBranding } from '/assets/branding.js';
 import { nameHasForbiddenCharacter } from '/assets/outbound-download.js';
 import { $, appendObjectCard, appLink, copyToClipboard, fieldError, formatBytes, formatDuration } from '/assets/object-card.js';
 import { admitPickBatch } from '/assets/upload-pick.js';
-import { entryFiles, runUploadBatch } from '/assets/upload-entries.js';
+import { entryFiles, expandBeginEntries, runUploadBatch } from '/assets/upload-entries.js';
 import {
   clearResumeRecord,
   expireForeignResumes,
@@ -1166,7 +1166,9 @@ async function runUpload() {
         if (sessionId) {
           try {
           try {
-            ({ entries } = await postWithRetry(`/api/session/${sessionId}/begin`, {}));
+            entries = expandBeginEntries(await postWithRetry(`/api/session/${sessionId}/begin`, {
+              headers: { 'X-Votport-Begin': 'compact' },
+            }), items.length);
           } catch (error) {
             if (sessionUnknown(error)) {
               // The server restarted between the last page and begin and
@@ -1230,7 +1232,9 @@ async function runUpload() {
               body: page,
             });
           }
-          ({ entries } = await postWithRetry(`/api/session/${sessionId}/begin`, {}));
+          entries = expandBeginEntries(await postWithRetry(`/api/session/${sessionId}/begin`, {
+            headers: { 'X-Votport-Begin': 'compact' },
+          }), items.length);
         }
 
         rangePostSeen ||= entries.some((entry) => !entry.complete);
