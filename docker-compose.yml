@@ -62,6 +62,11 @@ services:
       # up where they stopped, until the session has been idle this long.
       # 4h proved too short: a sender who stalls overnight loses the partial.
       VOTPORT_SESSION_IDLE_SECS: "172800"
+      # Deployment knobs: set both in .env. Without a metrics token /metrics
+      # is served unauthenticated; without trusted proxies every private
+      # peer's X-Forwarded-For is believed (docs/deployment.md).
+      VOTPORT_METRICS_TOKEN: "${VOTPORT_METRICS_TOKEN:-}"
+      VOTPORT_TRUSTED_PROXIES: "${VOTPORT_TRUSTED_PROXIES:-}"
     volumes:
       # votport state (links, secrets) — keep this private.
       - ./data:/data

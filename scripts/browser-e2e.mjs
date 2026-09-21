@@ -215,8 +215,11 @@ if (!receiveListFailed || await page.locator("#create-error").isVisible()) {
 // The copy click runs while a one-shot links route interception is armed;
 // the Chromium Fetch-domain race can freeze the clipboard stub. One bounded
 // re-click absorbs the stall without weakening the assertion.
+// 60s: observed three runner-side stalls past 30s on loaded CI hosts where
+// the same tree passes locally and on rerun; the re-click below already
+// absorbs Chromium Fetch races, this budget absorbs host contention.
 const copySettled = async () => page.waitForFunction((url) => window.__copiedText === url
-  && document.getElementById("links-action-status").textContent === "Request link copied.", linkUrl, { timeout: 30000, polling: 50 });
+  && document.getElementById("links-action-status").textContent === "Request link copied.", linkUrl, { timeout: 60000, polling: 50 });
 await page.click("#new-link-copy");
 try {
   await copySettled();
