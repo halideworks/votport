@@ -9,7 +9,8 @@
 # directory beside the other deploy records.
 set -Eeuo pipefail
 
-repo=$(cd "$(dirname "$0")/.." && pwd)
+# The production checkout when invoked from elsewhere (a worktree, a clone).
+repo=${VOTPORT_DEPLOY_REPO:-$(cd "$(dirname "$0")/.." && pwd)}
 override=$repo/docker-compose.override.yml
 sha=${1:?usage: scripts/deploy.sh <git-sha-on-main>}
 short=${sha:0:7}
