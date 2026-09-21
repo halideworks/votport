@@ -1,6 +1,6 @@
 //! Verified, administrator-selected outbound files.
 
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -18,6 +18,7 @@ use futures_util::{Stream, StreamExt as _};
 use serde::Deserialize;
 
 pub mod automation;
+pub mod root_cache;
 pub mod workflows;
 use crate::receipt::verify_receipt_with_key;
 pub use automation::automation_share;
@@ -31,6 +32,8 @@ use vot_sdk::object::{InMemoryObjectBuilder, ObjectId, Suite};
 use vot_sdk::proof::{self, CatalogHeader};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
+use self::root_cache::mtime_nanos;
+pub(crate) use self::root_cache::RootCache;
 use super::{ApiError, ApiResult};
 use crate::api::admin;
 use crate::app::App;
@@ -126,6 +129,284 @@ static LIBRARY_MUTATION_LOCK: Mutex<()> = Mutex::new(());
 static LIBRARY_MUTATION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 static LIBRARY_HASH_PERMITS: Semaphore = Semaphore::const_new(LIBRARY_HASH_CONCURRENCY);
+
+// The deliver page's create-share used to block the POST on hashing every
+// selected file, so a multi-gigabyte folder froze the page with no feedback.
+// Grant creation for paths/directory now answers 202 with a preparation id
+// and hashes in a detached job; the handles below carry live progress
+// (files/bytes done) and the terminal outcome. State is in-memory by design:
+// a restart loses pending preparations and the progress endpoint answers
+// with a clear retry error (PREPARATION_LOST_MESSAGE).
+const PREPARATION_PREPARING: u8 = 0;
+const PREPARATION_COMPLETE: u8 = 1;
+const PREPARATION_FAILED: u8 = 2;
+// Terminal preparations stay queryable for a few minutes so a page reload or
+// a slow poll still finds the finished link, then the sweep drops them.
+const PREPARATION_TTL_SECS: u64 = 15 * 60;
+const PREPARATION_LOST_MESSAGE: &str =
+    "This preparation is no longer available; the server may have restarted. Create the link again.";
+
+pub(crate) struct GrantPreparation {
+    id: String,
+    tenant: String,
+    status: std::sync::atomic::AtomicU8,
+    files_total: std::sync::atomic::AtomicU64,
+    files_done: std::sync::atomic::AtomicU64,
+    bytes_total: std::sync::atomic::AtomicU64,
+    bytes_done: std::sync::atomic::AtomicU64,
+    finished_at: std::sync::atomic::AtomicU64,
+    outcome: Mutex<Option<Result<CreatedGrant, (u16, String)>>>,
+}
+
+/// Totals are unknown until the per-file stat pass finishes; u64::MAX stands
+/// in for "not yet known" and serializes as null so the page can shimmer.
+const PREPARATION_UNKNOWN: u64 = u64::MAX;
+
+impl GrantPreparation {
+    fn new(identity: &auth::AdminIdentity) -> Self {
+        Self {
+            id: auth::random_token(),
+            tenant: identity.tenant.clone(),
+            status: std::sync::atomic::AtomicU8::new(PREPARATION_PREPARING),
+            files_total: std::sync::atomic::AtomicU64::new(PREPARATION_UNKNOWN),
+            files_done: std::sync::atomic::AtomicU64::new(0),
+            bytes_total: std::sync::atomic::AtomicU64::new(PREPARATION_UNKNOWN),
+            bytes_done: std::sync::atomic::AtomicU64::new(0),
+            finished_at: std::sync::atomic::AtomicU64::new(0),
+            outcome: Mutex::new(None),
+        }
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.status.load(Ordering::Relaxed) != PREPARATION_PREPARING
+    }
+
+    /// One hashed file left the pipeline; bytes are unknown when the file
+    /// itself failed, which fails the whole preparation right after.
+    fn record_file_done(&self, bytes: Option<u64>) {
+        self.files_done.fetch_add(1, Ordering::Relaxed);
+        if let Some(bytes) = bytes {
+            self.bytes_done.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    fn set_totals(&self, files: u64, bytes: u64) {
+        self.files_total.store(files, Ordering::Relaxed);
+        self.bytes_total.store(bytes, Ordering::Relaxed);
+    }
+
+    fn complete(&self, created: CreatedGrant) {
+        let mut outcome = self.outcome.lock().expect("grant preparation poisoned");
+        *outcome = Some(Ok(created));
+        drop(outcome);
+        self.finish(PREPARATION_COMPLETE);
+    }
+
+    fn fail(&self, status: u16, message: String) {
+        let mut outcome = self.outcome.lock().expect("grant preparation poisoned");
+        *outcome = Some(Err((status, message)));
+        drop(outcome);
+        self.finish(PREPARATION_FAILED);
+    }
+
+    fn finish(&self, status: u8) {
+        self.finished_at.store(now_unix(), Ordering::Relaxed);
+        self.status.store(status, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> serde_json::Value {
+        let known = |value: u64| (value != PREPARATION_UNKNOWN).then_some(value);
+        let outcome = self.outcome.lock().expect("grant preparation poisoned");
+        let (url, grant, error, error_status) = match &*outcome {
+            Some(Ok(created)) => (
+                Some(created.url.clone()),
+                Some(created.grant.clone()),
+                None,
+                None,
+            ),
+            Some(Err((status, message))) => (None, None, Some(message.clone()), Some(*status)),
+            None => (None, None, None, None),
+        };
+        json!({
+            "id": self.id,
+            "status": match self.status.load(Ordering::Relaxed) {
+                PREPARATION_COMPLETE => "complete",
+                PREPARATION_FAILED => "failed",
+                _ => "preparing",
+            },
+            "files_total": known(self.files_total.load(Ordering::Relaxed)),
+            "files_done": self.files_done.load(Ordering::Relaxed),
+            "bytes_total": known(self.bytes_total.load(Ordering::Relaxed)),
+            "bytes_done": self.bytes_done.load(Ordering::Relaxed),
+            "url": url,
+            "grant": grant,
+            "error": error,
+            "error_status": error_status,
+        })
+    }
+}
+
+/// Per-App preparation state; lives and dies with the process, so a restart
+/// loses pending preparations by design.
+#[derive(Default)]
+pub(crate) struct GrantPreparationRegistry {
+    by_id: HashMap<String, Arc<GrantPreparation>>,
+    /// One in-flight preparation per (tenant, admin subject): a second
+    /// create-share from the same session answers 409 instead of doubling
+    /// the hashing work.
+    in_flight: HashMap<(String, String), String>,
+}
+
+fn sweep_preparations(registry: &mut GrantPreparationRegistry) {
+    let cutoff = now_unix().saturating_sub(PREPARATION_TTL_SECS);
+    registry.by_id.retain(|_, preparation| {
+        !preparation.is_terminal() || preparation.finished_at.load(Ordering::Relaxed) > cutoff
+    });
+    registry
+        .in_flight
+        .retain(|_, id| registry.by_id.contains_key(id));
+}
+
+fn begin_grant_preparation(
+    app: &App,
+    identity: &auth::AdminIdentity,
+) -> ApiResult<Arc<GrantPreparation>> {
+    let mut registry = app
+        .grant_preparations
+        .lock()
+        .expect("grant preparations poisoned");
+    sweep_preparations(&mut registry);
+    let key = (identity.tenant.clone(), identity.subject.clone());
+    if let Some(id) = registry.in_flight.get(&key) {
+        let live = registry
+            .by_id
+            .get(id)
+            .is_some_and(|preparation| !preparation.is_terminal());
+        if live {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "a link preparation is already running for this session; wait for it to finish",
+            ));
+        }
+        registry.in_flight.remove(&key);
+    }
+    let preparation = Arc::new(GrantPreparation::new(identity));
+    registry.in_flight.insert(key, preparation.id.clone());
+    registry
+        .by_id
+        .insert(preparation.id.clone(), Arc::clone(&preparation));
+    Ok(preparation)
+}
+
+/// Everything `create_library_grant` needs, parked for the detached job.
+struct PreparationJob {
+    directory: Option<String>,
+    requested: Vec<String>,
+    max_files: usize,
+    options: GrantOptions,
+}
+
+/// The detached half of an async grant creation: same permit, same operation
+/// guard, same insert pipeline as the old synchronous request path.
+async fn run_grant_preparation(
+    app: Arc<App>,
+    preparation: Arc<GrantPreparation>,
+    identity: auth::AdminIdentity,
+    base: String,
+    job: PreparationJob,
+) {
+    let tenant = identity.tenant.clone();
+    let subject = identity.subject.clone();
+    let future = prepare_grant_files(&app, &preparation, &identity, &base, job);
+    // A panic in the pipeline must not strand the page on "preparing".
+    let outcome = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(future)).await;
+    match outcome {
+        Ok(Ok(created)) => preparation.complete(created),
+        Ok(Err(error)) => preparation.fail(error.0, error.1),
+        Err(_) => preparation.fail(
+            StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+            "preparing this link failed unexpectedly".to_owned(),
+        ),
+    }
+    let mut registry = app
+        .grant_preparations
+        .lock()
+        .expect("grant preparations poisoned");
+    registry.in_flight.remove(&(tenant, subject));
+    sweep_preparations(&mut registry);
+}
+
+async fn prepare_grant_files(
+    app: &Arc<App>,
+    preparation: &Arc<GrantPreparation>,
+    identity: &auth::AdminIdentity,
+    base: &str,
+    job: PreparationJob,
+) -> Result<CreatedGrant, (u16, String)> {
+    let failure = |error: ApiError| (error.status.as_u16(), error.message);
+    let _grant_permit = app.outbound_grant_permits.try_acquire().map_err(|_| {
+        (
+            StatusCode::TOO_MANY_REQUESTS.as_u16(),
+            "too many grant preparations; try again later".to_owned(),
+        )
+    })?;
+    let PreparationJob {
+        directory,
+        requested,
+        max_files,
+        options,
+    } = job;
+    let paths = match directory {
+        Some(directory) => {
+            let root = library_root(app, &identity.tenant);
+            let directory =
+                automation_directory(app, &identity.tenant, &directory).map_err(failure)?;
+            tokio::task::spawn_blocking(move || {
+                enumerate_automation_files(&root, &directory, MAX_LIBRARY_PROJECT_FILES)
+            })
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                    "enumerate outbound files failed".to_owned(),
+                )
+            })?
+            .map_err(failure)?
+        }
+        None => requested,
+    };
+    create_library_grant(
+        app,
+        base,
+        identity,
+        &paths,
+        max_files,
+        options,
+        Some(preparation),
+    )
+    .await
+    .map_err(failure)
+}
+
+pub async fn outbound_grant_preparation(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = admin::require_operator(&app, &headers)?;
+    let preparation = {
+        let mut registry = app
+            .grant_preparations
+            .lock()
+            .expect("grant preparations poisoned");
+        sweep_preparations(&mut registry);
+        registry.by_id.get(&id).cloned()
+    };
+    let preparation = preparation
+        .filter(|preparation| preparation.tenant == identity.tenant)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, PREPARATION_LOST_MESSAGE))?;
+    Ok(Json(preparation.snapshot()))
+}
 
 fn library_mutation_generation() -> u64 {
     // Relaxed is enough: only the lock-held re-read decides, and the mutex
@@ -1977,6 +2258,141 @@ fn require_automation_admin(app: &App, headers: &HeaderMap) -> ApiResult<admin::
     Ok(identity)
 }
 
+/// Shared prologue of both grant creation routes: parse the body and run the
+/// request-scoped validation. The synchronous route is a pinned contract
+/// (the CLI decodes its 200 body), so both routes must agree on it.
+async fn validated_grant_create(
+    app: &Arc<App>,
+    identity: &auth::AdminIdentity,
+    request: Request,
+) -> ApiResult<(
+    CreateOutboundRequest,
+    Option<crate::store::NotificationPolicy>,
+    Option<String>,
+)> {
+    let Json(request) = Json::<CreateOutboundRequest>::from_request(request, app)
+        .await
+        .map_err(|error| ApiError::new(error.status(), error.body_text()))?;
+    let notifications = super::notifications::creation_policy(
+        app,
+        &identity.tenant,
+        request.notifications.clone(),
+        &super::notifications::DOWNLOAD_EVENTS,
+    )?;
+    if !(1..=30).contains(&request.expires_days) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "expires_days must be 1..=30",
+        ));
+    }
+    validate_max_downloads(request.max_downloads)?;
+    let password_hash = hash_optional_password(request.password.as_deref())?;
+    Ok((request, notifications, password_hash))
+}
+
+/// The synchronous 200 body the CLI and scripts decode once a grant lands.
+fn grant_created_response(created: CreatedGrant) -> Response {
+    let CreatedGrant {
+        grant,
+        url,
+        operation_id,
+    } = created;
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({ "grant": grant, "url": url, "operation_id": operation_id })),
+    )
+        .into_response()
+}
+
+/// Answers 202 with a preparation handle and detaches hashing for the web
+/// page, which polls `outbound_grant_preparation` for live progress. The
+/// pinned CLI keeps using the synchronous `create_outbound_grant`.
+pub async fn create_outbound_grant_preparation(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    request: Request,
+) -> ApiResult<Response> {
+    let identity = admin::require_operator_write(&app, &headers)?;
+    let _grant_permit = app.outbound_grant_permits.try_acquire().map_err(|_| {
+        ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many grant preparations; try again later",
+        )
+        .with_retry_after(1)
+    })?;
+    let (request, notifications, password_hash) =
+        validated_grant_create(&app, &identity, request).await?;
+    let has_legacy_fields =
+        request.link_id.is_some() || request.upload_id.is_some() || request.file_index.is_some();
+    if let Some(directory_name) = request.directory {
+        if request.paths.is_some() || has_legacy_fields {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "directory cannot be combined with paths, link_id, upload_id, or file_index",
+            ));
+        }
+        let directory_label = library_directory_label(&directory_name);
+        // Cheap shape and mount sanity check before answering 202; the real
+        // walk runs in the preparation job.
+        automation_directory(&app, &identity.tenant, &directory_name)?;
+        return start_preparation(
+            &app,
+            &headers,
+            &identity,
+            PreparationJob {
+                directory: Some(directory_name),
+                requested: Vec::new(),
+                max_files: MAX_LIBRARY_PROJECT_FILES,
+                options: GrantOptions {
+                    workflow: None,
+                    automation: None,
+                    label: request
+                        .label
+                        .filter(|label| !label.trim().is_empty())
+                        .or(Some(directory_label)),
+                    password_hash,
+                    expires_days: request.expires_days,
+                    max_downloads: request.max_downloads,
+
+                    notifications,
+                },
+            },
+        );
+    }
+    if let Some(paths) = request.paths.as_deref() {
+        if has_legacy_fields {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "paths cannot be combined with link_id, upload_id, or file_index",
+            ));
+        }
+        return start_preparation(
+            &app,
+            &headers,
+            &identity,
+            PreparationJob {
+                directory: None,
+                requested: paths.to_vec(),
+                max_files: MAX_LIBRARY_PATHS_FILES,
+                options: GrantOptions {
+                    workflow: None,
+                    automation: None,
+                    label: request.label,
+                    password_hash,
+                    expires_days: request.expires_days,
+                    max_downloads: request.max_downloads,
+
+                    notifications,
+                },
+            },
+        );
+    }
+    Err(ApiError::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "paths or directory is required",
+    ))
+}
+
 pub async fn create_outbound_grant(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -1990,23 +2406,8 @@ pub async fn create_outbound_grant(
         )
         .with_retry_after(1)
     })?;
-    let Json(request) = Json::<CreateOutboundRequest>::from_request(request, &app)
-        .await
-        .map_err(|error| ApiError::new(error.status(), error.body_text()))?;
-    let notifications = super::notifications::creation_policy(
-        &app,
-        &identity.tenant,
-        request.notifications.clone(),
-        &super::notifications::DOWNLOAD_EVENTS,
-    )?;
-    if !(1..=30).contains(&request.expires_days) {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "expires_days must be 1..=30",
-        ));
-    }
-    validate_max_downloads(request.max_downloads)?;
-    let password_hash = hash_optional_password(request.password.as_deref())?;
+    let (request, notifications, password_hash) =
+        validated_grant_create(&app, &identity, request).await?;
     let has_legacy_fields =
         request.link_id.is_some() || request.upload_id.is_some() || request.file_index.is_some();
     if let Some(directory_name) = request.directory {
@@ -2016,6 +2417,7 @@ pub async fn create_outbound_grant(
                 "directory cannot be combined with paths, link_id, upload_id, or file_index",
             ));
         }
+        let base = admin::base_url(&app, &headers);
         let directory_label = library_directory_label(&directory_name);
         let directory = automation_directory(&app, &identity.tenant, &directory_name)?;
         let root = library_root(&app, &identity.tenant);
@@ -2024,9 +2426,9 @@ pub async fn create_outbound_grant(
         })
         .await
         .map_err(|_| ApiError::internal("enumerate outbound files failed"))??;
-        return create_library_grant(
+        let created = create_library_grant(
             &app,
-            &headers,
+            &base,
             &identity,
             &paths,
             MAX_LIBRARY_PROJECT_FILES,
@@ -2043,8 +2445,10 @@ pub async fn create_outbound_grant(
 
                 notifications: notifications.clone(),
             },
+            None,
         )
-        .await;
+        .await?;
+        return Ok(grant_created_response(created));
     }
     if let Some(paths) = request.paths.as_deref() {
         if has_legacy_fields {
@@ -2053,9 +2457,10 @@ pub async fn create_outbound_grant(
                 "paths cannot be combined with link_id, upload_id, or file_index",
             ));
         }
-        return create_library_grant(
+        let base = admin::base_url(&app, &headers);
+        let created = create_library_grant(
             &app,
-            &headers,
+            &base,
             &identity,
             paths,
             MAX_LIBRARY_PATHS_FILES,
@@ -2069,8 +2474,10 @@ pub async fn create_outbound_grant(
 
                 notifications: notifications.clone(),
             },
+            None,
         )
-        .await;
+        .await?;
+        return Ok(grant_created_response(created));
     }
     if !has_legacy_fields {
         return Err(ApiError::new(
@@ -2364,14 +2771,51 @@ struct GrantOptions {
     notifications: Option<crate::store::NotificationPolicy>,
 }
 
-async fn create_library_grant(
+/// Answers 202 with a preparation handle and detaches the hashing job; the
+/// page polls `outbound_grant_preparation` for live progress and the link.
+fn start_preparation(
     app: &Arc<App>,
     headers: &HeaderMap,
+    identity: &auth::AdminIdentity,
+    job: PreparationJob,
+) -> ApiResult<Response> {
+    let preparation = begin_grant_preparation(app, identity)?;
+    let base = admin::base_url(app, headers);
+    tokio::task::spawn(run_grant_preparation(
+        Arc::clone(app),
+        Arc::clone(&preparation),
+        identity.clone(),
+        base,
+        job,
+    ));
+    let mut response = Json(json!({
+        "preparation_id": preparation.id,
+        "preparation": preparation.snapshot(),
+    }))
+    .into_response();
+    *response.status_mut() = StatusCode::ACCEPTED;
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
+}
+
+struct CreatedGrant {
+    grant: serde_json::Value,
+    url: String,
+    operation_id: Option<String>,
+}
+
+async fn create_library_grant(
+    app: &Arc<App>,
+    base: &str,
     identity: &auth::AdminIdentity,
     requested: &[String],
     max_files: usize,
     options: GrantOptions,
-) -> ApiResult<Response> {
+    progress: Option<&GrantPreparation>,
+) -> ApiResult<CreatedGrant> {
     let operation = begin_outbound_operation_owned(app, &identity.tenant)?;
     if requested.is_empty() || requested.len() > max_files {
         return Err(ApiError::new(
@@ -2450,20 +2894,39 @@ async fn create_library_grant(
     let revalidation = selections.clone();
     let hash_root = root.clone();
     let proof_root = app.config.data_dir.join("outbound.proofs");
+    let tenant = identity.tenant.clone();
+    let cache_app = Arc::clone(app);
+    if let Some(progress) = progress {
+        progress.set_totals(selections.len() as u64, total_bytes);
+    }
     let hashed = futures_util::stream::iter(selections.into_iter().map(|(name, path)| {
         let hash_root = hash_root.clone();
         let proof_root = proof_root.clone();
+        let tenant = tenant.clone();
+        let cache_app = Arc::clone(&cache_app);
         async move {
             let _permit = LIBRARY_HASH_PERMITS
                 .acquire()
                 .await
                 .map_err(|_| ApiError::internal("hash outbound files failed"))?;
-            tokio::task::spawn_blocking(move || {
-                hash_library_file(&hash_root, &name, &path, &proof_root, max)
+            let hashed = tokio::task::spawn_blocking(move || {
+                hash_library_file(
+                    &hash_root,
+                    &name,
+                    &path,
+                    &proof_root,
+                    max,
+                    &tenant,
+                    &cache_app.root_cache,
+                )
             })
             .await
             .map_err(|_| ApiError::internal("hash outbound files failed"))?
-            .map_err(|_| ApiError::not_found())
+            .map_err(|_| ApiError::not_found());
+            if let Some(progress) = progress {
+                progress.record_file_done(hashed.as_ref().ok().map(|file| file.bytes));
+            }
+            hashed
         }
     }))
     .buffered(LIBRARY_HASH_CONCURRENCY)
@@ -2471,6 +2934,7 @@ async fn create_library_grant(
     .await
     .into_iter()
     .collect::<ApiResult<Vec<_>>>()?;
+    app.root_cache.persist();
     if let Some(expected) = &received {
         if expected.len() != hashed.len() {
             return Err(ApiError::new(
@@ -2689,12 +3153,12 @@ async fn create_library_grant(
     })
     .await
     .map_err(|_| ApiError::internal("create outbound grant failed"))??;
-    let base = admin::base_url(app, headers);
-    Ok((
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(json!({ "grant": public, "url": format!("{base}/s/{token}"), "operation_id": operation_id })),
-    )
-        .into_response())
+    let base_url = base;
+    Ok(CreatedGrant {
+        grant: public,
+        url: format!("{base_url}/s/{token}"),
+        operation_id,
+    })
 }
 
 fn valid_preparation_length(length: u64, expected: Option<u64>, max: u64) -> bool {
@@ -2746,28 +3210,59 @@ fn hash_library_file(
     path: &Path,
     proof_root: &Path,
     max: u64,
+    tenant: &str,
+    cache: &RootCache,
 ) -> io::Result<OutboundGrantFile> {
+    let grant_file = |object: &ObjectId| -> io::Result<OutboundGrantFile> {
+        Ok(OutboundGrantFile {
+            source: path
+                .strip_prefix(root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/"),
+            name: name.to_owned(),
+            suite: "blake3".to_owned(),
+            root: hex::encode(object.root),
+            bytes: object.length,
+            receipt_b64: String::new(),
+            downloads: 0,
+            first_download_at: None,
+            last_download_at: None,
+        })
+    };
+    // Cache first: an unchanged source (same size and mtime) re-shares
+    // without the full re-read. Large files still need their range-proof
+    // catalog; if the cached root cannot produce one, fall through to the
+    // honest full hash.
+    let stat = std::fs::symlink_metadata(path)?;
+    let (size, mtime) = (stat.len(), mtime_nanos(&stat));
+    if let Some(hex_root) = cache.lookup(tenant, path, size, mtime) {
+        let object = hex::decode(&hex_root)
+            .ok()
+            .and_then(|bytes| TryInto::<[u8; 32]>::try_into(bytes).ok())
+            .map(|root| ObjectId {
+                suite: 1,
+                root,
+                length: size,
+            });
+        if let Some(object) = object {
+            let usable =
+                size < BATCH_STAGE_BYTES || ensure_catalog(proof_root, path, &object).is_ok();
+            if usable {
+                return grant_file(&object);
+            }
+        }
+    }
     let prepared = prepare_library_file(path, Suite::Blake3Bao64, None, max)?;
     let bytes = prepared.object_id().length;
     let object = prepared.object_id().clone();
     if bytes >= BATCH_STAGE_BYTES {
         ensure_catalog_from_prepared(proof_root, &prepared)?;
     }
-    Ok(OutboundGrantFile {
-        source: path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/"),
-        name: name.to_owned(),
-        suite: "blake3".to_owned(),
-        root: hex::encode(object.root),
-        bytes,
-        receipt_b64: String::new(),
-        downloads: 0,
-        first_download_at: None,
-        last_download_at: None,
-    })
+    if bytes == size {
+        cache.insert(tenant, path, size, mtime, hex::encode(object.root));
+    }
+    grant_file(&object)
 }
 
 fn catalog_path(root: &Path, object: &ObjectId) -> PathBuf {

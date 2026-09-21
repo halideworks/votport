@@ -327,7 +327,7 @@ pub async fn automation_share(
     };
     create_library_grant(
         &app,
-        &headers,
+        &admin::base_url(&app, &headers),
         &identity,
         &paths,
         MAX_LIBRARY_PROJECT_FILES,
@@ -348,8 +348,20 @@ pub async fn automation_share(
                 &crate::api::notifications::DOWNLOAD_EVENTS,
             )?,
         },
+        None,
     )
     .await
+    .map(|created| {
+        (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({
+                "grant": created.grant,
+                "url": created.url,
+                "operation_id": created.operation_id,
+            })),
+        )
+            .into_response()
+    })
 }
 
 fn recover_response(

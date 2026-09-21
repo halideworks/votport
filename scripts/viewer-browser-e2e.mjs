@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { chromium } from 'playwright';
+import { settleGrant } from './browser-helpers.mjs';
 
 const run = promisify(execFile);
 const base = process.env.BASE_URL;
@@ -92,7 +93,7 @@ try {
     dest: id,
     expires_days: 7,
   })).link;
-  const grant = await adminJson('admin/outbound-grants', {
+  const grant = await settleGrant(admin, base, {
     paths: [libraryPath],
     label: `${id} download`,
     expires_days: 7,

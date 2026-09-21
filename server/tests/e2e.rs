@@ -30,6 +30,49 @@ struct TestServer {
     _received: tempfile::TempDir,
 }
 
+/// POSTs a library grant; when the server answers 202 with a preparation id,
+/// polls the progress endpoint to a terminal state and returns the grant
+/// payload (`grant`/`url`) the synchronous API used to give. Errors panic:
+/// this is test plumbing, not a tolerant client.
+async fn settle_grant(client: &reqwest::Client, base: &str, body: Value) -> Value {
+    let response = client
+        .post(format!("{base}/api/admin/outbound-grants/preparations"))
+        .header("x-votport", "1")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    if status != reqwest::StatusCode::ACCEPTED {
+        panic!(
+            "create grant: {status} {}",
+            response.text().await.unwrap_or_default()
+        );
+    }
+    let accepted: Value = response.json().await.unwrap();
+    let id = accepted["preparation_id"].as_str().unwrap().to_owned();
+    loop {
+        let response = client
+            .get(format!(
+                "{base}/api/admin/outbound-grants/preparations/{id}"
+            ))
+            .header("x-votport", "1")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let snapshot: Value = response.json().await.unwrap();
+        match snapshot["status"].as_str() {
+            Some("complete") => {
+                return json!({ "grant": snapshot["grant"], "url": snapshot["url"] });
+            }
+            Some("failed") => panic!("create grant failed: {snapshot}"),
+            _ => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+}
+
 // Small protocol fixtures collect explicit pages so their existing full-history assertions stay complete.
 async fn admin_links(client: &reqwest::Client, base: &str) -> reqwest::Result<Value> {
     let mut result = json!({"links":[]});
@@ -3963,18 +4006,12 @@ async fn throughput_outbound() {
         .error_for_status()
         .unwrap();
     let uploaded = upload_started.elapsed();
-    let grant = client
-        .post(format!("{}/api/admin/outbound-grants", server.base))
-        .header("x-votport", "1")
-        .json(&json!({ "paths": ["benchmark.bin"], "expires_days": 1 }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json::<Value>()
-        .await
-        .unwrap();
+    let grant = settle_grant(
+        &client,
+        &server.base,
+        json!({ "paths": ["benchmark.bin"], "expires_days": 1 }),
+    )
+    .await;
     let token = grant["url"]
         .as_str()
         .and_then(|url| url.rsplit('/').next())
@@ -4048,18 +4085,12 @@ async fn throughput_outbound_batch() {
     let streams = load_knob("VOTPORT_BENCH_STREAMS", 1);
     let mut tokens = Vec::with_capacity(streams);
     for _ in 0..streams {
-        let grant = client
-            .post(format!("{}/api/admin/outbound-grants", server.base))
-            .header("x-votport", "1")
-            .json(&json!({ "directory": "batch", "expires_days": 1 }))
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
-            .json::<Value>()
-            .await
-            .unwrap();
+        let grant = settle_grant(
+            &client,
+            &server.base,
+            json!({ "directory": "batch", "expires_days": 1 }),
+        )
+        .await;
         tokens.push(
             grant["url"]
                 .as_str()
@@ -5482,17 +5513,12 @@ async fn run_load(
     artifacts.outbound_path = Some(outbound_path.clone());
     let mut grants = Vec::with_capacity(downloads);
     for _ in 0..downloads {
-        let created = ok200(
-            admin
-                .post(format!("{base}/api/admin/outbound-grants"))
-                .header("X-Votport", "1")
-                .json(&json!({ "paths": [outbound_path], "expires_days": 1 })),
-            "create grant",
+        let created = settle_grant(
+            admin,
+            base,
+            json!({ "paths": [outbound_path], "expires_days": 1 }),
         )
-        .await?
-        .json::<Value>()
-        .await
-        .map_err(|error| format!("create grant: {error}"))?;
+        .await;
         artifacts.grant_ids.push(
             created["grant"]["id"]
                 .as_str()
@@ -5838,18 +5864,12 @@ async fn status_reports_receiving_sessions_and_the_days_uploads() {
         .unwrap()
         .error_for_status()
         .unwrap();
-    let grant: Value = client
-        .post(format!("{base}/api/admin/outbound-grants"))
-        .header("x-votport", "1")
-        .json(&json!({ "paths": ["strip/poster.pdf"], "expires_days": 1 }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let grant: Value = settle_grant(
+        &client,
+        &base,
+        json!({ "paths": ["strip/poster.pdf"], "expires_days": 1 }),
+    )
+    .await;
     let status: Value = client
         .get(format!("{base}/api/admin/status?since=3"))
         .send()
@@ -6011,18 +6031,12 @@ async fn a_download_lease_moves_to_the_final_url_and_counts_once() {
         .unwrap()
         .error_for_status()
         .unwrap();
-    let grant: Value = admin
-        .post(format!("{base}/api/admin/outbound-grants"))
-        .header("x-votport", "1")
-        .json(&json!({ "paths": ["grade/reel.bin"], "expires_days": 1, "max_downloads": 2 }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let grant: Value = settle_grant(
+        &admin,
+        &base,
+        json!({ "paths": ["grade/reel.bin"], "expires_days": 1, "max_downloads": 2 }),
+    )
+    .await;
     let token = grant["url"]
         .as_str()
         .unwrap()
@@ -6161,22 +6175,16 @@ async fn parallel_file_downloads_count_once_each_and_the_cap_holds() {
             .error_for_status()
             .unwrap();
     }
-    let grant: Value = admin
-        .post(format!("{base}/api/admin/outbound-grants"))
-        .header("x-votport", "1")
-        .json(&json!({
+    let grant: Value = settle_grant(
+        &admin,
+        &base,
+        json!({
             "paths": ["part/set0.bin", "part/set1.bin", "part/set2.bin"],
             "expires_days": 1,
             "max_downloads": 2
-        }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+        }),
+    )
+    .await;
     let token = grant["url"]
         .as_str()
         .unwrap()
@@ -6293,22 +6301,16 @@ async fn a_download_lease_binds_to_the_grant_generation_and_access() {
             .error_for_status()
             .unwrap();
     }
-    let grant: Value = admin
-        .post(format!("{base}/api/admin/outbound-grants"))
-        .header("x-votport", "1")
-        .json(&json!({
+    let grant: Value = settle_grant(
+        &admin,
+        &base,
+        json!({
             "paths": ["pair/poster.pdf", "pair/notes.txt"],
             "expires_days": 1,
             "max_downloads": 3
-        }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+        }),
+    )
+    .await;
     let grant_id = grant["grant"]["id"].as_str().unwrap().to_owned();
     let token = grant["url"]
         .as_str()
@@ -6391,22 +6393,16 @@ async fn a_download_lease_binds_to_the_grant_generation_and_access() {
     );
 
     // The password gate runs before any admission or redirect.
-    let gated: Value = admin
-        .post(format!("{base}/api/admin/outbound-grants"))
-        .header("x-votport", "1")
-        .json(&json!({
+    let gated: Value = settle_grant(
+        &admin,
+        &base,
+        json!({
             "paths": ["pair/poster.pdf"],
             "expires_days": 1,
             "password": "upgrade-grade-tower"
-        }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+        }),
+    )
+    .await;
     let gated_token = gated["url"]
         .as_str()
         .unwrap()
@@ -6582,18 +6578,12 @@ async fn search_finds_requests_files_and_downloads() {
         .unwrap()
         .error_for_status()
         .unwrap();
-    let grant = client
-        .post(format!("{base}/api/admin/outbound-grants"))
-        .header("x-votport", "1")
-        .json(&json!({ "paths": ["press/poster.pdf"], "expires_days": 1, "label": "Press kit" }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json::<Value>()
-        .await
-        .unwrap();
+    let grant = settle_grant(
+        &client,
+        &base,
+        json!({ "paths": ["press/poster.pdf"], "expires_days": 1, "label": "Press kit" }),
+    )
+    .await;
 
     let search = |q: &str| {
         let client = client.clone();
@@ -6777,18 +6767,12 @@ async fn a_library_grant_is_fetched_over_vot_quic_and_counted_once() {
             .error_for_status()
             .unwrap();
     }
-    let grant = client
-        .post(format!("{}/api/admin/outbound-grants", server.base))
-        .header("x-votport", "1")
-        .json(&json!({ "paths": ["grade/reel.bin", "grade/notes.txt"], "expires_days": 1, "max_downloads": 1 }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json::<Value>()
-        .await
-        .unwrap();
+    let grant = settle_grant(
+        &client,
+        &server.base,
+        json!({ "paths": ["grade/reel.bin", "grade/notes.txt"], "expires_days": 1, "max_downloads": 1 }),
+    )
+    .await;
     let token = grant["url"]
         .as_str()
         .and_then(|url| url.rsplit('/').next())
@@ -6987,18 +6971,12 @@ async fn a_library_grant_is_fetched_over_vot_quic_and_counted_once() {
 
     // A second grant over the same files shares the package root and is
     // still its own grant: its mint succeeds and its fetch is counted to it.
-    let twin = client
-        .post(format!("{}/api/admin/outbound-grants", server.base))
-        .header("x-votport", "1")
-        .json(&json!({ "paths": ["grade/reel.bin", "grade/notes.txt"], "expires_days": 1 }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json::<Value>()
-        .await
-        .unwrap();
+    let twin = settle_grant(
+        &client,
+        &server.base,
+        json!({ "paths": ["grade/reel.bin", "grade/notes.txt"], "expires_days": 1 }),
+    )
+    .await;
     let twin_token = twin["url"]
         .as_str()
         .and_then(|url| url.rsplit('/').next())
