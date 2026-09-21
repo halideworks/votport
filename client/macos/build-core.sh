@@ -29,8 +29,8 @@ version=$(sed -n 's/^version = "\(.*\)"$/\1/p' core/Cargo.toml | head -1)
 case "$version" in
     "" | *[!0-9.]*) echo "error: no plain version in core/Cargo.toml" >&2; exit 1 ;;
 esac
-sed -i '' "s/^        MARKETING_VERSION: \".*\"/        MARKETING_VERSION: \"$version\"/" project.yml
-grep -Fq "MARKETING_VERSION: \"$version\"" project.yml || {
+sed -i '' "s/^        MARKETING_VERSION: \".*\"/        MARKETING_VERSION: \"$version\"/" "$here/project.yml"
+grep -Fq "MARKETING_VERSION: \"$version\"" "$here/project.yml" || {
     echo "error: failed to stamp MARKETING_VERSION in project.yml" >&2
     exit 1
 }
