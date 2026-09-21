@@ -6996,6 +6996,63 @@ async fn a_second_library_grant_while_one_prepares_is_refused_until_it_settles()
     assert_eq!(snapshot["status"], "complete");
 }
 
+/// A preparation whose job never settles (dead NAS I/O) is dropped by the
+/// sweep once it passes the stale cap, which frees the session's 409 slot;
+/// the zombie's late cleanup then fails itself without touching the slot of
+/// the preparation that replaced it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stalled_preparation_frees_its_session_slot_after_the_stale_cap() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = crate::api::testing::build(directory.path());
+    let identity = auth::AdminIdentity {
+        subject: "local".to_owned(),
+        tenant: "acme".to_owned(),
+        role: "admin".to_owned(),
+        grants: vec![],
+        credential_version: 1,
+    };
+    let key = ("acme".to_owned(), "local".to_owned());
+
+    let stalled = begin_grant_preparation(&app, &identity).unwrap();
+    let refusal = match begin_grant_preparation(&app, &identity) {
+        Err(error) => error,
+        Ok(_) => panic!("a session with a live preparation must be refused"),
+    };
+    assert_eq!(refusal.status, StatusCode::CONFLICT);
+
+    stalled.created_at.store(
+        now_unix().saturating_sub(PREPARATION_STALE_SECS + 1),
+        Ordering::Relaxed,
+    );
+    {
+        let mut registry = app.grant_preparations.lock().unwrap();
+        sweep_preparations(&mut registry);
+        assert!(registry.by_id.is_empty(), "stale preparation is dropped");
+        assert!(registry.in_flight.is_empty(), "the 409 slot is freed");
+    }
+
+    let retry = begin_grant_preparation(&app, &identity).unwrap();
+    assert_ne!(retry.id, stalled.id);
+
+    // The zombie finally settles and cleans up: its own id no longer owns
+    // the slot, so the retry's slot survives.
+    stalled.fail(
+        StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+        "late zombie".to_owned(),
+    );
+    {
+        let mut registry = app.grant_preparations.lock().unwrap();
+        release_preparation_slot(&mut registry, &key, &stalled.id);
+        assert_eq!(
+            registry.in_flight.get(&key).map(String::as_str),
+            Some(retry.id.as_str()),
+            "the zombie cleanup keeps the newer preparation's slot"
+        );
+        release_preparation_slot(&mut registry, &key, &retry.id);
+        assert!(registry.in_flight.is_empty());
+    }
+}
+
 /// Hashed library roots consult the sidecar cache: a first grant misses and
 /// populates it, an unchanged source (same size and mtime) hits, and a
 /// content rewrite with a bumped mtime misses again and stores the new root.

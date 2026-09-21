@@ -5,9 +5,11 @@
 //! `(tenant, source path, size, mtime) -> root` after a successful hash and
 //! lets [`super::hash_library_file`] skip the re-read when all three key
 //! parts still match, the same invalidation rule build systems use. A
-//! content change that keeps size and mtime is not caught here; the
-//! per-download integrity checks stay the last word, which is exactly the
-//! pre-cache behavior for a file mutated after grant creation.
+//! content change that keeps size and mtime is not caught here - realistic
+//! on NAS exports with coarse mtime granularity, where two writes can land
+//! in one timestamp tick; the per-download integrity checks stay the last
+//! word and fail closed, which is exactly the pre-cache behavior for a file
+//! mutated after grant creation.
 //!
 //! Storage follows the `outbound.proofs` precedent: a small file under
 //! `data_dir`, never the main schema. Eviction is by age
@@ -116,10 +118,25 @@ impl RootCache {
             },
         );
         if state.entries.len() > ROOT_CACHE_MAX_ENTRIES {
-            let mut ages: Vec<u64> = state.entries.values().map(|e| e.cached_at).collect();
-            ages.sort_unstable();
-            let cutoff = ages[ages.len() / 8];
-            state.entries.retain(|_, entry| entry.cached_at > cutoff);
+            // Drop exactly an eighth of the entries, oldest first with a key
+            // tie-break: a `>` cutoff on cached_at would wipe every entry
+            // sharing the cutoff second, and bulk folder hashes land in one
+            // now_unix() second.
+            let evict = state.entries.len() / 8;
+            let mut order: Vec<(u64, &String)> = state
+                .entries
+                .iter()
+                .map(|(key, entry)| (entry.cached_at, key))
+                .collect();
+            order.sort_unstable();
+            let victims: Vec<String> = order[..evict]
+                .iter()
+                .map(|(_, key)| (*key).clone())
+                .collect();
+            drop(order);
+            for key in victims {
+                state.entries.remove(&key);
+            }
         }
         state.dirty = true;
     }
@@ -228,6 +245,15 @@ mod tests {
         cache.insert("acme", path, 4, 100, "ab".repeat(32));
         cache.persist();
         assert!(directory.path().join("outbound-roots.json").is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(directory.path().join("outbound-roots.json"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "the sidecar stays operator-only");
+        }
 
         // A fresh instance over the same data dir replays the entry.
         let reloaded = RootCache::new(directory.path());
@@ -289,5 +315,27 @@ mod tests {
             cache.insert("acme", path, index as u64, index as u64, "ab".repeat(32));
         }
         assert!(cache.state.lock().unwrap().entries.len() <= ROOT_CACHE_MAX_ENTRIES + 1);
+    }
+
+    /// A folder hash lands thousands of inserts in one now_unix() second;
+    /// eviction must drop exactly an eighth of them, not every entry that
+    /// shares the cutoff timestamp.
+    #[test]
+    fn bulk_same_second_eviction_keeps_the_fresh_majority() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = RootCache::new(directory.path());
+        let path = Path::new("/library/project/a.bin");
+        for index in 0..=(ROOT_CACHE_MAX_ENTRIES as u64) {
+            cache.insert("acme", path, index, index, "ab".repeat(32));
+        }
+        let state = cache.state.lock().unwrap();
+        let crossings = ROOT_CACHE_MAX_ENTRIES + 1;
+        assert_eq!(state.entries.len(), crossings - crossings / 8);
+        assert!(state.entries.contains_key(&cache_key(
+            "acme",
+            path,
+            ROOT_CACHE_MAX_ENTRIES as u64,
+            ROOT_CACHE_MAX_ENTRIES as u64
+        )));
     }
 }
