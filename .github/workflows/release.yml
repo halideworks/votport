@@ -105,7 +105,11 @@ jobs:
           ref: ${{ github.sha }}
 
       - name: Install Rust 1.97
-        run: rustup toolchain install 1.97 --profile minimal && rustup default 1.97
+        run: |
+          rustup toolchain install 1.97 --profile minimal && rustup default 1.97
+          # The core builds a universal XCFramework: both Apple targets need
+          # their rust-std, and the minimal profile ships the host's only.
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - name: Install cmake and xcodegen
         run: brew install cmake xcodegen
@@ -173,7 +177,12 @@ jobs:
         run: |
           $env:PATH = "C:\Program Files\NASM;" + $env:PATH
           .\build-core.ps1
-          dotnet build Votport\Votport.csproj -c Release -p:Platform=x64 -p:WindowsPackageType=MSIX -p:GenerateAppxPackageOnBuild=true
+          # The runner image's 10.x SDK swallows the WinAppSDK restore error
+          # (MSB4181 with no message); global.json pins 8.0 and this restore
+          # surfaces any remaining failure with its actual text.
+          dotnet --list-sdks
+          dotnet restore Votport\Votport.csproj -p:Platform=x64 --verbosity normal
+          dotnet build Votport\Votport.csproj -c Release -p:Platform=x64 -p:WindowsPackageType=MSIX -p:GenerateAppxPackageOnBuild=true --no-restore
           $msix = Get-ChildItem -Recurse -Filter "Votport_*.msix" | Where-Object { $_.FullName -notmatch "Dependencies" } | Select-Object -First 1
           Copy-Item $msix.FullName "votport-$env:VERSION-windows-x64.msix"
 
