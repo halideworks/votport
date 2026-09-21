@@ -1,0 +1,31 @@
+# Vulnerabilities in the Debian stable base image's packages, not in
+# VOTPort. The runtime stage runs one server binary plus curl for its
+# healthcheck: none of these packages' vulnerable code paths (mount,
+# nsenter, pam login, perl, the sqlite shell, ncurses) execute here, and
+# Debian has not published fixed packages for any of them yet. Each entry
+# is dropped when a base digest carrying its fix is available.
+CVE-2025-69720
+CVE-2026-11822
+CVE-2026-11824
+CVE-2026-12064
+CVE-2026-13221
+CVE-2026-16742
+CVE-2026-41992
+CVE-2026-42496
+CVE-2026-42497
+CVE-2026-48962
+CVE-2026-54369
+CVE-2026-57432
+CVE-2026-57433
+CVE-2026-76642
+CVE-2026-78408
+CVE-2026-78409
+CVE-2026-78410
+CVE-2026-8286
+CVE-2026-8376
+CVE-2026-8458
+CVE-2026-86145
+CVE-2026-89157
+CVE-2026-89161
+CVE-2026-8927
+CVE-2026-9538
