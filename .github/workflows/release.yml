@@ -119,10 +119,17 @@ jobs:
         run: |
           sh build-core.sh
           xcodegen generate
-          # The XCFramework holds one arm64 slice; a Release build would
-          # otherwise also ask for x86_64 and find no library for it.
+          # The published app targets Apple silicon; the bundled CLI is universal.
           xcodebuild -project Votport.xcodeproj -scheme Votport -configuration Release \
             -derivedDataPath build ARCHS=arm64 CODE_SIGN_IDENTITY=- build
+
+      - name: Verify the built app version
+        working-directory: client/macos
+        run: |
+          set -eu
+          app=build/Build/Products/Release/Votport.app
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "${RELEASE_TAG#v}"
+          test "$("$app/Contents/Resources/votport-cli" --version)" = "votport ${RELEASE_TAG#v}"
 
       # Developer ID signing and notarization go here once the identity is
       # in the repository secrets: codesign --deep --options runtime, then

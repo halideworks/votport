@@ -29,6 +29,8 @@ targets:
     info:
       path: Votport/Info.plist
       properties:
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         CFBundleName: Votport
         CFBundleDisplayName: votport
         LSMinimumSystemVersion: "14.0"
@@ -45,7 +47,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.halideworks.votport
         # The core's version, stamped here by build-core.sh so the app and
         # the core it links never disagree; XcodeGen's 1.0/1 must not ship.
-        MARKETING_VERSION: "0.1.1"
+        MARKETING_VERSION: "0.1.2"
         CURRENT_PROJECT_VERSION: "1"
         # Votport/Assets.xcassets, rendered by scripts/app-icon.py.
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
