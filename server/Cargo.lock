@@ -4979,7 +4979,7 @@ dependencies = [
  "argon2",
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "ed25519-dalek",
  "futures-util",
@@ -5034,7 +5034,7 @@ dependencies = [
 name = "votport-client-core"
 version = "0.1.2"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "ed25519-dalek",
  "fs4",
  "hex",
