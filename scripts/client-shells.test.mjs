@@ -170,3 +170,10 @@ test('every link entry path admits only a bare http or https origin (audit findi
   assert.match(core, /matches!\(url\.scheme\(\), "http" \| "https"\)[\s\S]*url\.query\(\)\.is_none\(\)[\s\S]*url\.fragment\(\)\.is_none\(\)/);
   assert.match(core, /!bare_origin\(base\)/);
 });
+
+test('editing a desktop link clears the previous preview before checking the replacement', async () => {
+  const mac = await read('client/macos/Votport/LinkPreviewer.swift');
+  const windows = await read('client/windows/Votport/LinkPreviewer.cs');
+  assert.match(mac, /current = trimmed\s+preview = nil\s+guard !trimmed\.isEmpty/);
+  assert.match(windows, /timer\.Stop\(\);\s+Preview = null;\s+if \(current\.Length == 0\)/);
+});

@@ -11,13 +11,13 @@ export { copyToClipboard };
 
 export async function api(path, options = {}) {
   const response = await fetch(path, {
+    credentials: 'same-origin',
+    ...options,
     headers: {
       'Content-Type': 'application/json',
       'X-Votport': '1',
       ...(options.headers || {}),
     },
-    credentials: 'same-origin',
-    ...options,
   });
   let body = null;
   try { body = await response.json(); } catch { /* non-JSON error page */ }

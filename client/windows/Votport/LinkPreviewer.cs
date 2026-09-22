@@ -37,9 +37,9 @@ public sealed class LinkPreviewer
     {
         current = link.Trim();
         timer.Stop();
+        Preview = null;
         if (current.Length == 0)
         {
-            Preview = null;
             Checking = false;
             changed();
             return;

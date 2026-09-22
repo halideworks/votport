@@ -71,8 +71,15 @@ pub fn dir() -> PathBuf {
     state_dir().join("journal")
 }
 
-fn path_of(dir: &std::path::Path, id: &str) -> PathBuf {
-    dir.join(format!("{id}.json"))
+fn path_of(dir: &std::path::Path, id: &str) -> Result<PathBuf> {
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(Error::UnknownTransfer { id: id.to_owned() });
+    }
+    Ok(dir.join(format!("{id}.json")))
 }
 
 /// A fresh id: the start time and 64 random bits, so two transfers started
@@ -181,7 +188,7 @@ fn write_in(dir: &std::path::Path, entry: &Entry) -> Result<()> {
     protect_directory(dir)?;
     let bytes = serde_json::to_vec_pretty(entry)
         .map_err(|error| Error::Other(format!("encoding a journal entry: {error}")))?;
-    crate::identity::write_private(&path_of(dir, &entry.id), &bytes)
+    crate::identity::write_private(&path_of(dir, &entry.id)?, &bytes)
 }
 
 /// Forgets the pending send entries that name exactly `path`: a watch drop
@@ -204,7 +211,9 @@ pub fn forget(id: &str) {
 }
 
 fn forget_in(dir: &std::path::Path, id: &str) {
-    let _ = fs::remove_file(path_of(dir, id));
+    if let Ok(path) = path_of(dir, id) {
+        let _ = fs::remove_file(path);
+    }
 }
 
 /// The journalled transfers, oldest first. An entry that cannot be read is
@@ -225,7 +234,10 @@ fn pending_in(dir: &std::path::Path) -> Vec<Entry> {
         .filter_map(std::result::Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-        .filter_map(|path| serde_json::from_slice(&fs::read(path).ok()?).ok())
+        .filter_map(|path| {
+            let entry: Entry = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+            (path_of(dir, &entry.id).ok()? == path).then_some(entry)
+        })
         .collect();
     entries.sort_by(|a, b| a.started_unix.cmp(&b.started_unix).then(a.id.cmp(&b.id)));
     let now = SystemTime::now()
@@ -250,15 +262,65 @@ pub fn get(id: &str) -> Result<Entry> {
 }
 
 fn get_in(dir: &std::path::Path, id: &str) -> Result<Entry> {
+    let path = path_of(dir, id)?;
     let bytes = protect_directory(dir)
-        .and_then(|()| fs::read(path_of(dir, id)))
+        .and_then(|()| fs::read(path))
         .map_err(|_| Error::UnknownTransfer { id: id.to_owned() })?;
-    serde_json::from_slice(&bytes).map_err(|_| Error::UnknownTransfer { id: id.to_owned() })
+    let entry: Entry =
+        serde_json::from_slice(&bytes).map_err(|_| Error::UnknownTransfer { id: id.to_owned() })?;
+    if entry.id != id {
+        return Err(Error::UnknownTransfer { id: id.to_owned() });
+    }
+    Ok(entry)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn journal_ids_cannot_escape_the_directory_or_retarget_an_entry() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("journal");
+        fs::create_dir(&dir).unwrap();
+        let mut entry = Entry {
+            id: "outside".into(),
+            kind: Kind::Receive,
+            link: "https://drop.example/s/DEL".into(),
+            paths: Vec::new(),
+            dest: None,
+            needs_password: false,
+            http: None,
+            started_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        };
+        let outside = home.path().join("outside.json");
+        let original = serde_json::to_vec(&entry).unwrap();
+        fs::write(&outside, &original).unwrap();
+        for id in ["../outside", "..\\outside", "", ".", "..", "C:outside"] {
+            assert!(get_in(&dir, id).is_err(), "{id}");
+            forget_in(&dir, id);
+            entry.id = id.into();
+            assert!(write_in(&dir, &entry).is_err(), "{id}");
+            assert_eq!(fs::read(&outside).unwrap(), original);
+        }
+        entry.id = home.path().join("outside").display().to_string();
+        assert!(get_in(&dir, &entry.id).is_err());
+        forget_in(&dir, &entry.id);
+        assert!(write_in(&dir, &entry).is_err());
+        assert_eq!(fs::read(&outside).unwrap(), original);
+        fs::write(dir.join("safe.json"), serde_json::to_vec(&entry).unwrap()).unwrap();
+        assert!(pending_in(&dir).is_empty());
+        assert!(get_in(&dir, "safe").is_err());
+        entry.id = "safe".into();
+        write_in(&dir, &entry).unwrap();
+        assert_eq!(get_in(&dir, "safe").unwrap(), entry);
+        assert_eq!(pending_in(&dir), vec![entry]);
+        forget_in(&dir, "safe");
+        assert!(!dir.join("safe.json").exists());
+    }
 
     #[test]
     fn a_recorded_entry_is_pending_until_forgotten_and_a_broken_file_is_skipped() {
@@ -290,12 +352,15 @@ mod tests {
         };
         fs::create_dir_all(&dir).unwrap();
         let retained = serde_json::to_vec(&first).unwrap();
-        fs::write(path_of(&dir, &first.id), &retained).unwrap();
+        fs::write(path_of(&dir, &first.id).unwrap(), &retained).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(path_of(&dir, &first.id), fs::Permissions::from_mode(0o644))
-                .unwrap();
+            fs::set_permissions(
+                path_of(&dir, &first.id).unwrap(),
+                fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
             for lookup in ["pending", "get"] {
                 fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
                 let entries = if lookup == "pending" {
@@ -309,7 +374,10 @@ mod tests {
                     0o700,
                     "{lookup} must protect existing journal credentials"
                 );
-                assert_eq!(fs::read(path_of(&dir, &first.id)).unwrap(), retained);
+                assert_eq!(
+                    fs::read(path_of(&dir, &first.id).unwrap()).unwrap(),
+                    retained
+                );
             }
             fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
         }
@@ -320,7 +388,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
             for entry in [&first, &second] {
                 assert_eq!(
-                    fs::metadata(path_of(&dir, &entry.id))
+                    fs::metadata(path_of(&dir, &entry.id).unwrap())
                         .unwrap()
                         .permissions()
                         .mode()

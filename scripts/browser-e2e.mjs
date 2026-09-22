@@ -1246,6 +1246,9 @@ if (title !== "Signature verified") {
 }
 let okClass = await page.$eval("#verify-result", (el) => el.classList.contains("ok"));
 if (okClass) throw new Error("sidecar-only check must not be .ok");
+if (!(await page.textContent("#verify-list .file-id")).startsWith("blake3:")) {
+  throw new Error("receipt identity must use the canonical hash-suite name");
+}
 
 await page.click("#reset");
 await page.setInputFiles("#payload-input", payloadPath);

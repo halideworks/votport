@@ -15,8 +15,8 @@ override=$repo/docker-compose.override.yml
 sha=${1:?usage: scripts/deploy.sh <git-sha-on-main>}
 short=${sha:0:7}
 image=votport-local:audit-$short
-version=$(awk -F'"' '/^version = /{print $2; exit}' "$repo/server/Cargo.toml")
-evidence="/nvme-mirror/temp/claude/tmp/votport-audit-deploy-$short-evidence"
+version=$(git -C "$repo" show "$sha:server/Cargo.toml" | awk -F'"' '/^version = /{print $2; exit}')
+evidence="${TMPDIR:-/tmp}/votport-audit-deploy-$short-evidence"
 host_port=$(docker port votport 2>/dev/null | awk -F' -> ' '/127.0.0.1/{split($2,a,":"); print a[length(a)]; exit}')
 
 [ "$(git -C "$repo" merge-base --is-ancestor "$sha" origin/main && echo yes)" = yes ] || {
@@ -28,10 +28,10 @@ previous_main=$(awk '/^# Deployed main /{print $4}' "$override")
 
 mkdir -p "$evidence"
 echo "== build $image (version $version) =="
-docker build -t "$image" \
+git -C "$repo" archive "$sha" | docker build -t "$image" \
   --build-arg "VOTPORT_VERSION=$version" \
   --build-arg "VOTPORT_REVISION=$sha" \
-  "$repo" > "$evidence/image-build.log" 2>&1
+  - > "$evidence/image-build.log" 2>&1
 image_id=$(docker image inspect "$image" --format '{{.Id}}')
 echo "image $image_id"
 
@@ -72,7 +72,7 @@ host=$(printf '%s' "$public_url" | sed -E 's#https://##')
 code=$(curl -s --resolve "$host:443:127.0.0.1" -o /dev/null -w '%{http_code} %{ssl_verify_result}' -m 8 "https://$host/")
 [ "$code" = "200 0" ] || fail "public path: $code"
 served=$(curl -s --resolve "$host:443:127.0.0.1" -m 8 "https://$host/assets/object-card.js" | sha256sum | cut -d' ' -f1)
-local=$(sha256sum "$repo/web/assets/object-card.js" | cut -d' ' -f1)
+local=$(git -C "$repo" show "$sha:web/assets/object-card.js" | sha256sum | cut -d' ' -f1)
 [ "$served" = "$local" ] || fail "served asset differs from repo"
 
 cat > "$evidence/deploy-summary.txt" <<EOF
