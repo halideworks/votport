@@ -21,7 +21,9 @@ self.onmessage = async ({ data: message }) => {
     if (op === 'hash') {
       const { file } = message;
       const size = BigInt(file.size);
-      const builder = new ObjectBuilder(Suite.Blake3Bao64, size, size);
+      const suite = message.suite ?? Suite.Blake3Bao64;
+      if (suite !== Suite.Blake3Bao64 && suite !== Suite.Sha256Bep52) throw new Error('unsupported hash suite');
+      const builder = new ObjectBuilder(suite, size, size);
       const readAt = (offset) =>
         file.slice(offset, Math.min(offset + HASH_READ_BYTES, file.size)).arrayBuffer();
       let offset = 0;

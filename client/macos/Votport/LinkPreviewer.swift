@@ -25,8 +25,8 @@ final class LinkPreviewer: ObservableObject {
         pending?.cancel()
         pending = nil
         current = trimmed
+        preview = nil
         guard !trimmed.isEmpty else {
-            preview = nil
             checking = false
             return
         }

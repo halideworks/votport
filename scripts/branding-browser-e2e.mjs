@@ -14,6 +14,16 @@ const api = apiClient(context, base);
 try {
   await api('admin/login', { password: process.env.ADMIN_PASSWORD });
   await page.goto(`${base}/system#branding`);
+  await openAncestors(page.locator('#branding-logo-upload'));
+  await page.setInputFiles('#branding-logo', {
+    name: 'logo.png', mimeType: 'image/png',
+    buffer: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l9sAAAAASUVORK5CYII=', 'base64'),
+  });
+  await page.click('#branding-logo-upload');
+  await page.locator('#branding-note').getByText('Logo uploaded.', { exact: true }).waitFor();
+  assert.equal((await api('admin/branding/default')).has_logo, true);
+  await page.click('#branding-logo-remove');
+  await page.locator('#branding-note').getByText('Logo removed.', { exact: true }).waitFor();
   await page.fill('#branding-footer-text', 'Studio delivery <help>');
   await page.fill('#branding-footer-link-label', 'Privacy policy');
   await page.fill('#branding-footer-link-url', 'https://studio.example/privacy#terms');

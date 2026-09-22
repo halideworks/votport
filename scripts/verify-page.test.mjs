@@ -11,7 +11,7 @@ const verifyScript = await readFile(new URL('../web/assets/verify.js', import.me
 test('the verify page verifies the receipt signature in-tab with the vendored wasm', () => {
   assert.match(
     verifyScript,
-    /import init, \{\s*ErrorCode,\s*verifyReceiptEd25519,\s*\} from '\/assets\/vendor\/vot_wasm\.js';/,
+    /import init, \{\s*ErrorCode,\s*SubjectKind,\s*verifyReceiptEd25519,\s*\} from '\/assets\/vendor\/vot_wasm\.js';/,
   );
   assert.match(verifyScript, /wasmReady \?\?= init\(\);/);
   assert.match(
@@ -22,7 +22,7 @@ test('the verify page verifies the receipt signature in-tab with the vendored wa
 
 test('the verify verdict needs the signature and the locally hashed root, never a server answer', () => {
   assert.match(verifyScript, /const signedRoot = toHex\(subject\.root\);/);
-  assert.match(verifyScript, /const match = signedRoot === root && signedLength === length;/);
+  assert.match(verifyScript, /const match = subject\.suite === done\.suite && signedRoot === root && signedLength === length;/);
   assert.match(verifyScript, /title: match \? 'Verified' : 'Does not match'/);
   // The old flow took its verdict from POST /api/verify; that must not return.
   assert.doesNotMatch(verifyScript, /\/api\/verify/);

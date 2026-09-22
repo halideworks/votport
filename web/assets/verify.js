@@ -7,6 +7,7 @@
 import { $, appendObjectCard, formatBytes } from '/assets/object-card.js';
 import init, {
   ErrorCode,
+  SubjectKind,
   verifyReceiptEd25519,
 } from '/assets/vendor/vot_wasm.js';
 
@@ -45,6 +46,8 @@ function reportIgnored(count) {
 
 function clearError() {
   $('verify-error').hidden = true;
+  $('verify-result').hidden = true;
+  $('reset').hidden = true;
 }
 
 function renderSlots() {
@@ -73,6 +76,7 @@ function renderSlots() {
 // One payload plus one sidecar per Check; anything else dropped on the zone
 // is named so the sender knows it was not checked.
 function takeFiles(files) {
+  if (checking) return 0;
   let ignored = 0;
   for (const file of files) {
     if (!sidecarFile && file.name.endsWith('.vot-receipt')) {
@@ -90,6 +94,7 @@ function takeFiles(files) {
 
 function setChecking(active) {
   checking = active;
+  for (const control of $('verify-form').querySelectorAll('button, input')) control.disabled = active;
   $('check').textContent = active ? 'Verifying…' : 'Verify receipt';
   renderSlots();
 }
@@ -104,7 +109,7 @@ function showResult({ ok, title, file, bytes, next, suite, root, observedAt }) {
   list.replaceChildren();
   appendObjectCard(
     list,
-    { name: file, suite, root },
+    { name: file, suite: suite === 0 ? 'blake3' : 'sha256', root },
     {
       tag: 'li',
       rowClass: ok ? 'done' : '',
@@ -139,7 +144,7 @@ function reset() {
 // hash-worker.js posts {req, step} per 8 MiB read and only the final message
 // carries done: {suite, root (Uint8Array), length (bigint)}. Steps drive no
 // UI here beyond the button state; a check is short relative to an upload.
-function hashPayload(file) {
+function hashPayload(file, suite) {
   return new Promise((resolve, reject) => {
     const worker = new Worker('/assets/hash-worker.js', { type: 'module' });
     worker.onmessage = ({ data }) => {
@@ -157,7 +162,7 @@ function hashPayload(file) {
       worker.terminate();
       reject(new Error('local verification failed'));
     };
-    worker.postMessage({ op: 'hash', req: 1, key: 'verify', file });
+    worker.postMessage({ op: 'hash', req: 1, key: 'verify', file, suite });
   });
 }
 
@@ -171,16 +176,21 @@ function hexBytes(text) {
 }
 
 async function check() {
+  if (checking || !sidecarFile) return;
   clearError();
   setChecking(true);
   try {
-    await runCheck();
+    await runCheck(payloadFile, sidecarFile);
   } finally {
     setChecking(false);
   }
 }
 
-async function runCheck() {
+async function runCheck(payloadFile, sidecarFile) {
+  if (sidecarFile.size > 64 * 1024) {
+    showError('This receipt exceeds the 64 KiB limit.');
+    return;
+  }
   const key = await receiptKey;
   if (!key) {
     showError('This port’s receipt key is unavailable. Reload the page and try again.');
@@ -226,9 +236,13 @@ async function runCheck() {
     return;
   }
 
+  if (receipt.subjectKind !== SubjectKind.Object) {
+    showError('This receipt has a valid signature, but it describes a package rather than a single file.');
+    return;
+  }
   let done;
   try {
-    done = await hashPayload(payloadFile);
+    done = await hashPayload(payloadFile, subject.suite);
   } catch {
     showError('Could not read the file. Pick it again.');
     return;
@@ -237,7 +251,7 @@ async function runCheck() {
   const length = Number(done.length);
   // Verified only when the root signed in the receipt is the root hashed in
   // this tab; nothing the server answers can produce a Verified card.
-  const match = signedRoot === root && signedLength === length;
+  const match = subject.suite === done.suite && signedRoot === root && signedLength === length;
   showResult({
     ok: match,
     title: match ? 'Verified' : 'Does not match',

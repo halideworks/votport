@@ -54,7 +54,7 @@ jobs:
       - name: Tests
         run: |
           cargo test --locked
-          cargo test --locked --lib -- --ignored --exact session::push_tests::dormant_staging_preserves_ranges_and_cleans_up_under_low_descriptor_limit
+          cargo test --locked --lib -- --ignored --exact session::tests::push_tests::dormant_staging_preserves_ranges_and_cleans_up_under_low_descriptor_limit
 
   client:
     runs-on: ubuntu-24.04
