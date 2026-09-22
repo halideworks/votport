@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
+import { runInNewContext } from 'node:vm';
 
 const request = await readFile(new URL('../web/request.html', import.meta.url), 'utf8');
 const receive = await readFile(new URL('../web/receive.html', import.meta.url), 'utf8');
@@ -67,7 +68,7 @@ test('recipient pages identify their request and receipt contexts', () => {
   assert.match(uploadScript, /document\.title = 'VOTPort · Request unavailable'/);
 });
 
-test('admin confirmation dialogs expose their shared title and detail', () => {
+test('admin confirmation dialogs expose their shared title and detail', async () => {
   for (const page of [receive, deliver, tenants, audit, system]) {
     const dialog = page.match(/<dialog id="confirm"[^>]*>/)?.[0];
     assert.ok(dialog, 'confirm dialog present');
@@ -80,17 +81,40 @@ test('admin confirmation dialogs expose their shared title and detail', () => {
       assert.match(page, new RegExp(`id="${id}"`), `${attribute} reference resolves`);
     }
   }
-  assert.match(commonScript, /document\.getElementById\('confirm-title'\)\.textContent = title/);
-  assert.match(commonScript, /document\.getElementById\('confirm-detail'\)\.textContent = detail/);
-  assert.match(commonScript, /document\.getElementById\('confirm-title'\)\.textContent = 'Something went wrong'/);
-  assert.match(commonScript, /document\.getElementById\('confirm-detail'\)\.textContent = message/);
+  const dialog = Object.assign(new EventTarget(), { showModal() {} });
+  const elements = new Map([['confirm', dialog]]);
+  const getElementById = (id) => {
+    if (!elements.has(id)) elements.set(id, {});
+    return elements.get(id);
+  };
+  const { confirmModal, alertModal } = runInNewContext(
+    commonScript.slice(commonScript.indexOf('function showModal('), commonScript.indexOf('export { formatAgo')).replaceAll('export function', 'function') + '\n({ confirmModal, alertModal })',
+    { document: { getElementById } },
+  );
+  alertModal('Failure detail');
+  assert.equal(getElementById('confirm-title').textContent, 'Something went wrong');
+  assert.equal(getElementById('confirm-detail').textContent, 'Failure detail');
+  assert.equal(getElementById('confirm-ok').hidden, true);
+  assert.equal(getElementById('confirm-cancel').textContent, 'OK');
+  for (const accepted of [true, false]) {
+    const result = confirmModal('Delete file', 'Cannot undo', 'Delete');
+    assert.equal(getElementById('confirm-title').textContent, 'Delete file');
+    assert.equal(getElementById('confirm-detail').textContent, 'Cannot undo');
+    assert.equal(getElementById('confirm-ok').textContent, 'Delete');
+    assert.equal(getElementById('confirm-ok').hidden, false);
+    assert.equal(getElementById('confirm-cancel').textContent, 'Cancel');
+    assert.equal(dialog.returnValue, 'cancel');
+    if (accepted) dialog.returnValue = 'ok';
+    dialog.dispatchEvent(new Event('close'));
+    assert.equal(await result, accepted);
+  }
 });
 
 test('accessible controls keep names, focus cues, and quiet list updates', () => {
   assert.match(verify, /id="pick-payload"[^>]+aria-label="Browse for file"[^>]+aria-describedby="payload-name"/);
   assert.match(verify, /id="pick-sidecar"[^>]+aria-label="Browse for receipt"[^>]+aria-describedby="sidecar-name"/);
-  assert.match(deliverScript, /row\.className = 'library-file'/);
-  assert.match(deliverScript, /label\.className = 'library-file-name'/);
+  assert.match(deliverScript, /node\('div', '', 'library-file'\)/);
+  assert.match(deliverScript, /node\('label', '', 'library-file-name'\)/);
   assert.match(deliverScript, /label\.append\(checkbox, name\)/);
   assert.match(style, /input:focus-visible,[\s\S]+outline: 2px solid var\(--progress\)/);
   assert.match(style, /#tenant-switcher:focus-visible[\s\S]+outline: 2px solid var\(--progress\)/);

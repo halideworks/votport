@@ -3,7 +3,7 @@ import { notificationEditor, notificationDetails, uploadEvents, workflowEvents }
 // votport receive page: issue request links and manage received files.
 // VOTPORT PROPRIETARY LICENSE.
 
-import { $, appendObjectCard, fieldError } from '/assets/object-card.js';
+import { node, $, appendObjectCard, fieldError } from '/assets/object-card.js';
 import { deleteStoredFiles } from '/assets/delete-stored-files.js';
 import { narrate, outcomeWords, summarize } from '/assets/timeline.js';
 import { startStatusPoll } from '/assets/status-strip.js';
@@ -22,6 +22,7 @@ import {
   revealHash,
   selectText,
   showGrantResult,
+  teachingEmptyState,
   undoable,
 } from '/assets/admin-common.js';
 
@@ -130,18 +131,12 @@ async function openTimeline(link, upload, trigger) {
   const stats = $('timeline-stats');
   stats.replaceChildren();
   const cell = (label, value, note) => {
-    const box = document.createElement('div');
-    box.className = 'stat';
-    const head = document.createElement('span');
-    head.className = 'stat-label';
-    head.textContent = label;
-    const strong = document.createElement('strong');
-    strong.textContent = value;
+    const box = node('div', '', 'stat');
+    const head = node('span', label, 'stat-label');
+    const strong = node('strong', value);
     box.append(head, strong);
     if (note) {
-      const small = document.createElement('span');
-      small.className = 'muted';
-      small.textContent = note;
+      const small = node('span', note, 'muted');
       box.append(small);
     }
     return box;
@@ -159,25 +154,20 @@ async function openTimeline(link, upload, trigger) {
   for (const event of upload.log || []) {
     const row = document.createElement('li');
     row.dataset.kind = event.kind;
-    const when = document.createElement('span');
-    when.className = 'when mono';
-    when.textContent = formatAgo(event.at);
+    const when = node('span', formatAgo(event.at), 'when mono');
     when.title = formatWhen(event.at);
     const text = document.createElement('span');
     const line = narrate(event);
     text.textContent = line.text;
     row.append(when, text);
     if (line.detail) {
-      const detail = document.createElement('span');
-      detail.className = 'detail';
-      detail.textContent = line.detail;
+      const detail = node('span', line.detail, 'detail');
       row.append(detail);
     }
     events.append(row);
   }
   if (!events.firstChild) {
-    const row = document.createElement('li');
-    row.textContent = 'This transfer predates the timeline; only its record is known.';
+    const row = node('li', 'This transfer predates the timeline; only its record is known.');
     events.append(row);
   }
   const download = $('timeline-download');
@@ -264,10 +254,8 @@ function renderUpload(link, upload) {
   // A hold being released is still a hold until the window closes.
   const held = link.legal_hold || pendingLinks.get(link.id)?.legal_hold === false;
 
-  const head = document.createElement('div');
-  head.className = 'upload-head';
-  const when = document.createElement('span');
-  when.textContent = formatAgo(upload.completed_at);
+  const head = node('div', '', 'upload-head');
+  const when = node('span', formatAgo(upload.completed_at));
   when.title = formatWhen(upload.completed_at);
   when.textContent += ` · ${formatBytes(upload.total_bytes)}`;
   // started_at is 0 on records from before it was tracked.
@@ -277,8 +265,7 @@ function renderUpload(link, upload) {
       ` · ${formatDuration(seconds)} · ${formatBytes(Math.round(upload.total_bytes / seconds))}/s`;
   }
   when.textContent += chunkTrouble(upload);
-  const transport = document.createElement('span');
-  transport.className = 'badge';
+  const transport = node('span', '', 'badge');
   transport.textContent = upload.transport === 'push' ? 'native push' : 'http';
   head.append(when, transport);
   head.append(button('Files and timeline', 'tiny ghost', (control) => openTimeline(link, upload, control)));
@@ -293,8 +280,7 @@ function renderUpload(link, upload) {
     }));
   }
   if (upload.partial) {
-    const partial = document.createElement('span');
-    partial.className = 'badge off';
+    const partial = node('span', '', 'badge off');
     partial.title = 'The session ended before the sender confirmed the transfer; only the files that were received are listed.';
     partial.textContent = 'partial';
     head.append(partial);
@@ -322,9 +308,7 @@ function renderUpload(link, upload) {
   }
   item.append(head);
 
-  const root = document.createElement('div');
-  root.className = 'mono muted file-id';
-  root.textContent = `package ${upload.package_root}`;
+  const root = node('div', `package ${upload.package_root}`, 'mono muted file-id');
   item.append(root);
   return item;
 }
@@ -335,14 +319,12 @@ function renderFile(link, upload, file) {
   const held = link.legal_hold || pendingLinks.get(link.id)?.legal_hold === false;
     const extras = [];
     if (!file.exists) {
-      const missing = document.createElement('span');
-      missing.className = 'badge off';
+      const missing = node('span', '', 'badge off');
       missing.textContent = 'missing';
       extras.push(missing);
     }
     if (file.receipt) {
-      const receipt = document.createElement('span');
-      receipt.className = 'badge on';
+      const receipt = node('span', '', 'badge on');
       receipt.textContent = 'receipt';
       extras.push(receipt);
     }
@@ -472,22 +454,6 @@ let linksExpanded = false;
 // A search result deep-links with the request's id as the list filter.
 let linksFilter = { search: new URLSearchParams(window.location.search).get('search') || '', status: '' };
 
-/// Three-step primer shown in place of an empty list.
-function teachingEmptyState(title, steps) {
-  const box = document.createElement('div');
-  box.className = 'empty-teach';
-  const heading = document.createElement('h3');
-  heading.textContent = title;
-  const list = document.createElement('ol');
-  for (const step of steps) {
-    const item = document.createElement('li');
-    item.textContent = step;
-    list.append(item);
-  }
-  box.append(heading, list);
-  return box;
-}
-
 // Live "Receiving now" line on a request card, from the status poll. `now`
 // is the server's clock, the same one that stamped started_at.
 function applyReceiving(card, transfers, now = null) {
@@ -592,32 +558,25 @@ function renderLink(link) {
     link = { ...link, ...pending };
     if (pending.active !== undefined) link.usable = pending.active && !expired;
   }
-  const card = document.createElement('div');
-  card.className = 'card link-item';
+  const card = node('div', '', 'card link-item');
   card.id = `link-${link.id}`;
 
-  const head = document.createElement('div');
-  head.className = 'head';
-  const title = document.createElement('h3');
-  title.textContent = link.label;
+  const head = node('div', '', 'head');
+  const title = node('h3', link.label);
   const badge = document.createElement('span');
   badge.className = `badge ${link.usable ? 'on' : 'off'}`;
   badge.textContent = linkStatusNames[link.usable ? 'open' : link.active ? 'expired' : 'closed'];
   head.append(title, badge);
   if (link.has_password) {
-    const lock = document.createElement('span');
-    lock.className = 'badge';
-    lock.textContent = 'password';
+    const lock = node('span', 'password', 'badge');
     head.append(lock);
   }
   if (receiveAdministrator) {
     const retention = document.createElement('details');
     retention.setAttribute('data-unsaved', '');
-    const retentionSummary = document.createElement('summary');
-    retentionSummary.textContent = 'Upload retention';
+    const retentionSummary = node('summary', 'Upload retention');
     retention.append(retentionSummary);
-    const retentionLabel = document.createElement('label');
-    retentionLabel.textContent = 'Retention days ';
+    const retentionLabel = node('label', 'Retention days ');
     const retentionInput = document.createElement('input');
     retentionInput.type = 'number';
     retentionInput.min = '1';
@@ -625,8 +584,7 @@ function renderLink(link) {
     retentionInput.placeholder = 'platform default';
     retentionInput.value = link.retention_days ?? '';
     retentionLabel.append(retentionInput);
-    const retentionNote = document.createElement('p');
-    retentionNote.className = 'muted';
+    const retentionNote = node('p', '', 'muted');
     retentionNote.setAttribute('role', 'status');
     const saveRetention = button('Save retention', 'ghost', async () => {
       saveRetention.disabled = true;
@@ -644,20 +602,17 @@ function renderLink(link) {
     card.append(retention);
   }
   if (link.legal_hold) {
-    const hold = document.createElement('span');
-    hold.className = 'badge';
+    const hold = node('span', '', 'badge');
     hold.textContent = 'legal hold';
     head.append(hold);
   }
   card.append(head);
 
-  const url = document.createElement('p');
-  url.className = 'mono';
+  const url = node('p', '', 'mono');
   url.textContent = link.url;
   card.append(url);
 
-  const meta = document.createElement('p');
-  meta.className = 'muted';
+  const meta = node('p', '', 'muted');
   const parts = [
     `to /${link.dest || ''}`.replace(/\/$/, '') || 'to receive root',
     `created ${formatWhen(link.created_at)}`,
@@ -688,8 +643,7 @@ function renderLink(link) {
     card.append(details);
   }
   // Filled in by the status poll while a sender is shipping into this link.
-  const receiving = document.createElement('p');
-  receiving.className = 'receiving-now';
+  const receiving = node('p', '', 'receiving-now');
   receiving.hidden = true;
   card.dataset.linkId = link.id;
   card.append(receiving);
@@ -701,24 +655,18 @@ function renderLink(link) {
     },
   }));
   if (link.legal_hold) {
-    const holdNote = document.createElement('p');
-    holdNote.className = 'muted';
-    holdNote.textContent = 'Manual deletion of stored files and transfer history is disabled and the retention sweep is suspended while this request is under legal hold.';
+    const holdNote = node('p', 'Manual deletion of stored files and transfer history is disabled and the retention sweep is suspended while this request is under legal hold.', 'muted');
     card.append(holdNote);
   } else if (receiveAdministrator) {
-    const holdHint = document.createElement('p');
-    holdHint.className = 'muted';
-    holdHint.textContent = 'Legal hold blocks manual deletion and suspends the retention sweep until released.';
+    const holdHint = node('p', 'Legal hold blocks manual deletion and suspends the retention sweep until released.', 'muted');
     card.append(holdHint);
   }
 
   // Lazily-loaded QR of the request link, toggled from the actions row.
-  const qr = document.createElement('div');
-  qr.className = 'qr';
+  const qr = node('div', '', 'qr');
   qr.hidden = true;
 
-  const actions = document.createElement('div');
-  actions.className = 'actions';
+  const actions = node('div', '', 'actions');
   const copy = button('Copy', 'tiny', () => copyToClipboard(copy, link.url));
   copy.setAttribute('aria-label', `Copy request link: ${link.label}`);
   const qrButton = button('QR', 'tiny ghost', async () => {
@@ -824,19 +772,16 @@ function renderLink(link) {
       if (details.open) openLinks.add(`${link.id}:events`);
       else openLinks.delete(`${link.id}:events`);
     });
-    const summary = document.createElement('summary');
-    summary.textContent = `${link.events.length} incomplete session${link.events.length === 1 ? '' : 's'}`;
+    const summary = node('summary', `${link.events.length} incomplete session${link.events.length === 1 ? '' : 's'}`);
     details.append(summary);
-    const list = document.createElement('ul');
-    list.className = 'uploads';
+    const list = node('ul', '', 'uploads');
     let built = false;
     details.addEventListener('toggle', () => {
       if (!details.open || built) return;
       built = true;
     for (const event of [...link.events].reverse()) {
       const item = document.createElement('li');
-      const eventHead = document.createElement('div');
-      eventHead.className = 'upload-head';
+      const eventHead = node('div', '', 'upload-head');
       let text = `${formatWhen(event.at)} · ${outcomeWords[event.outcome] ?? event.outcome}`;
       if (event.at > event.started_at) {
         text += ` after ${formatDuration(event.at - event.started_at)}`;
@@ -845,8 +790,7 @@ function renderLink(link) {
       text += chunkTrouble(event);
       eventHead.textContent = text;
       item.append(eventHead);
-      const detail = document.createElement('div');
-      detail.className = 'muted file-id';
+      const detail = node('div', '', 'muted file-id');
       detail.textContent = event.detail;
       item.append(detail);
       list.append(item);
@@ -922,9 +866,7 @@ async function refreshLinksInner({ append, fromPoll }) {
   if (!append) container.replaceChildren();
   if (!append && !links.length) {
     if (linksFilter.search || linksFilter.status) {
-      const empty = document.createElement('p');
-      empty.className = 'muted';
-      empty.textContent = 'No matching requests.';
+      const empty = node('p', 'No matching requests.', 'muted');
       container.append(empty);
     } else {
       container.append(teachingEmptyState('How receiving works', [

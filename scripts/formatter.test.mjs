@@ -107,7 +107,7 @@ test('462: stamps drop seconds and relative ages carry the absolute nearby', asy
   assert.match(audit, /formatAgo\(row\.at\)/);
   assert.match(audit, /when\.title = formatWhen\(row\.at\)/);
   const receive = await read('web/assets/page-receive.js');
-  assert.match(receive, /when\.textContent = formatAgo\(event\.at\);\n\s*when\.title = formatWhen\(event\.at\);/);
+  assert.match(receive, /node\('span', formatAgo\(event\.at\), 'when mono'\);\n\s*when\.title = formatWhen\(event\.at\);/);
   assert.match(receive, /when\.title = formatWhen\(upload\.completed_at\)/);
   assert.doesNotMatch(receive, /toLocaleTimeString\(\)/);
 });

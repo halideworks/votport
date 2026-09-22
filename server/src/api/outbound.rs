@@ -1715,22 +1715,11 @@ fn library_directory_paging(
             "cursor does not belong to this directory",
         ));
     }
-    let limit = raw_limit
-        .map(str::parse)
-        .transpose()
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "limit must be an integer between 1 and 1000",
-            )
-        })?
-        .unwrap_or(MAX_LIBRARY_DIRECTORY_ENTRIES);
-    if !(1..=MAX_LIBRARY_DIRECTORY_ENTRIES).contains(&limit) {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "limit must be between 1 and 1000",
-        ));
-    }
+    let limit = super::page_limit(
+        raw_limit,
+        MAX_LIBRARY_DIRECTORY_ENTRIES,
+        MAX_LIBRARY_DIRECTORY_ENTRIES,
+    )?;
     Ok((after.to_owned(), limit))
 }
 
@@ -2001,42 +1990,8 @@ pub struct OutboundGrantsQuery {
 }
 
 fn outbound_grants_paging(query: OutboundGrantsQuery) -> ApiResult<(usize, usize)> {
-    let limit = query
-        .limit
-        .as_deref()
-        .map(str::parse)
-        .transpose()
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "limit must be an integer between 1 and 100",
-            )
-        })?
-        .unwrap_or(50usize);
-    if !(1..=100).contains(&limit) {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "limit must be between 1 and 100",
-        ));
-    }
-    let offset = query
-        .offset
-        .as_deref()
-        .map(str::parse)
-        .transpose()
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "offset must be a non-negative integer",
-            )
-        })?
-        .unwrap_or(0usize);
-    if i64::try_from(offset).is_err() {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "offset is too large",
-        ));
-    }
+    let limit = super::page_limit(query.limit.as_deref(), 50, 100)?;
+    let offset = super::page_offset(query.offset.as_deref())?;
     Ok((limit, offset))
 }
 
@@ -3762,42 +3717,8 @@ fn outbound_metadata_paging(query: OutboundMetadataQuery) -> ApiResult<Option<(u
     if query.offset.is_none() && query.limit.is_none() {
         return Ok(None);
     }
-    let limit = query
-        .limit
-        .as_deref()
-        .map(str::parse)
-        .transpose()
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "limit must be an integer between 1 and 500",
-            )
-        })?
-        .unwrap_or(100usize);
-    if !(1..=500).contains(&limit) {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "limit must be between 1 and 500",
-        ));
-    }
-    let offset = query
-        .offset
-        .as_deref()
-        .map(str::parse)
-        .transpose()
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "offset must be a non-negative integer",
-            )
-        })?
-        .unwrap_or(0usize);
-    if i64::try_from(offset).is_err() {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "offset is too large",
-        ));
-    }
+    let limit = super::page_limit(query.limit.as_deref(), 100, 500)?;
+    let offset = super::page_offset(query.offset.as_deref())?;
     Ok(Some((offset, limit)))
 }
 

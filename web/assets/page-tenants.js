@@ -14,7 +14,7 @@ import {
   requireSession,
 } from '/assets/admin-common.js';
 import { searchDebounce } from '/assets/search-debounce.js';
-import { $, fieldError } from '/assets/object-card.js';
+import { node, $, fieldError } from '/assets/object-card.js';
 
 const PRINCIPAL_PAGE_SIZE = 50;
 // Page size follows the server convention (50 default, 100 max); the list
@@ -59,8 +59,7 @@ function nullableStorageBytes(value) {
 
 function editTenantForm(tenant) {
   const details = document.createElement('details');
-  const summary = document.createElement('summary');
-  summary.textContent = 'Edit namespace';
+  const summary = node('summary', 'Edit namespace');
   summary.setAttribute('aria-label', `Edit namespace: ${tenant.key}`);
   details.append(summary);
   const form = document.createElement('form'); form.setAttribute('data-unsaved', '');
@@ -73,12 +72,10 @@ function editTenantForm(tenant) {
     ['Concurrent uploads', 'max_sessions', tenant.max_sessions ?? '', 'number'],
     ['Retention days', 'retention_days', tenant.retention_days ?? '', 'number'],
   ];
-  const grid = document.createElement('div');
-  grid.className = 'grid';
+  const grid = node('div', '', 'grid');
   const inputs = {};
   for (const [label, key, value, type] of fields) {
-    const wrapper = document.createElement('label');
-    wrapper.textContent = label;
+    const wrapper = node('label', label);
     const input = document.createElement('input');
     input.type = type;
     input.value = value;
@@ -93,8 +90,7 @@ function editTenantForm(tenant) {
   const save = document.createElement('button');
   save.type = 'submit';
   save.textContent = 'Save';
-  const error = document.createElement('p');
-  error.className = 'error';
+  const error = node('p', '', 'error');
   error.setAttribute('role', 'alert');
   error.id = `tenant-quota-error-${tenant.key}`;
   error.hidden = true;
@@ -122,8 +118,7 @@ function editTenantForm(tenant) {
       quotaError.show(requestError.message);
     } finally { save.disabled = false; form.inert = false; }
   });
-  const actions = document.createElement('div');
-  actions.className = 'actions';
+  const actions = node('div', '', 'actions');
   actions.append(save);
   form.append(grid, actions, error);
   details.append(form);
@@ -133,22 +128,18 @@ function editTenantForm(tenant) {
 function brandingForm(tenant, { open = false } = {}) {
   const key = encodeURIComponent(tenant.key === '' ? 'default' : tenant.key);
   const details = document.createElement('details');
-  const summary = document.createElement('summary');
-  summary.textContent = 'Branding';
+  const summary = node('summary', 'Branding');
   details.append(summary);
   const form = document.createElement('form'); form.setAttribute('data-unsaved', ''); form.inert = true;
   form.className = 'tenant-edit';
-  const grid = document.createElement('div');
-  grid.className = 'grid';
+  const grid = node('div', '', 'grid');
 
-  const nameLabel = document.createElement('label');
-  nameLabel.textContent = 'Brand name';
+  const nameLabel = node('label', 'Brand name');
   const nameInput = document.createElement('input');
   nameInput.type = 'text';
   nameLabel.append(nameInput);
 
-  const colorLabel = document.createElement('label');
-  colorLabel.textContent = 'Accent color';
+  const colorLabel = node('label', 'Accent color');
   const colorInput = document.createElement('input');
   colorInput.type = 'color';
   colorInput.setAttribute('aria-label', 'Pick accent color');
@@ -161,14 +152,12 @@ function brandingForm(tenant, { open = false } = {}) {
   hexInput.maxLength = 7;
   hexInput.autocomplete = 'off';
   hexInput.spellcheck = false;
-  const pair = document.createElement('div');
-  pair.className = 'color-pair';
+  const pair = node('div', '', 'color-pair');
   pair.append(colorInput, hexInput);
   colorLabel.append(pair);
   const accent = colorPair(colorInput, hexInput);
 
-  const logoLabel = document.createElement('label');
-  logoLabel.textContent = 'Logo (PNG, JPEG, or SVG, 512 KiB max)';
+  const logoLabel = node('label', 'Logo (PNG, JPEG, or SVG, 512 KiB max)');
   const logoInput = document.createElement('input');
   logoInput.type = 'file';
   logoInput.accept = 'image/png,image/jpeg,image/svg+xml';
@@ -185,8 +174,7 @@ function brandingForm(tenant, { open = false } = {}) {
   const save = document.createElement('button');
   save.type = 'submit';
   save.textContent = 'Save branding';
-  const error = document.createElement('p');
-  error.className = 'error';
+  const error = node('p', '', 'error');
   error.setAttribute('role', 'alert');
   error.id = `tenant-branding-error-${key}`;
   error.hidden = true;
@@ -235,8 +223,7 @@ function brandingForm(tenant, { open = false } = {}) {
     } finally { save.disabled = false; form.inert = false; }
   });
 
-  const actions = document.createElement('div');
-  actions.className = 'actions';
+  const actions = node('div', '', 'actions');
   actions.append(
     save,
     button('Upload logo', 'ghost', async () => {
@@ -282,18 +269,13 @@ function renderTenant(tenant, usage) {
   const card = document.createElement('div');
   card.className = 'card link-item'; card.dataset.tenant = tenant.key;
 
-  const head = document.createElement('div');
-  head.className = 'head';
-  const title = document.createElement('h3');
-  title.textContent = tenant.key === '' ? 'Default' : tenant.key;
-  const badge = document.createElement('span');
-  badge.className = 'badge';
-  badge.textContent = tenant.label || 'namespace';
+  const head = node('div', '', 'head');
+  const title = node('h3', tenant.key === '' ? 'Default' : tenant.key);
+  const badge = node('span', tenant.label || 'namespace', 'badge');
   head.append(title, badge);
   card.append(head);
 
-  const meta = document.createElement('p');
-  meta.className = 'muted';
+  const meta = node('p', '', 'muted');
   const parts = [
     `created ${formatWhen(tenant.created_at)}`,
     `${formatBytes(usage?.received_bytes || 0)} received · ${usage?.links || 0} links`,
@@ -305,8 +287,7 @@ function renderTenant(tenant, usage) {
   if (tenant.key !== '') card.append(editTenantForm(tenant), brandingForm(tenant));
 
   if (tenant.key !== '') {
-    const actions = document.createElement('div');
-    actions.className = 'actions';
+    const actions = node('div', '', 'actions');
     card.append(actions);
     actions.append(
       button('Delete', 'danger', async () => {
@@ -349,21 +330,15 @@ function grantText(grants) {
 }
 
 function renderPrincipal(principal) {
-  const card = document.createElement('div');
-  card.className = 'card link-item';
+  const card = node('div', '', 'card link-item');
 
-  const head = document.createElement('div');
-  head.className = 'head';
-  const title = document.createElement('h3');
-  title.textContent = principal.subject;
-  const badge = document.createElement('span');
-  badge.className = principal.blocked ? 'badge off' : 'badge on';
-  badge.textContent = principal.blocked ? 'blocked' : 'active';
+  const head = node('div', '', 'head');
+  const title = node('h3', principal.subject);
+  const badge = node('span', principal.blocked ? 'blocked' : 'active', principal.blocked ? 'badge off' : 'badge on');
   head.append(title, badge);
   card.append(head);
 
-  const meta = document.createElement('p');
-  meta.className = 'muted';
+  const meta = node('p', '', 'muted');
   const login = principal.last_login_at
     ? `last sign-in ${formatWhen(principal.last_login_at)}`
     : 'never signed in';
@@ -373,8 +348,7 @@ function renderPrincipal(principal) {
   meta.textContent = [login, groups, grantText(principal.grants)].join(' · ');
   card.append(meta);
 
-  const actions = document.createElement('div');
-  actions.className = 'actions';
+  const actions = node('div', '', 'actions');
   if (principal.blocked) {
     actions.append(
       button('Unblock', 'tiny', async () => {
@@ -461,9 +435,7 @@ function renderTenants(holdings) {
   const editing = new Map([...container.children].filter((card) => [...card.querySelectorAll('form')].some(isFormDirty)).map((card) => [card.dataset.tenant, card]));
   container.replaceChildren();
   if (!tenantRows.length) {
-    const empty = document.createElement('p');
-    empty.className = 'muted';
-    empty.textContent = 'No named tenants yet.';
+    const empty = node('p', 'No named tenants yet.', 'muted');
     container.append(empty);
   } else {
     for (const tenant of tenantRows) {
@@ -481,8 +453,7 @@ function renderPrincipals() {
   const filtered = $('principal-search').value.trim() !== '';
   list.replaceChildren();
   if (!principalRows.length) {
-    const empty = document.createElement('p');
-    empty.className = 'muted';
+    const empty = node('p', '', 'muted');
     empty.textContent = filtered
       ? 'No matching principals.'
       : 'No SSO principals have signed in yet.';

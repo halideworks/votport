@@ -265,14 +265,14 @@ impl Observer for EntryBridge<'_> {
     }
 }
 
-fn decode_digest(hex_digest: &str) -> Result<[u8; 32]> {
+pub(crate) fn decode_digest(hex_digest: &str) -> Result<[u8; 32]> {
     hex::decode(hex_digest)
         .ok()
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or_else(|| Error::Other(format!("{hex_digest:?} is not a 32-byte digest")))
 }
 
-fn base64_decode(value: &str) -> Result<Vec<u8>> {
+pub(crate) fn base64_decode(value: &str) -> Result<Vec<u8>> {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD
         .decode(value)

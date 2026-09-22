@@ -134,26 +134,6 @@ pub struct FilesQuery {
     limit: Option<String>,
 }
 
-fn page_limit(limit: Option<&str>) -> ApiResult<usize> {
-    let limit = limit
-        .map(str::parse)
-        .transpose()
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "limit must be an integer between 1 and 100",
-            )
-        })?
-        .unwrap_or(50);
-    if !(1..=100).contains(&limit) {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "limit must be between 1 and 100",
-        ));
-    }
-    Ok(limit)
-}
-
 pub async fn files(
     State(app): State<Arc<App>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
@@ -167,7 +147,7 @@ pub async fn files(
         .unwrap_or_else(|| token.directory.clone().unwrap_or_default());
     check_directory(&app, &token, &directory)?;
     let directory = directory.trim_matches('/').to_owned();
-    let limit = page_limit(query.limit.as_deref())?;
+    let limit = crate::api::page_limit(query.limit.as_deref(), 50, 100)?;
     let after = query.after.unwrap_or_default();
     if after.len() > MAX_LIBRARY_CURSOR_BYTES {
         return Err(ApiError::new(
@@ -457,7 +437,7 @@ pub async fn deliveries(
 ) -> ApiResult<Json<serde_json::Value>> {
     let (token, _) = authenticate(&app, &headers, peer, Some("deliveries:read"))?;
     let _operation = begin_outbound_operation(&app, &token.tenant)?;
-    let limit = page_limit(query.limit.as_deref())?;
+    let limit = crate::api::page_limit(query.limit.as_deref(), 50, 100)?;
     let after = query
         .after
         .as_deref()

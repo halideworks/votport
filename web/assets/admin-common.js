@@ -4,7 +4,7 @@ import { mountDrafts, confirmLeave } from '/assets/form-drafts.js';
 
 // Copying text with a Copied flash lives with the shared public helpers so
 // public pages need not import this admin module for it.
-import { copyToClipboard, formatAgo, formatBytes, formatDuration } from '/assets/object-card.js';
+import { node, copyToClipboard, formatAgo, formatBytes, formatDuration } from '/assets/object-card.js';
 import { createUndoQueue } from '/assets/undo.js';
 import { searchDebounce } from '/assets/search-debounce.js';
 export { copyToClipboard };
@@ -124,14 +124,12 @@ function mountSearch(session) {
   let resultCount = 0;
   const group = (title, rows, render) => {
     if (!rows.length) return;
-    const heading = document.createElement('div');
-    heading.className = 'search-group';
+    const heading = node('div', '', 'search-group');
     heading.setAttribute('role', 'presentation');
     heading.textContent = title;
     results.append(heading);
     for (const row of rows) {
-      const link = document.createElement('a');
-      link.className = 'search-row';
+      const link = node('a', '', 'search-row');
       link.id = `global-search-option-${optionNumber}`;
       optionNumber += 1;
       link.tabIndex = -1;
@@ -139,11 +137,8 @@ function mountSearch(session) {
       link.setAttribute('aria-selected', 'false');
       const { href, primary, secondary } = render(row);
       link.href = href;
-      const main = document.createElement('span');
-      main.textContent = primary;
-      const meta = document.createElement('span');
-      meta.className = 'muted';
-      meta.textContent = secondary;
+      const main = node('span', primary);
+      const meta = node('span', secondary, 'muted');
       link.append(main, meta);
       link.addEventListener('click', close);
       results.append(link);
@@ -161,8 +156,7 @@ function mountSearch(session) {
       if (ticket !== latest) return;
       setActive(-1);
       results.replaceChildren();
-      const failed = document.createElement('div');
-      failed.className = 'search-group';
+      const failed = node('div', '', 'search-group');
       failed.textContent = `Search failed: ${error.message}`;
       results.append(failed);
       setExpanded(true);
@@ -203,8 +197,7 @@ function mountSearch(session) {
       }));
     }
     if (!results.firstChild) {
-      const none = document.createElement('div');
-      none.className = 'search-group';
+      const none = node('div', '', 'search-group');
       none.setAttribute('role', 'presentation');
       none.textContent = 'Nothing matches';
       results.append(none);
@@ -371,34 +364,36 @@ function buildNav(session) {
   });
 }
 
-// Styled replacements for native confirm()/alert(), sharing the one
-// <dialog class="modal"> present on every admin page.
-export function confirmModal(title, detail, action) {
+function showModal(title, detail, action) {
   const dialog = document.getElementById('confirm');
   document.getElementById('confirm-title').textContent = title;
   document.getElementById('confirm-detail').textContent = detail;
   const ok = document.getElementById('confirm-ok');
-  ok.textContent = action;
-  ok.hidden = false;
-  document.getElementById('confirm-cancel').textContent = 'Cancel';
+  ok.textContent = action || '';
+  ok.hidden = !action;
+  document.getElementById('confirm-cancel').textContent = action ? 'Cancel' : 'OK';
   dialog.returnValue = 'cancel';
   dialog.showModal();
+  return dialog;
+}
+
+export function confirmModal(title, detail, action) {
+  const dialog = showModal(title, detail, action);
   return new Promise((resolve) => {
-    dialog.addEventListener(
-      'close',
-      () => resolve(dialog.returnValue === 'ok'),
-      { once: true },
-    );
+    dialog.addEventListener('close', () => resolve(dialog.returnValue === 'ok'), { once: true });
   });
 }
 
 export function alertModal(message) {
-  const dialog = document.getElementById('confirm');
-  document.getElementById('confirm-title').textContent = 'Something went wrong';
-  document.getElementById('confirm-detail').textContent = message;
-  document.getElementById('confirm-ok').hidden = true;
-  document.getElementById('confirm-cancel').textContent = 'OK';
-  dialog.showModal();
+  showModal('Something went wrong', message);
+}
+
+export function teachingEmptyState(title, steps) {
+  const box = node('div', '', 'empty-teach');
+  const list = document.createElement('ol');
+  list.append(...steps.map((step) => node('li', step)));
+  box.append(node('h3', title), list);
+  return box;
 }
 
 export { formatAgo, formatBytes, formatDuration };
@@ -464,10 +459,8 @@ toastStack();
 /// runs on Undo. Resolves with whether it committed, once settled.
 export function undoable({ text, commit, restore = () => {}, focus, returnFocus }) {
   const stack = toastStack();
-  const toast = document.createElement('div');
-  toast.className = 'toast';
-  const label = document.createElement('span');
-  label.textContent = text;
+  const toast = node('div', '', 'toast');
+  const label = node('span', text);
   const undo = document.createElement('button');
   undo.type = 'button';
   undo.className = 'link';

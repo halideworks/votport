@@ -24,11 +24,12 @@ import {
   revealHash,
   selectText,
   showGrantResult,
+  teachingEmptyState,
 } from '/assets/admin-common.js';
 import { preparationProgress } from '/assets/deliver-progress.js';
 import { startStatusPoll } from '/assets/status-strip.js';
 import { searchDebounce } from '/assets/search-debounce.js';
-import { $, fieldError } from '/assets/object-card.js';
+import { node, $, fieldError } from '/assets/object-card.js';
 
 const deliverError = fieldError($('deliver-label'), $('deliver-error'));
 const createNotifications = notificationEditor({ events: downloadEvents });
@@ -70,52 +71,34 @@ function renderGrants() {
     : '0 deliveries.';
   $('outbound-grants-load-more').hidden = !grantHasMore;
   if (!grants.length) {
-    const empty = document.createElement('div');
-    empty.className = 'empty-teach';
-    const heading = document.createElement('h3');
-    heading.textContent = 'How delivering works';
-    const steps = document.createElement('ol');
-    for (const text of [
+    container.append(teachingEmptyState('How delivering works', [
       'Add files to the library, or pick ones that already arrived.',
       'Issue a delivery link, with a password or expiry if you like.',
       'Recipients request verified files; each file request is recorded here.',
-    ]) {
-      const item = document.createElement('li');
-      item.textContent = text;
-      steps.append(item);
-    }
-    empty.append(heading, steps);
-    container.append(empty);
+    ]));
     return;
   }
   for (const grant of grants) {
-    const card = document.createElement('div');
-    card.className = 'card link-item';
+    const card = node('div', '', 'card link-item');
     card.id = `grant-${grant.id}`;
-    const head = document.createElement('div');
-    head.className = 'head';
-    const title = document.createElement('h3');
-    title.textContent = grant.label || 'Delivery';
+    const head = node('div', '', 'head');
+    const title = node('h3', grant.label || 'Delivery');
     const status = grantStatus(grant);
     const badge = document.createElement('span');
     badge.className = `badge ${status === 'active' ? 'on' : 'off'}`;
     badge.textContent = grantStatusNames[status];
     head.append(title, badge);
     if (grant.has_password) {
-      const protectedBadge = document.createElement('span');
-      protectedBadge.className = 'badge';
-      protectedBadge.textContent = 'protected';
+      const protectedBadge = node('span', 'protected', 'badge');
       head.append(protectedBadge);
     }
     card.append(head);
 
-    const name = document.createElement('p');
-    name.className = 'mono';
+    const name = node('p', '', 'mono');
     name.textContent = grant.name;
     card.append(name);
 
-    const meta = document.createElement('p');
-    meta.className = 'muted';
+    const meta = node('p', '', 'muted');
     const expiry = `expires ${formatWhen(grant.expires_at)}`;
     const downloads = grant.downloads ?? 0;
     const downloadSummary = Number.isFinite(grant.max_downloads)
@@ -138,21 +121,14 @@ function renderGrants() {
     }));
 
     if (grant.files_truncated) {
-      const summary = document.createElement('p');
-      summary.className = 'muted';
-      summary.textContent = `${Number(grant.file_count).toLocaleString()} files in this delivery.`;
+      const summary = node('p', `${Number(grant.file_count).toLocaleString()} files in this delivery.`, 'muted');
       card.append(summary);
     } else if (Array.isArray(grant.files) && grant.files.length > 1) {
-      const files = document.createElement('ul');
-      files.className = 'uploads';
+      const files = node('ul', '', 'uploads');
       for (const file of grant.files) {
-        const item = document.createElement('li');
-        item.className = 'upload-file';
-        const fileName = document.createElement('span');
-        fileName.className = 'mono';
-        fileName.textContent = file.name;
-        const fileMeta = document.createElement('span');
-        fileMeta.className = 'muted';
+        const item = node('li', '', 'upload-file');
+        const fileName = node('span', file.name, 'mono');
+        const fileMeta = node('span', '', 'muted');
         const fileDownloads = file.downloads ?? 0;
         const fileParts = [
           `${fileDownloads} file request${fileDownloads === 1 ? '' : 's'}`,
@@ -171,8 +147,7 @@ function renderGrants() {
     }
 
     if (status !== 'revoked') {
-      const actions = document.createElement('div');
-      actions.className = 'actions';
+      const actions = node('div', '', 'actions');
       if (status === 'active') {
         const copyLink = button('Copy link', 'tiny', async (control) => {
           control.disabled = true;
@@ -273,9 +248,7 @@ async function refreshGrants(reset = true) {
     await sessionReady; renderGrants();
   } catch (error) {
     if (reset || !grantRows.length) {
-      const message = document.createElement('p');
-      message.className = 'muted';
-      message.textContent = 'Deliveries could not be loaded.';
+      const message = node('p', 'Deliveries could not be loaded.', 'muted');
       if ($('outbound-grants').contains(document.activeElement)) {
         announce('outbound-grants-status', message.textContent);
         $('outbound-grants-status').focus({ preventScroll: true });
@@ -517,18 +490,12 @@ function renderLibraryBreadcrumbs() {
 }
 
 function renderLibraryFile(file, container, showPath = false) {
-  const row = document.createElement('div');
-  row.className = 'library-file';
-  const label = document.createElement('label');
-  label.className = 'library-file-name';
+  const row = node('div', '', 'library-file');
+  const label = node('label', '', 'library-file-name');
   const checkbox = selectionCheckbox(file);
   checkbox.value = file.path;
-  const name = document.createElement('span');
-  name.className = 'mono';
-  name.textContent = showPath ? file.path : file.path.slice(file.path.lastIndexOf('/') + 1);
-  const size = document.createElement('span');
-  size.className = 'muted';
-  size.textContent = formatBytes(file.bytes);
+  const name = node('span', showPath ? file.path : file.path.slice(file.path.lastIndexOf('/') + 1), 'mono');
+  const size = node('span', formatBytes(file.bytes), 'muted');
   if (!deliverAdministrator) {
     checkbox.disabled = true;
     label.append(checkbox, name);
@@ -575,8 +542,7 @@ function renderLibraryDirectory(directory, container) {
   });
   open.setAttribute('aria-label', `Open folder ${name}`);
   open.title = name;
-  const row = document.createElement('div');
-  row.className = 'library-file library-folder';
+  const row = node('div', '', 'library-file library-folder');
   row.append(select, open);
   container.append(row);
 }
@@ -587,8 +553,7 @@ function renderLibraryView() {
   const container = $('library-files');
   container.replaceChildren();
   if (libraryError) {
-    const message = document.createElement('p');
-    message.className = 'error';
+    const message = node('p', '', 'error');
     message.setAttribute('role', 'alert');
     message.textContent = libraryError;
     container.append(message);
@@ -597,14 +562,10 @@ function renderLibraryView() {
   if (query) {
     for (const file of libraryFiles) renderLibraryFile(file, container, true);
     if (libraryTruncated) {
-      const note = document.createElement('p');
-      note.className = 'muted';
-      note.textContent = 'Search incomplete. Refine your search or browse folders.';
+      const note = node('p', 'Search incomplete. Refine your search or browse folders.', 'muted');
       container.append(note);
     } else if (!libraryFiles.length) {
-      const empty = document.createElement('p');
-      empty.className = 'muted';
-      empty.textContent = 'No matching library files.';
+      const empty = node('p', 'No matching library files.', 'muted');
       container.append(empty);
     }
     return;
@@ -612,15 +573,11 @@ function renderLibraryView() {
   for (const directory of libraryDirectories) renderLibraryDirectory(directory, container);
   for (const file of libraryFiles) renderLibraryFile(file, container);
   if (libraryTruncated) {
-    const note = document.createElement('p');
-    note.className = 'muted';
-    note.textContent = 'More entries are available on the next page.';
+    const note = node('p', 'More entries are available on the next page.', 'muted');
     container.append(note);
   }
   if (!libraryDirectories.length && !libraryFiles.length) {
-    const empty = document.createElement('p');
-    empty.className = 'muted';
-    empty.textContent = 'No library files.';
+    const empty = node('p', 'No library files.', 'muted');
     container.append(empty);
   }
 }

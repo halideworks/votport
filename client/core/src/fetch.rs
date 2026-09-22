@@ -32,7 +32,7 @@ use crate::progress::{with_events, Event, Observer, PlannedFile, Transport, PROG
 use crate::receive::{
     local_path_of, require_space, reusable_file, write_verified, Delivery, Received, Resumed,
 };
-use crate::send_push::{direct_rails, probe_any, Probe};
+use crate::send_push::{base64_decode, decode_digest, direct_rails, probe_any, Probe};
 
 /// The resume store vot-cli writes inside a bundle while fetching and removes
 /// once the bundle is whole. Its presence means a fetch owns the stage.
@@ -959,20 +959,6 @@ fn link_verified_object_during_fetch(
 /// `package::layout::object_name`: the lowercase hex root with a `.obj` suffix.
 fn object_name(root: &[u8; 32]) -> String {
     format!("{}.obj", hex::encode(root))
-}
-
-fn decode_digest(hex_digest: &str) -> Result<[u8; 32]> {
-    hex::decode(hex_digest)
-        .ok()
-        .and_then(|bytes| bytes.try_into().ok())
-        .ok_or_else(|| Error::Other(format!("{hex_digest:?} is not a 32-byte digest")))
-}
-
-fn base64_decode(value: &str) -> Result<Vec<u8>> {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD
-        .decode(value)
-        .map_err(|error| Error::Other(format!("the capability is not valid base64: {error}")))
 }
 
 #[cfg(all(test, windows))]
