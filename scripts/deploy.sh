@@ -9,7 +9,8 @@
 # directory beside the other deploy records.
 set -Eeuo pipefail
 
-repo=$(cd "$(dirname "$0")/.." && pwd)
+# The production checkout when invoked from elsewhere (a worktree, a clone).
+repo=${VOTPORT_DEPLOY_REPO:-$(cd "$(dirname "$0")/.." && pwd)}
 override=$repo/docker-compose.override.yml
 sha=${1:?usage: scripts/deploy.sh <git-sha-on-main>}
 short=${sha:0:7}
@@ -40,18 +41,16 @@ python3 - "$override" "$sha" "$short" "$previous_image" <<'PYEOF'
 import sys
 path, sha, short, previous = sys.argv[1:5]
 lines = open(path).read().split('\n')
+comment = image = False
 for i, line in enumerate(lines):
     if line.startswith('# Deployed main '):
         lines[i] = f'# Deployed main {short} (from {sha}). Previous image: {previous}.'
-        break
-    if line.startswith('    image: votport-local:'):
+        comment = True
+    elif line.startswith('    image: votport-local:'):
         lines[i] = f'    image: votport-local:audit-{short}'
-        break
-else:
+        image = True
+if not (comment and image):
     sys.exit('override shape not recognised')
-for line in lines:
-    if line.startswith('    image: votport-local:') and not line.endswith(f'audit-{short}'):
-        sys.exit('multiple image lines; refusing')
 open(path, 'w').write('\n'.join(lines))
 PYEOF
 cp "$override" "$evidence/override-after.yml"
