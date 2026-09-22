@@ -1,6 +1,8 @@
 //! Explicit conversion of a stopped, disposable schema35 data copy.
 
 use super::*;
+#[cfg(test)]
+use crate::workflow::JobState;
 use crate::{auth, receipt::ReceiptSigner, workflow::Job};
 use ed25519_dalek::Signer as _;
 use rusqlite::{params, types::ValueRef};
@@ -590,7 +592,7 @@ fn convert_jobs(
                     || job.actor != row.get::<_, String>(2)?
                     || job.request.operation_id != row.get::<_, String>(3)?
                     || job.project.id != row.get::<_, String>(4)?
-                    || job.state != row.get::<_, String>(5)?
+                    || job.state.as_str() != row.get::<_, String>(5)?
                 {
                     return Err("workflow document disagrees with indexed authority".into());
                 }
@@ -920,7 +922,11 @@ mod tests {
             actor_human: None,
             request,
             project: project(),
-            state: if grant { "ready" } else { "queued" }.into(),
+            state: if grant {
+                JobState::Ready
+            } else {
+                JobState::Queued
+            },
             manifest: None,
             approved_by: Some("sso:approver".into()),
             attempts: 2,

@@ -117,7 +117,6 @@ test('list actions announce their outcome and copy buttons confirm', () => {
   // Every clipboard write goes through copyToClipboard so the button flips to Copied.
   assert.doesNotMatch(receiveScript, /navigator\.clipboard/);
   assert.doesNotMatch(deliverScript, /navigator\.clipboard/);
-  assert.match(commonScript, /export \{ copyToClipboard \}/);
 });
 
 test('repeated actions and help controls carry their context', () => {
@@ -300,17 +299,6 @@ test('status strip banners a failed health probe or a draining instance', async 
   assert.match(statusStrip, /banner\?\.remove\(\)/);
   assert.match(statusStrip, /renderHealth\(status\)/);
   assert.match(style, /\.status-health-banner/);
-});
-
-test('admin timestamps carry the UTC zone name, matching logs, receipts and the audit export', () => {
-  // Audit finding 405: formatWhen was a bare toLocaleString, so every admin
-  // timestamp rendered in an unlabelled browser-local zone while the server's
-  // logs, receipts and audit export all speak UTC.
-  assert.match(commonScript, /export function formatWhen\(unixSeconds\) \{/);
-  assert.match(
-    commonScript,
-    /\.toLocaleString\(\[\], \{\s*timeZone: 'UTC',\s*timeZoneName: 'short',\s*year: 'numeric',\s*month: 'short',\s*day: 'numeric',\s*hour: '2-digit',\s*minute: '2-digit',\s*\}\);/,
-  );
 });
 
 test('the receive-link transfer limit is decimal GB on the web like the desktops', () => {

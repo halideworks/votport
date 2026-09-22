@@ -1,5 +1,6 @@
 use super::*;
 use crate::api::outbound::workflows::storage::Storage;
+use crate::workflow::JobState;
 use crate::workflow::{Job, JobRequest, Project};
 use rusqlite::params;
 
@@ -158,7 +159,7 @@ pub(super) fn finish_job(
     let mut current = job_in(connection, &job.id)
         .map_err(|e| e.to_string())?
         .ok_or("job missing")?;
-    if current.state != "preparing"
+    if current.state != JobState::Preparing
         || current.attempts != job.attempts
         || current.project != job.project
     {
@@ -175,18 +176,17 @@ pub(super) fn finish_job(
     current.manifest = Some(manifest.into());
     current.updated_at = now_unix();
     current.state = if project.require_approval {
-        "awaiting_approval"
+        JobState::AwaitingApproval
     } else if !project.destinations.is_empty() {
-        "exporting"
+        JobState::Exporting
     } else {
-        "ready"
-    }
-    .into();
+        JobState::Ready
+    };
     current.checks = job.checks.clone();
     if !project.require_approval && project.release == crate::workflow::Release::Local {
         current.checks["released_at"] = serde_json::json!(current.updated_at);
     }
-    if current.state == "exporting" {
+    if current.state == JobState::Exporting {
         connection
             .execute("UPDATE delivery_jobs SET owner='' WHERE id=?1", [&job.id])
             .map_err(|e| e.to_string())?;
@@ -426,7 +426,11 @@ pub(super) fn queue_received(
         actor_human: None,
         request,
         project,
-        state: if error.is_some() { "failed" } else { "queued" }.into(),
+        state: if error.is_some() {
+            JobState::Failed
+        } else {
+            JobState::Queued
+        },
         manifest: None,
         approved_by: None,
         attempts: 0,
@@ -482,7 +486,7 @@ impl Store {
         let mut job = job_in(&tx, id)
             .map_err(|e| e.to_string())?
             .ok_or("job missing")?;
-        if job.state != "preparing" || job.attempts != attempt {
+        if job.state != JobState::Preparing || job.attempts != attempt {
             return Err("job changed during snapshot".into());
         }
         let reserved: i64 = tx.query_row("SELECT COALESCE(SUM(snapshot_bytes),0) FROM delivery_jobs WHERE tenant=?1 AND id<>?2",params![job.tenant,id],|row| row.get(0)).map_err(|e| e.to_string())?;
@@ -507,10 +511,10 @@ impl Store {
         let Some(mut job) = job else {
             return Ok(None);
         };
-        if job.state != "retiring" {
+        if job.state != JobState::Retiring {
             job.checks["retired_from"] = serde_json::json!(job.state);
         }
-        job.state = "retiring".into();
+        job.state = JobState::Retiring;
         job.checks["retirement_attempt_at"] = serde_json::json!(now);
         save_job(&tx, &job).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
@@ -523,10 +527,10 @@ impl Store {
         let Some(mut job) = job_in(&tx, id).map_err(|e| e.to_string())? else {
             return Ok(());
         };
-        if job.state != "retiring" {
+        if job.state != JobState::Retiring {
             return Err("job is not retiring".into());
         }
-        job.state = "retired".into();
+        job.state = JobState::Retired;
         job.updated_at = now;
         job.checks["snapshot_bytes"] = serde_json::json!(0);
         job.checks["snapshot_purged_at"] = serde_json::json!(now);
@@ -784,7 +788,7 @@ impl Store {
             .iter()
             .all(|id| job.checks["destinations"][id]["state"] == "complete")
         {
-            job.state = "ready".into();
+            job.state = JobState::Ready;
         }
         job.updated_at = now_unix();
         save_job(&tx, &job).map_err(|e| e.to_string())?;
@@ -999,7 +1003,7 @@ impl Store {
             actor_human,
             request,
             project,
-            state: "queued".into(),
+            state: JobState::Queued,
             manifest: None,
             approved_by: None,
             attempts: 0,
@@ -1100,16 +1104,15 @@ impl Store {
             return Ok(None);
         };
         job.state = if job.manifest.is_some() {
-            "exporting"
+            JobState::Exporting
         } else {
-            "preparing"
-        }
-        .into();
+            JobState::Preparing
+        };
         job.attempts += 1;
         job.updated_at = now;
         job.error = None;
         if retry_attempts(&job) > 5 {
-            job.state = "failed".into();
+            job.state = JobState::Failed;
             job.error = Some("job recovery limit reached; retry explicitly".into());
         }
         tx.execute(
@@ -1138,16 +1141,15 @@ impl Store {
         let Some(mut job) = job_in(&tx, id).map_err(|e| e.to_string())? else {
             return Ok(());
         };
-        if !["preparing", "exporting"].contains(&job.state.as_str()) || job.attempts != attempt {
+        if !job.state.running() || job.attempts != attempt {
             return Ok(());
         }
-        job.state = if job.state == "exporting" && retry_attempts(&job) < 5 {
-            "retrying"
+        job.state = if job.state == JobState::Exporting && retry_attempts(&job) < 5 {
+            JobState::Retrying
         } else {
-            "failed"
-        }
-        .into();
-        if job.state == "retrying" {
+            JobState::Failed
+        };
+        if job.state == JobState::Retrying {
             let retry_at = now_unix().saturating_add(30 * (1u64 << retry_attempts(&job).min(4)));
             job.checks["retry_at"] = serde_json::json!(retry_at);
             tx.execute(
@@ -1223,8 +1225,10 @@ impl Store {
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| WorkflowMutationError::conflict("replacement delivery missing"));
         }
-        if !["failed", "retrying", "awaiting_approval", "ready"].contains(&original.state.as_str())
-        {
+        if !matches!(
+            original.state,
+            JobState::Failed | JobState::Retrying | JobState::AwaitingApproval | JobState::Ready
+        ) {
             return Err(WorkflowMutationError::conflict(
                 "only an inactive prepared delivery can be reprocessed",
             ));
@@ -1301,7 +1305,7 @@ impl Store {
             request,
             checks: trade::snapshot(&tx, &identity.tenant, &project)?,
             project,
-            state: "queued".into(),
+            state: JobState::Queued,
             manifest: None,
             approved_by: None,
             attempts: 0,
@@ -1314,7 +1318,7 @@ impl Store {
         };
         actor_active(&tx, &replacement)?;
         check_job_source(&tx, &replacement)?;
-        original.state = "cancelled".into();
+        original.state = JobState::Cancelled;
         original.updated_at = now;
         original.reprocessed_as = Some(replacement.id.clone());
         save_job(&tx, &original).map_err(|e| e.to_string())?;
@@ -1358,7 +1362,7 @@ impl Store {
         let project = project_in(&tx, tenant, &job.project.id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| WorkflowMutationError::conflict("project missing"))?;
-        if job.state == "suspended" {
+        if job.state == JobState::Suspended {
             return Err(WorkflowMutationError::conflict(
                 "delivery is held after restore; create a new job",
             ));
@@ -1388,7 +1392,7 @@ impl Store {
                         job.actor
                     )));
                 }
-                if job.state != "awaiting_approval"
+                if job.state != JobState::AwaitingApproval
                     || job.manifest.as_deref() != manifest
                     || manifest.is_none()
                     || project.revision != job.project.revision
@@ -1404,11 +1408,10 @@ impl Store {
                     job.checks["released_at"] = serde_json::json!(now_unix());
                 }
                 job.state = if !project.destinations.is_empty() {
-                    "exporting"
+                    JobState::Exporting
                 } else {
-                    "ready"
-                }
-                .into();
+                    JobState::Ready
+                };
             }
             "cancel" => {
                 if !project.allows(actor, "sender", administrator) && actor != job.actor {
@@ -1416,15 +1419,15 @@ impl Store {
                         crate::workflow::permission_refusal("sender"),
                     ));
                 }
-                if ["retiring", "retired"].contains(&job.state.as_str()) {
+                if job.state.retiring() {
                     return Err(WorkflowMutationError::conflict(
                         "delivery is retiring or retired",
                     ));
                 }
-                if job.state == "cancelled" {
+                if job.state == JobState::Cancelled {
                     return Ok(job);
                 }
-                job.state = "cancelled".into();
+                job.state = JobState::Cancelled;
             }
             "retry" => {
                 if !project.allows(actor, "sender", administrator) && actor != job.actor {
@@ -1432,7 +1435,7 @@ impl Store {
                         crate::workflow::permission_refusal("sender"),
                     ));
                 }
-                if !["failed", "retrying"].contains(&job.state.as_str()) {
+                if !matches!(job.state, JobState::Failed | JobState::Retrying) {
                     return Err(WorkflowMutationError::conflict(
                         "only a failed job can retry",
                     ));
@@ -1465,11 +1468,10 @@ impl Store {
                 job.checks["first_failure_at"] = serde_json::Value::Null;
                 job.checks["retry_at"] = serde_json::Value::Null;
                 job.state = if job.manifest.is_some() {
-                    "exporting"
+                    JobState::Exporting
                 } else {
-                    "queued"
-                }
-                .into();
+                    JobState::Queued
+                };
             }
             _ => return Err(WorkflowMutationError::invalid("unknown job action")),
         }
@@ -1540,7 +1542,7 @@ impl Store {
         let project = project_in(&tx, tenant, &job.project.id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| WorkflowMutationError::conflict("project missing"))?;
-        if job.state == "suspended" {
+        if job.state == JobState::Suspended {
             return Err(WorkflowMutationError::conflict(
                 "delivery is held after restore; create a new job",
             ));
@@ -1550,7 +1552,10 @@ impl Store {
                 crate::workflow::permission_refusal("sender"),
             ));
         }
-        if ["cancelled", "retiring", "retired"].contains(&job.state.as_str()) {
+        if matches!(
+            job.state,
+            JobState::Cancelled | JobState::Retiring | JobState::Retired
+        ) {
             return Err(WorkflowMutationError::conflict(format!(
                 "a {} delivery cannot change recipients",
                 job.state
@@ -1606,7 +1611,10 @@ impl Store {
             .map_err(|e| e.to_string())?
             .filter(|job| job.tenant == tenant)
             .ok_or("job missing")?;
-        if ["retiring", "retired", "suspended"].contains(&job.state.as_str()) {
+        if matches!(
+            job.state,
+            JobState::Retiring | JobState::Retired | JobState::Suspended
+        ) {
             return Err("delivery is no longer active; create a new job".into());
         }
         if job.token_generation != generation {
@@ -1760,7 +1768,7 @@ fn export_in(connection: &Connection, id: &str, attempt: u64) -> Result<Job, Str
     let project = project_in(connection, &job.tenant, &job.project.id)
         .map_err(|e| e.to_string())?
         .ok_or("project missing")?;
-    if job.state != "exporting"
+    if job.state != JobState::Exporting
         || job.attempts != attempt
         || !job.project.same_delivery_policy(&project)
         || (project.require_approval && job.approved_by.is_none())
@@ -2080,7 +2088,7 @@ mod tests {
         // preparation fills in once enrollment finishes.
         let jobs = store.delivery_jobs("", "", 100, None, "", "").unwrap();
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].state, "queued");
+        assert_eq!(jobs[0].state, JobState::Queued);
         assert_eq!(
             jobs[0].checks["trade_routes"][&route.id]["permission"]["grant"],
             ""
@@ -2105,7 +2113,7 @@ mod tests {
             .find(|job| job.request.operation_id == upload.id)
             .unwrap();
         assert_eq!(failed.project.revision, updated.revision);
-        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.state, JobState::Failed);
         let retry = || store.change_delivery_job("", &failed.id, "admin", true, "retry", None);
         assert!(retry().unwrap_err().contains("metadata"));
         let mut corrected = workflow.clone();
@@ -2142,7 +2150,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store.delivery_job(&failed.id).unwrap().unwrap().state,
-            "failed"
+            JobState::Failed
         );
         let before =
             serde_json::to_value(store.delivery_job(&failed.id).unwrap().unwrap()).unwrap();
@@ -2184,7 +2192,7 @@ mod tests {
             2
         );
         let mut frozen = retried;
-        frozen.state = "failed".into();
+        frozen.state = JobState::Failed;
         frozen.manifest = Some("frozen-manifest".into());
         frozen.approved_by = Some("approver".into());
         frozen.checks["destinations"][&route.id] = serde_json::json!({"state":"complete"});
@@ -2406,7 +2414,7 @@ mod tests {
             "suspended",
         ] {
             let mut busy = original.clone();
-            busy.state = state.into();
+            busy.state = state.parse().unwrap();
             store.with(|c| save_job(c, &busy)).unwrap();
             assert!(attempt(&identity).is_err(), "{state}");
             assert_eq!(
@@ -2530,13 +2538,13 @@ mod tests {
             .complete_delivery_export(&original.id, original.attempts, "old", "late")
             .is_err());
         let mut stale = original.clone();
-        stale.state = "preparing".into();
+        stale.state = JobState::Preparing;
         assert!(store
             .insert_workflow_grant(grant(&stale), None, Some(&stale), None)
             .is_err());
         assert_eq!(
             store.delivery_job(&original.id).unwrap().unwrap().state,
-            "cancelled"
+            JobState::Cancelled
         );
         let running = store
             .claim_delivery_job("worker", now_unix())
@@ -2686,7 +2694,7 @@ mod tests {
             .with(|c| c.execute("DELETE FROM delivery_jobs WHERE id='busy_1000'", []))
             .unwrap();
         let mut pending = original.clone();
-        pending.state = "awaiting_approval".into();
+        pending.state = JobState::AwaitingApproval;
         store.with(|c| save_job(c, &pending)).unwrap();
         assert!(attempt().is_ok());
     }
@@ -2843,7 +2851,7 @@ mod tests {
         store.revoke_inbound_route("inbound", &revoke).unwrap();
         assert_eq!(
             store.delivery_job(&next.id).unwrap().unwrap().state,
-            "cancelled"
+            JobState::Cancelled
         );
         assert!(store
             .reprocess_received_job(
@@ -3347,7 +3355,7 @@ mod tests {
             .unwrap();
         for job in [&first, &second] {
             let mut record = job.clone();
-            record.state = "retiring".into();
+            record.state = JobState::Retiring;
             let connection = store.connection.lock().unwrap();
             save_job(&connection, &record).unwrap();
         }
@@ -3608,7 +3616,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store.delivery_job(&job.id).unwrap().unwrap().state,
-            "preparing"
+            JobState::Preparing
         );
         assert!(store
             .insert_workflow_grant(grant(&stale), None, Some(&stale), None)
@@ -3620,7 +3628,7 @@ mod tests {
             .insert_workflow_grant(grant(&job), None, Some(&job), None)
             .unwrap();
         let pending = store.delivery_job(&job.id).unwrap().unwrap();
-        assert_eq!(pending.state, "awaiting_approval");
+        assert_eq!(pending.state, JobState::AwaitingApproval);
         assert!(store.delivery_release(&job.id).is_err());
         let manifest = pending.manifest.as_deref();
         assert!(store
@@ -3638,7 +3646,7 @@ mod tests {
         assert_eq!(approved.approved_by.as_deref(), Some("approver"));
         assert_eq!(
             store.delivery_release(&job.id).unwrap().unwrap().state,
-            "ready"
+            JobState::Ready
         );
         store
             .rotate_delivery_job_token("", &job.id, 0, "rotated")
@@ -3983,7 +3991,7 @@ mod tests {
             .fail_delivery_job(job_id, attempt, "pin failure")
             .unwrap();
         let failed = store.delivery_job(job_id).unwrap().unwrap();
-        assert_eq!(failed.state, "retrying");
+        assert_eq!(failed.state, JobState::Retrying);
         assert_eq!(retry_attempts(&failed), attempt);
         let retry_at = failed.checks["retry_at"].as_u64().unwrap();
         let expected = before + 30 * (1u64 << attempt.min(4));
@@ -4024,7 +4032,7 @@ mod tests {
             .unwrap();
         assert_eq!(staged.attempts, 1);
         staged.manifest = Some("pin-manifest".into());
-        staged.state = "exporting".into();
+        staged.state = JobState::Exporting;
         store
             .with(|connection| save_job(connection, &staged))
             .unwrap();
@@ -4062,14 +4070,14 @@ mod tests {
                 .unwrap();
             assert_eq!(claimed.id, job.id);
             assert_eq!(claimed.attempts, expected);
-            assert_ne!(claimed.state, "failed");
+            assert_ne!(claimed.state, JobState::Failed);
         }
         let exhausted = store
             .claim_delivery_job("pin-b", now_unix())
             .unwrap()
             .unwrap();
         assert_eq!(exhausted.attempts, 6);
-        assert_eq!(exhausted.state, "failed");
+        assert_eq!(exhausted.state, JobState::Failed);
         assert_eq!(
             exhausted.error.as_deref(),
             Some("job recovery limit reached; retry explicitly")
@@ -4087,7 +4095,7 @@ mod tests {
             .unwrap()
             .unwrap();
         staged.manifest = Some("pin-manifest".into());
-        staged.state = "exporting".into();
+        staged.state = JobState::Exporting;
         store
             .with(|connection| save_job(connection, &staged))
             .unwrap();
@@ -4095,7 +4103,7 @@ mod tests {
             .fail_delivery_job(&job.id, staged.attempts, "pin failure")
             .unwrap();
         let failed = store.delivery_job(&job.id).unwrap().unwrap();
-        assert_eq!(failed.state, "retrying");
+        assert_eq!(failed.state, JobState::Retrying);
         let mut next_claim_at = failed.checks["retry_at"].as_u64().unwrap() + 1;
         for retry in 2u64..=4 {
             let claimed = store
@@ -4107,7 +4115,7 @@ mod tests {
                 .fail_delivery_job(&job.id, claimed.attempts, "pin failure")
                 .unwrap();
             let failed = store.delivery_job(&job.id).unwrap().unwrap();
-            assert_eq!(failed.state, "retrying");
+            assert_eq!(failed.state, JobState::Retrying);
             next_claim_at = failed.checks["retry_at"].as_u64().unwrap() + 1;
         }
         let fifth = store
@@ -4120,7 +4128,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store.delivery_job(&job.id).unwrap().unwrap().state,
-            "failed"
+            JobState::Failed
         );
     }
 }

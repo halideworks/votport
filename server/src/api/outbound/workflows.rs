@@ -2,7 +2,7 @@ pub mod routes;
 pub mod storage;
 
 use super::*;
-use crate::workflow::{Job, JobRequest, Project};
+use crate::workflow::{Job, JobRequest, JobState, Project};
 
 struct Actor {
     identity: auth::AdminIdentity,
@@ -302,23 +302,8 @@ pub async fn list(
         || after.len() > 100
         || project.len() > 100
         || search.chars().count() > 200
-        || ![
-            "",
-            "attention",
-            "active",
-            "queued",
-            "preparing",
-            "awaiting_approval",
-            "exporting",
-            "retrying",
-            "ready",
-            "failed",
-            "cancelled",
-            "retiring",
-            "retired",
-            "suspended",
-        ]
-        .contains(&state.as_str())
+        || (!["", "attention", "active"].contains(&state.as_str())
+            && state.parse::<JobState>().is_err())
     {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -705,7 +690,7 @@ async fn delivery_claim_loop(app: Arc<App>) {
         }
         if let Ok(operation) = begin_outbound_operation(&app, "") {
             match app.store.claim_delivery_job(&app.lease_holder, now_unix()) {
-                Ok(Some(job)) if job.state == "preparing" || job.state == "exporting" => {
+                Ok(Some(job)) if job.state.running() => {
                     claim_dedupe.recovered();
                     tracing::debug!(
                         job_id = %job.id,
@@ -773,8 +758,9 @@ static DELIVERY_ATTENTION_WARN: std::sync::OnceLock<Mutex<crate::api::outbound::
 fn notify_delivery_attention(app: &Arc<App>, job: &Job) {
     match app.store.delivery_job(&job.id) {
         Ok(Some(current))
-            if current.state == "failed"
-                || (current.state == "retrying" && job.checks["first_failure_at"].is_null()) =>
+            if current.state == JobState::Failed
+                || (current.state == JobState::Retrying
+                    && job.checks["first_failure_at"].is_null()) =>
         {
             let notify_app = Arc::clone(app);
             tokio::spawn(async move {
@@ -804,7 +790,7 @@ fn notify_delivery_attention(app: &Arc<App>, job: &Job) {
 }
 
 async fn prepare(app: &Arc<App>, mut job: Job) -> ApiResult<()> {
-    if job.state == "exporting" {
+    if job.state == JobState::Exporting {
         return storage::export(app, &job).await;
     }
     let project = app
@@ -1847,7 +1833,7 @@ mod tests {
             actor_human: None,
             request: crate::workflow::tests::request(),
             project: crate::workflow::tests::project(),
-            state: "failed".to_owned(),
+            state: JobState::Failed,
             manifest: None,
             approved_by: None,
             attempts: 1,
@@ -2263,7 +2249,7 @@ mod tests {
             .unwrap();
         prepare(&app, running).await.unwrap();
         let pending = app.store.delivery_job(&job.id).unwrap().unwrap();
-        assert_eq!(pending.state, "awaiting_approval");
+        assert_eq!(pending.state, JobState::AwaitingApproval);
         let cookie = admin_cookie(&app);
         let action = json!({
             "action": "approve",
@@ -3236,7 +3222,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 app.store.delivery_job(&job.id).unwrap().unwrap().state,
-                "queued"
+                JobState::Queued
             );
             let job = app
                 .store
@@ -3249,7 +3235,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 app.store.delivery_job(&job.id).unwrap().unwrap().state,
-                "preparing"
+                JobState::Preparing
             );
             assert!(app.store.outbound_grant_by_id(&job.id).unwrap().is_none());
             prepare(&app, job.clone()).await.unwrap();
@@ -3322,7 +3308,7 @@ mod tests {
                 .claim_delivery_job("worker", now_unix())
                 .unwrap()
                 .unwrap();
-            assert_eq!(exporting.state, "exporting");
+            assert_eq!(exporting.state, JobState::Exporting);
             assert_eq!(
                 exporting.released(),
                 release == crate::workflow::Release::Local
@@ -3359,7 +3345,7 @@ mod tests {
                 .fail_delivery_job(&job.id, exporting.attempts, &error.message)
                 .unwrap();
             let retrying = app.store.delivery_job(&job.id).unwrap().unwrap();
-            assert_eq!(retrying.state, "retrying");
+            assert_eq!(retrying.state, JobState::Retrying);
             assert!(retrying.checks["first_failure_at"].is_u64());
             assert_eq!(
                 app.store.delivery_release(&job.id).is_ok(),
@@ -3489,7 +3475,7 @@ mod tests {
                     2
                 );
                 let retained = app.store.delivery_job(&original.id).unwrap().unwrap();
-                assert_eq!(retained.state, "cancelled");
+                assert_eq!(retained.state, JobState::Cancelled);
                 assert_eq!(retained.project, original.project);
                 assert_eq!(retained.manifest, original.manifest);
                 assert_eq!(retained.checks, original.checks);
@@ -3525,7 +3511,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(
                     app.store.delivery_job(&original.id).unwrap().unwrap().state,
-                    "cancelled"
+                    JobState::Cancelled
                 );
                 let preparing = app
                     .store
@@ -3535,7 +3521,7 @@ mod tests {
                 assert_eq!(preparing.id, replacement.id);
                 prepare(&app, preparing).await.unwrap();
                 let pending = app.store.delivery_job(&replacement.id).unwrap().unwrap();
-                assert_eq!(pending.state, "awaiting_approval");
+                assert_eq!(pending.state, JobState::AwaitingApproval);
                 assert_eq!(pending.manifest, original.manifest);
                 assert!(app
                     .store
@@ -3566,7 +3552,7 @@ mod tests {
                     .unwrap();
                 prepare(&app, exporting).await.unwrap();
                 let ready = app.store.delivery_job(&replacement.id).unwrap().unwrap();
-                assert_eq!(ready.state, "ready");
+                assert_eq!(ready.state, JobState::Ready);
                 assert_ne!(ready.checks["destinations"]["online"]["location"], key);
                 assert_eq!(std::fs::read(&completion).unwrap(), signed);
                 assert_eq!(
@@ -3614,7 +3600,7 @@ mod tests {
             prepare(&app, retry).await.unwrap();
             assert_eq!(std::fs::read(&completion).unwrap(), signed);
             let ready = app.store.delivery_job(&job.id).unwrap().unwrap();
-            assert_eq!(ready.state, "ready");
+            assert_eq!(ready.state, JobState::Ready);
             assert!(app.store.delivery_release(&job.id).is_ok());
             assert!(app
                 .store
@@ -3667,7 +3653,7 @@ mod tests {
                 .into_iter()
                 .find(|job| job.request.operation_id == "disabled")
                 .unwrap();
-            assert_eq!(refused.state, "failed");
+            assert_eq!(refused.state, JobState::Failed);
             assert!(app
                 .store
                 .change_delivery_job("", &refused.id, "local", true, "retry", None)
@@ -3951,7 +3937,7 @@ mod tests {
             .unwrap()
             .unwrap();
             let ready = source.store.delivery_job(&exporting.id).unwrap().unwrap();
-            assert_eq!(ready.state, "ready");
+            assert_eq!(ready.state, JobState::Ready);
             let receipt: crate::route_protocol::RouteReceipt =
                 serde_json::from_value(ready.checks["route_receipts"]["nyc"].clone()).unwrap();
             assert!(receipt.verify(&receiver.signer.public_hex));
@@ -4146,7 +4132,7 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .state,
-                "cancelled"
+                JobState::Cancelled
             );
             assert!(receiver.store.delivery_release(&received_job.id).is_err());
             assert!(receiver.store.remove_link("nyc", &token).is_err());
@@ -5633,7 +5619,7 @@ mod tests {
         );
         for state in ["retiring", "retired"] {
             let before = app.store.delivery_job(&job.id).unwrap().unwrap();
-            assert_eq!(before.state, state);
+            assert_eq!(before.state.as_str(), state);
             let events =
                 serde_json::to_value(app.store.delivery_events("", 0, 100).unwrap()).unwrap();
             assert_eq!(
@@ -5657,7 +5643,7 @@ mod tests {
         assert!(!retire_snapshot(&app).await.unwrap());
         assert!(!root.exists());
         let retired = app.store.delivery_job(&job.id).unwrap().unwrap();
-        assert_eq!(retired.state, "retired");
+        assert_eq!(retired.state, JobState::Retired);
         assert_eq!(retired.checks["snapshot_bytes"], 0);
         assert!(app
             .store

@@ -192,3 +192,43 @@ export function formatAgo(unixSeconds, now = Math.round(Date.now() / 1000)) {
   const value = Math.max(1, Math.floor(Math.abs(delta) / divisor));
   return delta > 0 ? `${value} ${unit} ago` : `in ${value} ${unit}`;
 }
+
+export function formatWhen(unixSeconds) {
+  // UTC, named: the server's logs, receipts and audit export all speak UTC,
+  // so admin timestamps read in the same zone instead of an unlabelled
+  // browser-local one (audit finding 405). Seconds are dropped: a transfer
+  // stamp never needs them and the audit export carries full precision.
+  return new Date(unixSeconds * 1000).toLocaleString([], {
+    timeZone: 'UTC',
+    timeZoneName: 'short',
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+function showModal(title, detail, action) {
+  const dialog = document.getElementById('confirm');
+  document.getElementById('confirm-title').textContent = title;
+  document.getElementById('confirm-detail').textContent = detail;
+  const ok = document.getElementById('confirm-ok');
+  ok.textContent = action || '';
+  ok.hidden = !action;
+  document.getElementById('confirm-cancel').textContent = action ? 'Cancel' : 'OK';
+  dialog.returnValue = 'cancel';
+  dialog.showModal();
+  return dialog;
+}
+
+export function confirmModal(title, detail, action) {
+  const dialog = showModal(title, detail, action);
+  return new Promise((resolve) => {
+    dialog.addEventListener('close', () => resolve(dialog.returnValue === 'ok'), { once: true });
+  });
+}
+
+export function alertModal(message) {
+  showModal('Something went wrong', message);
+}

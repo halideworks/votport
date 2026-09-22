@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 
-import { formatAgo, formatBytes, formatDuration } from '../web/assets/object-card.js';
+import { formatAgo, formatBytes, formatDuration, formatWhen } from '../web/assets/object-card.js';
 
 const read = (path) => readFile(new URL(`../${path}`, import.meta.url), 'utf8');
 
@@ -93,9 +93,9 @@ test('506: the one duration formatter never rolls minutes over at 60', () => {
 });
 
 test('462: stamps drop seconds and relative ages carry the absolute nearby', async () => {
-  const common = await read('web/assets/admin-common.js');
-  assert.match(common, /month: 'short',/);
-  assert.doesNotMatch(common, /second: '2-digit'/);
+  assert.match(formatWhen(0), /UTC/);
+  assert.equal(formatWhen(0), formatWhen(59));
+  assert.notEqual(formatWhen(0), formatWhen(60));
   const fixed = 1_700_000_460;
   assert.equal(formatAgo(fixed, fixed), 'just now');
   assert.equal(formatAgo(fixed - 45, fixed), 'just now');

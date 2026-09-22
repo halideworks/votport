@@ -1,7 +1,5 @@
-// Share preparation progress: pure presentation for one preparation
-// snapshot. The page polls /api/admin/outbound-grants/preparations/{id}
-// and renders what this returns, so the state logic stays unit-testable
-// and the DOM layer stays dumb. VOTPORT PROPRIETARY LICENSE.
+// Delivery preparation progress and workflow action eligibility.
+// VOTPORT PROPRIETARY LICENSE.
 import { formatBytes } from './object-card.js';
 
 // A snapshot in flight: totals are unknown until the server's selection
@@ -35,4 +33,30 @@ export function preparationProgress(snapshot) {
 
 function count(done, total) {
   return total !== null && total !== undefined ? `${done ?? 0} of ${total}` : `${done ?? 0}`;
+}
+
+// Polls one preparation to a terminal state, rendering each in-flight
+// snapshot through `render`. The long ceiling matches the job's own idea
+// of a few minutes for big libraries; the 15-minute server TTL only
+// applies after a preparation reaches a terminal state.
+export async function pollDeliverPreparation(id, render, api) {
+  const deadline = Date.now() + 15 * 60 * 1000;
+  for (;;) {
+    const snapshot = await api(
+      `/api/admin/outbound-grants/preparations/${encodeURIComponent(id)}`,
+    );
+    if (snapshot.status !== 'preparing') return snapshot;
+    render(snapshot);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    if (Date.now() > deadline) {
+      throw new Error(
+        'Preparing this link is taking unusually long. Keep the page open; the link also appears in Delivery links when it finishes.',
+      );
+    }
+  }
+}
+
+export function canReprocess(job, project) {
+  return Boolean(job.received && job.manifest && !job.reprocessed_as && project?.receive && project.revision !== job.project.revision
+    && ['failed', 'retrying', 'awaiting_approval', 'ready'].includes(job.state));
 }

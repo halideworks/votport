@@ -2028,6 +2028,21 @@ pub async fn list_outbound_grants(
     })))
 }
 
+pub async fn get_outbound_grant(
+    State(app): State<Arc<App>>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = admin::require_operator(&app, &headers)?;
+    let _operation = begin_outbound_operation(&app, &identity.tenant)?;
+    let (grant, count) = app
+        .store
+        .outbound_grant_preview(&identity.tenant, &id, OUTBOUND_GRANT_PREVIEW_FILES)
+        .map_err(super::store_unavailable)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "delivery not found"))?;
+    Ok(Json(public_grant_with_file_count(&grant, count)))
+}
+
 pub async fn outbound_grant_url(
     State(app): State<Arc<App>>,
     AxumPath(id): AxumPath<String>,

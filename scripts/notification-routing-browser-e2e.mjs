@@ -181,8 +181,15 @@ try {
   await page.locator('#library-files input[type=checkbox][value="notification-clip.txt"]').check();
   await page.locator('#deliver-label').fill(downloadLabel);
   await choose(page.locator('#deliver-notifications'), 'Incoming', 'First file requested');
+  let preparationPolls = 0;
+  await page.route('**/api/admin/outbound-grants/preparations/*', (route) => {
+    if (preparationPolls++ === 0) return route.fulfill({ json: { status: 'preparing', files_done: 0, files_total: 1, bytes_done: 0, bytes_total: 30 } });
+    return route.continue();
+  });
   await page.getByRole('button', { name: 'Create delivery link', exact: true }).click();
-  await page.getByRole('heading', { name: downloadLabel, exact: true }).waitFor();
+  await page.locator('#deliver-progress-bar:not([hidden])').waitFor();
+  await page.getByRole('heading', { name: downloadLabel, exact: true }).waitFor().catch(async (error) => { console.error(await page.locator('body').innerText()); throw error; });
+  await page.unroute('**/api/admin/outbound-grants/preparations/*');
   const grants = await api('admin/outbound-grants'); const grant = grants.grants.find((grant) => grant.label === downloadLabel);
   assert.deepEqual(grant.notifications.rules, [{ destination_id: incoming.id, events: ['outbound_download_started'] }]);
   await page.goto(`${base}/workflows#projects`);

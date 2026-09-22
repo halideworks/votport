@@ -96,6 +96,84 @@ pub struct Import {
     pub prefix: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobState {
+    Queued,
+    Preparing,
+    AwaitingApproval,
+    Exporting,
+    Retrying,
+    Ready,
+    Failed,
+    Cancelled,
+    Retiring,
+    Retired,
+    Suspended,
+}
+
+impl JobState {
+    pub const ALL: [Self; 11] = [
+        Self::Queued,
+        Self::Preparing,
+        Self::AwaitingApproval,
+        Self::Exporting,
+        Self::Retrying,
+        Self::Ready,
+        Self::Failed,
+        Self::Cancelled,
+        Self::Retiring,
+        Self::Retired,
+        Self::Suspended,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Preparing => "preparing",
+            Self::AwaitingApproval => "awaiting_approval",
+            Self::Exporting => "exporting",
+            Self::Retrying => "retrying",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Retiring => "retiring",
+            Self::Retired => "retired",
+            Self::Suspended => "suspended",
+        }
+    }
+
+    pub const fn running(self) -> bool {
+        matches!(self, Self::Preparing | Self::Exporting)
+    }
+
+    pub const fn retiring(self) -> bool {
+        matches!(self, Self::Retiring | Self::Retired)
+    }
+}
+
+impl std::fmt::Display for JobState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for JobState {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|state| state.as_str() == value)
+            .ok_or("invalid job state")
+    }
+}
+
+impl rusqlite::ToSql for JobState {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(rusqlite::types::ToSqlOutput::from(self.as_str()))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Job {
     pub id: String,
@@ -112,7 +190,7 @@ pub struct Job {
     pub actor_human: Option<String>,
     pub request: JobRequest,
     pub project: Project,
-    pub state: String,
+    pub state: JobState,
     pub manifest: Option<String>,
     pub approved_by: Option<String>,
     pub attempts: u64,
@@ -130,9 +208,12 @@ pub struct Job {
 
 impl Job {
     pub fn released(&self) -> bool {
-        self.state == "ready"
+        self.state == JobState::Ready
             || (self.checks["released_at"].as_u64().is_some()
-                && ["exporting", "retrying", "failed"].contains(&self.state.as_str()))
+                && matches!(
+                    self.state,
+                    JobState::Exporting | JobState::Retrying | JobState::Failed
+                ))
     }
 
     pub fn uses_snapshot(&self) -> bool {
@@ -729,5 +810,47 @@ pub(crate) mod tests {
         assert!(!valid_holder("ab"));
         project.recipients.push(project.recipients[0].clone());
         assert!(project.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::JobState;
+    #[test]
+    fn job_states_preserve_wire_and_database_values() {
+        let names = [
+            "queued",
+            "preparing",
+            "awaiting_approval",
+            "exporting",
+            "retrying",
+            "ready",
+            "failed",
+            "cancelled",
+            "retiring",
+            "retired",
+            "suspended",
+        ];
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        for (state, name) in JobState::ALL.into_iter().zip(names) {
+            assert_eq!(name.parse::<JobState>().unwrap(), state);
+            assert_eq!(serde_json::to_value(state).unwrap(), name);
+            assert_eq!(
+                serde_json::from_value::<JobState>(serde_json::json!(name)).unwrap(),
+                state
+            );
+            assert_eq!(
+                connection
+                    .query_row("SELECT ?1", [state], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                name
+            );
+            assert_eq!(state.running(), ["preparing", "exporting"].contains(&name));
+            assert_eq!(state.retiring(), ["retiring", "retired"].contains(&name));
+        }
+        for invalid in ["", "Ready", " ready", "done", "active"] {
+            assert!(invalid.parse::<JobState>().is_err());
+            assert!(serde_json::from_value::<JobState>(serde_json::json!(invalid)).is_err());
+        }
     }
 }

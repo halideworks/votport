@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use vot_cli::authz::Holder;
 use vot_cli::{
-    parse_rendezvous, probe_serve, push_from, BundleServer, Error as VotError, PushOptions,
+    parse_rendezvous, probe_serve, push_from_with_cancellation, BundleServer, Error as VotError,
+    PushOptions,
 };
 
 use crate::api::{Client, PushPackageAnnouncement};
@@ -101,10 +102,6 @@ pub fn try_push(
     });
     observer.event(Event::Transport(Transport::Push));
 
-    // ponytail: after the preflight a cancel is not honoured: the receiver
-    // holds the session and the bundle lands whole. Threading vot-cli's
-    // CancellationHandle through PushOptions is the VOT change that makes a
-    // mid-push cancel possible.
     let result = push(device, prepared, &preflight, reachable, observer);
     if result.is_err() {
         // A push that fails after the preflight leaves a reserved session and
@@ -168,8 +165,12 @@ fn push(
 
     let server = BundleServer::assemble(&prepared.manifest_root, prepared.served.clone())?;
     let mut bridge = EntryBridge::new(prepared, observer);
-    with_progress(&mut bridge, |progress| {
-        push_from(
+    let cancellation = vot_cli::CancellationHandle::default();
+    if bridge.cancelled() {
+        return Err(Error::Cancelled);
+    }
+    with_progress(&mut bridge, &cancellation, |progress| {
+        push_from_with_cancellation(
             &server,
             PushOptions {
                 address,
@@ -180,7 +181,12 @@ fn push(
                 extensions: BTreeSet::new(),
                 progress: Some((PROGRESS_QUANTUM, progress)),
             },
+            &cancellation,
         )
+    })
+    .map_err(|error| match error {
+        VotError::Cancelled => Error::Cancelled,
+        error => Error::Package(error),
     })?;
     Ok(())
 }

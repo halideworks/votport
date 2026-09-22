@@ -4048,7 +4048,7 @@ mod tests {
                 let mut job = store
                     .enqueue_delivery_job("", "sender", 1, None, project.clone(), request)
                     .unwrap();
-                job.state = state.into();
+                job.state = state.parse().unwrap();
                 job.checks["snapshot_bytes"] = serde_json::json!(17);
                 job.checks["route_revocations"] =
                     serde_json::json!({"destination":{"state":"pending"}});
@@ -4187,11 +4187,15 @@ mod tests {
                     store
                         .delivery_token_active(&job.id, &crate::auth::hash_token(token))
                         .unwrap(),
-                    !historical && job.state != "retired"
+                    !historical && job.state != crate::workflow::JobState::Retired
                 );
                 assert_eq!(
                     restored.state,
-                    if historical { "suspended" } else { &job.state }
+                    if historical {
+                        crate::workflow::JobState::Suspended
+                    } else {
+                        job.state
+                    }
                 );
                 assert_eq!(restored.checks, job.checks);
                 assert_eq!(
@@ -4201,9 +4205,9 @@ mod tests {
                         .unwrap()
                         .revoked_at
                         .is_some(),
-                    historical || job.state == "retired"
+                    historical || job.state == crate::workflow::JobState::Retired
                 );
-                if job.state == "retired" {
+                if job.state == crate::workflow::JobState::Retired {
                     assert_eq!(
                         store
                             .outbound_grant_by_id(&job.id)

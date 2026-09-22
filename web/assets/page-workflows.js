@@ -1,3 +1,4 @@
+import { canReprocess } from '/assets/deliver-progress.js';
 import { isFormDirty, discardForm, markFormSaved, markFormChanged } from '/assets/form-drafts.js';
 import { notificationEditor, notificationDetails, workflowEvents } from '/assets/notifications.js';
 /* global URL, Blob, Option, sessionStorage, crypto */
@@ -48,10 +49,6 @@ function empty(title, detail, action) {
   const element = node('div', '', 'empty-state'); element.append(node('h3', title), node('p', detail));
   if (action) element.append(action);
   return element;
-}
-function canReprocess(job, project) {
-  return Boolean(job.received && job.manifest && !job.reprocessed_as && project?.receive && project.revision !== job.project.revision
-    && ['failed', 'retrying', 'awaiting_approval', 'ready'].includes(job.state));
 }
 function reprocessAction(job, project, canSend) {
   if (!canReprocess(job, project) || !canSend) return null;

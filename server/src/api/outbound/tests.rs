@@ -7263,3 +7263,64 @@ async fn library_grant_creation_stays_synchronous_for_the_pinned_cli() {
     assert_eq!(payload["grant"]["files"][0]["name"], "a.bin");
     assert!(payload["url"].as_str().unwrap().contains("/s/"));
 }
+
+#[tokio::test]
+async fn direct_grant_lookup_is_authenticated_tenant_scoped_and_bounded() {
+    let (_directory, app, cookie, _bytes) = fixture().await;
+    let mut grant = crate::notify::tests::test_grant(vec![]);
+    grant.tenant = String::new();
+    grant.files = (0..=OUTBOUND_GRANT_PREVIEW_FILES)
+        .map(|index| crate::store::OutboundGrantFile {
+            source: format!("file-{index}"),
+            name: format!("file-{index}"),
+            suite: "blake3".into(),
+            root: "00".repeat(32),
+            bytes: 1,
+            receipt_b64: String::new(),
+            downloads: 0,
+            first_download_at: None,
+            last_download_at: None,
+        })
+        .collect();
+    app.store.insert_outbound_grant(grant.clone()).unwrap();
+    let response = router(app.clone())
+        .oneshot(
+            Request::get(format!("/api/admin/outbound-grants/{}", grant.id))
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let preview = body(response).await;
+    assert_eq!(preview["id"], grant.id);
+    assert_eq!(preview["files_truncated"], true);
+    assert_eq!(preview["files"], json!([]));
+    assert_eq!(preview["file_count"], OUTBOUND_GRANT_PREVIEW_FILES + 1);
+    let response = router(app.clone())
+        .oneshot(
+            Request::get(format!("/api/admin/outbound-grants/{}", grant.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    grant.id = "foreign-grant".into();
+    grant.token_hash = "different-token".into();
+    grant.tenant = "other".into();
+    app.store.insert_outbound_grant(grant).unwrap();
+    for id in ["foreign-grant", "missing"] {
+        let response = router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/admin/outbound-grants/{id}"))
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}

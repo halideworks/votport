@@ -91,12 +91,19 @@ pub trait Observer {
 /// thread drains a channel until the callback is dropped with the options.
 pub(crate) fn with_progress<T: Send>(
     observer: &mut dyn Observer,
+    cancellation: &vot_cli::CancellationHandle,
     work: impl FnOnce(vot_cli::Progress) -> T + Send,
 ) -> T {
     with_events(
         |event| {
+            if observer.cancelled() {
+                cancellation.cancel();
+            }
             if let Some(event) = event {
                 observer.event(event);
+            }
+            if observer.cancelled() {
+                cancellation.cancel();
             }
         },
         |sender| {

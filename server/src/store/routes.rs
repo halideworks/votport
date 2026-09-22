@@ -683,7 +683,7 @@ mod tests {
                     crate::workflow::tests::request(),
                 )
                 .unwrap();
-            job.state = state.into();
+            job.state = state.parse().unwrap();
             job.received = Some(crate::workflow::Received {
                 link_id: link.id.clone(),
                 upload_id: "upload".into(),
@@ -743,6 +743,8 @@ mod tests {
             assert_eq!(
                 revoked.state,
                 if state == "ready" { "cancelled" } else { state }
+                    .parse::<crate::workflow::JobState>()
+                    .unwrap()
             );
             assert_eq!(revoked.checks["retired_from"], "ready");
             assert!(revoked.checks["source_revoked_at"].as_u64().is_some());
@@ -808,7 +810,8 @@ mod tests {
                     "cancelled" => "cancelled",
                     _ => "ready",
                 }
-                .into();
+                .parse()
+                .unwrap();
                 job.checks["destinations"]["destination"] =
                     serde_json::json!({"state": if complete { "complete" } else { "sending" }});
                 if trigger == "retired_cancelled" {

@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
-import { runInNewContext } from 'node:vm';
+import { fillDeployment, fillBackupStatus } from '../web/assets/system-view.js';
+import { formatWhen } from '../web/assets/object-card.js';
 
 const html = await readFile(new URL('../web/system.html', import.meta.url), 'utf8');
-const script = await readFile(new URL('../web/assets/page-system.js', import.meta.url), 'utf8');
+const script = await readFile(new URL('../web/assets/page-system.js', import.meta.url), 'utf8') + await readFile(new URL('../web/assets/system-view.js', import.meta.url), 'utf8');
 
 test('system settings are grouped and deployment values have DOM targets', () => {
   const groups = [...html.matchAll(/data-group="([^"]+)"/g)].map((match) => match[1]);
@@ -183,7 +184,7 @@ test('deployment warnings and the snapshot download carry the CSRF header', () =
   }
 });
 
-test('filesystem notices follow detected profiles and clear stale warnings', () => {
+test('filesystem notices follow detected profiles and clear stale warnings', (t) => {
   const elements = new Map();
   const context = {
     document: { getElementById(id) {
@@ -192,12 +193,11 @@ test('filesystem notices follow detected profiles and clear stale warnings', () 
     } },
     formatBytes: String,
   };
-  // The shared $ lives in object-card.js now, so the fragment gets the same
-  // lookup bound to the stub document.
-  context.$ = (id) => context.document.getElementById(id);
-  runInNewContext(script.slice(script.indexOf('function sourceLabel'), script.indexOf('function gibValue')), context);
+  const previous = globalThis.document;
+  globalThis.document = context.document;
+  t.after(() => { globalThis.document = previous; });
   for (const profile of ['fast', 'balanced', null]) {
-    context.fillDeployment({ deployment: { receive_commit_profile: profile, outbound_filesystem_profile: profile } });
+    fillDeployment({ deployment: { receive_commit_profile: profile, outbound_filesystem_profile: profile } });
     for (const kind of ['receive', 'outbound']) {
       const id = `setting-${kind}-profile`;
       const notice = elements.get(id);
@@ -214,7 +214,7 @@ test('filesystem notices follow detected profiles and clear stale warnings', () 
   }
 });
 
-test('backup pause overrides activity and clears without replacing run history', () => {
+test('backup pause overrides activity and clears without replacing run history', (t) => {
   const elements = new Map();
   const context = {
     $(id) {
@@ -225,35 +225,37 @@ test('backup pause overrides activity and clears without replacing run history',
     isFormDirty: () => true,
     formatWhen: String,
   };
-  runInNewContext(script.slice(script.indexOf('function fillBackups('), script.indexOf('function setBackupActions(')), context);
+  const previous = globalThis.document;
+  globalThis.document = { ...context.document, getElementById: context.$ };
+  t.after(() => { globalThis.document = previous; });
   const data = { config: { enabled: true }, inventory: [], status: { running: true, last_success_at: 123, last_error: 'Upload failed' }, paused_reason: 'restore pending; restart required' };
-  context.fillBackups(data);
+  fillBackupStatus(data);
   assert.equal(elements.get('backup-status').textContent, 'Backups paused: restore pending; restart required');
   assert.equal(elements.get('backup-status-error').hidden, false);
   assert.equal(elements.get('backup-status-error').textContent, 'Upload failed');
   data.status.running = false;
   data.status.last_error = null;
-  context.fillBackups(data);
+  fillBackupStatus(data);
   assert.match(elements.get('backup-status').textContent, /^Backups paused:/);
   assert.equal(elements.get('backup-status-error').hidden, true);
   data.paused_reason = null;
-  context.fillBackups(data);
-  assert.equal(elements.get('backup-status').textContent, 'Last successful run 123');
+  fillBackupStatus(data);
+  assert.equal(elements.get('backup-status').textContent, `Last successful run ${formatWhen(123)}`);
   assert.equal(elements.get('backup-status-error').hidden, true);
   data.config.enabled = false;
-  context.fillBackups(data);
-  assert.equal(elements.get('backup-status').textContent, 'Automatic backups are off. Last successful run 123');
+  fillBackupStatus(data);
+  assert.equal(elements.get('backup-status').textContent, `Automatic backups are off. Last successful run ${formatWhen(123)}`);
   data.status.last_success_at = null;
-  context.fillBackups(data);
+  fillBackupStatus(data);
   assert.equal(elements.get('backup-status').textContent, 'Automatic backups are off. No backup run recorded.');
   data.status.running = true;
-  context.fillBackups(data);
+  fillBackupStatus(data);
   assert.equal(elements.get('backup-status').textContent, 'Backup running…');
   data.status.running = false;
   data.status.last_error = 'Manual run failed';
-  context.fillBackups(data);
+  fillBackupStatus(data);
   assert.equal(elements.get('backup-status').textContent, 'Automatic backups are off. Last run failed: Manual run failed');
   data.paused_reason = 'restore pending; restart required';
-  context.fillBackups(data);
+  fillBackupStatus(data);
   assert.equal(elements.get('backup-status').textContent, 'Backups paused: restore pending; restart required');
 });
