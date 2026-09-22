@@ -4973,7 +4973,7 @@ dependencies = [
 
 [[package]]
 name = "votport"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "age",
  "argon2",
@@ -5032,7 +5032,7 @@ dependencies = [
 
 [[package]]
 name = "votport-client-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
