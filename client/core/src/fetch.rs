@@ -12,6 +12,8 @@
 //! path's name, existence, and temp-then-rename guards: a QUIC fetch is a
 //! different transport, not a different trust boundary.
 
+mod clone;
+
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Seek, SeekFrom};
@@ -189,6 +191,7 @@ fn try_fetch_with_resume_mode(
     }
     fs::create_dir_all(staging_parent)?;
     let _stage_lock = FetchLock::try_acquire(&stage)?;
+    clone::cleanup(&stage)?;
     let saved_capability = load_saved_holder(
         &capability_path,
         device,
@@ -259,9 +262,12 @@ fn try_fetch_with_resume_mode(
     };
 
     let total: u64 = metadata.files.iter().map(|file| file.bytes).sum();
-    // ponytail: reserve the full stage plus remaining copies; credit verified
-    // staged bytes when VOT exposes coverage. An owned retry cannot switch to HTTP.
-    if require_space(staging_parent, total.saturating_add(remaining)).is_err() {
+    let copies = if clone::supported(staging_parent, dest) {
+        0
+    } else {
+        remaining
+    };
+    if require_space(staging_parent, total.saturating_add(copies)).is_err() {
         if !matches!(&saved_capability, SavedCapabilityState::Missing) {
             return Err(Error::Other(
                 "the interrupted fetch has insufficient staging space; retry later".to_owned(),
@@ -361,8 +367,7 @@ fn try_fetch_with_resume_mode(
     // store in the stage until the bundle is whole and resumes from a partial
     // one; the stage is kept on failure for that resume and removed once the
     // files materialized.
-    // ponytail: the bundle is a full second copy on disk; fetch-to-loose or a
-    // hardlink materialize is the upgrade when a large sequence needs it.
+    // Filesystem clones keep verified outputs independent without a second payload allocation.
     // A per-delivery lock keeps concurrent receives from clearing or writing
     // the same stage. The kernel releases it when an owner crashes, while the
     // lock file itself remains as harmless coordination state.
@@ -808,7 +813,7 @@ fn materialize_entries(
                     &object, dest, &path, identity, observer, streaming,
                 )?;
             #[cfg(not(windows))]
-            let linked = false;
+            let linked = clone::publish(&object, bundle, dest, &path, identity, observer)?;
             if !linked {
                 let mut source = |offset: u64| -> Result<Resumed> {
                     let mut file = File::open(&object).map_err(|source| Error::Read {

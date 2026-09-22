@@ -1,16 +1,12 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
-import { runInNewContext } from 'node:vm';
+import { api } from '../web/assets/admin-api.js';
 
-test('custom upload headers preserve the admin CSRF header', async () => {
-  const source = await readFile(new URL('../web/assets/admin-common.js', import.meta.url), 'utf8');
+test('custom upload headers preserve the admin CSRF header', async (t) => {
   let request;
-  const api = runInNewContext(`${source.slice(source.indexOf('export async function api('), source.indexOf('/// The switch reply')).replace('export ', '')}\napi`, {
-    fetch: async (path, options) => {
-      request = { path, ...options };
-      return { ok: true, json: async () => ({ ok: true }) };
-    },
+  t.mock.method(globalThis, 'fetch', async (path, options) => {
+    request = { path, ...options };
+    return { ok: true, json: async () => ({ ok: true }) };
   });
   const body = new Blob(['logo'], { type: 'image/png' });
   await api('/api/admin/branding/default/logo', {

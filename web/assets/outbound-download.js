@@ -316,3 +316,63 @@ export async function runWorkerPool(items, worker, limit = 4, onComplete) {
   await Promise.all(Array.from({ length: count }, run));
   return results;
 }
+
+// A refused download answers JSON, so every handoff probes with HEAD and
+// renders the refusal here instead of navigating the top frame to it.
+// HEAD runs the same admission checks without recording a download.
+export async function triggerDownload(url, name, showError) {
+  let response;
+  try {
+    response = await fetch(url, { method: 'HEAD' });
+  } catch {
+    showError('The download could not be reached. Check your connection and try again.');
+    return false;
+  }
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    showError(body?.error || `The download was refused (${response.status}).`);
+    return false;
+  }
+  const link = document.createElement('a');
+  link.href = url;
+  if (name) link.download = name;
+  link.hidden = true;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  return true;
+}
+
+export async function saveFile(directory, file, name, onAuthLost = async () => false) {
+  const handle = await createDownloadFile(directory, name);
+  const writable = await handle.createWritable();
+  try {
+    await streamToWritable((...args) => fetch(...args), writable, file, {
+      onAuthLost,
+    });
+    await writable.close();
+    return handle.name;
+  } catch (error) {
+    await writable.abort().catch(() => {});
+    throw error;
+  }
+}
+
+export async function triggerSeparateDownloads(files, names, stop, onProgress) {
+  let requested = 0;
+  for (const [index, file] of files.entries()) {
+    if (stop.stopped) break;
+    const link = document.createElement('a');
+    link.href = file.download_url;
+    link.download = names[index];
+    link.hidden = true;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    requested += 1;
+    onProgress(requested, files.length);
+    // WebKit drops later downloads unless each anchor yields to the event loop.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  return { requested, stopped: stop.stopped };
+}

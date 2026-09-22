@@ -17,7 +17,7 @@ const browser = await chromium.launch();
 const context = await browser.newContext();
 const page = await context.newPage();
 const errors = [];
-page.on('pageerror', (error) => errors.push(error.message));
+page.on('pageerror', (error) => { errors.push(error.message); console.error(error.message); });
 await page.addInitScript(() => {
   window.showDirectoryPicker = () => window.savedDirectory;
   Object.defineProperty(navigator, 'clipboard', { value: { writeText: async (text) => { window.copiedText = text; } } });
@@ -37,6 +37,19 @@ try {
   assert.match(await page.locator('#evidence-open-app').getAttribute('href'), /^votport:\/\/s\//);
   await page.goto(`${base}/deliver#workflows`);
   await page.waitForURL('**/workflows');
+  assert.deepEqual(await page.locator('#workflow-filter-state option').evaluateAll((options) => options.filter((option) => option.value).map((option) => ({ id: option.value, label: option.textContent }))), [
+    { id: 'queued', label: 'Scheduled' },
+    { id: 'preparing', label: 'Preparing files' },
+    { id: 'awaiting_approval', label: 'Needs approval' },
+    { id: 'exporting', label: 'Delivering copies' },
+    { id: 'retrying', label: 'Retry scheduled' },
+    { id: 'ready', label: 'Ready to share' },
+    { id: 'failed', label: 'Needs attention' },
+    { id: 'cancelled', label: 'Cancelled' },
+    { id: 'retiring', label: 'Cleaning up' },
+    { id: 'retired', label: 'Archived' },
+    { id: 'suspended', label: 'Held after restore' },
+  ]);
   await page.getByRole('link', { name: 'Projects', exact: true }).click();
   await page.click('#workflow-new-project');
   await openAncestors(page.locator('#wp-id')); await page.fill('#wp-id', project);
@@ -69,11 +82,48 @@ try {
   }
   assert.ok(ready.url, JSON.stringify(ready));
   await page.click('#workflow-refresh');
-  await page.locator('#workflow-jobs article').filter({ hasText: ready.job.manifest }).getByRole('button', { name: 'Copy delivery link', exact: true }).click();
+  await page.locator(`#job-${id}`).getByRole('button', { name: 'Copy delivery link', exact: true }).click();
   await page.waitForFunction((url) => window.copiedText === url, ready.url);
   await page.waitForTimeout(250);
   assert.equal(await page.locator('dialog[open]').count(), 0);
   await page.screenshot({ path: path.join(root, 'workflow-admin.png'), fullPage: true });
+  let refreshedRevision = ready.job.project.revision + 1;
+  const reprocessRequests = [];
+  await page.route('**/api/workflows/projects', async (route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    body.projects = body.projects.map((item) => item.id === project ? { ...item, receive: true, revision: refreshedRevision } : item);
+    await route.fulfill({ response, json: body });
+  });
+  await page.route('**/api/workflows/jobs?*', async (route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    body.jobs = body.jobs.map((entry) => entry.job.id === id ? { ...entry, job: { ...entry.job, received: {} } } : entry);
+    await route.fulfill({ response, json: body });
+  });
+  await page.route(`**/api/workflows/jobs/${id}/reprocess`, async (route) => {
+    reprocessRequests.push(route.request().postDataJSON());
+    await route.fulfill({ json: { job: { id: 'replacement' } } });
+  });
+  await page.click('#workflow-refresh');
+  const reprocess = page.locator(`#job-${id}`).getByRole('button', { name: 'Reprocess with current rules', exact: true });
+  await reprocess.waitFor();
+  refreshedRevision += 1;
+  await reprocess.click();
+  const confirmation = page.getByRole('dialog', { name: 'Reprocess with current rules', exact: true });
+  await confirmation.waitFor();
+  assert.match(await confirmation.textContent(), new RegExp(`revision ${refreshedRevision}`));
+  assert.match(await confirmation.textContent(), /may create new copies/);
+  await confirmation.getByRole('button', { name: 'Cancel', exact: true }).click();
+  assert.equal(reprocessRequests.length, 0);
+  await reprocess.click();
+  await confirmation.getByRole('button', { name: 'Create new delivery', exact: true }).click();
+  await page.waitForURL('**/workflows#job-replacement');
+  assert.deepEqual(reprocessRequests, [{ manifest: ready.job.manifest, project_revision: refreshedRevision }]);
+  await page.unroute('**/api/workflows/projects');
+  await page.unroute('**/api/workflows/jobs?*');
+  await page.unroute(`**/api/workflows/jobs/${id}/reprocess`);
+
   await page.goto(ready.url);
   await page.locator('#delivery-evidence').evaluate((node) => { node.open = true; });
   await page.waitForSelector('#download-content:not([hidden])');
@@ -86,7 +136,7 @@ try {
   });
   await page.route('**/api/s/*/files/1', (route) => route.fulfill({ status: 404 }));
   await page.getByRole('button', { name: 'Download all files', exact: true }).click();
-  await page.waitForFunction(() => document.getElementById('separate-download-status').textContent.startsWith('Downloaded 1/2.'), null, { timeout: 10000 });
+  await page.waitForFunction(() => document.getElementById('separate-download-status').textContent.startsWith('Downloaded 1/2.'), null, { timeout: 10000 }).catch(async (error) => { console.error(await page.locator('#separate-download-status').textContent()); throw error; });
   await page.evaluate(async () => {
     const selected = new DataTransfer();
     selected.items.add(await (await window.savedDirectory.getFileHandle('saved (2).bin')).getFile());
@@ -164,7 +214,24 @@ try {
   const grantDirectory = `${project}-keyboard`;
   await fs.mkdir(path.join(root, 'library', grantDirectory));
   await fs.writeFile(path.join(root, 'library', grantDirectory, 'sample.txt'), 'Keyboard fixture.');
-  await request('admin/outbound-grants', { directory: grantDirectory, label: 'Keyboard grant' });
+  const createdGrant = await request('admin/outbound-grants', { directory: grantDirectory, label: 'Keyboard grant' });
+  const pages = [];
+  await page.route('**/api/admin/outbound-grants?*', async (route) => {
+    const offset = Number(new URL(route.request().url()).searchParams.get('offset'));
+    pages.push(offset);
+    await route.fulfill({ json: {
+      grants: Array.from({ length: 50 }, (_, index) => ({ ...createdGrant.grant, id: `older-${offset + index}`, label: `Other grant ${offset + index}` })),
+      total: 5000, has_more: true, offset, limit: 50,
+    } });
+  });
+  await page.goto(`${base}/deliver#grant-${createdGrant.grant.id}`);
+  await page.locator(`#grant-${createdGrant.grant.id}`).waitFor();
+  assert.deepEqual(pages, [0], 'A deep link looks up its grant without scanning history');
+  await page.locator('#outbound-grants-load-more').click();
+  await page.waitForFunction(() => document.querySelectorAll('#outbound-grants .link-item').length === 101);
+  assert.deepEqual(pages, [0, 50], 'The separately revealed grant does not advance pagination');
+  assert.equal(await page.locator(`#grant-${createdGrant.grant.id}`).count(), 1);
+  await page.unroute('**/api/admin/outbound-grants?*');
   await page.goto(`${base}/deliver`);
   const grantCard = page.locator('#outbound-grants .card').filter({ has: page.getByRole('heading', { name: 'Keyboard grant', exact: true }) });
   await grantCard.waitFor();

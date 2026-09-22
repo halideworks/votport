@@ -4,6 +4,7 @@
 //! and on disk, so a notification failure is logged and nothing else.
 
 mod routing;
+use crate::workflow::JobState;
 pub use routing::{destination, test_destination};
 use routing::{send_policy, Route};
 
@@ -367,7 +368,7 @@ pub async fn workflow_failed(app: Arc<App>, job: crate::workflow::Job) {
         .as_ref()
         .or(job.request.notifications.as_ref())
         .or(job.project.notifications.as_ref());
-    let retrying = job.state == "retrying";
+    let retrying = job.state == JobState::Retrying;
     let title = format!(
         "\"{}\": delivery {} · {}",
         job.request.label,
@@ -1675,7 +1676,7 @@ pub(crate) mod tests {
             actor_human: None,
             request,
             project: crate::workflow::tests::project(),
-            state: "failed".to_owned(),
+            state: JobState::Failed,
             manifest: None,
             approved_by: None,
             attempts: 1,
@@ -1930,7 +1931,7 @@ pub(crate) mod tests {
             actor_human: None,
             request,
             project: crate::workflow::tests::project(),
-            state: "failed".to_owned(),
+            state: JobState::Failed,
             manifest: None,
             approved_by: None,
             attempts: 1,

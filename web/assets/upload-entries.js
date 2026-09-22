@@ -74,6 +74,22 @@ export async function runUploadBatch(items, upload, onProgress = () => {}, onCom
   if (failed) throw firstError;
 }
 
+const LIBRARY_CHUNK_BYTES = 8 * 1024 * 1024;
+
+// Hash fixed-size chunks into a chain so identification stays bounded in memory.
+export async function libraryFileIdentity(file) {
+  let digest = new Uint8Array(32);
+  for (let offset = 0; offset < file.size; offset += LIBRARY_CHUNK_BYTES) {
+    const bytes = new Uint8Array(await file.slice(offset, offset + LIBRARY_CHUNK_BYTES).arrayBuffer());
+    if (bytes.length !== Math.min(LIBRARY_CHUNK_BYTES, file.size - offset)) throw new Error('The selected file could not be read completely. Select it again.');
+    const input = new Uint8Array(digest.length + bytes.length);
+    input.set(digest);
+    input.set(bytes, digest.length);
+    digest = new Uint8Array(await crypto.subtle.digest('SHA-256', input));
+  }
+  return [...digest].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
 export async function uploadLibraryFile(file, path, progress = () => {}) {
   if (file.size === 0) {
     const response = await fetch(`/api/admin/outbound-files?path=${encodeURIComponent(path)}`, {
@@ -88,14 +104,22 @@ export async function uploadLibraryFile(file, path, progress = () => {}) {
     progress(0);
     return;
   }
-  // ponytail: cross-selection resume needs a content identity, not file metadata.
-  const uploadId = [...globalThis.crypto.getRandomValues(new Uint8Array(32))]
-    .map((byte) => byte.toString(16).padStart(2, '0')).join('');
-  const chunkSize = 8 * 1024 * 1024;
+  const uploadId = await libraryFileIdentity(file);
+  const checkpoint = `votport-library-v1:${encodeURIComponent(path)}:${uploadId}`;
   let offset = 0;
+  try {
+    const saved = Number(sessionStorage.getItem(checkpoint));
+    if (Number.isSafeInteger(saved) && saved > 0 && saved < file.size) offset = saved;
+  } catch { /* storage unavailable; the upload can still start at zero */ }
+  const remember = () => {
+    try {
+      if (offset === file.size) sessionStorage.removeItem(checkpoint);
+      else sessionStorage.setItem(checkpoint, String(offset));
+    } catch { /* upload retries in this selection remain available */ }
+  };
   let rewinds = 0;
   while (offset < file.size) {
-    const end = Math.min(offset + chunkSize, file.size);
+    const end = Math.min(offset + LIBRARY_CHUNK_BYTES, file.size);
     let retries = 0;
     while (true) {
       try {
@@ -118,12 +142,14 @@ export async function uploadLibraryFile(file, path, progress = () => {}) {
           // across successful chunks so a rewind cycle cannot run forever.
           if (body.offset < offset && ++rewinds > 3) throw new Error('server repeatedly lost upload progress');
           offset = body.offset;
+          remember();
           progress(offset);
           break;
         }
         if (!response.ok) throw new Error(body?.error || `upload failed (${response.status})`);
         if (!Number.isInteger(body?.offset) || (body.offset !== end && body.offset !== file.size)) throw new Error('server returned invalid upload offset');
         offset = body.offset;
+        remember();
         progress(offset);
         break;
       } catch (error) {

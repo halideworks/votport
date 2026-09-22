@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
-import { entryFiles, runUploadBatch, uploadLibraryFile } from '../web/assets/upload-entries.js';
+import { entryFiles, runUploadBatch, uploadLibraryFile, libraryFileIdentity } from '../web/assets/upload-entries.js';
 
 const deliver = await readFile(new URL('../web/deliver.html', import.meta.url), 'utf8');
 const deliverScript = await readFile(new URL('../web/assets/page-deliver.js', import.meta.url), 'utf8');
@@ -105,7 +105,7 @@ test('library upload attempts isolate same-metadata files and keep the id throug
 });
 
 test('library upload recovery rejects unchanged and unpublished completion offsets', async (t) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
+  t.mock.method(globalThis, 'setTimeout', (done) => { queueMicrotask(done); });
   for (const offset of [0, 1, 2, -1]) {
     let requests = 0;
     t.mock.method(globalThis, 'fetch', async () => {
@@ -113,17 +113,13 @@ test('library upload recovery rejects unchanged and unpublished completion offse
       return Response.json({ offset }, { status: 409 });
     });
     const result = assert.rejects(uploadLibraryFile(new File(['x'], 'x'), 'x'), /invalid upload offset/);
-    for (let i = 0; i < 20; i += 1) {
-      await new Promise((resolve) => setImmediate(resolve));
-      t.mock.timers.tick(1000);
-    }
     await result;
     assert.equal(requests, 4);
   }
 });
 
 test('library uploads recover a lost stage but bound repeated rewinds across successful chunks', async (t) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
+  t.mock.method(globalThis, 'setTimeout', (done) => { queueMicrotask(done); });
   const file = new File([new Uint8Array(8 * 1024 * 1024 + 1)], 'two-chunks.bin');
   for (const lostStages of [1, 4]) {
     let losses = 0;
@@ -136,10 +132,6 @@ test('library uploads recover a lost stage but bound repeated rewinds across suc
     });
     const upload = uploadLibraryFile(file, file.name);
     const result = lostStages === 1 ? upload : assert.rejects(upload, /repeatedly lost upload progress/);
-    for (let i = 0; i < 30; i += 1) {
-      await new Promise((resolve) => setImmediate(resolve));
-      t.mock.timers.tick(1000);
-    }
     await result;
     assert.equal(requests, lostStages === 1 ? 4 : 8);
   }
@@ -179,4 +171,36 @@ test('upload batches cap concurrency and wait for running work after failure', a
   for (const { resolve } of deferred.values()) resolve();
   await assert.rejects(result, (error) => error === undefined);
   assert.equal(active, 0);
+});
+
+test('library uploads resume acknowledged chunks after reselection and clear completed checkpoints', async (t) => {
+  const saved = new Map();
+  const previous = globalThis.sessionStorage;
+  globalThis.sessionStorage = { getItem: (key) => saved.get(key) ?? null, setItem: (key, value) => saved.set(key, value), removeItem: (key) => saved.delete(key) };
+  t.after(() => { if (previous === undefined) delete globalThis.sessionStorage; else globalThis.sessionStorage = previous; });
+  t.mock.method(globalThis, 'setTimeout', (done) => { queueMicrotask(done); });
+  const bytes = new Uint8Array(8 * 1024 * 1024 + 1);
+  bytes[bytes.length - 1] = 19;
+  let offline = true;
+  const requests = [];
+  t.mock.method(globalThis, 'fetch', async (_url, request) => {
+    const [, start, end] = /^bytes (\d+)-(\d+)\/\d+$/.exec(request.headers['Content-Range']);
+    requests.push([Number(start), request.headers['X-Votport-Upload-Id']]);
+    if (Number(start) > 0 && offline) throw new TypeError('offline');
+    return Response.json({ offset: Number(end) + 1 });
+  });
+  await assert.rejects(uploadLibraryFile(new File([bytes], 'large.bin', { lastModified: 1 }), 'large.bin'), /offline/);
+  assert.deepEqual([...saved.values()], [String(8 * 1024 * 1024)]);
+  offline = false;
+  await uploadLibraryFile(new File([bytes], 'large.bin', { lastModified: 2 }), 'large.bin');
+  assert.equal(requests.at(-1)[0], 8 * 1024 * 1024);
+  assert.equal(requests.at(-1)[1], requests[0][1]);
+  assert.equal(saved.size, 0);
+});
+
+test('library identities bind contents and reject short reads', async () => {
+  const original = new File(['same contents'], 'first');
+  assert.equal(await libraryFileIdentity(original), await libraryFileIdentity(new File(['same contents'], 'renamed')));
+  assert.notEqual(await libraryFileIdentity(original), await libraryFileIdentity(new File(['Same contents'], 'first')));
+  await assert.rejects(libraryFileIdentity({ size: 2, slice: () => new Blob(['x']) }), /could not be read completely/);
 });

@@ -1058,7 +1058,7 @@ mod tests {
                 crate::workflow::tests::request(),
             )
             .unwrap();
-        job.state = "suspended".into();
+        job.state = crate::workflow::JobState::Suspended;
         let source = store
             .event_signer
             .sign_route(crate::route_protocol::RouteDocument {

@@ -26,7 +26,7 @@ import {
   showGrantResult,
   teachingEmptyState,
 } from '/assets/admin-common.js';
-import { preparationProgress } from '/assets/deliver-progress.js';
+import { preparationProgress, pollDeliverPreparation } from '/assets/deliver-progress.js';
 import { startStatusPoll } from '/assets/status-strip.js';
 import { searchDebounce } from '/assets/search-debounce.js';
 import { node, $, fieldError } from '/assets/object-card.js';
@@ -49,12 +49,14 @@ function grantStatus(grant) {
 }
 
 let grantRows = [];
+let revealedGrant = null;
 let grantTotal = 0;
 let grantHasMore = false;
 let grantLoading = false;
 
 function renderGrants() {
-  const grants = grantRows;
+  const grants = revealedGrant && !grantRows.some((grant) => grant.id === revealedGrant.id)
+    ? [revealedGrant, ...grantRows] : grantRows;
   const container = $('outbound-grants');
   const editingNotifications = new Map([...container.querySelectorAll('.link-item')]
     .map((card) => [card.id, card.querySelector('.notification-details')])
@@ -246,6 +248,7 @@ async function refreshGrants(reset = true) {
     grantTotal = response.total ?? grantRows.length;
     grantHasMore = Boolean(response.has_more);
     await sessionReady; renderGrants();
+    await revealGrant(true);
   } catch (error) {
     if (reset || !grantRows.length) {
       const message = node('p', 'Deliveries could not be loaded.', 'muted');
@@ -786,27 +789,6 @@ function deliverFormValues() {
   };
 }
 
-// Polls one preparation to a terminal state, rendering each in-flight
-// snapshot through `render`. The long ceiling matches the job's own idea
-// of a few minutes for big libraries; the 15-minute server TTL only
-// applies after a preparation reaches a terminal state.
-async function pollDeliverPreparation(id, render) {
-  const deadline = Date.now() + 15 * 60 * 1000;
-  for (;;) {
-    const snapshot = await api(
-      `/api/admin/outbound-grants/preparations/${encodeURIComponent(id)}`,
-    );
-    if (snapshot.status !== 'preparing') return snapshot;
-    render(snapshot);
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    if (Date.now() > deadline) {
-      throw new Error(
-        'Preparing this link is taking unusually long. Keep the page open; the link also appears in Delivery links when it finishes.',
-      );
-    }
-  }
-}
-
 function renderDeliverProgress(snapshot) {
   const bar = $('deliver-progress-bar');
   const view = preparationProgress(snapshot);
@@ -840,7 +822,8 @@ async function submitDeliverGrant() {
   $('deliver-fields').disabled = true;
   $('library-files').disabled = true;
   submit.textContent = 'Preparing link…';
-  progress.textContent = 'Verifying selected files and preparing your delivery link. Large files can take a few minutes. Keep this page open.';
+  $('deliver-progress-text').textContent = 'Verifying selected files and preparing your delivery link. Large files can take a few minutes. Keep this page open.';
+  $('deliver-progress-bar').hidden = true;
   progress.hidden = false;
   progress.focus({ preventScroll: true });
   $('outbound-result').hidden = true;
@@ -853,7 +836,7 @@ async function submitDeliverGrant() {
       // The server answered 202: hashing runs as a detached job and this
       // page polls its progress until the link is ready (or it fails).
       progress.dataset.live = 'true';
-      response = await pollDeliverPreparation(response.preparation_id, renderDeliverProgress);
+      response = await pollDeliverPreparation(response.preparation_id, renderDeliverProgress, api);
     }
     if (!response.url) throw new Error('server did not return a download URL');
     markFormSaved($('deliver-form'));
@@ -884,16 +867,23 @@ $('deliver-form').addEventListener('submit', async (event) => {
   await submitDeliverGrant();
 });
 
-// A search result may name a grant past the first page: page forward until
-// it is on the page. ponytail: bounded at ten pages; a grant lookup by id
-// is the upgrade if active deliveries ever run to thousands.
-async function revealGrant() {
-  if (!window.location.hash.startsWith('#grant-')) return;
-  for (let pages = 0; !revealHash() && grantHasMore && pages < 10; pages += 1) {
-    await refreshGrants(false);
+async function revealGrant(refresh = false) {
+  const hash = window.location.hash;
+  if (!hash.startsWith('#grant-') || (!refresh && revealHash())) return;
+  if (refresh && grantRows.some((grant) => `#grant-${grant.id}` === hash)) { revealedGrant = null; return; }
+  try {
+    const grant = await api(`/api/admin/outbound-grants/${encodeURIComponent(hash.slice(7))}`);
+    if (window.location.hash !== hash) return;
+    await sessionReady;
+    if (window.location.hash !== hash) return;
+    revealedGrant = grant;
+    renderGrants();
+    revealHash();
+  } catch (error) {
+    if (window.location.hash === hash) announce('outbound-grants-status', error.message);
   }
 }
-window.addEventListener('hashchange', () => { revealGrant().catch(() => {}); });
+window.addEventListener('hashchange', () => { revealGrant(); });
 
 function renderStatus(status) {
   const outbound = status.outbound || {};

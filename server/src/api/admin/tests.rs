@@ -1030,7 +1030,7 @@ mod handler_tests {
     }
 
     /// Axum 0.8 keeps its route table private, so this walks the `.route(`
-    /// registrations in app.rs the way the bare-require-admin lint walks
+    /// registrations in app/router.rs the way the bare-require-admin lint walks
     /// handler sources. Every mutating admin, trade and notifications route
     /// must refuse a viewer session that lacks the X-Votport header: the
     /// require_admin_write role check and the CSRF header check both answer
@@ -1249,10 +1249,10 @@ mod handler_tests {
             ("POST", "/api/notifications/{id}/test", "", ""),
         ];
 
-        // Sync the table against app.rs: a new mutating route on these
+        // Sync the table against app/router.rs: a new mutating route on these
         // prefixes cannot merge without appearing here (or below as a
         // documented exemption).
-        let source = std::fs::read_to_string("src/app.rs").unwrap();
+        let source = std::fs::read_to_string("src/app/router.rs").unwrap();
         let prefixes = [
             "/api/admin",
             "/api/port",
@@ -1278,7 +1278,7 @@ mod handler_tests {
         expected.sort();
         assert_eq!(
             registered, expected,
-            "route table out of sync with src/app.rs"
+            "route table out of sync with src/app/router.rs"
         );
 
         for (method, template, query, body) in covered {

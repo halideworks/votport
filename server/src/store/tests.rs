@@ -1091,6 +1091,23 @@ fn outbound_grants_page_is_newest_first_bounded_and_tenant_scoped() {
         .0
         .is_empty());
     assert_eq!(store.outbound_grants_page("other", 2, 0, 64).unwrap().1, 1);
+    assert_eq!(
+        store
+            .outbound_grant_preview("acme", "g1", 64)
+            .unwrap()
+            .unwrap()
+            .0
+            .id,
+        "g1"
+    );
+    assert!(store
+        .outbound_grant_preview("other", "g1", 64)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .outbound_grant_preview("acme", "missing", 64)
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -1151,6 +1168,21 @@ fn outbound_grants_page_reports_counts_and_bounds_file_previews() {
     );
 
     let page = store.outbound_grants_page("acme", 10, 0, 2).unwrap().0;
+    for (grant, count) in &page {
+        let (preview, preview_count) = store
+            .outbound_grant_preview("acme", &grant.id, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(preview_count, *count);
+        assert_eq!(preview.id, grant.id);
+        assert_eq!(preview.files.len(), grant.files.len());
+        for (actual, expected) in preview.files.iter().zip(&grant.files) {
+            assert_eq!(
+                (&actual.name, actual.downloads),
+                (&expected.name, expected.downloads)
+            );
+        }
+    }
     let find = |id: &str| page.iter().find(|(grant, _)| grant.id == id).unwrap();
     let (legacy, legacy_count) = find("legacy");
     assert_eq!(*legacy_count, 1);

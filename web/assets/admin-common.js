@@ -4,30 +4,13 @@ import { mountDrafts, confirmLeave } from '/assets/form-drafts.js';
 
 // Copying text with a Copied flash lives with the shared public helpers so
 // public pages need not import this admin module for it.
-import { node, copyToClipboard, formatAgo, formatBytes, formatDuration } from '/assets/object-card.js';
+import { node, copyToClipboard, formatAgo, formatBytes, formatDuration, formatWhen, confirmModal, alertModal } from '/assets/object-card.js';
 import { createUndoQueue } from '/assets/undo.js';
 import { searchDebounce } from '/assets/search-debounce.js';
-export { copyToClipboard };
+export { copyToClipboard, formatWhen, confirmModal, alertModal };
 
-export async function api(path, options = {}) {
-  const response = await fetch(path, {
-    credentials: 'same-origin',
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Votport': '1',
-      ...(options.headers || {}),
-    },
-  });
-  let body = null;
-  try { body = await response.json(); } catch { /* non-JSON error page */ }
-  if (!response.ok) {
-    const error = new Error(body?.error || `request failed (${response.status})`);
-    error.status = response.status;
-    throw error;
-  }
-  return body;
-}
+import { api } from '/assets/admin-api.js';
+export { api };
 
 /// The switch reply reissues the session cookie, but a reload started in
 /// the same breath can race the browser's cookie commit and land back in
@@ -364,30 +347,6 @@ function buildNav(session) {
   });
 }
 
-function showModal(title, detail, action) {
-  const dialog = document.getElementById('confirm');
-  document.getElementById('confirm-title').textContent = title;
-  document.getElementById('confirm-detail').textContent = detail;
-  const ok = document.getElementById('confirm-ok');
-  ok.textContent = action || '';
-  ok.hidden = !action;
-  document.getElementById('confirm-cancel').textContent = action ? 'Cancel' : 'OK';
-  dialog.returnValue = 'cancel';
-  dialog.showModal();
-  return dialog;
-}
-
-export function confirmModal(title, detail, action) {
-  const dialog = showModal(title, detail, action);
-  return new Promise((resolve) => {
-    dialog.addEventListener('close', () => resolve(dialog.returnValue === 'ok'), { once: true });
-  });
-}
-
-export function alertModal(message) {
-  showModal('Something went wrong', message);
-}
-
 export function teachingEmptyState(title, steps) {
   const box = node('div', '', 'empty-teach');
   const list = document.createElement('ol');
@@ -532,22 +491,6 @@ export function showGrantResult(url, protectedGrant = false, focusResult = false
       } else report('Could not copy the delivery link. Use Copy link below to retry.');
     }
   };
-}
-
-export function formatWhen(unixSeconds) {
-  // UTC, named: the server's logs, receipts and audit export all speak UTC,
-  // so admin timestamps read in the same zone instead of an unlabelled
-  // browser-local one (audit finding 405). Seconds are dropped: a transfer
-  // stamp never needs them and the audit export carries full precision.
-  return new Date(unixSeconds * 1000).toLocaleString([], {
-    timeZone: 'UTC',
-    timeZoneName: 'short',
-    year: 'numeric',
-    month: 'short',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-  });
 }
 
 /// The stock accent for the current theme, read from the stylesheet, so a

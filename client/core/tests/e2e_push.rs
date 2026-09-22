@@ -85,3 +85,94 @@ fn a_drop_pushes_over_quic_and_lands_in_the_receive_directory() {
         assert_eq!(&received_bytes, expected, "{relative} bytes differ");
     }
 }
+
+#[test]
+fn cancellation_after_preflight_and_during_push_leaves_a_resumable_transfer() {
+    use votport_client_core::progress::{Event, Observer, Transport};
+    struct Cancel {
+        during_transfer: bool,
+        session: Option<String>,
+        stopped: bool,
+        transports: Vec<Transport>,
+    }
+    impl Observer for Cancel {
+        fn event(&mut self, event: Event) {
+            match event {
+                Event::SessionCreated { session } => {
+                    self.session = Some(session);
+                    self.stopped = !self.during_transfer;
+                }
+                Event::Bytes { moved, .. } if moved > 0 => self.stopped = true,
+                Event::Transport(transport) => self.transports.push(transport),
+                Event::Finished { .. } => panic!("a cancelled push reported completion"),
+                _ => {}
+            }
+        }
+        fn cancelled(&self) -> bool {
+            self.stopped
+        }
+    }
+    let Some(bin) = common::server_binary() else {
+        return;
+    };
+    let push_port = common::free_port();
+    let server = common::start_server(
+        &bin,
+        &[
+            ("VOTPORT_PUSH_BIND", format!("127.0.0.1:{push_port}")),
+            ("VOTPORT_PUSH_ADVERTISE", format!("127.0.0.1:{push_port}")),
+        ],
+    );
+    let token = common::create_link(&server.base);
+    let source = tempfile::tempdir().unwrap();
+    let path = source.path().join("cancel.bin");
+    std::fs::write(&path, vec![37; 20 * 1024 * 1024]).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let device = Device::load_or_create_in(state.path()).unwrap();
+    for during_transfer in [false, true] {
+        let mut observer = Cancel {
+            during_transfer,
+            session: None,
+            stopped: false,
+            transports: Vec::new(),
+        };
+        let result = send(
+            &server.base,
+            Drop {
+                token: token.clone(),
+                password: None,
+                files: vec![Selected {
+                    relative: "cancel.bin".into(),
+                    source: path.clone(),
+                }],
+            },
+            &device,
+            &mut observer,
+        );
+        assert!(
+            matches!(result, Err(votport_client_core::Error::Cancelled)),
+            "expected cancellation, got {:?}",
+            result.err()
+        );
+        assert!(observer.stopped);
+        assert_eq!(observer.transports, [Transport::Push]);
+        assert!(observer.session.is_some());
+    }
+    let sent = send(
+        &server.base,
+        Drop {
+            token,
+            password: None,
+            files: vec![Selected {
+                relative: "cancel.bin".into(),
+                source: path,
+            }],
+        },
+        &device,
+        &mut Silent,
+    )
+    .expect("resume after cancellation");
+    assert!(matches!(sent, Sent::Push { files: 1 }));
+    let landed = common::find_file(&server.received, "cancel.bin").unwrap();
+    assert_eq!(std::fs::read(landed).unwrap(), vec![37; 20 * 1024 * 1024]);
+}

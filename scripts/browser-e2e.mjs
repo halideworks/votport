@@ -1222,6 +1222,24 @@ const payloadPath = path.join(stored, "Résumé Draft.pdf");
 const sidecarPath = path.join(stored, sidecarName);
 await page.goto(`${base}/verify`);
 await page.waitForSelector("#verify-drop", { timeout: 15000 });
+const workerSuites = await page.evaluate(async () => {
+  const worker = new Worker('/assets/hash-worker.js', { type: 'module' });
+  try {
+    const replies = [];
+    for (const suite of [undefined, 0, 1, 'unknown']) {
+      replies.push(await new Promise((resolve, reject) => {
+        worker.onmessage = ({ data }) => resolve(data);
+        worker.onerror = reject;
+        worker.postMessage({ op: 'hash', req: 1, key: 'suite', file: new File([], 'empty'), suite });
+      }));
+    }
+    return replies.map((reply) => reply.error || reply.done.suite);
+  } finally { worker.terminate(); }
+});
+if (JSON.stringify(workerSuites.slice(0, 3)) !== '[0,0,1]' || !workerSuites[3].includes('unsupported hash suite')) {
+  throw new Error(`worker suite selection: ${JSON.stringify(workerSuites)}`);
+}
+
 for (const [selector, name, describedBy] of [
   ["#pick-payload", "Browse for file", "payload-name"],
   ["#pick-sidecar", "Browse for receipt", "sidecar-name"],

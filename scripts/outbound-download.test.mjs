@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
-import { runInNewContext } from 'node:vm';
 import {
   appendMetadataPage,
   batchDownloadEligible,
@@ -16,29 +15,20 @@ import {
   BatchDownloadUnsupportedError,
   sanitizeFilename,
   streamToWritable,
+  saveFile,
+  createDownloadFile,
+  triggerDownload,
+  triggerSeparateDownloads,
   summarizeFailures,
   nextFileBatch,
 } from '../web/assets/outbound-download.js';
 
 const outboundScript = await readFile(new URL('../web/assets/outbound.js', import.meta.url), 'utf8');
 const sendPage = await readFile(new URL('../web/send.html', import.meta.url), 'utf8');
-const downloadHelpers = await import('../web/assets/outbound-download.js');
-
-function individualSave(directory, file, name) {
-  const save = runInNewContext(`${outboundScript.slice(outboundScript.indexOf('async function saveFile('), outboundScript.indexOf('async function triggerSeparateDownloads('))}\nsaveFile`, {
-    streamToWritable,
-    createDownloadFile: downloadHelpers.createDownloadFile,
-    fetch: async () => new Response(file.content),
-    reauthorizeDownload: async () => false,
-  });
-  return save(directory, file, name);
-}
-
 test('VOTPort imposes no anchor fallback file-count cap; Chromium batches permission after 10', () => {
   assert.doesNotMatch(outboundScript, /MAX_ANCHOR_DOWNLOADS|anchorDownloadsAllowed/);
   assert.match(outboundScript, /prepareAnchorDownloads\(\)[\s\S]+loadRemainingMetadata\(\)/);
   assert.match(outboundScript, /triggerSeparateDownloads\(\s*pending\.files,\s*pending\.names,/);
-  assert.match(outboundScript, /const link = document\.createElement\('a'\);[\s\S]+await new Promise\(\(resolve\) => setTimeout\(resolve, 0\)\)/);
   assert.match(outboundScript, /separate-download-stop/);
   assert.match(sendPage, />Stop requesting remaining files<\/button>/);
   assert.doesNotMatch(outboundScript, /cannot request more than|Chrome\/Edge/);
@@ -55,108 +45,57 @@ test('anchor fallback copy explains multiple downloads', () => {
   assert.match(sendPage, />Start downloads<\/button>/);
 });
 
-test('single-file handoff probes first and reports browser ownership after success', () => {
-  const singleFileBranch = outboundScript.slice(
-    outboundScript.indexOf('  } else {', outboundScript.indexOf('if (metadataTotal > 1)')),
-    outboundScript.indexOf('\n  const fetchBlock', outboundScript.indexOf('if (metadataTotal > 1)')),
-  );
-  assert.match(singleFileBranch, /await triggerDownload\(only\.download_url, only\.name\)/);
-  assert.ok(singleFileBranch.indexOf('triggerDownload') < singleFileBranch.indexOf('setSeparateDownloadStatus(\'Download handed to the browser.'));
-});
+function downloadDocument(t, clicked) {
+  const previous = globalThis.document;
+  globalThis.document = {
+    body: { append() {} },
+    createElement() { return { click() { clicked(this); }, remove() {} }; },
+  };
+  t.after(() => { globalThis.document = previous; });
+}
 
-test('download handoffs probe and never navigate the top frame', async () => {
-  // Every download button routes through triggerDownload, so a refusal is
-  // rendered by the page instead of replacing it with raw JSON.
-  assert.doesNotMatch(outboundScript, /location\.assign\(/);
-  assert.match(outboundScript, /downloadButton\('Download file', file\.download_url, 'tiny', file\.name\)/);
-  assert.match(outboundScript, /\$\('bundle-download-button'\)\.onclick = \(\) => triggerDownload\(body\.bundle_url\)/);
-  const source = outboundScript.slice(
-    outboundScript.indexOf('async function triggerDownload('),
-    outboundScript.indexOf('function downloadButton('),
-  );
+test('download handoff probes first and leaves refused or unreachable downloads on the page', async (t) => {
   const clicks = [];
+  downloadDocument(t, (link) => clicks.push(link));
   let shown = null;
-  const trigger = runInNewContext(`${source}\ntriggerDownload`, {
-    fetch: async () => ({
-      ok: true,
-    }),
-    document: {
-      body: { append() {} },
-      createElement() {
-        return { click() { clicks.push(1); }, remove() {} };
-      },
-    },
-    showError(message) { shown = message; },
+  const showError = (message) => { shown = message; };
+  t.mock.method(globalThis, 'fetch', async (url, request) => {
+    assert.equal(url, '/api/s/t/file');
+    assert.equal(request.method, 'HEAD');
+    assert.equal(clicks.length, 0);
+    return Response.json({});
   });
-  assert.equal(await trigger('/api/s/t/file', 'report.pdf'), true);
+  assert.equal(await triggerDownload('/api/s/t/file', 'report.pdf', showError), true);
   assert.equal(clicks.length, 1);
+  assert.equal(clicks[0].href, '/api/s/t/file');
+  assert.equal(clicks[0].download, 'report.pdf');
   assert.equal(shown, null);
-
-  const refused = runInNewContext(`${source}\ntriggerDownload`, {
-    fetch: async () => ({
-      ok: false,
-      status: 404,
-      json: async () => ({ error: 'not found' }),
-    }),
-    document: {
-      body: { append() {} },
-      createElement() {
-        return { click() { clicks.push(1); }, remove() {} };
-      },
-    },
-    showError(message) { shown = message; },
-  });
-  assert.equal(await refused('/api/s/t/file', 'report.pdf'), false);
-  assert.equal(clicks.length, 1, 'a refused download must not hand off');
+  t.mock.method(globalThis, 'fetch', async () => Response.json({ error: 'not found' }, { status: 404 }));
+  assert.equal(await triggerDownload('/api/s/t/file', 'report.pdf', showError), false);
+  assert.equal(clicks.length, 1);
   assert.equal(shown, 'not found');
-
-  const unreachable = runInNewContext(`${source}\ntriggerDownload`, {
-    fetch: async () => {
-      throw new TypeError('lost');
-    },
-    document: {
-      body: { append() {} },
-      createElement() {
-        return { click() { clicks.push(1); }, remove() {} };
-      },
-    },
-    showError(message) { shown = message; },
-  });
-  assert.equal(await unreachable('/api/s/t/file', 'report.pdf'), false);
+  t.mock.method(globalThis, 'fetch', async () => { throw new TypeError('lost'); });
+  assert.equal(await triggerDownload('/api/s/t/file', 'report.pdf', showError), false);
   assert.equal(clicks.length, 1);
   assert.match(shown, /could not be reached/);
 });
 
-test('anchor requests stop before the next click and report each handoff', async () => {
-  const triggerSource = outboundScript.slice(
-    outboundScript.indexOf('async function triggerSeparateDownloads('),
-    outboundScript.indexOf('\n\nlet separateDownloadBusy', outboundScript.indexOf('async function triggerSeparateDownloads(')),
-  );
-  let clicks = 0;
-  const delays = [];
-  const trigger = runInNewContext(`${triggerSource}\ntriggerSeparateDownloads`, {
-    document: {
-      body: { append() {} },
-      createElement() { return { click() { clicks += 1; }, remove() {} }; },
-    },
-    setTimeout(callback, delay) { delays.push(delay); callback(); },
-  });
+test('anchor requests stop before the next click and report each handoff', async (t) => {
+  const clicks = [];
+  downloadDocument(t, (link) => clicks.push(link));
   const stop = { stopped: false };
   const progress = [];
-  const result = await trigger(
+  const result = await triggerSeparateDownloads(
     [{ download_url: '/f/0' }, { download_url: '/f/1' }, { download_url: '/f/2' }],
-    ['one', 'two', 'three'],
-    stop,
+    ['one', 'two', 'three'], stop,
     (requested, total) => {
       progress.push([requested, total]);
       if (requested === 2) stop.stopped = true;
     },
   );
-  assert.equal(clicks, 2);
+  assert.deepEqual(clicks.map(({ href, download }) => [href, download]), [['/f/0', 'one'], ['/f/1', 'two']]);
   assert.deepEqual(progress, [[1, 3], [2, 3]]);
-  assert.deepEqual(delays, [0, 0]);
-  assert.equal(result.requested, 2);
-  assert.equal(result.stopped, true);
+  assert.deepEqual(result, { requested: 2, stopped: true });
 });
 
 test('recipient page has one primary action with ZIP as a secondary link', () => {
@@ -415,7 +354,9 @@ test('batch saves preserve existing files and directories with numbered names', 
   ]);
 });
 
-test('parallel individual saves and interrupted batch fallback retain earlier files', async () => {
+test('parallel individual saves and interrupted batch fallback retain earlier files', async (t) => {
+  t.mock.method(globalThis, 'fetch', async (url) => new Response(url));
+  const individualSave = (directory, file, name) => saveFile(directory, { ...file, download_url: file.content }, name);
   const directory = fakeDirectory({ initialFiles: [['chart.txt', 'keep']] });
   await Promise.all([
     individualSave(directory, { content: 'one', bytes: 3 }, 'chart.txt'),
@@ -437,19 +378,19 @@ test('name allocation propagates permission, cancellation and invalid-name failu
   for (const name of ['NotAllowedError', 'AbortError', 'TypeError', 'QuotaExceededError']) {
     const failure = new DOMException('Cannot use this filename', name);
     let probes = 0;
-    await assert.rejects(downloadHelpers.createDownloadFile({
+    await assert.rejects(createDownloadFile({
       async getFileHandle() { probes += 1; throw failure; },
     }, 'chart.txt'), (error) => error === failure);
     assert.equal(probes, 1);
     const directory = fakeDirectory();
-    await downloadHelpers.createDownloadFile(directory, 'chart.txt');
+    await createDownloadFile(directory, 'chart.txt');
     assert.deepEqual([...directory.files], [['chart.txt', '']]);
   }
 });
 
 test('name allocation bounds collisions and handles a directory appearing during creation', async () => {
   let probes = 0;
-  await assert.rejects(downloadHelpers.createDownloadFile({
+  await assert.rejects(createDownloadFile({
     async getFileHandle(_name, options) {
       assert.equal(options, undefined);
       probes += 1;
@@ -466,7 +407,7 @@ test('name allocation bounds collisions and handles a directory appearing during
     }
     return getFileHandle(name, options);
   };
-  await downloadHelpers.createDownloadFile(directory, 'chart.txt');
+  await createDownloadFile(directory, 'chart.txt');
   assert.deepEqual([...directory.files], [['chart (2).txt', '']]);
 });
 
