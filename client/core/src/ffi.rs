@@ -387,7 +387,7 @@ pub struct PreviewFile {
 /// What a link is, read before anything is sent, minted, or reserved, so a
 /// screen can show what a pasted link does and ask for a password only when
 /// one is needed.
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record, Default)]
 pub struct LinkPreview {
     /// What the link is, once it parsed as one.
     pub kind: Option<LinkKind>,
@@ -479,15 +479,7 @@ pub fn inspect(link: String, expect: Option<LinkKind>) -> LinkPreview {
             kind: split_link(&link).ok().map(|link| link.kind),
             problem: Some(error.headline()),
             detail: Some(error.to_string()),
-            label: None,
-            needs_password: false,
-            usable: false,
-            quic: None,
-            max_bytes: None,
-            max_entries: None,
-            files: Vec::new(),
-            total_bytes: None,
-            line: None,
+            ..LinkPreview::default()
         },
     }
     .with_line()
@@ -518,17 +510,13 @@ fn preview(link: &str, expect: Option<LinkKind>) -> std::result::Result<LinkPrev
         };
         Ok(LinkPreview {
             kind: Some(LinkKind::Delivery),
-            problem: None,
-            detail: None,
             label: metadata.label,
             needs_password: !known,
             usable: true,
             quic: known.then_some(metadata.fetch.is_some()),
-            max_bytes: None,
-            max_entries: None,
             total_bytes: known.then(|| files.iter().map(|file| file.bytes).sum()),
             files,
-            line: None,
+            ..LinkPreview::default()
         })
     } else {
         let info = client.link_info_for_preview(&link.token)?;
@@ -545,9 +533,7 @@ fn preview(link: &str, expect: Option<LinkKind>) -> std::result::Result<LinkPrev
             quic: Some(info.push),
             max_bytes: Some(info.max_bytes),
             max_entries: Some(info.max_entries as u64),
-            files: Vec::new(),
-            total_bytes: None,
-            line: None,
+            ..LinkPreview::default()
         })
     }
 }

@@ -2293,91 +2293,22 @@ pub async fn create_outbound_grant_preparation(
     headers: HeaderMap,
     request: Request,
 ) -> ApiResult<Response> {
-    let identity = admin::require_operator_write(&app, &headers)?;
-    let _grant_permit = app.outbound_grant_permits.try_acquire().map_err(|_| {
-        ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many grant preparations; try again later",
-        )
-        .with_retry_after(1)
-    })?;
-    let (request, notifications, password_hash) =
-        validated_grant_create(&app, &identity, request).await?;
-    let has_legacy_fields =
-        request.link_id.is_some() || request.upload_id.is_some() || request.file_index.is_some();
-    if let Some(directory_name) = request.directory {
-        if request.paths.is_some() || has_legacy_fields {
-            return Err(ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "directory cannot be combined with paths, link_id, upload_id, or file_index",
-            ));
-        }
-        let directory_label = library_directory_label(&directory_name);
-        // Cheap shape and mount sanity check before answering 202; the real
-        // walk runs in the preparation job.
-        automation_directory(&app, &identity.tenant, &directory_name)?;
-        return start_preparation(
-            &app,
-            &headers,
-            &identity,
-            PreparationJob {
-                directory: Some(directory_name),
-                requested: Vec::new(),
-                max_files: MAX_LIBRARY_PROJECT_FILES,
-                options: GrantOptions {
-                    workflow: None,
-                    automation: None,
-                    label: request
-                        .label
-                        .filter(|label| !label.trim().is_empty())
-                        .or(Some(directory_label)),
-                    password_hash,
-                    expires_days: request.expires_days,
-                    max_downloads: request.max_downloads,
-
-                    notifications,
-                },
-            },
-        );
-    }
-    if let Some(paths) = request.paths.as_deref() {
-        if has_legacy_fields {
-            return Err(ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "paths cannot be combined with link_id, upload_id, or file_index",
-            ));
-        }
-        return start_preparation(
-            &app,
-            &headers,
-            &identity,
-            PreparationJob {
-                directory: None,
-                requested: paths.to_vec(),
-                max_files: MAX_LIBRARY_PATHS_FILES,
-                options: GrantOptions {
-                    workflow: None,
-                    automation: None,
-                    label: request.label,
-                    password_hash,
-                    expires_days: request.expires_days,
-                    max_downloads: request.max_downloads,
-
-                    notifications,
-                },
-            },
-        );
-    }
-    Err(ApiError::new(
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "paths or directory is required",
-    ))
+    create_outbound_grant_inner(app, headers, request, true).await
 }
 
 pub async fn create_outbound_grant(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
     request: Request,
+) -> ApiResult<Response> {
+    create_outbound_grant_inner(app, headers, request, false).await
+}
+
+async fn create_outbound_grant_inner(
+    app: Arc<App>,
+    headers: HeaderMap,
+    request: Request,
+    background: bool,
 ) -> ApiResult<Response> {
     let identity = admin::require_operator_write(&app, &headers)?;
     let _grant_permit = app.outbound_grant_permits.try_acquire().map_err(|_| {
@@ -2391,74 +2322,87 @@ pub async fn create_outbound_grant(
         validated_grant_create(&app, &identity, request).await?;
     let has_legacy_fields =
         request.link_id.is_some() || request.upload_id.is_some() || request.file_index.is_some();
-    if let Some(directory_name) = request.directory {
-        if request.paths.is_some() || has_legacy_fields {
-            return Err(ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "directory cannot be combined with paths, link_id, upload_id, or file_index",
-            ));
-        }
-        let base = admin::base_url(&app, &headers);
-        let directory_label = library_directory_label(&directory_name);
-        let directory = automation_directory(&app, &identity.tenant, &directory_name)?;
-        let root = library_root(&app, &identity.tenant);
-        let paths = tokio::task::spawn_blocking(move || {
-            enumerate_automation_files(&root, &directory, MAX_LIBRARY_PROJECT_FILES)
-        })
-        .await
-        .map_err(|_| ApiError::internal("enumerate outbound files failed"))??;
-        let created = create_library_grant(
-            &app,
-            &base,
-            &identity,
-            &paths,
-            MAX_LIBRARY_PROJECT_FILES,
-            GrantOptions {
+    if request.directory.is_some() || request.paths.is_some() {
+        let (directory, requested, max_files, label) = if let Some(directory) = request.directory {
+            if request.paths.is_some() || has_legacy_fields {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "directory cannot be combined with paths, link_id, upload_id, or file_index",
+                ));
+            }
+            let label = request
+                .label
+                .filter(|label| !label.trim().is_empty())
+                .or_else(|| Some(library_directory_label(&directory)));
+            (
+                Some(directory),
+                Vec::new(),
+                MAX_LIBRARY_PROJECT_FILES,
+                label,
+            )
+        } else {
+            if has_legacy_fields {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "paths cannot be combined with link_id, upload_id, or file_index",
+                ));
+            }
+            (
+                None,
+                request.paths.unwrap_or_default(),
+                MAX_LIBRARY_PATHS_FILES,
+                request.label,
+            )
+        };
+        let job = PreparationJob {
+            directory,
+            requested,
+            max_files,
+            options: GrantOptions {
                 workflow: None,
                 automation: None,
-                label: request
-                    .label
-                    .filter(|label| !label.trim().is_empty())
-                    .or(Some(directory_label)),
+                label,
                 password_hash,
                 expires_days: request.expires_days,
                 max_downloads: request.max_downloads,
-
-                notifications: notifications.clone(),
+                notifications,
             },
+        };
+        let directory = job
+            .directory
+            .as_deref()
+            .map(|directory| automation_directory(&app, &identity.tenant, directory))
+            .transpose()?;
+        if background {
+            return start_preparation(&app, &headers, &identity, job);
+        }
+        let paths = if let Some(directory) = directory {
+            let root = library_root(&app, &identity.tenant);
+            tokio::task::spawn_blocking(move || {
+                enumerate_automation_files(&root, &directory, max_files)
+            })
+            .await
+            .map_err(|_| ApiError::internal("enumerate outbound files failed"))??
+        } else {
+            job.requested
+        };
+        let created = create_library_grant(
+            &app,
+            &admin::base_url(&app, &headers),
+            &identity,
+            &paths,
+            max_files,
+            job.options,
             None,
         )
         .await?;
         return Ok(grant_created_response(created));
     }
-    if let Some(paths) = request.paths.as_deref() {
-        if has_legacy_fields {
-            return Err(ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "paths cannot be combined with link_id, upload_id, or file_index",
-            ));
-        }
-        let base = admin::base_url(&app, &headers);
-        let created = create_library_grant(
-            &app,
-            &base,
-            &identity,
-            paths,
-            MAX_LIBRARY_PATHS_FILES,
-            GrantOptions {
-                workflow: None,
-                automation: None,
-                label: request.label,
-                password_hash,
-                expires_days: request.expires_days,
-                max_downloads: request.max_downloads,
-
-                notifications: notifications.clone(),
-            },
-            None,
-        )
-        .await?;
-        return Ok(grant_created_response(created));
+    if background {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "paths or directory is required",
+        ));
     }
     if !has_legacy_fields {
         return Err(ApiError::new(
@@ -3530,7 +3474,7 @@ pub async fn outbound_metadata(
     Query(query): Query<OutboundMetadataQuery>,
 ) -> ApiResult<Response> {
     let paging = outbound_metadata_paging(query)?;
-    if let Some((offset, limit)) = paging {
+    let (grant, page) = if let Some((offset, limit)) = paging {
         if !valid_token(&token) {
             return Err(ApiError::not_found());
         }
@@ -3539,81 +3483,16 @@ pub async fn outbound_metadata(
             .outbound_grant_files_page_by_token_hash(&hash_token(&token), offset, limit)
             .map_err(super::store_unavailable)?
             .ok_or_else(ApiError::not_found)?;
-        let grant = page.grant;
-        let files_total = page.file_count;
-        if grant.revoked_at.is_some() || grant.expires_at <= now_unix() {
+        if page.grant.revoked_at.is_some() || page.grant.expires_at <= now_unix() {
             return Err(ApiError::not_found());
         }
-        let _operation = begin_outbound_operation(&app, &grant.tenant)?;
-        let recipient = workflows::require_recipient(&app, &grant, &headers)?;
-        let authorized = grant_authorized(&app, &grant, &headers);
-        if grant.password_hash.is_some() && !authorized {
-            return Ok((
-                [(header::CACHE_CONTROL, "no-store")],
-                Json(json!({ "has_password": true, "authorized": false })),
-            )
-                .into_response());
-        }
-        let manifest = app
-            .store
-            .delivery_manifest(&grant.id)
-            .map_err(super::store_unavailable)?;
-        let evidence_authorization = super::evidence::metadata_authorization(
-            &app,
-            &grant,
-            &headers,
-            &manifest,
-            recipient.as_deref(),
-        )?;
-        let receipt_url = (!grant.link_id.is_empty()
-            || page
-                .files
-                .iter()
-                .any(|(index, file)| *index == 0 && file.source.starts_with("received:")))
-        .then(|| format!("/api/s/{token}/receipt"));
-        let files = page
-            .files
-            .into_iter()
-            .map(|(index, file)| outbound_metadata_file(&token, index, &file))
-            .collect::<Vec<_>>();
-        let has_more = offset.saturating_add(files.len()) < files_total;
-        let branding =
-            super::public_branding(&app, &grant.tenant).map_err(super::store_unavailable)?;
-        return Ok((
-            [(header::CACHE_CONTROL, "no-store")],
-            Json(json!({
-                "has_password": grant.password_hash.is_some(),
-                "authorized": authorized,
-                "branding": branding,
-                "label": grant.label,
-                "name": grant.name,
-                "suite": grant.suite,
-                "root": grant.root,
-                "bytes": grant.bytes,
-                "length": grant.bytes,
-                "package_root": grant.package_root,
-                "expires_at": grant.expires_at,
-                "downloads": grant.downloads,
-                "max_downloads": grant.max_downloads,
-                "receipt_key": app.signer.public_hex,
-                "grant_id": grant.id,
-                "delivery_manifest": manifest,
-                "evidence_authorization": evidence_authorization,
-                "receipt_url": receipt_url,
-                "download_url": format!("/api/s/{token}/file"),
-                "bundle_url": format!("/api/s/{token}/bundle"),
-                "batch_url": format!("/api/s/{token}/batch"),
-                "files": files,
-                "files_total": files_total,
-                "total_bytes": page.total_bytes,
-                "offset": offset,
-                "limit": limit,
-                "has_more": has_more,
-            })),
+        (
+            page.grant,
+            Some((page.files, page.file_count, page.total_bytes)),
         )
-            .into_response());
-    }
-    let grant = readable_grant(&app, &token)?;
+    } else {
+        (readable_grant(&app, &token)?, None)
+    };
     let _operation = begin_outbound_operation(&app, &grant.tenant)?;
     let recipient = workflows::require_recipient(&app, &grant, &headers)?;
     let authorized = grant_authorized(&app, &grant, &headers);
@@ -3635,64 +3514,92 @@ pub async fn outbound_metadata(
         &manifest,
         recipient.as_deref(),
     )?;
-    let files = if grant.files.is_empty() {
-        vec![json!({
-            "name": grant.name,
-            "suite": grant.suite,
-            "root": grant.root,
-            "bytes": grant.bytes,
-            "receipt_url": format!("/api/s/{token}/receipt"),
-            "download_url": format!("/api/s/{token}/file")
-        })]
+    let (files, receipt_url, extra) = if let Some((files, file_count, total_bytes)) = page {
+        let (offset, limit) = paging.expect("page was loaded with pagination");
+        let receipt_url = (!grant.link_id.is_empty()
+            || files
+                .iter()
+                .any(|(index, file)| *index == 0 && file.source.starts_with("received:")))
+        .then(|| format!("/api/s/{token}/receipt"));
+        let files = files
+            .into_iter()
+            .map(|(index, file)| outbound_metadata_file(&token, index, &file))
+            .collect::<Vec<_>>();
+        let has_more = offset.saturating_add(files.len()) < file_count;
+        (
+            files,
+            receipt_url,
+            json!({
+                "files_total": file_count, "total_bytes": total_bytes,
+                "offset": offset, "limit": limit, "has_more": has_more,
+            }),
+        )
     } else {
-        grant
-            .files
-            .iter()
-            .enumerate()
-            .map(|(index, file)| outbound_metadata_file(&token, index, file))
-            .collect()
+        let files = if grant.files.is_empty() {
+            vec![json!({
+                "name": grant.name,
+                "suite": grant.suite,
+                "root": grant.root,
+                "bytes": grant.bytes,
+                "receipt_url": format!("/api/s/{token}/receipt"),
+                "download_url": format!("/api/s/{token}/file")
+            })]
+        } else {
+            grant
+                .files
+                .iter()
+                .enumerate()
+                .map(|(index, file)| outbound_metadata_file(&token, index, file))
+                .collect()
+        };
+        let receipt_url = (grant.files.is_empty()
+            || grant.files[0].source.starts_with("received:"))
+        .then(|| format!("/api/s/{token}/receipt"));
+        (
+            files,
+            receipt_url,
+            json!({
+                "fetch": app.serve.as_ref().filter(|_| !grant.max_downloads.is_some_and(|max| grant.downloads >= max)).map(|serve| json!({
+                    "address": serve.address,
+                    "certificate_digest": hex::encode(serve.certificate_digest),
+                    "mint_url": format!("/api/s/{token}/fetch"),
+                })),
+                "total_bytes": if grant.files.is_empty() { grant.bytes } else {
+                    grant.files.iter().fold(0u64, |total, file| total.saturating_add(file.bytes))
+                },
+            }),
+        )
     };
     let branding = super::public_branding(&app, &grant.tenant).map_err(super::store_unavailable)?;
-    Ok((
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(json!({
-            "has_password": grant.password_hash.is_some(),
-            "authorized": authorized,
-            "branding": branding,
-            "label": grant.label,
-            "name": grant.name,
-            "suite": grant.suite,
-            "root": grant.root,
-            "bytes": grant.bytes,
-            "length": grant.bytes,
-            "package_root": grant.package_root,
-            "expires_at": grant.expires_at,
-            "downloads": grant.downloads,
-            "max_downloads": grant.max_downloads,
-            "receipt_key": app.signer.public_hex,
-                "grant_id": grant.id,
-                "delivery_manifest": manifest,
-                "evidence_authorization": evidence_authorization,
-            "receipt_url": (grant.files.is_empty() || grant.files[0].source.starts_with("received:")).then(|| format!("/api/s/{token}/receipt")),
-            "download_url": format!("/api/s/{token}/file"),
-            "bundle_url": format!("/api/s/{token}/bundle"),
-            "batch_url": format!("/api/s/{token}/batch"),
-            // Present only when the VOT serve listener is bound: where a VOT
-            // client dials and where it mints its capability.
-            "fetch": app.serve.as_ref().filter(|_| !grant.max_downloads.is_some_and(|max| grant.downloads >= max)).map(|serve| json!({
-                "address": serve.address,
-                "certificate_digest": hex::encode(serve.certificate_digest),
-                "mint_url": format!("/api/s/{token}/fetch"),
-            })),
-            "total_bytes": if grant.files.is_empty() {
-                grant.bytes
-            } else {
-                grant.files.iter().fold(0u64, |total, file| total.saturating_add(file.bytes))
-            },
-            "files": files,
-        })),
-    )
-        .into_response())
+    let mut metadata = json!({
+        "has_password": grant.password_hash.is_some(),
+        "authorized": authorized,
+        "branding": branding,
+        "label": grant.label,
+        "name": grant.name,
+        "suite": grant.suite,
+        "root": grant.root,
+        "bytes": grant.bytes,
+        "length": grant.bytes,
+        "package_root": grant.package_root,
+        "expires_at": grant.expires_at,
+        "downloads": grant.downloads,
+        "max_downloads": grant.max_downloads,
+        "receipt_key": app.signer.public_hex,
+        "grant_id": grant.id,
+        "delivery_manifest": manifest,
+        "evidence_authorization": evidence_authorization,
+        "receipt_url": receipt_url,
+        "download_url": format!("/api/s/{token}/file"),
+        "bundle_url": format!("/api/s/{token}/bundle"),
+        "batch_url": format!("/api/s/{token}/batch"),
+        "files": files,
+    });
+    metadata
+        .as_object_mut()
+        .expect("metadata object")
+        .extend(extra.as_object().expect("metadata fields").clone());
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(metadata)).into_response())
 }
 
 /// Tenant logo for a delivery. Password-gated like the metadata: the

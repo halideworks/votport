@@ -4079,27 +4079,7 @@ impl Store {
         &self,
         token_hash: &str,
     ) -> Result<Option<OutboundGrant>, String> {
-        self.with(|connection| {
-            connection
-                .prepare_cached(
-                    "SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
-                            name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
-                            expires_at, revoked_at, downloads, max_downloads, notifications_json, first_download_at,
-                            last_download_at,
-                            files_json
-                     FROM outbound_grants WHERE token_hash = ?1",
-                )?
-                .query_row([token_hash], map_outbound_grant)
-                .optional()
-                .and_then(|grant| {
-                    grant
-                        .map(|mut grant| {
-                            overlay_outbound_file_counters(connection, &mut grant)?;
-                            Ok(grant)
-                        })
-                        .transpose()
-                })
-        })
+        self.outbound_grant("token_hash", token_hash)
     }
 
     /// The manifest root recorded for a grant's VOT package, if one was built.
@@ -4146,17 +4126,21 @@ impl Store {
 
     /// One grant by id, for fetch admission through its ticket.
     pub fn outbound_grant_by_id(&self, id: &str) -> Result<Option<OutboundGrant>, String> {
+        self.outbound_grant("id", id)
+    }
+
+    fn outbound_grant(&self, column: &str, value: &str) -> Result<Option<OutboundGrant>, String> {
         self.with(|connection| {
             connection
                 .prepare_cached(
-                    "SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
+                    &format!("SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
                             name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
                             expires_at, revoked_at, downloads, max_downloads, notifications_json, first_download_at,
                             last_download_at,
                             files_json
-                     FROM outbound_grants WHERE id = ?1",
+                     FROM outbound_grants WHERE {column} = ?1"),
                 )?
-                .query_row([id], map_outbound_grant)
+                .query_row([value], map_outbound_grant)
                 .optional()
                 .and_then(|grant| {
                     grant
@@ -4288,26 +4272,7 @@ impl Store {
         index: usize,
     ) -> Result<Option<(OutboundGrant, Option<OutboundGrantFile>)>, String> {
         self.with(|connection| {
-            let parent = connection
-                .prepare_cached(
-                    "SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
-                            name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
-                            expires_at, revoked_at, downloads, max_downloads, notifications_json,
-                            first_download_at, last_download_at, file_count
-                     FROM outbound_grants WHERE token_hash = ?1",
-                )?
-                .query_row([token_hash], |row| {
-                        let file_count = row.get::<_, i64>("file_count")?;
-                        let file_count = usize::try_from(file_count.max(0)).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                0,
-                                rusqlite::types::Type::Integer,
-                                Box::new(error),
-                            )
-                        })?;
-                        Ok((map_outbound_grant_base(row)?, file_count))
-                })
-                .optional()?;
+            let parent = outbound_grant_parent(connection, token_hash)?;
             let Some((grant, file_count)) = parent else {
                 return Ok(None);
             };
@@ -4361,26 +4326,7 @@ impl Store {
             i64::try_from(offset).map_err(|_| "outbound file offset overflow".to_owned())?;
         let limit = i64::try_from(limit).map_err(|_| "outbound file limit overflow".to_owned())?;
         self.with(|connection| {
-            let parent = connection
-                .prepare_cached(
-                    "SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
-                            name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
-                            expires_at, revoked_at, downloads, max_downloads, notifications_json,
-                            first_download_at, last_download_at, file_count
-                     FROM outbound_grants WHERE token_hash = ?1",
-                )?
-                .query_row([token_hash], |row| {
-                        let file_count = row.get::<_, i64>("file_count")?;
-                        let file_count = usize::try_from(file_count.max(0)).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                0,
-                                rusqlite::types::Type::Integer,
-                                Box::new(error),
-                            )
-                        })?;
-                        Ok((map_outbound_grant_base(row)?, file_count))
-                })
-                .optional()?;
+            let parent = outbound_grant_parent(connection, token_hash)?;
             let Some((grant, file_count)) = parent else {
                 return Ok(None);
             };
@@ -5764,6 +5710,32 @@ fn map_outbound_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboundGrant
     let mut grant = map_outbound_grant_base(row)?;
     grant.files = parse_json(&row.get::<_, String>("files_json")?, 20)?;
     Ok(grant)
+}
+
+fn outbound_grant_parent(
+    connection: &Connection,
+    token_hash: &str,
+) -> rusqlite::Result<Option<(OutboundGrant, usize)>> {
+    connection
+        .prepare_cached(
+            "SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
+                            name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
+                            expires_at, revoked_at, downloads, max_downloads, notifications_json,
+                            first_download_at, last_download_at, file_count
+                     FROM outbound_grants WHERE token_hash = ?1",
+        )?
+        .query_row([token_hash], |row| {
+            let file_count = row.get::<_, i64>("file_count")?;
+            let file_count = usize::try_from(file_count.max(0)).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Integer,
+                    Box::new(error),
+                )
+            })?;
+            Ok((map_outbound_grant_base(row)?, file_count))
+        })
+        .optional()
 }
 
 fn map_outbound_grant_base(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboundGrant> {

@@ -575,42 +575,37 @@ pub struct ListQuery {
 /// Which attribute an equality filter names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FilterKey {
-    UserName,
+    Name,
     ExternalId,
 }
 
-/// The filters provisioning clients send: `userName eq "value"` and
-/// `externalId eq "value"`.
-fn filter_subject(filter: &str) -> ScimResult<(FilterKey, String)> {
+fn filter_equality(filter: &str, name: &str) -> ScimResult<(FilterKey, String)> {
     let filter = filter.trim();
-    let (key, rest) = if filter
-        .get(..8)
-        .is_some_and(|head| head.eq_ignore_ascii_case("userName"))
-    {
-        (FilterKey::UserName, filter.get(8..))
-    } else if filter
-        .get(..10)
-        .is_some_and(|head| head.eq_ignore_ascii_case("externalId"))
-    {
-        (FilterKey::ExternalId, filter.get(10..))
-    } else {
-        (FilterKey::UserName, None)
-    };
-    let rest = rest
+    let (key, rest) = [
+        (name, FilterKey::Name),
+        ("externalId", FilterKey::ExternalId),
+    ]
+    .into_iter()
+    .find_map(|(attribute, key)| {
+        filter
+            .get(..attribute.len())
+            .filter(|head| head.eq_ignore_ascii_case(attribute))
+            .map(|_| (key, filter.get(attribute.len()..)))
+    })
+    .unwrap_or((FilterKey::Name, None));
+    let value = rest
         .map(str::trim_start)
         .and_then(|rest| rest.strip_prefix("eq").or_else(|| rest.strip_prefix("EQ")))
         .map(str::trim)
         .and_then(|rest| rest.strip_prefix('"'))
         .and_then(|rest| rest.strip_suffix('"'))
         .filter(|value| !value.contains('"'))
-        .ok_or_else(|| {
-            ScimError::typed(
-                StatusCode::BAD_REQUEST,
-                "invalidFilter",
-                "only the filters userName eq \"value\" and externalId eq \"value\" are supported",
-            )
-        })?;
-    Ok((key, rest.to_owned()))
+        .ok_or_else(|| ScimError::typed(
+            StatusCode::BAD_REQUEST,
+            "invalidFilter",
+            format!("only the filters {name} eq \"value\" and externalId eq \"value\" are supported"),
+        ))?;
+    Ok((key, value.to_owned()))
 }
 
 pub async fn list_users(
@@ -624,9 +619,9 @@ pub async fn list_users(
     let count = query.count.unwrap_or(MAX_PAGE).min(MAX_PAGE);
     let (rows, total) = match query.filter.as_deref() {
         Some(filter) => {
-            let (key, value) = filter_subject(filter)?;
+            let (key, value) = filter_equality(filter, "userName")?;
             let found = match key {
-                FilterKey::UserName => app.store.principal(&value),
+                FilterKey::Name => app.store.principal(&value),
                 FilterKey::ExternalId => app.store.principal_by_external_id(&value),
             };
             let rows: Vec<_> = found.map_err(ScimError::store)?.into_iter().collect();
@@ -901,45 +896,6 @@ fn name_taken(error: String) -> ScimError {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GroupFilterKey {
-    DisplayName,
-    ExternalId,
-}
-
-/// The filters provisioning clients send for groups: `displayName eq "x"`
-/// and `externalId eq "x"`.
-fn filter_group(filter: &str) -> ScimResult<(GroupFilterKey, String)> {
-    let filter = filter.trim();
-    let (key, rest) = if filter
-        .get(..11)
-        .is_some_and(|head| head.eq_ignore_ascii_case("displayName"))
-    {
-        (GroupFilterKey::DisplayName, filter.get(11..))
-    } else if filter
-        .get(..10)
-        .is_some_and(|head| head.eq_ignore_ascii_case("externalId"))
-    {
-        (GroupFilterKey::ExternalId, filter.get(10..))
-    } else {
-        (GroupFilterKey::DisplayName, None)
-    };
-    rest.map(str::trim_start)
-        .and_then(|rest| rest.strip_prefix("eq").or_else(|| rest.strip_prefix("EQ")))
-        .map(str::trim)
-        .and_then(|rest| rest.strip_prefix('"'))
-        .and_then(|rest| rest.strip_suffix('"'))
-        .filter(|value| !value.contains('"'))
-        .map(|value| (key, value.to_owned()))
-        .ok_or_else(|| {
-            ScimError::typed(
-                StatusCode::BAD_REQUEST,
-                "invalidFilter",
-                "only the filters displayName eq \"value\" and externalId eq \"value\" are supported",
-            )
-        })
-}
-
 pub async fn list_groups(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -951,10 +907,10 @@ pub async fn list_groups(
     let count = query.count.unwrap_or(MAX_PAGE).min(MAX_PAGE);
     let (rows, total) = match query.filter.as_deref() {
         Some(filter) => {
-            let (key, value) = filter_group(filter)?;
+            let (key, value) = filter_equality(filter, "displayName")?;
             let found = match key {
-                GroupFilterKey::DisplayName => app.store.scim_group_by_name(&value),
-                GroupFilterKey::ExternalId => app.store.scim_group_by_external_id(&value),
+                FilterKey::Name => app.store.scim_group_by_name(&value),
+                FilterKey::ExternalId => app.store.scim_group_by_external_id(&value),
             };
             let rows: Vec<_> = found.map_err(ScimError::store)?.into_iter().collect();
             let total = rows.len() as u64;
@@ -1824,29 +1780,40 @@ mod tests {
     }
 
     #[test]
-    fn filter_parser_accepts_username_and_external_id_only() {
-        assert_eq!(
-            filter_subject(r#"userName eq "a b""#).unwrap(),
-            (FilterKey::UserName, "a b".to_owned())
-        );
-        assert_eq!(
-            filter_subject(r#"  username EQ "x"  "#).unwrap(),
-            (FilterKey::UserName, "x".to_owned())
-        );
-        assert_eq!(
-            filter_subject(r#"externalId eq "00u1""#).unwrap(),
-            (FilterKey::ExternalId, "00u1".to_owned())
-        );
-        for bad in [
-            r#"userName co "a""#,
-            r#"userName eq a"#,
-            r#"userName eq "a" and active eq true"#,
-            r#"emails eq "a""#,
-            r#"userName eq "a"b""#,
-            "",
-        ] {
-            assert!(filter_subject(bad).is_err(), "{bad}");
+    fn equality_filters_preserve_user_and_group_grammar() {
+        for name in ["userName", "displayName"] {
+            for attribute in [
+                name.to_owned(),
+                name.to_ascii_lowercase(),
+                name.to_ascii_uppercase(),
+            ] {
+                for operator in ["eq", "EQ"] {
+                    assert_eq!(
+                        filter_equality(&format!("  {attribute} {operator} \"a b\"  "), name)
+                            .unwrap(),
+                        (FilterKey::Name, "a b".to_owned())
+                    );
+                }
+            }
+            assert_eq!(
+                filter_equality(r#"externalId eq "00u1""#, name).unwrap(),
+                (FilterKey::ExternalId, "00u1".to_owned())
+            );
+            for bad in [
+                format!("{name} co \"a\""),
+                format!("{name} eq a"),
+                format!("{name} eq \"a\" and active eq true"),
+                format!("{name} eq \"a\"b\""),
+                format!("{name} Eq \"a\""),
+                "emails eq \"a\"".into(),
+                "☃☃☃☃ eq \"a\"".into(),
+                String::new(),
+            ] {
+                assert!(filter_equality(&bad, name).is_err(), "{name}: {bad}");
+            }
         }
+        assert!(filter_equality(r#"displayName eq "x""#, "userName").is_err());
+        assert!(filter_equality(r#"userName eq "x""#, "displayName").is_err());
     }
 
     #[tokio::test]

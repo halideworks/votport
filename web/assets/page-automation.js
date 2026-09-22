@@ -1,6 +1,6 @@
 import { markFormSaved } from '/assets/form-drafts.js';
 import { api, button, confirmModal, copyToClipboard, formatWhen, requireSession } from '/assets/admin-common.js';
-import { $, fieldError } from '/assets/object-card.js';
+import { node, $, fieldError } from '/assets/object-card.js';
 // Page size follows the server convention (50 default, 100 max); the list
 // follows `next` until it runs out, like the workflows page.
 const TOKEN_PAGE_SIZE = 50;
@@ -34,19 +34,14 @@ function renderAutomationTokens() {
   $('automation-token-more').disabled = tokenLoading;
   container.replaceChildren();
   if (!tokenRows.length) {
-    const empty = document.createElement('p');
-    empty.className = 'muted';
-    empty.textContent = 'No automation tokens issued.';
+    const empty = node('p', 'No automation tokens issued.', 'muted');
     container.append(empty);
     return;
   }
   for (const token of [...tokenRows].reverse()) {
-    const card = document.createElement('div');
-    card.className = 'card link-item';
-    const head = document.createElement('div');
-    head.className = 'head';
-    const title = document.createElement('h3');
-    title.textContent = token.label || 'Automation token';
+    const card = node('div', '', 'card link-item');
+    const head = node('div', '', 'head');
+    const title = node('h3', token.label || 'Automation token');
     const status = automationTokenStatus(token);
     const badge = document.createElement('span');
     badge.className = `badge ${status === 'active' ? 'on' : 'off'}`;
@@ -54,8 +49,7 @@ function renderAutomationTokens() {
     head.append(title, badge);
     card.append(head);
 
-    const meta = document.createElement('p');
-    meta.className = 'muted';
+    const meta = node('p', '', 'muted');
     const parts = [
       `created ${formatWhen(token.created_at)}`,
       `expires ${formatWhen(token.expires_at)}`,
@@ -106,8 +100,7 @@ async function refreshAutomationTokens(reset = false) {
     renderAutomationTokens();
   } catch (error) {
     $('automation-token-status').textContent = 'Automation tokens could not be loaded.';
-    const message = document.createElement('p');
-    message.className = 'error';
+    const message = node('p', '', 'error');
     message.setAttribute('role', 'alert');
     message.textContent = error.message;
     $('automation-tokens').replaceChildren(message);

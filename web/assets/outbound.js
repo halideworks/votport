@@ -2,7 +2,7 @@
 
 import { deliveryMetadata, initDeliveryEvidence } from '/assets/delivery-evidence.js';
 import { applyBranding } from '/assets/branding.js';
-import { $, appLink, appendObjectCard, fieldError, formatBytes } from '/assets/object-card.js';
+import { node, $, offerApp, appendObjectCard, fieldError, formatBytes } from '/assets/object-card.js';
 import {
   appendMetadataPage,
   batchDownloadEligible,
@@ -92,9 +92,7 @@ function scheduleSavedFeedback() {
 function landedBadge(row) {
   if (row.classList.contains('saved')) return;
   row.classList.add('saved');
-  const badge = document.createElement('span');
-  badge.className = 'badge on';
-  badge.textContent = 'landed';
+  const badge = node('span', 'landed', 'badge on');
   row.querySelector('.status').after(badge);
 }
 
@@ -601,18 +599,7 @@ async function loadMetadata() {
   $('receipt-key').textContent = body.receipt_key;
   $('receipt-key').title = body.receipt_key;
   $('download-content').hidden = false;
-  offerApp('s');
-}
-// Offers the desktop app the same link: `votport://<kind>/<token>?base=<origin>`,
-// which the app prefills and the user confirms. Phones have no app.
-function offerApp(kind) {
-  if (/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)) return;
-  const link = document.getElementById('open-in-app-link');
-  if (!link) return;
-  link.href = appLink(kind, token);
-  link.hidden = false;
-  const holder = document.getElementById('open-in-app');
-  if (holder) holder.hidden = false;
+  offerApp('s', token);
 }
 
 $('separate-download-start').addEventListener('click', startAnchorDownloads);

@@ -3,6 +3,7 @@
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import vm from 'node:vm';
 
 const request = await readFile(new URL('../web/request.html', import.meta.url), 'utf8');
 const send = await readFile(new URL('../web/send.html', import.meta.url), 'utf8');
@@ -20,9 +21,36 @@ test('every app link comes from the shared builder with its own origin and token
   assert.match(objectCard, /export function appLink\(kind, token\)/);
   assert.match(objectCard, /votport:\/\/\$\{kind\}\/\$\{encodeURIComponent\(token\)\}\?base=\$\{encodeURIComponent\(window\.location\.origin\)\}/);
   for (const [script, kind] of [[upload, 'r'], [outbound, 's']]) {
-    assert.match(script, /function offerApp\(kind\)/);
-    assert.match(script, /link\.href = appLink\(kind, token\)/);
-    assert.match(script, new RegExp(`offerApp\\('${kind}'\\)`));
+    assert.match(script, /import \{[^}]*offerApp[^}]*\} from '\/assets\/object-card\.js'/);
+    assert.match(script, new RegExp(`offerApp\\('${kind}', token\\)`));
   }
   assert.match(evidence, /appLink\('s', token\)/);
+});
+
+test('desktop offers reveal the encoded link and mobile offers stay hidden', () => {
+  const link = { hidden: true }, holder = { hidden: true };
+  const context = vm.createContext({
+    navigator: { userAgent: 'Desktop' },
+    window: { location: { origin: 'https://port.example' } },
+    document: { getElementById: (id) => id === 'open-in-app-link' ? link : holder },
+  });
+  vm.runInContext(objectCard.replaceAll('export ', ''), context);
+  vm.runInContext("offerApp('r', 'a/b')", context);
+  assert.equal(link.href, 'votport://r/a%2Fb?base=https%3A%2F%2Fport.example');
+  assert.equal(link.hidden, false);
+  assert.equal(holder.hidden, false);
+  for (const userAgent of ['Android', 'iPhone', 'iPad', 'iPod', 'Mobile']) {
+    context.navigator.userAgent = userAgent;
+    link.hidden = holder.hidden = true;
+    vm.runInContext("offerApp('s', 'token')", context);
+    assert.equal(link.hidden, true);
+    assert.equal(holder.hidden, true);
+  }
+  context.navigator.userAgent = 'Desktop';
+  context.document.getElementById = () => null;
+  assert.doesNotThrow(() => vm.runInContext("offerApp('s', 'token')", context));
+  context.document.getElementById = (id) => id === 'open-in-app-link' ? link : null;
+  vm.runInContext("offerApp('s', 'token')", context);
+  assert.equal(link.hidden, false);
+  assert.equal(link.href, 'votport://s/token?base=https%3A%2F%2Fport.example');
 });
