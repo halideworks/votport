@@ -171,7 +171,7 @@ test('recipient page has one primary action with ZIP as a secondary link', () =>
   assert.doesNotMatch(sendPage, /id="expires"/);
   assert.match(outboundScript, /available until \$\{when\(body\.expires_at\)\}/);
   // A finished save is "landed", never "verified": the browser checks nothing.
-  assert.match(outboundScript, /badge\.textContent = 'landed'/);
+  assert.match(outboundScript, /node\('span', 'landed', 'badge on'\)/);
   assert.doesNotMatch(outboundScript, /verified on this device/);
   // The anchor-fallback path still carries the multiple-downloads advice.
   assert.match(outboundScript, /prepareAnchorDownloads\(\)/);

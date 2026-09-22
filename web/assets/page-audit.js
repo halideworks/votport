@@ -2,7 +2,7 @@
 // VOTPORT PROPRIETARY LICENSE.
 
 import { formatAgo, formatWhen, requireSession } from '/assets/admin-common.js';
-import { $ } from '/assets/object-card.js';
+import { node, $ } from '/assets/object-card.js';
 
 const PAGE_SIZE = 250;
 const MAX_RENDERED_ROWS = 1000;
@@ -133,9 +133,7 @@ function updateEvents() {
 function renderField(tag, className, label, text) {
   const field = document.createElement('span');
   field.className = `audit-field ${className.split(' ', 1)[0]}-field`;
-  const caption = document.createElement('span');
-  caption.className = 'audit-field-label';
-  caption.textContent = `${label}:`;
+  const caption = node('span', `${label}:`, 'audit-field-label');
   const value = document.createElement(tag);
   value.className = className;
   value.textContent = text;
@@ -144,8 +142,7 @@ function renderField(tag, className, label, text) {
 }
 
 function renderRow(row) {
-  const line = document.createElement('div');
-  line.className = 'audit-row';
+  const line = node('div', '', 'audit-row');
 
   const when = renderField('span', 'audit-when muted', 'Time', formatAgo(row.at));
   when.title = formatWhen(row.at);
@@ -157,10 +154,8 @@ function renderRow(row) {
   line.append(when, tenant, event, subject, actor);
   const keys = Object.keys(row.detail ?? {});
   if (keys.length) {
-    const details = document.createElement('details');
-    details.className = 'audit-detail muted';
-    const summary = document.createElement('summary');
-    summary.textContent = 'Details';
+    const details = node('details', '', 'audit-detail muted');
+    const summary = node('summary', 'Details');
     const detail = document.createElement('div');
     detail.textContent = keys
       .map((key) => `${key}=${JSON.stringify(row.detail[key])}`)

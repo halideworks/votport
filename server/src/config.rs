@@ -663,12 +663,7 @@ pub fn from_env() -> Result<Config, String> {
     };
     let allow_hidden = env_bool("VOTPORT_ALLOW_HIDDEN", false)?;
 
-    let upload_retention_days = match env::var("VOTPORT_UPLOAD_RETENTION_DAYS") {
-        Ok(value) => value
-            .parse()
-            .map_err(|error| format!("VOTPORT_UPLOAD_RETENTION_DAYS: {error}"))?,
-        Err(_) => 0,
-    };
+    let upload_retention_days = env_u64("VOTPORT_UPLOAD_RETENTION_DAYS", 0)?;
     let metrics_token = optional("VOTPORT_METRICS_TOKEN");
     if metrics_token.is_none() {
         eprintln!(
@@ -688,15 +683,7 @@ pub fn from_env() -> Result<Config, String> {
         DEFAULT_MAX_LINK_SESSIONS,
     )?;
 
-    let sso_session_secs = match env::var("VOTPORT_SSO_SESSION_SECS") {
-        Ok(value) => {
-            let parsed: u64 = value
-                .parse()
-                .map_err(|error| format!("VOTPORT_SSO_SESSION_SECS: {error}"))?;
-            parsed
-        }
-        Err(_) => DEFAULT_SSO_SESSION_SECS,
-    };
+    let sso_session_secs = env_u64("VOTPORT_SSO_SESSION_SECS", DEFAULT_SSO_SESSION_SECS)?;
 
     // Read raw, not through `optional`: that helper treats a whitespace-only
     // value as unset, which for this variable means "trust every private
@@ -734,12 +721,7 @@ pub fn from_env() -> Result<Config, String> {
         }
     };
 
-    let audit_retention_days = match env::var("VOTPORT_AUDIT_RETENTION_DAYS") {
-        Ok(value) => value
-            .parse()
-            .map_err(|error| format!("VOTPORT_AUDIT_RETENTION_DAYS: {error}"))?,
-        Err(_) => 400,
-    };
+    let audit_retention_days = env_u64("VOTPORT_AUDIT_RETENTION_DAYS", 400)?;
 
     let default_max_total_bytes = optional_positive_u64("VOTPORT_DEFAULT_MAX_TOTAL_BYTES")?;
     let default_max_links = optional_positive_u64("VOTPORT_DEFAULT_MAX_LINKS")?;
@@ -747,12 +729,7 @@ pub fn from_env() -> Result<Config, String> {
     let public_password_login = env_bool("VOTPORT_PUBLIC_PASSWORD_LOGIN", true)?;
     let require_provisioning = env_bool("VOTPORT_SCIM_REQUIRE_PROVISIONING", false)?;
 
-    let session_idle_secs = match env::var("VOTPORT_SESSION_IDLE_SECS") {
-        Ok(value) => value
-            .parse()
-            .map_err(|error| format!("VOTPORT_SESSION_IDLE_SECS: {error}"))?,
-        Err(_) => 1800,
-    };
+    let session_idle_secs = env_u64("VOTPORT_SESSION_IDLE_SECS", 1800)?;
 
     let smtp_port = match env::var("VOTPORT_NOTIFY_SMTP_PORT") {
         Ok(value) if !value.trim().is_empty() => {
@@ -1020,6 +997,12 @@ fn env_bool(name: &str, default: bool) -> Result<bool, String> {
         "0" | "false" | "no" | "off" => Ok(false),
         _ => Err(format!("{name} must be 1/0, true/false, yes/no or on/off")),
     }
+}
+
+fn env_u64(name: &str, default: u64) -> Result<u64, String> {
+    env::var(name).map_or(Ok(default), |value| {
+        value.parse().map_err(|error| format!("{name}: {error}"))
+    })
 }
 
 fn env_or(name: &str, default: &str) -> String {
@@ -1468,6 +1451,17 @@ mod tests {
             ),
             ("VOTPORT_ADMIN_PASSWORD_HASH", format!("  {hash}\n"), true),
         ];
+        for name in [
+            "VOTPORT_UPLOAD_RETENTION_DAYS",
+            "VOTPORT_AUDIT_RETENTION_DAYS",
+            "VOTPORT_SSO_SESSION_SECS",
+            "VOTPORT_SESSION_IDLE_SECS",
+        ] {
+            for value in ["", " 1", "-1", "18446744073709551616", "text"] {
+                cases.push((name, value.to_owned(), false));
+            }
+            cases.push((name, "42".to_owned(), true));
+        }
         for salt in ["c2FsdA", "abcdefghi"] {
             let mut parts: Vec<_> = hash.split('$').collect();
             parts[4] = salt;

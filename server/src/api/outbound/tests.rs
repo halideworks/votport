@@ -340,6 +340,67 @@ fn outbound_operation_refusal_is_retryable_during_tenant_purge() {
     drop(operation);
 }
 
+#[tokio::test]
+async fn grant_creation_routes_share_validation_and_preserve_legacy_refusals() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = crate::api::testing::build(directory.path());
+    for suffix in ["", "/preparations"] {
+        for (request, expected) in [
+            (
+                json!({"directory":"project", "paths":[]}),
+                "directory cannot be combined with paths, link_id, upload_id, or file_index",
+            ),
+            (
+                json!({"directory":"project", "file_index":0}),
+                "directory cannot be combined with paths, link_id, upload_id, or file_index",
+            ),
+            (
+                json!({"paths":[], "upload_id":"upload"}),
+                "paths cannot be combined with link_id, upload_id, or file_index",
+            ),
+            (json!({"expires_days":0}), "expires_days must be 1..=30"),
+            (
+                json!({}),
+                if suffix.is_empty() {
+                    "paths, directory, or link_id, upload_id, and file_index are required"
+                } else {
+                    "paths or directory is required"
+                },
+            ),
+            (
+                json!({"file_index":0}),
+                if suffix.is_empty() {
+                    "link_id is required"
+                } else {
+                    "paths or directory is required"
+                },
+            ),
+        ] {
+            let response = router(app.clone())
+                .oneshot(
+                    Request::post(format!("/api/admin/outbound-grants{suffix}"))
+                        .header("cookie", admin_cookie(&app))
+                        .header("x-votport", "1")
+                        .header("content-type", "application/json")
+                        .body(Body::from(request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{suffix}: {request}"
+            );
+            assert_eq!(
+                body(response).await["error"],
+                expected,
+                "{suffix}: {request}"
+            );
+        }
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn cancelled_library_mutation_keeps_admission_until_worker_finishes() {
     use std::time::{Duration, Instant};
@@ -870,19 +931,21 @@ async fn metadata_branding_and_logo_hide_behind_the_password() {
         .insert_outbound_grant(branding_grant(open, None))
         .unwrap();
 
-    // Pre-password metadata reveals nothing, branding included.
-    let response = router(app.clone())
-        .oneshot(
-            Request::get(format!("/api/s/{gated}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let json = body(response).await;
-    assert_eq!(json["has_password"], true);
-    assert_eq!(json["authorized"], false);
-    assert!(json.get("branding").is_none(), "{json}");
+    for suffix in ["", "?offset=0&limit=10"] {
+        let response = router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{gated}{suffix}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body(response).await,
+            json!({"has_password": true, "authorized": false})
+        );
+    }
     // ... so the logo hides with it.
     let response = router(app.clone())
         .oneshot(
@@ -941,6 +1004,7 @@ async fn metadata_branding_and_logo_hide_behind_the_password() {
 
     // Without a password, metadata (plain and paged) carries branding
     // and the logo streams.
+    let mut metadata = Vec::new();
     for uri in [
         format!("/api/s/{open}"),
         format!("/api/s/{open}?offset=0&limit=10"),
@@ -954,7 +1018,44 @@ async fn metadata_branding_and_logo_hide_behind_the_password() {
         assert_eq!(json["branding"]["name"], "Acme Corp", "{uri}");
         assert_eq!(json["branding"]["color"], "#12ab99", "{uri}");
         assert_eq!(json["branding"]["has_logo"], true, "{uri}");
+        metadata.push(json);
     }
+    let [plain, paged] = metadata.as_slice() else {
+        panic!("both metadata forms");
+    };
+    for key in [
+        "has_password",
+        "authorized",
+        "branding",
+        "label",
+        "name",
+        "suite",
+        "root",
+        "bytes",
+        "length",
+        "package_root",
+        "expires_at",
+        "downloads",
+        "max_downloads",
+        "receipt_key",
+        "grant_id",
+        "delivery_manifest",
+        "evidence_authorization",
+        "download_url",
+        "bundle_url",
+        "batch_url",
+        "total_bytes",
+    ] {
+        assert_eq!(plain.get(key), paged.get(key), "{key}");
+        assert!(plain.get(key).is_some(), "missing {key}");
+    }
+    assert!(plain.get("fetch").is_some());
+    assert!(paged.get("fetch").is_none());
+    assert!(plain.get("offset").is_none());
+    assert_eq!(paged["offset"], 0);
+    assert_eq!(paged["limit"], 10);
+    assert_eq!(paged["files_total"], 1);
+    assert_eq!(paged["has_more"], false);
     let response = router(app.clone())
         .oneshot(
             Request::get(format!("/api/s/{open}/logo"))

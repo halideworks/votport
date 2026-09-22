@@ -3,7 +3,7 @@
 
 import { applyBranding } from '/assets/branding.js';
 import { nameHasForbiddenCharacter } from '/assets/outbound-download.js';
-import { $, appendObjectCard, appLink, copyToClipboard, fieldError, formatBytes, formatDuration } from '/assets/object-card.js';
+import { node, $, appendObjectCard, offerApp, copyToClipboard, fieldError, formatBytes, formatDuration } from '/assets/object-card.js';
 import { admitPickBatch } from '/assets/upload-pick.js';
 import { entryFiles, expandBeginEntries, runUploadBatch } from '/assets/upload-entries.js';
 import {
@@ -235,18 +235,6 @@ class Cancelled extends Error {
 function checkCancelled() {
   if (cancelled) throw new Cancelled();
   if (controller?.signal.aborted) throw controller.signal.reason;
-}
-
-// Offers the desktop app the same link: `votport://<kind>/<token>?base=<origin>`,
-// which the app prefills and the user confirms. Phones have no app.
-function offerApp(kind) {
-  if (/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)) return;
-  const link = document.getElementById('open-in-app-link');
-  if (!link) return;
-  link.href = appLink(kind, token);
-  link.hidden = false;
-  const holder = document.getElementById('open-in-app');
-  if (holder) holder.hidden = false;
 }
 
 // A record of the session currently in flight, so an interrupted transfer can
@@ -692,11 +680,8 @@ function renderPicked() {
     visible += 1;
     const item = document.createElement('li');
     item.dataset.path = path;
-    const name = document.createElement('span');
-    name.textContent = path;
-    const status = document.createElement('span');
-    status.className = 'status';
-    status.textContent = formatBytes(file.size);
+    const name = node('span', path);
+    const status = node('span', formatBytes(file.size), 'status');
     item.append(name, status);
     list.append(item);
     rows.set(path, item);
@@ -1693,7 +1678,7 @@ $('resume-discard').addEventListener('click', () => {
   }
   document.title = `VOTPort · ${info.label}`;
   $('title').textContent = info.label;
-  offerApp('r');
+  offerApp('r', token);
   $('subtitle').textContent = 'Files are verified on receipt.';
   applyBranding(info.branding, `/api/r/${token}/logo`);
   chunkBytes = info.chunk_bytes || chunkBytes;

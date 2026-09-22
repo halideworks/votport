@@ -231,6 +231,46 @@ pub fn invalid_page(reason: &str) -> ApiError {
     )
 }
 
+fn page_limit(raw: Option<&str>, default: usize, max: usize) -> ApiResult<usize> {
+    let limit = raw
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("limit must be an integer between 1 and {max}"),
+            )
+        })?
+        .unwrap_or(default);
+    if !(1..=max).contains(&limit) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("limit must be between 1 and {max}"),
+        ));
+    }
+    Ok(limit)
+}
+
+fn page_offset(raw: Option<&str>) -> ApiResult<usize> {
+    let offset = raw
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "offset must be a non-negative integer",
+            )
+        })?
+        .unwrap_or(0usize);
+    if i64::try_from(offset).is_err() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "offset is too large",
+        ));
+    }
+    Ok(offset)
+}
+
 impl From<SessionError> for ApiError {
     fn from(error: SessionError) -> Self {
         Self::new(
@@ -647,6 +687,59 @@ mod refusal_copy_tests {
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
                 json!(format!("too many {what}; try again in {seconds} seconds"))
+            );
+        }
+    }
+
+    #[test]
+    fn page_parameters_preserve_defaults_bounds_and_errors() {
+        for (default, max) in [(50, 100), (100, 500), (1000, 1000)] {
+            assert_eq!(page_limit(None, default, max).unwrap(), default);
+            for limit in [1, max] {
+                assert_eq!(
+                    page_limit(Some(&limit.to_string()), default, max).unwrap(),
+                    limit
+                );
+            }
+            for (raw, message) in [
+                (
+                    "nope".to_owned(),
+                    format!("limit must be an integer between 1 and {max}"),
+                ),
+                (
+                    "-1".to_owned(),
+                    format!("limit must be an integer between 1 and {max}"),
+                ),
+                ("0".to_owned(), format!("limit must be between 1 and {max}")),
+                (
+                    (max + 1).to_string(),
+                    format!("limit must be between 1 and {max}"),
+                ),
+            ] {
+                let error = page_limit(Some(&raw), default, max).unwrap_err();
+                assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+                assert_eq!(error.message, message);
+            }
+        }
+        assert_eq!(page_offset(None).unwrap(), 0);
+        assert_eq!(page_offset(Some("4")).unwrap(), 4);
+        for raw in ["-1", "1.5", "18446744073709551616"] {
+            assert_eq!(
+                page_offset(Some(raw)).unwrap_err().message,
+                "offset must be a non-negative integer"
+            );
+        }
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(
+                page_offset(Some("9223372036854775807")).unwrap(),
+                i64::MAX as usize
+            );
+            assert_eq!(
+                page_offset(Some("9223372036854775808"))
+                    .unwrap_err()
+                    .message,
+                "offset is too large"
             );
         }
     }

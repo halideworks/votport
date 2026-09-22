@@ -22,6 +22,36 @@ impl Actor {
             project.allows(&self.identity.subject, role, self.identity.role == "admin")
         }
     }
+
+    fn project(&self, app: &App, id: &str, role: &str) -> ApiResult<Project> {
+        let project = app
+            .store
+            .delivery_project(&self.identity.tenant, id)
+            .map_err(crate::api::store_unavailable)?
+            .ok_or_else(ApiError::not_found)?;
+        if !self.allows(&project, role) {
+            return Err(if role == "viewer" {
+                ApiError::not_found()
+            } else {
+                ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    crate::workflow::permission_refusal(role),
+                )
+            });
+        }
+        Ok(project)
+    }
+
+    fn job(&self, app: &App, id: &str, role: &str) -> ApiResult<Job> {
+        let job = app
+            .store
+            .delivery_job(id)
+            .map_err(crate::api::store_unavailable)?
+            .filter(|job| job.tenant == self.identity.tenant)
+            .ok_or_else(ApiError::not_found)?;
+        self.project(app, &job.project.id, role)?;
+        Ok(job)
+    }
 }
 
 fn actor(
@@ -174,17 +204,7 @@ pub async fn create(
             )?;
         }
     }
-    let project = app
-        .store
-        .delivery_project(&actor.identity.tenant, &request.project_id)
-        .map_err(crate::api::store_unavailable)?
-        .ok_or_else(ApiError::not_found)?;
-    if !actor.allows(&project, "sender") {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            crate::workflow::permission_refusal("sender"),
-        ));
-    }
+    let project = actor.project(&app, &request.project_id, "sender")?;
     // Audit finding 563: the prefix is normalised at the edge so the stored
     // request, the valid_path gate and the S3 listing all see one canonical
     // relative shape.
@@ -350,20 +370,7 @@ pub async fn get(
     AxumPath(id): AxumPath<String>,
 ) -> ApiResult<Response> {
     let actor = actor(&app, &headers, peer, "jobs:read", false)?;
-    let job = app
-        .store
-        .delivery_job(&id)
-        .map_err(crate::api::store_unavailable)?
-        .filter(|j| j.tenant == actor.identity.tenant)
-        .ok_or_else(ApiError::not_found)?;
-    let project = app
-        .store
-        .delivery_project(&job.tenant, &job.project.id)
-        .map_err(crate::api::store_unavailable)?
-        .ok_or_else(ApiError::not_found)?;
-    if !actor.allows(&project, "viewer") {
-        return Err(ApiError::not_found());
-    }
+    let job = actor.job(&app, &id, "viewer")?;
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         Json(public_job(&app, &headers, job)),
@@ -379,20 +386,7 @@ pub async fn evidence(
     Query(page): Query<Page>,
 ) -> ApiResult<Response> {
     let actor = actor(&app, &headers, peer, "jobs:read", false)?;
-    let job = app
-        .store
-        .delivery_job(&id)
-        .map_err(crate::api::store_unavailable)?
-        .filter(|j| j.tenant == actor.identity.tenant)
-        .ok_or_else(ApiError::not_found)?;
-    let project = app
-        .store
-        .delivery_project(&job.tenant, &job.project.id)
-        .map_err(crate::api::store_unavailable)?
-        .ok_or_else(ApiError::not_found)?;
-    if !actor.allows(&project, "viewer") {
-        return Err(ApiError::not_found());
-    }
+    actor.job(&app, &id, "viewer")?;
     let limit = page.limit.unwrap_or(50);
     let after = page
         .after
@@ -427,23 +421,7 @@ pub async fn purge_evidence(
     AxumPath(id): AxumPath<String>,
 ) -> ApiResult<Response> {
     let actor = actor(&app, &headers, peer, "jobs:cancel", true)?;
-    let job = app
-        .store
-        .delivery_job(&id)
-        .map_err(crate::api::store_unavailable)?
-        .filter(|j| j.tenant == actor.identity.tenant)
-        .ok_or_else(ApiError::not_found)?;
-    let project = app
-        .store
-        .delivery_project(&job.tenant, &job.project.id)
-        .map_err(crate::api::store_unavailable)?
-        .ok_or_else(ApiError::not_found)?;
-    if !actor.allows(&project, "sender") {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            crate::workflow::permission_refusal("sender"),
-        ));
-    }
+    let job = actor.job(&app, &id, "sender")?;
     let purged = app
         .store
         .purge_delivery_evidence(&job.tenant, &job.id, &actor.identity.subject)
@@ -560,34 +538,12 @@ pub async fn change(
             ));
         }
     }
-    let job = app
-        .store
-        .delivery_job(&id)
-        .map_err(crate::api::store_unavailable)?
-        .filter(|j| j.tenant == actor.identity.tenant)
-        .ok_or_else(ApiError::not_found)?;
-    let project = app
-        .store
-        .delivery_project(&job.tenant, &job.project.id)
-        .map_err(crate::api::store_unavailable)?
-        .ok_or_else(ApiError::not_found)?;
-    if !actor.allows(
-        &project,
-        if action.action == "approve" {
-            "approver"
-        } else {
-            "sender"
-        },
-    ) {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            crate::workflow::permission_refusal(if action.action == "approve" {
-                "approver"
-            } else {
-                "sender"
-            }),
-        ));
-    }
+    let role = if action.action == "approve" {
+        "approver"
+    } else {
+        "sender"
+    };
+    let job = actor.job(&app, &id, role)?;
     let administrator = actor.token.is_none() && actor.identity.role == "admin";
     let job = if action.action == "remove_recipient" {
         app.store.remove_delivery_recipient(
@@ -1827,23 +1783,7 @@ pub async fn update_notifications(
     Json(policy): Json<Option<crate::store::NotificationPolicy>>,
 ) -> ApiResult<Response> {
     let actor = actor(&app, &headers, peer, "jobs:create", true)?;
-    let job = app
-        .store
-        .delivery_job(&id)
-        .map_err(crate::api::store_unavailable)?
-        .filter(|job| job.tenant == actor.identity.tenant)
-        .ok_or_else(ApiError::not_found)?;
-    let project = app
-        .store
-        .delivery_project(&job.tenant, &job.project.id)
-        .map_err(crate::api::store_unavailable)?
-        .ok_or_else(ApiError::not_found)?;
-    if !actor.allows(&project, "sender") {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            crate::workflow::permission_refusal("sender"),
-        ));
-    }
+    let job = actor.job(&app, &id, "sender")?;
     if let Some(policy) = &policy {
         crate::api::notifications::validate_policy(
             &app,

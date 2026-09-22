@@ -47,6 +47,16 @@ export function appLink(kind, token) {
   return `votport://${kind}/${encodeURIComponent(token)}?base=${encodeURIComponent(window.location.origin)}`;
 }
 
+export function offerApp(kind, token) {
+  if (/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)) return;
+  const link = document.getElementById('open-in-app-link');
+  if (!link) return;
+  link.href = appLink(kind, token);
+  link.hidden = false;
+  const holder = document.getElementById('open-in-app');
+  if (holder) holder.hidden = false;
+}
+
 /// The shared getElementById lookup and text-content element builder, so
 /// the pages stop repeating the same one-liners.
 export function $(id) {

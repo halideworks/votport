@@ -1295,42 +1295,12 @@ pub async fn list_principals(
     Query(query): Query<PrincipalsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let _identity = require_platform_admin(&app, &headers)?;
-    let limit = query
-        .limit
-        .as_deref()
-        .map(str::parse)
-        .transpose()
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "limit must be an integer between 1 and 100",
-            )
-        })?
-        .unwrap_or(PRINCIPAL_PAGE_DEFAULT);
-    if !(1..=PRINCIPAL_PAGE_MAX).contains(&limit) {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "limit must be between 1 and 100",
-        ));
-    }
-    let offset = query
-        .offset
-        .as_deref()
-        .map(str::parse)
-        .transpose()
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "offset must be a non-negative integer",
-            )
-        })?
-        .unwrap_or(0usize);
-    if i64::try_from(offset).is_err() {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "offset is too large",
-        ));
-    }
+    let limit = super::page_limit(
+        query.limit.as_deref(),
+        PRINCIPAL_PAGE_DEFAULT,
+        PRINCIPAL_PAGE_MAX,
+    )?;
+    let offset = super::page_offset(query.offset.as_deref())?;
     let query = query.q.filter(|value| !value.is_empty());
     if query
         .as_ref()
