@@ -230,7 +230,12 @@ command with the token filled in, next to the HTTP buttons, when
 
 `max_downloads` is a client-delivery control: it applies to outside-facing
 grants (`/s/{token}`), never to an agent fetching the tenant's own uploads.
-The HTTP path counts a download per request. Over QUIC a completed fetch
+The HTTP path counts a file once, when a response that reaches its last byte
+has handed that byte to the transport: a whole download and a resumed one
+each count once, and a range that stops short counts nothing. The lease a
+counted admission hands out still resumes after that count for its 24 hour
+life, since the count can land before the client has read the last frame.
+Over QUIC a completed fetch
 sends a final-cursor GOAWAY, the receiver's completion acknowledgement
 (ADR-0050), and the serve reports that cursor at session end. Every rail is
 its own session, but only the primary carries the final cursor, so the

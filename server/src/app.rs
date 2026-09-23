@@ -266,6 +266,10 @@ pub struct App {
     /// Cancellation token per grant with a live download stream; a revocation
     /// cancels it so admitted streams stop at their next frame.
     pub outbound_stream_cancels: Mutex<HashMap<String, tokio_util::sync::CancellationToken>>,
+    /// File download leases whose retrieval has been counted, with the
+    /// lease expiry. Process-local: after a restart a spent file's lease no
+    /// longer passes, the documented limit of resuming across a failover.
+    pub counted_leases: Mutex<HashMap<String, u64>>,
     /// Concurrent byte reservations for outbound staging on the data filesystem.
     pub outbound_stage_budget: Arc<crate::api::outbound::StageBudget>,
     pub(crate) admin_status: crate::api::admin::AdminStatusCache,
@@ -1151,6 +1155,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         automation_read_rate: crate::api::session_rate::SessionRate::with_limit(6000),
         outbound_active: Mutex::new(HashSet::new()),
         outbound_stream_cancels: Mutex::new(HashMap::new()),
+        counted_leases: Mutex::new(HashMap::new()),
         outbound_stage_budget: Arc::new(crate::api::outbound::StageBudget::new()),
         admin_status: crate::api::admin::AdminStatusCache::default(),
         staging_permits: Arc::new(tokio::sync::Semaphore::new(
@@ -3679,6 +3684,12 @@ async fn sweep_short(app: &Arc<App>) {
     .await;
     sweep_task(app, "push tickets", sweep_push_tickets).await;
     sweep_task(app, "serve cache", crate::api::serve::prune).await;
+    sweep_task(
+        app,
+        "revoked download streams",
+        crate::api::outbound::cancel_stale_grant_streams,
+    )
+    .await;
     sweep_task(app, "push staging", sweep_push_staging).await;
     sweep_task(app, "library staging", |app| {
         crate::api::outbound::sweep_upload_stages(app, std::time::SystemTime::now());

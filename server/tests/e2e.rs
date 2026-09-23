@@ -6810,6 +6810,17 @@ async fn a_library_grant_is_fetched_over_vot_quic_and_counted_once() {
         .unwrap();
     let fetch = &metadata["fetch"];
     assert_eq!(fetch["mint_url"], format!("/api/s/{token}/fetch"));
+    // The recipient page asks for paged metadata, which carries the same
+    // offer.
+    let paged = recipient
+        .get(format!("{}/api/s/{token}?offset=0&limit=100", server.base))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(&paged["fetch"], fetch);
     let address: SocketAddr = fetch["address"].as_str().unwrap().parse().unwrap();
     let identity: [u8; 32] = hex::decode(fetch["certificate_digest"].as_str().unwrap())
         .unwrap()

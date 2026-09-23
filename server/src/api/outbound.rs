@@ -3446,6 +3446,7 @@ pub async fn update_outbound_grant(
         if !changed {
             return Err(ApiError::not_found());
         }
+        cancel_stale_grant_streams(&app);
         app.store.audit(
             &identity.tenant,
             &identity.subject,
@@ -3529,6 +3530,23 @@ pub async fn outbound_metadata(
         &manifest,
         recipient.as_deref(),
     )?;
+    // The recipient page always requests paged metadata, so both shapes
+    // carry the QUIC fetch offer.
+    let fetch = app
+        .serve
+        .as_ref()
+        .filter(|_| {
+            !grant
+                .max_downloads
+                .is_some_and(|max| grant.downloads >= max)
+        })
+        .map(|serve| {
+            json!({
+                "address": serve.address,
+                "certificate_digest": hex::encode(serve.certificate_digest),
+                "mint_url": format!("/api/s/{token}/fetch"),
+            })
+        });
     let (files, receipt_url, extra) = if let Some((files, file_count, total_bytes)) = page {
         let (offset, limit) = paging.expect("page was loaded with pagination");
         let receipt_url = (!grant.link_id.is_empty()
@@ -3545,6 +3563,7 @@ pub async fn outbound_metadata(
             files,
             receipt_url,
             json!({
+                "fetch": fetch,
                 "files_total": file_count, "total_bytes": total_bytes,
                 "offset": offset, "limit": limit, "has_more": has_more,
             }),
@@ -3574,11 +3593,7 @@ pub async fn outbound_metadata(
             files,
             receipt_url,
             json!({
-                "fetch": app.serve.as_ref().filter(|_| !grant.max_downloads.is_some_and(|max| grant.downloads >= max)).map(|serve| json!({
-                    "address": serve.address,
-                    "certificate_digest": hex::encode(serve.certificate_digest),
-                    "mint_url": format!("/api/s/{token}/fetch"),
-                })),
+                "fetch": fetch,
                 "total_bytes": if grant.files.is_empty() { grant.bytes } else {
                     grant.files.iter().fold(0u64, |total, file| total.saturating_add(file.bytes))
                 },
@@ -3845,9 +3860,9 @@ pub async fn outbound_batch(
         })
         .await
         .map_err(|_| ApiError::internal("batch source validation failed"))??;
+        audit_download_request(&app, &grant, &headers, peer, "batch", None, None).await?;
         let indexes: Vec<usize> = (0..count).collect();
         record_download(&app, &grant, &indexes).await?;
-        audit_download_request(&app, &grant, &headers, peer, "batch", None, false).await?;
         let mut response = Body::empty().into_response();
         response.headers_mut().insert(
             header::CONTENT_TYPE,
@@ -3904,7 +3919,7 @@ pub async fn outbound_batch(
         recorded: 0,
     };
     state.fill_lookahead();
-    audit_download_request(&app, &state.grant, &headers, peer, "batch", None, false).await?;
+    audit_download_request(&app, &state.grant, &headers, peer, "batch", None, None).await?;
     let stream = futures_util::stream::try_unfold(state, |mut state| async move {
         // Normal polls record only files whose bytes a previous poll handed
         // to the transport. The final frame is validated and admitted before
@@ -4233,15 +4248,18 @@ async fn outbound_file_inner(
     route_path: String,
     query: Option<&str>,
 ) -> ApiResult<Response> {
-    let (grant, leased, file) = active_download_grant(&app, &token, index, &headers, query)?;
+    let (grant, lease, file) = active_download_grant(&app, &token, index, &headers, query)?;
+    let leased = lease.is_some();
     let grant = Arc::new(grant);
     let operation = begin_outbound_operation_owned(&app, &grant.tenant)?;
     // A verified lease was minted only after a full access check, so the
     // redirected request streams on the MAC alone: it carries no grant
-    // cookie for a password gated grant.
-    if !leased {
-        require_grant_access(&app, &grant, &headers)?;
-    }
+    // cookie for a password gated grant. Its recipient is still re-checked
+    // when the response is audited.
+    let holder = match &lease {
+        Some(lease) => lease.holder().to_owned(),
+        None => require_grant_access(&app, &grant, &headers)?.unwrap_or_default(),
+    };
     let allowed = app
         .outbound_rate
         .allow_individual(&grant.token_hash, || {
@@ -4318,8 +4336,7 @@ async fn outbound_file_inner(
             .await
             .map_err(|_| ApiError::not_found())?;
             drop(probe);
-            audit_download_request(&app, &grant, &headers, peer, "file", Some(index), leased)
-                .await?;
+            audit_download_request(&app, &grant, &headers, peer, "file", Some(index), None).await?;
             let lifetime = grant
                 .expires_at
                 .saturating_sub(now_unix())
@@ -4330,6 +4347,7 @@ async fn outbound_file_inner(
                     &grant.id,
                     &grant.token_hash,
                     index,
+                    &holder,
                     lifetime,
                 );
                 return Ok(download_lease_redirect(&route_path, &lease));
@@ -4353,18 +4371,32 @@ async fn outbound_file_inner(
         drop(pin);
         let length = range.map_or(source.object.length, |(start, end)| end - start + 1);
         // The batch route records each file as its last byte is handed to the
-        // transport; this route now applies the same completion rule (audit
-        // finding 490): only a response covering the whole object records,
-        // once its last frame has passed through, so an interrupted download
-        // burns no quota and range resumes on the leased URL never recount.
-        let whole_object =
-            range.is_none_or(|(start, end)| start == 0 && end + 1 == source.object.length);
+        // transport; this route applies the same completion rule (audit
+        // finding 490): a response that reaches the object's last byte
+        // records once its last frame has passed through. Every complete
+        // retrieval ends there exactly once, whether it arrived whole or as
+        // a resume, so an interrupted download burns no quota and a resumed
+        // one still counts.
+        let reaches_end = range.is_none_or(|(_, end)| end + 1 == source.object.length);
+        // Access is re-checked before anything is counted or announced.
+        audit_download_request(
+            &app,
+            &grant,
+            &headers,
+            peer,
+            "file",
+            Some(index),
+            lease.as_ref().map(DownloadLease::holder),
+        )
+        .await?;
         let remaining = if length == 0 {
             // An empty body has no last frame to carry the record, so it
             // lands before the response, the way the empty batch records.
-            record_download(&app, &grant, &[index]).await?;
+            if claim_download_count(&app, lease.as_ref()) {
+                record_download(&app, &grant, &[index]).await?;
+            }
             None
-        } else if whole_object {
+        } else if reaches_end {
             Some(length)
         } else {
             None
@@ -4375,13 +4407,13 @@ async fn outbound_file_inner(
             app: Arc::clone(&app),
             grant: Arc::clone(&grant),
             index,
+            lease,
         };
         let mut response = Body::from_stream(stream).into_response();
         add_file_headers(&mut response, &source, length, range)?;
         if range.is_some() {
             *response.status_mut() = StatusCode::PARTIAL_CONTENT;
         }
-        audit_download_request(&app, &grant, &headers, peer, "file", Some(index), leased).await?;
         Ok(response)
     }
 }
@@ -4393,13 +4425,21 @@ async fn outbound_file_head_inner(
     index: usize,
     query: Option<&str>,
 ) -> ApiResult<Response> {
-    let (grant, leased, file) = active_download_grant(&app, &token, index, &headers, query)?;
+    let (grant, lease, file) = active_download_grant(&app, &token, index, &headers, query)?;
     let grant = Arc::new(grant);
     let operation = begin_outbound_operation_owned(&app, &grant.tenant)?;
     // Same as the streaming path: a verified lease stands in for the
-    // grant access recheck.
-    if !leased {
-        require_grant_access(&app, &grant, &headers)?;
+    // password check, and its recipient must still be enrolled.
+    match &lease {
+        None => {
+            require_grant_access(&app, &grant, &headers)?;
+        }
+        Some(lease) => {
+            let job = workflows::release(&app, &grant)?;
+            if !lease_holder_enrolled(job.as_ref(), lease.holder()) {
+                return Err(recipient_removed());
+            }
+        }
     }
     if !app.outbound_rate.allow(&grant.token_hash) {
         return Err(ApiError::new(
@@ -4530,6 +4570,7 @@ fn issue_download_lease(
     grant: &OutboundGrant,
     token: &str,
     index: usize,
+    holder: &str,
     response: &mut Response,
 ) {
     let lifetime = grant
@@ -4539,8 +4580,14 @@ fn issue_download_lease(
     if lifetime == 0 {
         return;
     }
-    let value =
-        auth::issue_download_lease(&app.secret, &grant.id, &grant.token_hash, index, lifetime);
+    let value = auth::issue_download_lease(
+        &app.secret,
+        &grant.id,
+        &grant.token_hash,
+        index,
+        holder,
+        lifetime,
+    );
     let cookie = format!(
         "{}={value}; Path=/api/s/{token}; HttpOnly; SameSite=Lax; Max-Age={lifetime}{}",
         download_lease_cookie_name(&grant.id, index),
@@ -4581,7 +4628,7 @@ pub async fn outbound_bundle(
     let is_head = request.method() == Method::HEAD;
     let grant = active_grant(&app, &token)?;
     let operation = begin_outbound_operation_owned(&app, &grant.tenant)?;
-    require_grant_access(&app, &grant, &headers)?;
+    let holder = require_grant_access(&app, &grant, &headers)?.unwrap_or_default();
     if !app.outbound_rate.allow(&grant.token_hash) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -4660,6 +4707,9 @@ pub async fn outbound_bundle(
     // commits against, so the bundle keeps up-front recording; the batch
     // endpoint records per delivered file instead. The bundle lease lets an
     // interrupted bundle recover each file through the existing range path.
+    // The build can take minutes; access is checked again before anything
+    // is counted or announced, so a link revoked meanwhile spends nothing.
+    audit_download_request(&app, &grant, &headers, peer, "bundle", None, None).await?;
     let indexes: Vec<usize> = (0..count).collect();
     record_download(&app, &grant, &indexes).await?;
     let stream = ReaderStream::with_capacity(
@@ -4691,9 +4741,9 @@ pub async fn outbound_bundle(
         &grant,
         &token,
         BUNDLE_DOWNLOAD_LEASE_INDEX,
+        &holder,
         &mut response,
     );
-    audit_download_request(&app, &grant, &headers, peer, "bundle", None, false).await?;
     Ok(response)
 }
 
@@ -4730,7 +4780,11 @@ fn active_download_grant(
     index: usize,
     headers: &HeaderMap,
     query: Option<&str>,
-) -> ApiResult<(OutboundGrant, bool, Option<OutboundGrantFile>)> {
+) -> ApiResult<(
+    OutboundGrant,
+    Option<DownloadLease>,
+    Option<OutboundGrantFile>,
+)> {
     if !valid_token(token) {
         return Err(ApiError::not_found());
     }
@@ -4742,11 +4796,71 @@ fn active_download_grant(
     if grant.revoked_at.is_some() || grant.expires_at <= now_unix() {
         return Err(ApiError::not_found());
     }
-    let leased = download_lease_authorized(app, &grant, index, headers, query);
-    if !leased && grant_is_exhausted(&grant, index, file.as_ref()) {
+    let lease = download_lease_authorized(app, &grant, index, headers, query);
+    if !lease.as_ref().is_some_and(|lease| lease.passes_spent(app))
+        && grant_is_exhausted(&grant, index, file.as_ref())
+    {
         return Err(ApiError::not_found());
     }
-    Ok((grant, leased, file))
+    Ok((grant, lease, file))
+}
+
+/// A verified lease on a per-file request, carrying the enrolled recipient
+/// it was minted for ("" when the delivery has none).
+enum DownloadLease {
+    /// Minted at a file admission before anything was counted: its first
+    /// retrieval to reach the last byte records, and only that lease may
+    /// then resume past a spent count.
+    File { holder: String, lease: String },
+    /// Handed out by a bundle that already recorded every file, so its
+    /// recovery downloads record nothing more.
+    Bundle(String),
+}
+
+impl DownloadLease {
+    fn holder(&self) -> &str {
+        match self {
+            Self::File { holder, .. } | Self::Bundle(holder) => holder,
+        }
+    }
+
+    /// Whether this lease may reach a file whose count is spent: the bundle
+    /// already counted it, and a file lease that counted it may resume,
+    /// since the count lands before the client has read the last frame.
+    fn passes_spent(&self, app: &App) -> bool {
+        match self {
+            Self::Bundle(_) => true,
+            Self::File { lease, .. } => app
+                .counted_leases
+                .lock()
+                .expect("counted leases poisoned")
+                .contains_key(lease),
+        }
+    }
+}
+
+/// Claims the one count a completed retrieval may make: unleased requests
+/// always record, a bundle recovery never does, and a file lease records
+/// only its first retrieval to reach the last byte.
+fn claim_download_count(app: &App, lease: Option<&DownloadLease>) -> bool {
+    const COUNTED_LEASES_CAP: usize = 4096;
+    match lease {
+        None => true,
+        Some(DownloadLease::Bundle(_)) => false,
+        Some(DownloadLease::File { lease, .. }) => {
+            let expires = lease
+                .split('.')
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            let mut counted = app.counted_leases.lock().expect("counted leases poisoned");
+            if counted.len() >= COUNTED_LEASES_CAP {
+                let now = now_unix();
+                counted.retain(|_, until| *until > now);
+            }
+            counted.insert(lease.clone(), expires).is_none()
+        }
+    }
 }
 
 fn grant_is_exhausted(
@@ -4764,10 +4878,10 @@ fn grant_is_exhausted(
         })
 }
 
-/// Audits a download response. `leased` marks a request whose per-file
-/// URL lease already proved grant access at admission, so the closure
-/// records the audit event without re-running the password and recipient
-/// checks that the redirected request can no longer answer.
+/// Audits a download response. `lease_holder` is set for a request whose
+/// per-file lease already proved grant access at admission: the closure
+/// skips the password check the redirected request can no longer answer,
+/// and requires only that the lease's recipient is still enrolled.
 async fn audit_download_request(
     app: &Arc<App>,
     grant: &OutboundGrant,
@@ -4775,8 +4889,9 @@ async fn audit_download_request(
     peer: std::net::SocketAddr,
     mode: &'static str,
     index: Option<usize>,
-    leased: bool,
+    lease_holder: Option<&str>,
 ) -> ApiResult<()> {
+    let lease_holder = lease_holder.map(str::to_owned);
     let client_ip = super::client_ip(headers, &peer, &app.config.trusted_proxies);
     let tenant = grant.tenant.clone();
     let subject = grant.id.clone();
@@ -4806,7 +4921,11 @@ async fn audit_download_request(
                     ApiError::new(StatusCode::FORBIDDEN, error).with_code("delivery_pending")
                 }
             })?;
-            if !leased {
+            if let Some(holder) = &lease_holder {
+                if !lease_holder_enrolled(job.as_ref(), holder) {
+                    return Err(recipient_removed());
+                }
+            } else {
                 if password_hash.is_some()
                     && !super::upload::cookie_authorized(
                         &app,
@@ -4843,6 +4962,22 @@ async fn audit_download_request(
     })
     .await
     .map_err(|_| ApiError::internal("download authorization failed"))?
+}
+
+/// Whether a lease minted for `holder` still names an enrolled device; a
+/// delivery without recipients accepts every lease.
+fn lease_holder_enrolled(job: Option<&crate::workflow::Job>, holder: &str) -> bool {
+    job.is_none_or(|job| {
+        job.request.recipients.is_empty() || job.request.recipients.iter().any(|key| key == holder)
+    })
+}
+
+fn recipient_removed() -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "this delivery requires an enrolled recipient device",
+    )
+    .with_code("recipient_required")
 }
 
 async fn record_download(
@@ -4913,33 +5048,32 @@ fn download_lease_authorized(
     index: usize,
     headers: &HeaderMap,
     query: Option<&str>,
-) -> bool {
-    if let Some(value) = download_lease_query(query) {
-        if auth::verify_download_lease(&app.secret, &grant.id, &grant.token_hash, index, value) {
-            return true;
-        }
+) -> Option<DownloadLease> {
+    if let Some((value, holder)) = download_lease_query(query).and_then(|value| {
+        auth::verify_download_lease(&app.secret, &grant.id, &grant.token_hash, index, value)
+            .map(|holder| (value, holder))
+    }) {
+        return Some(DownloadLease::File {
+            holder,
+            lease: value.to_owned(),
+        });
     }
     // The bundle sentinel stays a cookie: it is issued once after every
     // bundle index has been recorded, so its size does not grow with the
     // file list the way one per-file cookie did.
-    headers
-        .get(header::COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|cookies| {
-            auth::cookie_value(
-                cookies,
-                &download_lease_cookie_name(&grant.id, BUNDLE_DOWNLOAD_LEASE_INDEX),
-            )
-            .is_some_and(|value| {
-                auth::verify_download_lease(
-                    &app.secret,
-                    &grant.id,
-                    &grant.token_hash,
-                    BUNDLE_DOWNLOAD_LEASE_INDEX,
-                    value,
-                )
-            })
-        })
+    let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
+    let value = auth::cookie_value(
+        cookies,
+        &download_lease_cookie_name(&grant.id, BUNDLE_DOWNLOAD_LEASE_INDEX),
+    )?;
+    auth::verify_download_lease(
+        &app.secret,
+        &grant.id,
+        &grant.token_hash,
+        BUNDLE_DOWNLOAD_LEASE_INDEX,
+        value,
+    )
+    .map(DownloadLease::Bundle)
 }
 
 /// The raw value of the `download_lease` query parameter, when present.
@@ -4968,10 +5102,10 @@ pub(crate) fn require_grant_access(
     app: &App,
     grant: &OutboundGrant,
     headers: &HeaderMap,
-) -> ApiResult<()> {
-    workflows::require_recipient(app, grant, headers)?;
+) -> ApiResult<Option<String>> {
+    let holder = workflows::require_recipient(app, grant, headers)?;
     if grant_authorized(app, grant, headers) {
-        Ok(())
+        Ok(holder)
     } else {
         Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
@@ -5235,12 +5369,14 @@ struct VerifiedStream {
 struct RecordingStream {
     inner: VerifiedStream,
     /// Bytes still to hand off before the count lands. `None` never records:
-    /// a partial range response (resumes stay free under the download lease)
-    /// and the empty body, which recorded before the response.
+    /// a range that stops short of the object's last byte, and the empty
+    /// body, which recorded before the response.
     remaining: Option<u64>,
     app: Arc<App>,
     grant: Arc<OutboundGrant>,
     index: usize,
+    /// The lease the request came in on; see [`claim_download_count`].
+    lease: Option<DownloadLease>,
 }
 
 impl Stream for RecordingStream {
@@ -5256,6 +5392,9 @@ impl Stream for RecordingStream {
             *remaining = remaining.saturating_sub(bytes.len() as u64);
             if *remaining == 0 {
                 this.remaining = None;
+                if !claim_download_count(&this.app, this.lease.as_ref()) {
+                    return Poll::Ready(frame);
+                }
                 let app = Arc::clone(&this.app);
                 let grant = Arc::clone(&this.grant);
                 let index = this.index;
@@ -5725,6 +5864,27 @@ fn stream_cancel_token(app: &App, token_hash: &str) -> CancellationToken {
         .lock()
         .expect("outbound stream cancels poisoned");
     cancels.entry(token_hash.to_owned()).or_default().clone()
+}
+
+/// Stops the live streams of every grant that no longer admits downloads:
+/// revoked, expired, or re-keyed since the stream started. Paths that revoke
+/// in bulk (reprocess, a revoked trade route, token rotation) call it once
+/// their change commits, and the short sweep runs it for any path that does
+/// not. Only grants with a live stream are read.
+pub(crate) fn cancel_stale_grant_streams(app: &App) {
+    let live: Vec<String> = app
+        .outbound_stream_cancels
+        .lock()
+        .expect("outbound stream cancels poisoned")
+        .keys()
+        .cloned()
+        .collect();
+    let now = now_unix();
+    for token_hash in live {
+        if app.store.outbound_grant_admits(&token_hash, now) == Ok(false) {
+            cancel_grant_streams(app, &token_hash);
+        }
+    }
 }
 
 /// Cancels every live download stream of a grant. Called by the revoke

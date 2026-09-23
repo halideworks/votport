@@ -472,6 +472,8 @@ pub async fn revoke(
         .store
         .revoke_inbound_route(&id, &request)
         .map_err(conflict)?;
+    // The revocation also revoked every grant the route fed.
+    crate::api::outbound::cancel_stale_grant_streams(&app);
     if let Some(session) = route.as_ref().and_then(|route| route.session_id.as_ref()) {
         let _ =
             crate::api::upload::upload_abort(State(Arc::clone(&app)), AxumPath(session.clone()))

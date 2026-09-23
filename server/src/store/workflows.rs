@@ -1571,6 +1571,18 @@ impl Store {
                 "that device is not enrolled on this delivery",
             ));
         }
+        // An empty list means an open delivery, so removing the last device
+        // would hand the files to anyone holding the URL.
+        if job
+            .request
+            .recipients
+            .iter()
+            .all(|enrolled| enrolled == holder)
+        {
+            return Err(WorkflowMutationError::conflict(
+                "a delivery keeps at least one enrolled recipient; cancel it instead",
+            ));
+        }
         job.request.recipients.retain(|enrolled| enrolled != holder);
         job.updated_at = now_unix();
         save_job(&tx, &job).map_err(|e| e.to_string())?;

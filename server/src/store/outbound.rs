@@ -212,6 +212,21 @@ impl Store {
         self.outbound_grant("token_hash", token_hash)
     }
 
+    /// Whether the grant keyed by this token hash still admits downloads:
+    /// present, unrevoked and unexpired. Reads two columns, not the file list.
+    pub fn outbound_grant_admits(&self, token_hash: &str, now: u64) -> Result<bool, String> {
+        self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT revoked_at IS NULL AND expires_at > ?2 FROM outbound_grants WHERE token_hash = ?1",
+                    rusqlite::params![token_hash, now as i64],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()
+                .map(|admits| admits.unwrap_or(false))
+        })
+    }
+
     /// The manifest root recorded for a grant's VOT package, if one was built.
     pub fn outbound_grant_manifest_root(&self, grant_id: &str) -> Result<Option<String>, String> {
         self.with(|connection| {

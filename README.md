@@ -37,8 +37,8 @@ VOT object identity and signed receipt against a cached proof catalog (built
 once per object), then streams verified ranges directly from the source. ZIP
 and grouped batch downloads copy each source into private staging and verify
 it per request. Individual files support RFC 9110 single-byte-range requests for
-resumable downloads; each logical file download is counted once and a short-lived
-secure lease permits subsequent ranges. For multi-file deliveries, recipients may download a payload-only
+resumable downloads; a file counts once, when a response reaching its last byte
+completes, and a short-lived secure lease permits the ranges before it. For multi-file deliveries, recipients may download a payload-only
 ZIP or stream the files separately in bulk; signed receipts remain optional
 individual downloads. Optional link passwords gate metadata, files, receipts,
 and the ZIP.

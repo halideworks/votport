@@ -474,6 +474,8 @@ pub async fn reprocess(
             request.project_revision,
         )
         .map_err(workflow_store_error)?;
+    // Reprocessing revokes the original's link; its open streams stop too.
+    super::cancel_stale_grant_streams(&app);
     app.workflow_ready.notify_one();
     Ok((
         StatusCode::ACCEPTED,
@@ -5303,17 +5305,27 @@ mod tests {
         .unwrap();
         let key = ed25519_dalek::SigningKey::from_bytes(&[2; 32]);
         let holder = hex::encode(key.verifying_key().to_bytes());
+        let other = hex::encode(
+            ed25519_dalek::SigningKey::from_bytes(&[3; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
         let mut project = crate::workflow::tests::project();
-        project.recipients.push(crate::workflow::Recipient {
-            email: "recipient@example.com".into(),
-            holder: holder.clone(),
-        });
+        for (email, key) in [
+            ("recipient@example.com", &holder),
+            ("other@example.com", &other),
+        ] {
+            project.recipients.push(crate::workflow::Recipient {
+                email: email.into(),
+                holder: key.clone(),
+            });
+        }
         let project = app
             .store
             .save_delivery_project("", "local", project)
             .unwrap();
         let mut request = crate::workflow::tests::request();
-        request.recipients = vec![holder.clone()];
+        request.recipients = vec![holder.clone(), other.clone()];
         let job = app
             .store
             .enqueue_delivery_job("", "sender", 1, None, project, request)
@@ -5507,6 +5519,35 @@ mod tests {
                 );
             }
         }
+        // The lease names the device it was minted for, so removing that
+        // device ends it even though the URL alone carries no cookie.
+        assert_eq!(
+            call(&app, Method::GET, &leased_path, None, None).await.0,
+            StatusCode::OK
+        );
+        app.store
+            .remove_delivery_recipient("", &job.id, "local", true, &holder)
+            .unwrap();
+        let refused = call(&app, Method::GET, &leased_path, None, None).await;
+        assert_eq!(refused.0, StatusCode::FORBIDDEN);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&refused.2).unwrap()["code"],
+            "recipient_required"
+        );
+        // Removing the last device would open the delivery to anyone.
+        assert!(app
+            .store
+            .remove_delivery_recipient("", &job.id, "local", true, &other)
+            .is_err());
+        assert_eq!(
+            app.store
+                .delivery_job(&job.id)
+                .unwrap()
+                .unwrap()
+                .request
+                .recipients,
+            vec![other.clone()]
+        );
         let rotated = call(
             &app,
             Method::PATCH,
