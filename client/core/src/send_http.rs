@@ -74,6 +74,9 @@ pub fn send_with_session(
             return Err(Error::ResumeSessionInvalid);
         }
     }
+    if observer.cancelled() {
+        return Err(Error::Cancelled);
+    }
     let (session, chunk_bytes, resume) = match existing {
         Some((session, chunk_bytes)) => (session.to_owned(), chunk_bytes, true),
         None => {

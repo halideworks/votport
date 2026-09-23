@@ -259,7 +259,15 @@ impl Transfer {
 #[uniffi::export]
 pub fn pending() -> Vec<journal::Entry> {
     crate::evidence::start_retry_worker();
+    // A send another process (the CLI, or the app beside it) is running is
+    // live, not interrupted: listing it would offer Resume and Remove, and
+    // Remove aborts its server session.
     journal::pending()
+        .into_iter()
+        .filter(
+            |entry| !matches!(entry.paths.as_slice(), [only] if watch::shipping_elsewhere(only)),
+        )
+        .collect()
 }
 
 /// Drops a transfer from the journal, for a failed or interrupted one the
@@ -360,15 +368,21 @@ pub fn resume(
             // failed park leaves the drop for the next watch run, whose
             // ship the server's dedupe keeps short, as in `ship`.
             let drop = entry.paths.first().cloned();
-            let sent = run_send(entry, password, transfer, listener, false, None);
+            let before = drop
+                .as_deref()
+                .and_then(|path| watch::fingerprint(Path::new(path)));
+            let listener = LastView::wrap(listener);
+            let sent = run_send(entry, password, transfer, listener.clone(), false, None);
             if sent.is_ok() {
                 if let Some(path) = drop {
                     if watch::is_watched_drop(Path::new(&path)) {
-                        let _ = watch::park(Path::new(&path));
+                        if let Err(error) = watch::park_if_unchanged(Path::new(&path), before) {
+                            listener.note(&error);
+                        }
                     }
                 }
             }
-            sent.map(ResumeReport::Sent)
+            sent.map(|(report, _flight)| ResumeReport::Sent(report))
         }
         journal::Kind::Receive => {
             let dest = dest.map(|dest| journal::absolute(&dest));
@@ -760,8 +774,20 @@ pub fn ship(
         None,
         password.is_some(),
     );
-    let report = run_send(entry, password, transfer, listener, true, Some(flight))?;
-    let parked = watch::park(Path::new(&path));
+    let sent = watch::fingerprint(Path::new(&path));
+    let listener = LastView::wrap(listener);
+    let (report, _flight) = run_send(
+        entry,
+        password,
+        transfer,
+        listener.clone(),
+        true,
+        Some(flight),
+    )?;
+    let parked = watch::park_if_unchanged(Path::new(&path), sent);
+    if let Err(error) = &parked {
+        listener.note(error);
+    }
     Ok(ShipReport {
         files: report.files,
         parked: parked.is_ok(),
@@ -790,7 +816,7 @@ pub fn send(
     listener: Arc<dyn TransferListener>,
 ) -> std::result::Result<SendReport, Error> {
     let entry = journal::record(journal::Kind::Send, &link, paths, None, password.is_some());
-    run_send(entry, password, transfer, listener, true, None)
+    run_send(entry, password, transfer, listener, true, None).map(|(report, _)| report)
 }
 
 /// Runs a journalled send. The entry is dropped from the journal when the
@@ -803,7 +829,7 @@ fn run_send(
     listener: Arc<dyn TransferListener>,
     new_journal: bool,
     claimed_flight: Option<watch::Flight>,
-) -> std::result::Result<SendReport, Error> {
+) -> std::result::Result<(SendReport, Option<watch::Flight>), Error> {
     let existing_http = entry.http.clone();
     let resume = existing_http.as_ref().map(|http| transfer::HttpResume {
         session: &http.session,
@@ -811,13 +837,14 @@ fn run_send(
         root: &http.root,
         length: http.length,
     });
-    let journal_id = entry.id.clone();
     let handle = Arc::clone(&transfer);
     let mut forward = Forward::new(journal::Kind::Send, transfer, listener);
     if new_journal {
         handle.set_journal_id(&entry.id);
     }
-    let _flight = if let Some(flight) = claimed_flight {
+    // The claim goes back to the caller with the report, so a ship or
+    // resume keeps the drop claimed until it has been parked.
+    let flight = if let Some(flight) = claimed_flight {
         Some(flight)
     } else {
         match entry.paths.as_slice() {
@@ -865,7 +892,7 @@ fn run_send(
                 resume,
                 |session, chunk_bytes, prepared| {
                     journal::mark_http(
-                        &journal_id,
+                        &entry,
                         journal::HttpResume {
                             session: session.to_owned(),
                             chunk_bytes,
@@ -914,7 +941,7 @@ fn run_send(
     };
     handle.settle(&entry, result.as_ref().err());
     forward.finish(result.as_ref().err());
-    result
+    result.map(|report| (report, flight))
 }
 
 fn clear_resume_error(id: &str, error: Error) -> Error {
@@ -1415,6 +1442,47 @@ impl Model {
         }
         self.view.rate_bytes_per_second = None;
         self.view.eta_seconds = None;
+    }
+}
+
+/// Forwards a transfer's views and keeps the last, so a note that lands
+/// after the send itself (a drop that could not be parked) still reaches
+/// the card as its detail line.
+struct LastView {
+    inner: Arc<dyn TransferListener>,
+    last: Mutex<Option<TransferView>>,
+}
+
+impl LastView {
+    fn wrap(inner: Arc<dyn TransferListener>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            last: Mutex::new(None),
+        })
+    }
+
+    fn note(&self, park_problem: &Error) {
+        let last = self
+            .last
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(mut view) = last {
+            view.detail = Some(format!(
+                "Sent. It was not moved into shipped: {park_problem}"
+            ));
+            self.inner.update(view);
+        }
+    }
+}
+
+impl TransferListener for LastView {
+    fn update(&self, view: TransferView) {
+        *self
+            .last
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(view.clone());
+        self.inner.update(view);
     }
 }
 
@@ -2209,6 +2277,27 @@ mod tests {
         fn update(&self, view: TransferView) {
             self.0.lock().unwrap().push(view);
         }
+    }
+
+    /// A drop that could not be parked says so on its card: the last view
+    /// is sent again with the reason as its detail line.
+    #[test]
+    fn a_park_problem_reaches_the_card_as_its_detail() {
+        let count = Arc::new(Count(std::sync::Mutex::new(Vec::new())));
+        let remember = LastView::wrap(count.clone());
+        remember.note(&Error::Other("ignored before any view".into()));
+        assert!(count.0.lock().unwrap().is_empty());
+        let mut done = Model::new(journal::Kind::Send).view;
+        done.phase = Phase::Done;
+        remember.update(done);
+        remember.note(&Error::Other("it changed while it was sending".into()));
+        let views = count.0.lock().unwrap();
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[1].phase, Phase::Done);
+        assert!(views[1]
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("it changed while it was sending")));
     }
 
     #[test]

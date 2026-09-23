@@ -261,6 +261,12 @@ fn prepare(base: &str, drop: Drop, observer: &mut dyn Observer) -> Result<Ready>
     let staging: TempDir = new_staging()?;
     let manifest_root = staging.path().join("manifest-root");
     let prepared = package::build(admitted, &manifest_root)?;
+    // Hashing a large drop takes minutes and cannot be interrupted midway;
+    // a Cancel or Pause pressed meanwhile takes effect here, before any
+    // session is opened.
+    if observer.cancelled() {
+        return Err(Error::Cancelled);
+    }
 
     Ok(Ready {
         client,
@@ -633,6 +639,10 @@ mod tests {
 
     /// Sends one small file through the real decision in [`send_with_session`].
     fn send_one_file(base: &str) -> Result<Sent> {
+        send_one_file_observed(base, &mut crate::progress::Silent)
+    }
+
+    fn send_one_file_observed(base: &str, observer: &mut dyn Observer) -> Result<Sent> {
         let device_dir = tempfile::tempdir().unwrap();
         // Staging lives under the state directory; pin a per-test one so a
         // concurrent test's state-dir teardown cannot sweep this send's
@@ -653,10 +663,29 @@ mod tests {
                 }],
             },
             &device,
-            &mut crate::progress::Silent,
+            observer,
             None,
             |_, _, _| Ok(false),
         )
+    }
+
+    /// A Cancel or Pause pressed while the drop hashes ends the send before
+    /// any session is opened on the receiver.
+    #[test]
+    fn a_cancel_during_hashing_opens_no_session() {
+        struct Cancelled;
+        impl Observer for Cancelled {
+            fn event(&mut self, _: crate::progress::Event) {}
+            fn cancelled(&self) -> bool {
+                true
+            }
+        }
+        let mock = spawn_link_mock((404, "push is off"));
+        let error = send_one_file_observed(&mock.base, &mut Cancelled)
+            .err()
+            .expect("a cancelled send must not complete");
+        assert!(matches!(error, Error::Cancelled), "{error}");
+        assert_eq!(mock.session_creates.load(Ordering::Relaxed), 0);
     }
 
     /// The prepare preflight succeeds (the mock link is usable with push on),

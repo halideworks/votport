@@ -244,7 +244,8 @@ the state directory (a folder, a request link, and the link's password
 when it has one, since an unattended send must hold it); a watcher thread
 scans every watched folder every two seconds and hands the listener each
 top-level file or folder whose fingerprint (entry count, total bytes,
-newest change) has held still for ten seconds, once. When a folder is chosen
+newest change) has held still for 30 seconds, with its newest change at
+least 30 seconds old, once. When a folder is chosen
 for a normal send, hidden descendants are included only when the request link
 allows hidden names; otherwise they are skipped. Watch folders skip dotfiles
 at their root and fingerprint nested hidden descendants so the same link
@@ -252,11 +253,15 @@ policy applies when they ship. A folder containing only skipped metadata
 stays in place after an empty-send notice. The caller ships it
 with `ship`, which runs the ordinary journalled send and then moves the
 drop into the folder's `shipped` subfolder, so the folder is its own
-ledger. Dotfiles, `shipped`, and a folder with nothing in it yet are
-skipped; a drop that fails stays put with its failed card and Retry, and
-is handed over again only if it changes. One drop ships at a time per
-path, and a drop that shipped but could not be moved aside is reported
-as shipped with the reason; at the next launch the watcher hands it over
+ledger. Dotfiles, `shipped` (in any letter case), and a folder with nothing
+in it yet are skipped; a drop that fails stays put with its failed card and
+Retry, and is handed over again only if it changes. One drop ships at a time
+per path, across the app and the CLI where they share the state folder (macOS,
+and the unpackaged Windows build; the packaged Windows app keeps its own
+state, so a CLI beside it is not coordinated with it). A drop
+that changed while it was sending stays in place and ships again once it
+settles. A drop that shipped but could not be moved aside is reported as
+shipped with the reason on its card; at the next launch the watcher hands it over
 again, and the server's dedupe on a known package root makes that second
 send short. A watch send cut by a quit leaves its journal entry, offered as
 Resume like any other; the drop also settles again at the next launch,

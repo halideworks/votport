@@ -126,6 +126,15 @@ fn active_transfers_hold_the_system_awake() {
         "Power.transfer(true)",
         "the macOS transfer run holds the machine awake",
     );
+    claim(
+        &transfer_store,
+        "Power.transfer(!active.isEmpty)",
+        "a finished transfer releases the assertion only when no other transfer runs",
+    );
+    assert!(
+        !transfer_store.contains("Power.transfer(false)"),
+        "no path drops the assertion while another transfer is active"
+    );
     let port_store = shell_source("macos", "PortStore.swift");
     claim(
         &port_store,
@@ -138,6 +147,18 @@ fn active_transfers_hold_the_system_awake() {
         "the macOS library upload release also runs on the session reset path",
     );
     let windows_store = shell_source("windows", "TransferStore.cs");
+    // The tray's Resume binds CanResumeNow, which follows Journalled and
+    // NeedsPassword as well as Running.
+    claim(
+        &windows_store,
+        "Changed(nameof(CanResume)); Changed(nameof(ShowPassword)); Changed(nameof(CanResumeNow));",
+        "Journalled re-announces CanResumeNow",
+    );
+    claim(
+        &windows_store,
+        "Changed(nameof(ShowPassword)); Changed(nameof(CanResumeNow)); }",
+        "NeedsPassword re-announces CanResumeNow",
+    );
     claim(
         &windows_store,
         "SetThreadExecutionState",

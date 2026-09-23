@@ -886,6 +886,8 @@ pub(crate) fn local_paths<'a>(
     names: impl IntoIterator<Item = &'a str> + 'a,
 ) -> Result<impl Iterator<Item = Result<PathBuf>> + 'a> {
     let anchor = resolve_directory(dest)?;
+    let names: Vec<&'a str> = names.into_iter().collect();
+    refuse_companion_names(&names)?;
     let mut parents = std::collections::HashSet::new();
     Ok(names.into_iter().map(move |name| {
         let path = joined_path(dest, name)?;
@@ -896,6 +898,53 @@ pub(crate) fn local_paths<'a>(
         }
         Ok(path)
     }))
+}
+
+/// A receive keeps `.vot-<name>.journal`, `.id` and `.lease` beside each
+/// file while it arrives and removes them on publish, so a delivery that
+/// also names one of those would have that file overwritten and deleted.
+fn refuse_companion_names(names: &[&str]) -> Result<()> {
+    // Compared as the paths land: normalized the way admission writes them
+    // and folded like a case-insensitive disk.
+    let normalized = |name: &str| {
+        admit(name, PathBuf::new(), true).ok().map(|entry| {
+            entry
+                .path
+                .iter()
+                .map(|component| match component {
+                    Component::Text(text) => text.to_lowercase(),
+                    Component::Bytes(bytes) => String::from_utf8_lossy(bytes).to_lowercase(),
+                })
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+    };
+    let delivered: std::collections::HashSet<String> =
+        names.iter().filter_map(|name| normalized(name)).collect();
+    for name in names {
+        let Some(path) = normalized(name) else {
+            continue;
+        };
+        let (parent, file) = path
+            .rsplit_once('/')
+            .map_or(("", path.as_str()), |(parent, file)| (parent, file));
+        for suffix in ["journal", "id", "lease"] {
+            let companion = if parent.is_empty() {
+                format!(".vot-{file}.{suffix}")
+            } else {
+                format!("{parent}/.vot-{file}.{suffix}")
+            };
+            if delivered.contains(&companion) {
+                return Err(Error::BadName {
+                    name: companion,
+                    reason: format!(
+                        "it is the name this client keeps beside {name} while it arrives"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn joined_path(dest: &Path, name: &str) -> Result<PathBuf> {
@@ -1379,6 +1428,28 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>>>()
             .is_err());
+        // A delivery naming the journal, identity or lease the receive keeps
+        // beside one of its own files is refused before anything is written.
+        for companion in [
+            "nested/.vot-a.id",
+            "nested/.vot-a.lease",
+            "nested/.VOT-A.JOURNAL",
+        ] {
+            assert!(local_paths(&dest, ["nested/a", companion])
+                .and_then(|paths| paths.collect::<Result<Vec<_>>>())
+                .is_err());
+        }
+        assert!(local_paths(&dest, ["nested/a", "other/.vot-a.id"]).is_ok());
+        // Compared as the paths land: a doubled separator or a non-ASCII case
+        // difference is the same file on disk.
+        for (file, companion) in [
+            ("nested//a", "nested/.vot-a.id"),
+            ("nested/\u{c9}t\u{e9}", "nested/.vot-\u{e9}t\u{e9}.lease"),
+        ] {
+            assert!(local_paths(&dest, [file, companion])
+                .and_then(|paths| paths.collect::<Result<Vec<_>>>())
+                .is_err());
+        }
         fs::write(home.path().join("file"), b"untouched").unwrap();
         assert!(local_path(home.path(), "file/child").is_err());
         assert!(resolve_directory(&home.path().join("missing/../file")).is_err());
