@@ -2142,9 +2142,9 @@ pub struct AutomationTokenPage {
 // Page size follows the jobs and principals convention: 50 default, 100 max.
 const AUTOMATION_TOKEN_PAGE_DEFAULT: usize = 50;
 const AUTOMATION_TOKEN_PAGE_MAX: usize = 100;
-// Creation cap per tenant, in the style of the workflows project limit: it
-// keeps the token table and its listing finite even under automation that
-// mints tokens on a schedule.
+// Live (unrevoked, unexpired) tokens per tenant, in the style of the
+// workflows project limit: automation minting on a schedule must revoke or
+// let tokens expire before it can mint more.
 const MAX_AUTOMATION_TOKENS_PER_TENANT: u64 = 100;
 
 pub async fn list_automation_tokens(
@@ -2578,7 +2578,7 @@ async fn create_outbound_grant_inner(
     };
     app.store
         .insert_workflow_grant(grant.clone(), None, None, Some(&token))
-        .map_err(ApiError::internal)?;
+        .map_err(workflows::workflow_store_error)?;
     app.store.audit(
         &identity.tenant,
         &identity.subject,
@@ -3139,7 +3139,7 @@ async fn create_library_grant(
                 workflow.as_ref(),
                 Some(&token_for_worker),
             )
-            .map_err(super::store_unavailable)?;
+            .map_err(workflows::workflow_store_error)?;
         drop(_lock);
         worker.store.audit(
             &tenant,

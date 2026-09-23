@@ -1996,9 +1996,7 @@ fn s3_store(
         builder = builder.with_region(region);
     }
     builder = builder.with_virtual_hosted_style_request(!config.s3_path_style);
-    if endpoint.starts_with("http://") {
-        builder = builder.with_allow_http(true);
-    }
+    builder = crate::api::outbound::workflows::storage::client_settings(builder, endpoint);
     Ok(Arc::new(
         builder
             .build()

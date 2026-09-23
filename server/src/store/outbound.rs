@@ -19,19 +19,27 @@ impl Store {
         operation: Option<&AutomationOperation>,
     ) -> Result<(), String> {
         self.insert_workflow_grant(grant, operation, None, None)
+            .map_err(String::from)
     }
 
+    /// Inserts a grant, and for a workflow job records it finished. Policy
+    /// refusals (a protected directory, a project edited meanwhile) come back
+    /// as conflicts, not as a store failure the caller would retry.
     pub fn insert_workflow_grant(
         &self,
         mut grant: OutboundGrant,
         operation: Option<&AutomationOperation>,
         job: Option<&crate::workflow::Job>,
         share_token: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<(), WorkflowMutationError> {
         if share_token.is_some_and(|token| crate::auth::hash_token(token) != grant.token_hash) {
-            return Err("download token does not match grant".into());
+            return Err(WorkflowMutationError::invalid(
+                "download token does not match grant",
+            ));
         }
-        grant.validate_names()?;
+        grant
+            .validate_names()
+            .map_err(WorkflowMutationError::invalid)?;
         let delivery_digest = evidence::grant_digest(&grant);
         let (bytes_hi, bytes_lo) = split_bytes(grant.bytes);
         let files_json = serde_json::to_string(&grant.files).unwrap_or_else(|_| "[]".to_owned());
@@ -141,14 +149,18 @@ impl Store {
                 rusqlite::params![operation.token_id, now_unix() as i64], |row| row.get(0),
             ).map_err(|error| error.to_string())?;
             if !active {
-                return Err("automation token expired or revoked".to_owned());
+                return Err(WorkflowMutationError::conflict(
+                    "automation token expired or revoked",
+                ));
             }
             transaction.execute(
                 "INSERT INTO automation_operations (token_id, operation_id, request_hash, grant_id) VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params![operation.token_id, operation.operation_id, operation.request_hash, grant_id],
             ).map_err(|error| error.to_string())?;
         }
-        transaction.commit().map_err(|error| error.to_string())
+        transaction
+            .commit()
+            .map_err(|error| WorkflowMutationError::store(error.to_string()))
     }
 
     pub fn outbound_grants(&self, tenant: &str) -> Result<Vec<OutboundGrant>, String> {
@@ -355,7 +367,10 @@ impl Store {
         {
             return Ok(false);
         }
-        let changed = tx.execute("UPDATE outbound_fetch_tickets SET admitted_at=COALESCE(admitted_at,?4) WHERE token_id=?1 AND grant_id=?2 AND grant_token_hash=?3 AND expires_at>?4 AND EXISTS(SELECT 1 FROM outbound_grants WHERE id=?2 AND token_hash=?3 AND revoked_at IS NULL AND expires_at>?4 AND (max_downloads IS NULL OR downloads<max_downloads))", rusqlite::params![ticket.token_id,ticket.grant_id,ticket.grant_token_hash,now as i64]).map_err(|error|error.to_string())?;
+        // Other holders' live, undelivered reservations count as at mint, so
+        // a ticket that already delivered cannot fetch again into a slot
+        // another recipient reserved.
+        let changed = tx.execute("UPDATE outbound_fetch_tickets SET admitted_at=COALESCE(admitted_at,?4) WHERE token_id=?1 AND grant_id=?2 AND grant_token_hash=?3 AND expires_at>?4 AND EXISTS(SELECT 1 FROM outbound_grants g WHERE g.id=?2 AND g.token_hash=?3 AND g.revoked_at IS NULL AND g.expires_at>?4 AND (g.max_downloads IS NULL OR g.downloads+(SELECT COUNT(*) FROM outbound_fetch_tickets o WHERE o.grant_id=?2 AND o.token_id<>?1 AND o.expires_at>?4 AND o.delivered_at IS NULL AND (o.admitted_at IS NOT NULL OR (o.grant_token_hash=?3 AND o.policy_revision=?5 AND o.holder<>?6)))<g.max_downloads))", rusqlite::params![ticket.token_id,ticket.grant_id,ticket.grant_token_hash,now as i64,ticket.policy_revision as i64,ticket.holder]).map_err(|error|error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(changed == 1)
     }
@@ -388,19 +403,18 @@ impl Store {
         })
     }
 
-    /// (Tenant, manifest root) pairs of grants still open: what the serve
-    /// registry keeps a server for. The tenant rides along because grants in
-    /// two tenants can share a byte-identical package root.
-    pub fn servable_manifest_roots(&self, now: u64) -> Result<Vec<(String, String)>, String> {
+    /// Grants with a built manifest that may still be fetched: what the serve
+    /// registry keeps a server for.
+    pub fn servable_grant_ids(&self, now: u64) -> Result<Vec<String>, String> {
         self.with(|connection| {
             connection
                 .prepare_cached(
-                    "SELECT g.tenant, m.manifest_root FROM outbound_grant_manifests m
+                    "SELECT m.grant_id FROM outbound_grant_manifests m
                      JOIN outbound_grants g ON g.id = m.grant_id
                      WHERE g.revoked_at IS NULL AND g.expires_at > ?1
                        AND (g.max_downloads IS NULL OR g.downloads < g.max_downloads)",
                 )?
-                .query_map([now as i64], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .query_map([now as i64], |row| row.get(0))?
                 .collect()
         })
     }

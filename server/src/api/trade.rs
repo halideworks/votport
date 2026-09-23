@@ -264,10 +264,15 @@ async fn remote_json(
         .await
         .map_err(|_| invalid("port could not be reached"))?;
     if !response.status().is_success() {
-        return Err(invalid(format!(
+        let refused = invalid(format!(
             "port refused the request (HTTP {})",
             response.status().as_u16()
-        )));
+        ));
+        return Err(if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            refused.with_code(PEER_UNAUTHORIZED)
+        } else {
+            refused
+        });
     }
     let mut bytes = Vec::new();
     while let Some(chunk) = response
@@ -572,13 +577,54 @@ pub async fn status(
         json!({"grant":route.id,"state":state,"endpoint":route.endpoint,"deliveries":deliveries}),
     )))
 }
+const PEER_UNAUTHORIZED: &str = "peer_unauthorized";
+
+/// Asks the peer for the route's status with one credential.
+async fn route_status(
+    app: &Arc<App>,
+    route: &TradeRoute,
+    credential: &str,
+) -> ApiResult<(SignedPortMessage, SignedPortMessage)> {
+    let request = app.signer.port_message(
+        "status",
+        &route.peer_key,
+        crate::auth::random_token(),
+        minted_now(),
+        json!({"grant": route.remote_grant, "credential": credential}),
+    );
+    let response = remote_json(app, &route.address, "/api/port/status", Some(&request)).await?;
+    Ok((request, response))
+}
+
 async fn refresh_route_inner(app: &Arc<App>, route: &TradeRoute) -> ApiResult<()> {
     if route.remote_grant.is_empty() {
         return enroll_outgoing(app, route).await;
     }
     probe(app, &route.address, Some(&route.peer_key)).await?;
-    let request=app.signer.port_message("status",&route.peer_key,crate::auth::random_token(),minted_now(),json!({"grant":route.remote_grant,"credential":app.store.trade_credential(&route.tenant,&route.id).map_err(store_unavailable)?}));
-    let response = remote_json(app, &route.address, "/api/port/status", Some(&request)).await?;
+    let credential = app
+        .store
+        .trade_credential(&route.tenant, &route.id)
+        .map_err(store_unavailable)?;
+    let mut rotated = None;
+    let (request, response) = match route_status(app, route, &credential).await {
+        // A rotation whose reply was lost: the peer committed the next
+        // credential and refuses the old one. A signed status for the next
+        // one finishes the rotation here instead of failing until an admin
+        // presses Rotate again.
+        Err(error) if error.code == PEER_UNAUTHORIZED => {
+            let Some(next) = app
+                .store
+                .trade_rotation_in_flight(&route.id)
+                .map_err(store_unavailable)?
+            else {
+                return Err(error);
+            };
+            let answered = route_status(app, route, &next).await?;
+            rotated = Some(next);
+            answered
+        }
+        result => result?,
+    };
     verify_response(app, route, &request, &response, "status")?;
     let state = response.document.body["state"]
         .as_str()
@@ -588,6 +634,24 @@ async fn refresh_route_inner(app: &Arc<App>, route: &TradeRoute) -> ApiResult<()
         || response.document.body["endpoint"] != route.endpoint
     {
         return Err(invalid("peer status names a different permission"));
+    }
+    if let Some(next) = rotated {
+        if let Err(error) = app
+            .store
+            .rotate_trade_credential(&route.id, &credential, &next, "port")
+        {
+            // Refused only when another rotation already moved the credential on.
+            let current = app
+                .store
+                .trade_credential(&route.tenant, &route.id)
+                .map_err(store_unavailable)?;
+            if current == credential {
+                return Err(invalid(error));
+            }
+        }
+        app.store
+            .clear_trade_rotation(&route.id, &next)
+            .map_err(store_unavailable)?;
     }
     let changed = app
         .store
@@ -994,6 +1058,136 @@ mod tests {
         });
         let records = std::fs::read_to_string(log.path()).unwrap().lines().count();
         assert_eq!(records, 2);
+    }
+
+    /// A peer that already committed the next credential: it answers
+    /// status only for `accepted`, and 401 otherwise.
+    #[derive(Clone)]
+    struct RotatedPeer {
+        signer: Arc<crate::receipt::ReceiptSigner>,
+        accepted: String,
+        remote_grant: String,
+        /// Answers with a nonce the request did not carry.
+        forged: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    async fn rotated_peer_discovery(
+        axum::extract::State(peer): axum::extract::State<RotatedPeer>,
+        axum::extract::Query(query): axum::extract::Query<DiscoveryQuery>,
+    ) -> axum::response::Response {
+        super::private(peer.signer.port_message(
+            "discovery",
+            "",
+            query.challenge,
+            super::now() + 300,
+            serde_json::json!({"protocols":[1]}),
+        ))
+    }
+
+    async fn rotated_peer_status(
+        axum::extract::State(peer): axum::extract::State<RotatedPeer>,
+        axum::Json(request): axum::Json<SignedPortMessage>,
+    ) -> axum::response::Response {
+        if request.document.body["credential"] != peer.accepted.as_str() {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        let nonce = if peer.forged.load(std::sync::atomic::Ordering::SeqCst) {
+            crate::auth::random_token()
+        } else {
+            request.document.nonce
+        };
+        super::private(peer.signer.port_message(
+            "status",
+            &request.document.issuer,
+            nonce,
+            super::now() + 300,
+            serde_json::json!({
+                "state": "active",
+                "grant": peer.remote_grant,
+                "endpoint": "endpoint",
+                "deliveries": [],
+            }),
+        ))
+    }
+
+    /// The peer took the next credential but the rotation reply was lost:
+    /// the route's next status check proves the next credential and
+    /// finishes the rotation instead of failing until an admin rotates.
+    #[tokio::test]
+    async fn a_lost_rotation_reply_is_finished_by_the_next_status_check() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let peer_directory = tempfile::tempdir().unwrap();
+        let signer =
+            Arc::new(crate::receipt::ReceiptSigner::load_or_create(peer_directory.path()).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let old = crate::auth::random_token();
+        let next = crate::auth::random_token();
+        let route = TradeRoute {
+            id: "lost-reply".into(),
+            revision: 1,
+            tenant: String::new(),
+            direction: "outgoing".into(),
+            name: "Remote".into(),
+            peer_name: "Remote".into(),
+            peer_key: signer.public_hex.clone(),
+            address: format!("http://{address}"),
+            endpoint: "endpoint".into(),
+            endpoint_name: "Endpoint".into(),
+            category: "external".into(),
+            forwarding: false,
+            metadata_keys: vec![],
+            state: "active".into(),
+            notifications: crate::store::NotificationPolicy::default(),
+            last_contact: None,
+            error: None,
+            remote_grant: "remote-grant".into(),
+            remote_state: "active".into(),
+            cancel_active: false,
+        };
+        let document = serde_json::to_string(&route).unwrap();
+        app.store
+            .with(|connection| {
+                connection.execute(
+                    "INSERT INTO trade_routes(id,tenant,direction,peer_key,endpoint,document,credential) VALUES (?1,'','outgoing',?2,'endpoint',?3,?4)",
+                    rusqlite::params![&route.id, &route.peer_key, document, &old],
+                )?;
+                connection.execute(
+                    "INSERT INTO trade_rotations(route_id,credential) VALUES (?1,?2)",
+                    rusqlite::params![&route.id, &next],
+                )
+            })
+            .unwrap();
+        let forged = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let peer = RotatedPeer {
+            signer,
+            accepted: next.clone(),
+            remote_grant: route.remote_grant.clone(),
+            forged: Arc::clone(&forged),
+        };
+        let peer_router = axum::Router::new()
+            .route("/api/port", axum::routing::get(rotated_peer_discovery))
+            .route("/api/port/status", axum::routing::post(rotated_peer_status))
+            .with_state(peer);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, peer_router).await.unwrap();
+        });
+        // A reply that fails verification commits nothing.
+        let unverified = super::refresh_route_inner(&app, &route).await;
+        assert!(unverified.is_err());
+        assert_eq!(app.store.trade_credential("", &route.id).unwrap(), old);
+        assert_eq!(
+            app.store.trade_rotation_in_flight(&route.id).unwrap(),
+            Some(next.clone())
+        );
+        forged.store(false, std::sync::atomic::Ordering::SeqCst);
+        let result = super::refresh_route_inner(&app, &route).await;
+        server.abort();
+        let _ = server.await;
+        result.unwrap();
+        assert_eq!(app.store.trade_credential("", &route.id).unwrap(), next);
+        assert_eq!(app.store.trade_rotation_in_flight(&route.id).unwrap(), None);
     }
 
     #[derive(Clone)]

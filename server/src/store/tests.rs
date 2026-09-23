@@ -1592,8 +1592,8 @@ fn serve_prune_queries_preserve_expiry_revoke_and_ticket_retention() {
             .unwrap();
 
     assert_eq!(
-        store.servable_manifest_roots(20).unwrap(),
-        vec![("acme".to_owned(), "root-open".to_owned())]
+        store.servable_grant_ids(20).unwrap(),
+        vec!["open".to_owned()]
     );
     assert_eq!(store.prune_fetch_tickets(20).unwrap(), 1);
     let remaining: Vec<String> = store
@@ -6590,4 +6590,58 @@ fn a_clock_earlier_than_the_build_is_refused() {
         epoch + std::time::Duration::from_secs(BUILD_UNIX_SECS)
     ));
     assert!(!clock_predates_build(std::time::SystemTime::now()));
+}
+
+/// The creation cap counts usable tokens only, so revoking one makes room
+/// as the refusal tells the admin to.
+#[test]
+fn automation_token_count_skips_revoked_and_expired_tokens() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    for id in ["live", "revoked", "expired"] {
+        let mut token = test_automation_token(id, "acme");
+        token.expires_at = if id == "expired" {
+            1
+        } else {
+            now_unix() + 3600
+        };
+        store.insert_automation_token(token).unwrap();
+    }
+    assert!(store.revoke_automation_token("acme", "revoked", 5).unwrap());
+    assert_eq!(store.automation_token_count("acme").unwrap(), 1);
+}
+
+/// With two downloads allowed, one holder's delivered ticket cannot fetch
+/// again into the slot another holder reserved at mint.
+#[test]
+fn a_delivered_ticket_does_not_take_another_holders_reservation() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    let mut grant = test_outbound_grant("g1", "acme", 0);
+    grant.max_downloads = Some(2);
+    grant.expires_at = 100;
+    store.insert_outbound_grant(grant).unwrap();
+    let ticket = |holder: &str, token: &str| FetchTicket {
+        holder: holder.into(),
+        grant_token_hash: "hash-g1".into(),
+        policy_revision: 0,
+        token_id: token.into(),
+        grant_id: "g1".into(),
+        manifest_root: "00".repeat(32),
+        expires_at: 90,
+        delivered_at: None,
+    };
+    let first = ticket("a", "ticket-a");
+    assert!(store.put_fetch_ticket(&first, 1).unwrap());
+    assert!(store.admit_fetch_ticket(&first, 2).unwrap());
+    store
+        .record_fetch_download("g1", &[0], 3, "ticket-a")
+        .unwrap();
+    let second = ticket("b", "ticket-b");
+    assert!(store.put_fetch_ticket(&second, 4).unwrap());
+    assert!(
+        !store.admit_fetch_ticket(&first, 5).unwrap(),
+        "the delivered holder must not take the reserved slot"
+    );
+    assert!(store.admit_fetch_ticket(&second, 6).unwrap());
 }
