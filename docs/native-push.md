@@ -315,7 +315,10 @@ an absent value on an older record means `"http"`.
   session ID and capability while reusing complete objects from the same device,
   request, and package. Schema 25 records the staging key in `upload_sessions`
   so the quota reservation and objects survive a restart. Idle cleanup removes
-  parked state; every reused object is rehashed and reproved before publication.
+  parked state without file checkpoints. A parked push with file checkpoints
+  keeps its staging and quota reservation for its sender for 7 days after its
+  last checkpoint; then it is recorded as interrupted and removed. Every reused
+  object is rehashed and reproved before publication.
 - `push-issuer.key` is always under `data_dir`. `push.key` and `push.crt` are
   generated there unless the operator supplies certificate and key paths,
   which are used in place.

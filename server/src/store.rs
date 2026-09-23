@@ -2216,6 +2216,11 @@ impl Store {
              WHERE session_id IN (
                  SELECT id FROM upload_sessions WHERE tenant=?1 AND link_id=?2
              )",
+            "DELETE FROM meta
+             WHERE key IN (
+                 SELECT 'interrupted_session:' || id FROM upload_sessions
+                 WHERE tenant=?1 AND link_id=?2
+             )",
             "DELETE FROM upload_sessions
              WHERE tenant=?1 AND link_id=?2",
             "DELETE FROM trade_rotations
@@ -2467,6 +2472,7 @@ impl Store {
                 .execute("DELETE FROM link_uploads WHERE tenant=?1", [key])
                 .map_err(|e| e.to_string())?;
             transaction.execute("DELETE FROM upload_session_files WHERE session_id IN (SELECT id FROM upload_sessions WHERE tenant=?1)", [key]).map_err(|error| error.to_string())?;
+            transaction.execute("DELETE FROM meta WHERE key IN (SELECT 'interrupted_session:' || id FROM upload_sessions WHERE tenant=?1)", [key]).map_err(|error| error.to_string())?;
             transaction
                 .execute("DELETE FROM upload_sessions WHERE tenant=?1", [key])
                 .map_err(|error| error.to_string())?;
@@ -2731,6 +2737,13 @@ impl Store {
                 }
             }
         }
+        // The parked-push expiry counts from the last checkpoint.
+        transaction
+            .execute(
+                "UPDATE upload_sessions SET created_at = ?2 WHERE id = ?1",
+                rusqlite::params![session_id, i64::try_from(now_unix()).unwrap_or(i64::MAX)],
+            )
+            .map_err(|error| error.to_string())?;
         transaction.commit().map_err(|error| error.to_string())
     }
 
@@ -2760,6 +2773,20 @@ impl Store {
     /// Every persisted session with its files, for boot re-attach.
     pub fn load_upload_sessions(&self) -> Result<Vec<PersistedUploadSession>, String> {
         self.load_sessions(false, None)
+    }
+
+    /// When a session's resume record was last written, in Unix seconds.
+    pub fn upload_session_written_at(&self, id: &str) -> Result<Option<u64>, String> {
+        self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT created_at FROM upload_sessions WHERE id=?1",
+                    [id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+        })
+        .map(|at| at.map(|at| at.max(0) as u64))
     }
 
     pub fn load_push_sessions(&self) -> Result<Vec<PersistedUploadSession>, String> {
@@ -2900,7 +2927,45 @@ impl Store {
         transaction
             .execute("DELETE FROM upload_sessions WHERE id = ?1", [session_id])
             .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM meta WHERE key = ?1",
+                [interruption_key(session_id)],
+            )
+            .map_err(|error| error.to_string())?;
         transaction.commit().map_err(|error| error.to_string())
+    }
+
+    /// Whether a boot already reported this suspended session as interrupted.
+    pub fn interruption_reported(&self, session_id: &str) -> Result<bool, String> {
+        self.with(|connection| {
+            connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM meta WHERE key = ?1)",
+                [interruption_key(session_id)],
+                |row| row.get(0),
+            )
+        })
+    }
+
+    pub fn set_interruption_reported(
+        &self,
+        session_id: &str,
+        reported: bool,
+    ) -> Result<(), String> {
+        self.with(|connection| {
+            if reported {
+                connection.execute(
+                    "INSERT OR IGNORE INTO meta(key, value) VALUES (?1, '1')",
+                    [interruption_key(session_id)],
+                )
+            } else {
+                connection.execute(
+                    "DELETE FROM meta WHERE key = ?1",
+                    [interruption_key(session_id)],
+                )
+            }
+        })
+        .map(drop)
     }
 
     // ----------------------------------------------------------- principals
@@ -5887,6 +5952,10 @@ fn object_from_row(suite: i64, root_hex: &str, length: i64) -> rusqlite::Result<
         root,
         length: length.max(0) as u64,
     })
+}
+
+fn interruption_key(session_id: &str) -> String {
+    format!("interrupted_session:{session_id}")
 }
 
 pub fn now_unix() -> u64 {

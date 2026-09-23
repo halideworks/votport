@@ -27,6 +27,8 @@ use votport_client_core::error::human_bytes;
 const MAX_NOTIFICATION_FILES: usize = 100;
 const DESTINATION_FAILURE: &str =
     "The destination did not accept the test. Check its connection settings and try again.";
+pub(crate) const INTERNAL_ADDRESS: &str =
+    "This address is on an internal network. Ask the platform administrator to allow it.";
 
 /// Product name for notification titles: the tenant's brand name when one is
 /// set, else the tenant label, else "VOTPort".
@@ -1149,6 +1151,30 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_named_tenant_cannot_send_to_an_internal_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let literal =
+            test_destination_config(&application, "webhook", format!("http://127.0.0.1:{port}/"));
+        assert_eq!(
+            test_destination(&application, "studio", &literal).await,
+            Err(INTERNAL_ADDRESS)
+        );
+        let named =
+            test_destination_config(&application, "webhook", format!("http://localhost:{port}/"));
+        assert!(test_destination(&application, "studio", &named)
+            .await
+            .is_err());
+        let accepted = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+        assert!(
+            accepted.is_err(),
+            "no connection reaches the internal listener"
+        );
+    }
+
+    #[tokio::test]
     async fn uploaded_ntfy_and_test_share_safe_bounded_requests() {
         use axum::{
             http::{HeaderMap, StatusCode, Uri},
@@ -1168,7 +1194,9 @@ pub(crate) mod tests {
         );
         let directory = tempfile::tempdir().unwrap();
         let mut application = testing::build(directory.path());
-        Arc::get_mut(&mut application).unwrap().config.public_url = None;
+        let config = &mut Arc::get_mut(&mut application).unwrap().config;
+        config.public_url = None;
+        config.tenant_private_networks = vec![crate::config::IpCidr::parse("127.0.0.0/8").unwrap()];
         let destination =
             test_destination_config(&application, "ntfy", format!("http://{address}/topic"));
         application

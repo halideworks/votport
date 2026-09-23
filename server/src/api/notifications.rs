@@ -238,6 +238,11 @@ pub async fn save(
         destination.token.clear();
     }
     validate_destination(&destination)?;
+    if !identity.tenant.is_empty()
+        && crate::egress::refused_literal(&destination.url, &app.config.tenant_private_networks)
+    {
+        return Err(invalid(crate::notify::INTERNAL_ADDRESS));
+    }
     if destination.enabled
         && destination.channel == "email"
         && app
@@ -651,6 +656,16 @@ mod tests {
         assert!(save(State(app.clone()), missing, Json(connection("CSRF")))
             .await
             .is_err());
+        let mut metadata = connection("Metadata");
+        metadata["url"] = json!("http://169.254.169.254/latest/meta-data");
+        let refused = save(
+            State(app.clone()),
+            headers(&app, "a", "admin"),
+            Json(metadata),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.message, crate::notify::INTERNAL_ADDRESS);
         let rules = policy(id, "upload_complete");
         defaults(
             State(app.clone()),

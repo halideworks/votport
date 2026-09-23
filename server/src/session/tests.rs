@@ -3818,7 +3818,7 @@ mod push_tests {
     }
 
     #[tokio::test]
-    async fn deduplication_and_published_recovery_reject_changed_bytes() {
+    async fn deduplication_rejects_changed_bytes_and_published_recovery_is_settled() {
         for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
             let directory = tempfile::tempdir().unwrap();
             let expected = object(suite, b"original");
@@ -3883,11 +3883,11 @@ mod push_tests {
                 first_range_at: None,
                 rehash: false,
             };
+            // A published file whose journal is retired is settled: editing
+            // or moving it afterwards does not strand the session.
             let mut persisted = persisted_session(&setup, &[file]);
             let (_, receiver) = mpsc::channel(1);
-            assert!(resume_worker(setup, receiver, &mut persisted)
-                .unwrap_err()
-                .contains("changed after publication"));
+            resume_worker(setup, receiver, &mut persisted).unwrap();
         }
     }
 

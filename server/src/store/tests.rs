@@ -5421,6 +5421,7 @@ mod settings_tests {
             max_link_sessions: 8,
             sso_session_secs: 7 * 24 * 3600,
             trusted_proxies: Vec::new(),
+            tenant_private_networks: Vec::new(),
             oidc: None,
             default_max_total_bytes: None,
             default_max_links: None,

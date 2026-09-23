@@ -357,7 +357,9 @@ The administrator webhook sends the signed event JSON with:
 - `X-Votport-Signature`: `sha256=` followed by HMAC-SHA256 over
   `timestamp + "." + raw_body`, using the displayed secret as UTF-8 bytes.
 
-Only 2xx acknowledges delivery; redirects are not followed. Attempts persist,
+Only 2xx acknowledges delivery; redirects are not followed. A named tenant's
+webhook reaches only public addresses and the networks listed in
+`VOTPORT_TENANT_PRIVATE_NETWORKS` ([Tenants](deployment.md#tenants)). Attempts persist,
 use bounded exponential retry, and become `dead` after 12 failures. Operators
 can inspect attempts and replay individual events. Changing webhook configuration
 rotates its secret, supersedes pending attempts under the old revision, and

@@ -1526,6 +1526,11 @@ pub async fn put_webhook(
             "webhook URL must use HTTPS, except loopback, without embedded credentials".into(),
         ));
     }
+    if !identity.tenant.is_empty()
+        && crate::egress::refused_literal(&request.url, &app.config.tenant_private_networks)
+    {
+        return Err(conflict(crate::notify::INTERNAL_ADDRESS.into()));
+    }
     let previous = app.store.delivery_webhook(&identity.tenant).ok().flatten();
     let hook = app
         .store
@@ -1622,12 +1627,8 @@ pub async fn replay_webhook(
 pub async fn event_worker(app: Arc<App>) {
     const DISPATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
     const RETIREMENT_EMPTY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-    let client = match reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-    {
-        Ok(client) => client,
+    let clients = match webhook_clients(&app.config) {
+        Ok(clients) => clients,
         Err(error) => {
             tracing::error!(%error,"build delivery webhook client");
             return;
@@ -1639,7 +1640,7 @@ pub async fn event_worker(app: Arc<App>) {
         if app.lease_lost.load(std::sync::atomic::Ordering::Relaxed) || app.is_stopping() {
             return;
         }
-        match dispatch_events(&app, &client).await {
+        match dispatch_events(&app, &clients).await {
             Ok(()) => {
                 dispatch_dedupe.recovered();
             }
@@ -1665,7 +1666,26 @@ pub async fn event_worker(app: Arc<App>) {
     }
 }
 
-async fn dispatch_events(app: &App, client: &reqwest::Client) -> Result<(), String> {
+/// The delivery webhook clients: a named tenant's may reach only the
+/// addresses `crate::egress` allows.
+struct WebhookClients {
+    platform: reqwest::Client,
+    tenant: reqwest::Client,
+}
+
+fn webhook_clients(config: &crate::config::Config) -> reqwest::Result<WebhookClients> {
+    let builder = || {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(5))
+    };
+    Ok(WebhookClients {
+        platform: builder().build()?,
+        tenant: crate::egress::restrict(builder(), &config.tenant_private_networks).build()?,
+    })
+}
+
+async fn dispatch_events(app: &App, clients: &WebhookClients) -> Result<(), String> {
     use hmac::{Hmac, Mac};
     app.store.escalate_delivery_jobs(now_unix())?;
     app.store.queue_delivery_webhooks(now_unix())?;
@@ -1700,6 +1720,18 @@ async fn dispatch_events(app: &App, client: &reqwest::Client) -> Result<(), Stri
                 now_unix(),
             )?;
             continue;
+        };
+        let client = if attempt.tenant.is_empty() {
+            &clients.platform
+        } else if crate::egress::refused_literal(&hook.url, &app.config.tenant_private_networks) {
+            app.store.finish_delivery_webhook(
+                &attempt,
+                Some("receiver address is on an internal network"),
+                now_unix(),
+            )?;
+            continue;
+        } else {
+            &clients.tenant
         };
         let body = serde_json::to_vec(&event).map_err(|e| e.to_string())?;
         let timestamp = now_unix().to_string();
@@ -2570,12 +2602,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_tenant_webhook_client_refuses_names_that_resolve_internally() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://localhost:{}/",
+            listener.local_addr().unwrap().port()
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let clients = webhook_clients(&crate::api::testing::config(directory.path())).unwrap();
+        assert!(clients.tenant.post(&url).send().await.is_err());
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept()).await;
+        assert!(
+            accepted.is_err(),
+            "no connection reaches the internal listener"
+        );
+    }
+
+    #[tokio::test]
     async fn invalid_event_chain_does_not_starve_other_webhook_tenants() {
         let directory = tempfile::tempdir().unwrap();
-        let app = crate::api::testing::build(directory.path());
-        app.store
-            .insert_tenant(crate::store::tests::test_tenant("healthy"))
-            .unwrap();
+        let mut app = crate::api::testing::build(directory.path());
+        Arc::get_mut(&mut app)
+            .unwrap()
+            .config
+            .tenant_private_networks = vec![crate::config::IpCidr::parse("127.0.0.0/8").unwrap()];
+        for tenant in ["healthy", "internal"] {
+            app.store
+                .insert_tenant(crate::store::tests::test_tenant(tenant))
+                .unwrap();
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/events", listener.local_addr().unwrap());
         app.store
@@ -2583,6 +2639,11 @@ mod tests {
             .unwrap();
         app.store
             .save_delivery_webhook("healthy", "local", &url, true, 0)
+            .unwrap();
+        // A named tenant's receiver outside the allowed networks is never
+        // contacted.
+        app.store
+            .save_delivery_webhook("internal", "lan", "http://10.0.0.1/events", true, 0)
             .unwrap();
         app.store
             .with(|c| {
@@ -2617,7 +2678,11 @@ mod tests {
                         .await
                 },
                 async {
-                    let result = dispatch_events(&app, &client).await;
+                    let clients = WebhookClients {
+                        platform: client,
+                        tenant: webhook_clients(&app.config).unwrap().tenant,
+                    };
+                    let result = dispatch_events(&app, &clients).await;
                     let _ = stop.send(());
                     result
                 }
@@ -2643,6 +2708,15 @@ mod tests {
             .unwrap();
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].status, "delivered");
+        let refused = app
+            .store
+            .delivery_webhook_attempts("internal", 0, 100)
+            .unwrap();
+        assert_eq!(refused.len(), 1);
+        assert_eq!(
+            refused[0].error.as_deref(),
+            Some("receiver address is on an internal network")
+        );
     }
 
     #[tokio::test]
@@ -5873,6 +5947,27 @@ mod tests {
             credential_version: 1,
         };
         let platform_cookie = admin::test_admin_cookie(&app, &platform_admin);
+
+        // A named tenant's webhook may not name an internal address.
+        let refused = crate::app::router(app.clone())
+            .oneshot(
+                Request::put("/api/workflows/webhook")
+                    .header(header::COOKIE, tenant_cookie.clone())
+                    .header("x-votport", "1")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "url": "https://169.254.169.254/latest/meta-data",
+                            "enabled": true,
+                            "revision": 0
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
 
         // Tenant webhook change: audited in the webhook's tenant without the
         // URL value or the signing secret.

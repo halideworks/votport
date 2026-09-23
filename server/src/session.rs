@@ -1527,22 +1527,37 @@ pub(crate) fn discard_refused_session(
             .join(".vot-stage")
             .join(format!(".vot-push-{key}"));
         match lock_push_directory(&directory, destinations.contract()) {
-            Ok(lock) => destinations.remove_push_directory(&directory, &lock)?,
-            // The staging is already gone; only the record remains.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Ok(lock) => {
+                discard_session_files(destinations, session)?;
+                destinations.remove_push_directory(&directory, &lock)?;
+            }
+            // The push directory is already gone; its files' staging may not be.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                discard_session_files(destinations, session)?;
+            }
             Err(error) => return Err(error.to_string()),
         }
     } else {
-        for file in &session.files {
-            for path in [&file.staging_path, &file.journal_path] {
-                if path.as_os_str().is_empty() {
-                    continue;
-                }
-                discard_staged_path(destinations, path)?;
-            }
-        }
+        discard_session_files(destinations, session)?;
     }
     store.delete_upload_session(&session.id)
+}
+
+/// Removes each file's staging and journal, which live in `.vot-stage` beside
+/// the file's destination, outside a push session's own directory.
+pub(crate) fn discard_session_files(
+    destinations: &crate::receiving::Destinations,
+    session: &crate::store::PersistedUploadSession,
+) -> Result<(), String> {
+    for file in &session.files {
+        for path in [&file.staging_path, &file.journal_path] {
+            if path.as_os_str().is_empty() {
+                continue;
+            }
+            discard_staged_path(destinations, path)?;
+        }
+    }
+    Ok(())
 }
 
 fn discard_staged_path(
@@ -1613,12 +1628,11 @@ fn restore_files(
         let name = destination.file_name().ok_or("missing destination name")?;
         let runs = (file.prefix_bytes > 0).then_some((0, file.prefix_bytes));
         let state = persisted_resume_state(file);
+        // A published file whose journal is retired was verified when it was
+        // published and is settled; it may since have been moved or edited.
         let native = if file.published
             && !file.journal_path.try_exists().map_err(|e| e.to_string())?
         {
-            if !staged_object_valid(&destination, &file.object, &active)? {
-                return Err(format!("{} changed after publication", file.display_path));
-            }
             None
         } else {
             if file.staging_path != parent.join(".vot-stage").join(&state.staging_name)
@@ -2709,7 +2723,7 @@ pub fn commit_persisted_interruption(
         at,
         started_at: session.started_at,
         outcome: "interrupted".to_owned(),
-        detail: format!("resume after restart failed: {detail}"),
+        detail: detail.to_owned(),
         received_bytes: received,
         expected_bytes: session.package.length,
         replayed_chunks: 0,
