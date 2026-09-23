@@ -3,10 +3,11 @@
 //! One resource type, User, keyed by `userName`, which must equal the OIDC
 //! `sub` claim the identity provider issues at sign-in: the row a SCIM client
 //! deactivates has to be the row `finish_sso_login` looks up. Deactivate and
-//! delete both revoke (credential version bump plus blocked); a row is never
-//! deleted, because `principal_allows` accepts a missing row at version 1
-//! and a deleted subject could sign in again. Groups are not served: roles
-//! come from the group claims at login.
+//! delete both revoke (credential version bump plus blocked); SCIM never
+//! deletes a row, because `principal_allows` accepts a missing row at
+//! version 1 and a deleted subject could sign in again. The operator's purge
+//! erases the row but leaves a hashed tombstone that keeps its credential
+//! version. Groups are not served: roles come from the group claims at login.
 
 use std::sync::Arc;
 

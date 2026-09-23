@@ -2992,10 +2992,12 @@ impl Store {
         let groups_json = serde_json::to_string(groups).unwrap_or_else(|_| "[]".to_owned());
         let grants_json = serde_json::to_string(grants).unwrap_or_else(|_| "[]".to_owned());
         let at = i64::try_from(now_unix()).unwrap_or(0);
+        let tombstone = purged_principal_key(subject);
         self.with(|connection| {
-            connection.query_row(
-                "INSERT INTO principals (subject, last_login_at, last_groups, last_grants, source, created_at)
-                 VALUES (?1, ?2, ?3, ?4, 'sso', ?2)
+            let principal = connection.query_row(
+                "INSERT INTO principals (subject, last_login_at, last_groups, last_grants, source, created_at, credential_version)
+                 VALUES (?1, ?2, ?3, ?4, 'sso', ?2,
+                         COALESCE((SELECT CAST(value AS INTEGER) + 1 FROM meta WHERE key = ?5), 1))
                  ON CONFLICT(subject) DO UPDATE SET
                     last_login_at = CASE WHEN blocked = 0
                                          THEN excluded.last_login_at ELSE last_login_at END,
@@ -3005,9 +3007,11 @@ impl Store {
                                        THEN excluded.last_grants ELSE last_grants END
                  RETURNING subject, credential_version, blocked, last_login_at,
                            last_groups, last_grants, source, external_id, created_at",
-                rusqlite::params![subject, at, groups_json, grants_json],
+                rusqlite::params![subject, at, groups_json, grants_json, tombstone],
                 map_principal,
-            )
+            )?;
+            connection.execute("DELETE FROM meta WHERE key = ?1", [&tombstone])?;
+            Ok(principal)
         })
     }
 
@@ -3019,12 +3023,17 @@ impl Store {
         external_id: Option<&str>,
     ) -> Result<bool, String> {
         let at = i64::try_from(now_unix()).unwrap_or(0);
+        let tombstone = purged_principal_key(subject);
         self.with(|connection| {
             let changed = connection.execute(
-                "INSERT OR IGNORE INTO principals (subject, source, external_id, created_at)
-                 VALUES (?1, 'scim', ?2, ?3)",
-                rusqlite::params![subject, external_id, at],
+                "INSERT OR IGNORE INTO principals (subject, source, external_id, created_at, credential_version)
+                 VALUES (?1, 'scim', ?2, ?3,
+                         COALESCE((SELECT CAST(value AS INTEGER) + 1 FROM meta WHERE key = ?4), 1))",
+                rusqlite::params![subject, external_id, at, tombstone],
             )?;
+            if changed > 0 {
+                connection.execute("DELETE FROM meta WHERE key = ?1", [&tombstone])?;
+            }
             Ok(changed > 0)
         })
     }
@@ -3262,15 +3271,39 @@ impl Store {
         })
     }
 
-    /// Missing row accepts cv 1 only. A present row must match version and be
-    /// unblocked. A read failure denies: this decides whether a session is
-    /// still valid, and the safe answer to "cannot tell" is no. The local
-    /// break-glass subject never reaches here, so denying cannot lock the
-    /// operator out.
+    /// Missing row accepts cv 1 only, and only for a subject that was never
+    /// purged: a purge keeps a tombstone so sessions minted before it stay
+    /// dead. A present row must match version and be unblocked. A read
+    /// failure denies: this decides whether a session is still valid, and the
+    /// safe answer to "cannot tell" is no. The local break-glass subject never
+    /// reaches here, so denying cannot lock the operator out.
     pub fn principal_allows(&self, subject: &str, credential_version: u64) -> bool {
-        match self.principal(subject) {
-            Ok(None) => credential_version == 1,
-            Ok(Some(row)) => credential_version == row.credential_version && !row.blocked,
+        // One read under one lock: a sign-in re-creating the row between a
+        // row read and a tombstone read would otherwise admit an old cookie.
+        let row = self.with(|connection| {
+            let row = connection
+                .query_row(
+                    "SELECT subject, credential_version, blocked, last_login_at,
+                            last_groups, last_grants, source, external_id, created_at
+                     FROM principals WHERE lower(subject) = lower(?1)
+                     ORDER BY subject LIMIT 1",
+                    [subject],
+                    map_principal,
+                )
+                .optional()?;
+            let purged = connection
+                .query_row(
+                    "SELECT 1 FROM meta WHERE key = ?1",
+                    [purged_principal_key(subject)],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            Ok((row, purged))
+        });
+        match row {
+            Ok((None, purged)) => credential_version == 1 && !purged,
+            Ok((Some(row), _)) => credential_version == row.credential_version && !row.blocked,
             Err(error) => {
                 tracing::error!(%error, subject = %crate::logging::reduce_subject(subject), "principal read failed; refusing the session");
                 false
@@ -3328,10 +3361,22 @@ impl Store {
     /// persisting in the store and every backup taken after it. A revoke
     /// must come first, since it already invalidates credentials and tokens;
     /// the deleted predicate keeps an unblocked principal un-erasable here.
+    /// What survives is a tombstone keyed by the subject's hash holding its
+    /// last credential version, so neither a session minted before the purge
+    /// nor a later re-creation of the row can bring those sessions back.
     pub fn purge_principal(&self, subject: &str) -> Result<bool, String> {
         let mut connection = self.connection.lock().expect("store poisoned");
         let transaction = connection
             .transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO meta (key, value)
+                 SELECT ?2, CAST(MAX(credential_version) AS TEXT) FROM principals
+                 WHERE lower(subject) = lower(?1) AND blocked = 1
+                 HAVING COUNT(*) > 0",
+                rusqlite::params![subject, purged_principal_key(subject)],
+            )
             .map_err(|error| error.to_string())?;
         let changed = transaction
             .execute(
@@ -4960,6 +5005,15 @@ fn write_scim_members(
         )?;
     }
     Ok(())
+}
+
+/// The `meta` key of a purged principal's tombstone: a hash of the folded
+/// subject, so the erased subject itself is not kept.
+pub(crate) fn purged_principal_key(subject: &str) -> String {
+    format!(
+        "purged_principal:{}",
+        crate::auth::hash_token(&subject.to_lowercase())
+    )
 }
 
 fn map_principal(row: &rusqlite::Row<'_>) -> rusqlite::Result<Principal> {

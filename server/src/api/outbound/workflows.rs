@@ -5508,9 +5508,14 @@ mod tests {
                 "votport_admin={}",
                 auth::issue_admin_token(&app.secret, &identity, &app.config.admin_token_tag)
             );
+            // The Deliver routes for the job's grant follow the project's
+            // membership too: a viewer outside it gets neither the grant nor
+            // its live link.
             for route in [
                 format!("/api/admin/outbound/{}/evidence", job.id),
                 format!("/api/workflows/jobs/{}/evidence", job.id),
+                format!("/api/admin/outbound-grants/{}", job.id),
+                format!("/api/admin/outbound-grants/{}/url", job.id),
             ] {
                 assert_eq!(
                     call(&app, Method::GET, &route, Some(&cookie), None).await.0,
@@ -5518,6 +5523,25 @@ mod tests {
                     "{subject}: {route}"
                 );
             }
+            let listed = call(
+                &app,
+                Method::GET,
+                "/api/admin/outbound-grants",
+                Some(&cookie),
+                None,
+            )
+            .await;
+            assert_eq!(listed.0, StatusCode::OK);
+            let listed: serde_json::Value = serde_json::from_slice(&listed.2).unwrap();
+            assert_eq!(
+                listed["grants"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|grant| grant["id"] == job.id.as_str()),
+                expected == StatusCode::OK,
+                "{subject}: grant list"
+            );
         }
         // The lease names the device it was minted for, so removing that
         // device ends it even though the URL alone carries no cookie.

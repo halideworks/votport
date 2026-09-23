@@ -1071,10 +1071,20 @@ pub async fn admin_search(
             "search needs between 2 and 200 characters",
         ));
     }
-    let results = app
+    let mut results = app
         .store
         .search(&identity.tenant, phrase, 5)
         .map_err(super::store_unavailable)?;
+    // Workflow job grants follow their project's membership, as on Deliver.
+    if identity.role != "admin" {
+        let mut visible = Vec::with_capacity(results.downloads.len());
+        for download in results.downloads {
+            if super::outbound::grant_visible(&app, &identity, &download.id)? {
+                visible.push(download);
+            }
+        }
+        results.downloads = visible;
+    }
     Ok(Json(json!({
         "requests": results.requests,
         "downloads": results.downloads,
@@ -3272,6 +3282,8 @@ pub async fn admin_change_password(
     Json(request): Json<ChangePasswordRequest>,
 ) -> ApiResult<Response> {
     let identity = require_operator_write(&app, &headers)?;
+    // Read while the old cookie still verifies: the new hash ends it.
+    let (_, session_expires) = require_admin_session(&app, &headers)?;
     // The local password is the break-glass credential for the platform;
     // SSO tenant admins rotate access at their identity provider instead.
     if !identity.tenant.is_empty() || identity.role != "admin" {
@@ -3359,7 +3371,17 @@ pub async fn admin_change_password(
         "",
         &serde_json::json!({}),
     );
-    let cookie = issue_admin_cookie(&app, &auth::AdminIdentity::local_admin(), None)?;
+    // The caller keeps their own identity: an SSO admin who rotates the
+    // break-glass password stays attributable and revocable, with the
+    // session end their sign-in already had.
+    // The local session keeps its single-grant shape: its verified grants
+    // list every tenant, which can push the cookie past what browsers keep.
+    let (reissued, expires) = if identity.subject == "local" {
+        (auth::AdminIdentity::local_admin(), None)
+    } else {
+        (identity.identity.clone(), Some(session_expires))
+    };
+    let cookie = issue_admin_cookie(&app, &reissued, expires)?;
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
 }
 

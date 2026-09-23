@@ -536,6 +536,12 @@ mod handler_tests {
                 &admin_token_phc(&application).unwrap(),
             )
         );
+        let (_, sso_expires) = crate::auth::verify_admin_token(
+            &application.secret,
+            &admin_token_phc(&application).unwrap(),
+            sso_cookie.strip_prefix("votport_admin=").unwrap(),
+        )
+        .unwrap();
         let response = change_password_req(
             application.clone(),
             &sso_cookie,
@@ -544,6 +550,18 @@ mod handler_tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
+        // The reissued cookie keeps the caller's own identity and session
+        // end, not a fresh break-glass session.
+        let reissued = response.headers()[header::SET_COOKIE].to_str().unwrap();
+        let token = crate::auth::cookie_value(reissued, "votport_admin").unwrap();
+        let (identity, expires) = crate::auth::verify_admin_token(
+            &application.secret,
+            &admin_token_phc(&application).unwrap(),
+            token,
+        )
+        .unwrap();
+        assert_eq!(identity.subject, "sso:admin");
+        assert_eq!(expires, sso_expires);
 
         let rows = application.store.audit_export(None, 0, 0, 100).unwrap();
         let out = rows
@@ -6579,6 +6597,17 @@ mod principals_api_tests {
             .create_scim_group("employees", None, &["User@Example.com".to_owned()])
             .unwrap();
         let platform = platform_cookie(&application);
+        // A session minted before the revoke, as a retained or stolen cookie.
+        let old = cookie_for(&application, sso_identity("user@example.com", 1));
+        let session = |cookie: &str| {
+            Request::builder()
+                .uri("/api/admin/session")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let (status, _, _) = send(application.clone(), session(&old)).await;
+        assert_eq!(status, StatusCode::OK);
         let purge = |subject: &'static str| {
             Request::builder()
                 .method("POST")
@@ -6631,6 +6660,42 @@ mod principals_api_tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _, _) = send(application.clone(), purge("missing@example.com")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+        // The erased row does not bring the revoked session back, and neither
+        // does the subject signing in again or being provisioned afresh: the
+        // new row starts above every version the old cookies carried.
+        let (status, _, _) = send(application.clone(), session(&old)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let fresh = application
+            .store
+            .upsert_sso_principal("user@example.com", &[], &json!([]))
+            .unwrap();
+        assert_eq!(fresh.credential_version, 3);
+        let (status, _, _) = send(application.clone(), session(&old)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(application.store.principal_allows("user@example.com", 3));
+        // SCIM provisioning after a purge lands above the tombstone too.
+        application
+            .store
+            .revoke_principal("user@example.com")
+            .unwrap();
+        application
+            .store
+            .purge_principal("user@example.com")
+            .unwrap();
+        assert!(!application.store.principal_allows("user@example.com", 1));
+        assert!(application
+            .store
+            .provision_principal("user@example.com", None)
+            .unwrap());
+        assert_eq!(
+            application
+                .store
+                .principal("user@example.com")
+                .unwrap()
+                .unwrap()
+                .credential_version,
+            5
+        );
     }
 
     #[tokio::test]

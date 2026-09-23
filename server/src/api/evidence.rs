@@ -170,19 +170,8 @@ pub async fn list(
         .map_err(super::store_unavailable)?
         .filter(|g| g.tenant == identity.tenant)
         .ok_or_else(ApiError::not_found)?;
-    if let Some(job) = app
-        .store
-        .delivery_job(&id)
-        .map_err(super::store_unavailable)?
-    {
-        let project = app
-            .store
-            .delivery_project(&identity.tenant, &job.project.id)
-            .map_err(super::store_unavailable)?
-            .ok_or_else(ApiError::not_found)?;
-        if !project.allows(&identity.subject, "viewer", identity.role == "admin") {
-            return Err(ApiError::not_found());
-        }
+    if !super::outbound::grant_visible(&app, &identity, &id)? {
+        return Err(ApiError::not_found());
     }
     let limit = page.limit.unwrap_or(50);
     if !(1..=100).contains(&limit) || page.after.unwrap_or(0) > i64::MAX as u64 {

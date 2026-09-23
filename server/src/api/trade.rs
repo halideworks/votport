@@ -346,14 +346,19 @@ pub async fn inspect(
         &origin,
         &json!({"outcome": if probed.is_ok() { "success" } else { "failure" }}),
     );
-    let port = probed.map_err(|error| {
-        if error.message.contains("identity mismatch") {
-            error
-        } else {
-            invalid("no Votport port answered at that address")
-        }
-    })?;
+    let port = probed.map_err(collapse_probe_error)?;
     Ok(private(port))
+}
+
+/// A probe of an operator-chosen address answers only whether a Votport port
+/// with the expected key replied, never how another host failed: the
+/// reachability and HTTP status of an arbitrary internal URL stay private.
+fn collapse_probe_error(error: ApiError) -> ApiError {
+    if error.message.contains("identity mismatch") {
+        error
+    } else {
+        invalid("no Votport port answered at that address")
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -381,7 +386,7 @@ pub async fn accept(
         &origin,
         &json!({"outcome": if probed.is_ok() { "success" } else { "failure" }}),
     );
-    let peer = probed?;
+    let peer = probed.map_err(collapse_probe_error)?;
     if peer.document.issuer == app.signer.public_hex {
         return Err(invalid("cannot pair a port with itself"));
     }
@@ -762,7 +767,9 @@ pub async fn change_address(
         .map_err(store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
     let origin = address(&body.address).map_err(unprocessable)?;
-    probe(&app, &origin, Some(&route.peer_key)).await?;
+    probe(&app, &origin, Some(&route.peer_key))
+        .await
+        .map_err(collapse_probe_error)?;
     app.store
         .change_trade_address(&actor.tenant, &id, body.revision, &origin, &actor.subject)
         .map_err(invalid)?;
@@ -1741,6 +1748,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!response.status().is_success());
+        // Like inspect, accept says only that no port answered, never how
+        // the host failed, so it cannot map reachable internal hosts.
+        let refusal: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(refusal["error"], "no Votport port answered at that address");
 
         // Storage test against an unreadable shared folder: recorded as a
         // failure with the folder path as the address.
