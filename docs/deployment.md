@@ -651,6 +651,16 @@ and must remain private. Upgrade replicas to the same release.
 The local platform password is break-glass for every namespace; named
 tenants have no separate password.
 
+A named tenant's notification destinations and delivery webhook reach only
+public addresses. Loopback, private, link-local (including the cloud metadata
+address), shared, reserved and multicast addresses are refused when the URL is
+saved as an address, and at every send when a host name resolves to one. List
+internal networks a named tenant may reach as CIDR blocks in
+`VOTPORT_TENANT_PRIVATE_NETWORKS`, for example `10.20.0.0/16,fd00:20::/48`.
+The default tenant is not restricted. A named tenant's requests ignore
+`HTTPS_PROXY` and `HTTP_PROXY` and connect directly, since a proxy would
+resolve the host name itself.
+
 ### Principals
 
 SSO sign-in records the principal on `/tenants`. Kick someone (current

@@ -85,6 +85,7 @@ pub(super) async fn send_policy(
         .for_each_concurrent(8, |destination| async {
             let delivered = send_destination(
                 app,
+                route.tenant,
                 destination,
                 &title,
                 &body,
@@ -105,8 +106,10 @@ pub(super) async fn send_policy(
         .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_destination(
     app: &App,
+    tenant: &str,
     destination: &NotificationDestination,
     title: &str,
     body: &str,
@@ -143,8 +146,16 @@ async fn send_destination(
         )
         .await;
     }
+    let client = if tenant.is_empty() {
+        &app.http
+    } else if crate::egress::refused_literal(&destination.url, &app.config.tenant_private_networks)
+    {
+        return Err(unavailable(INTERNAL_ADDRESS));
+    } else {
+        &app.tenant_http
+    };
     let request =
-        destination_request(&app.http, destination, title, body, payload).ok_or_else(|| {
+        destination_request(client, destination, title, body, payload).ok_or_else(|| {
             unavailable("Invalid notification destination");
             DESTINATION_FAILURE
         })?;
@@ -157,7 +168,7 @@ async fn send_destination(
             drop(result);
             tokio::time::sleep(delay).await;
             let Some(retry_request) =
-                destination_request(&app.http, destination, title, body, payload)
+                destination_request(client, destination, title, body, payload)
             else {
                 unavailable("Invalid notification destination");
                 return Err(DESTINATION_FAILURE);
@@ -280,6 +291,7 @@ pub async fn test_destination(
     let body = "This is a notification test.\nSample file: Résumé_撮影.mov";
     let delivered = send_destination(
         app,
+        tenant,
         destination,
         &title,
         body,
@@ -368,6 +380,7 @@ mod tests {
                 .finish();
             let result = send_destination(
                 &app,
+                "",
                 &destination,
                 "Fixture",
                 "Body",
@@ -473,11 +486,18 @@ mod tests {
         let mut destination = push_destination("webhook");
         destination.url = format!("http://{address}/");
         let payload = json!({"message":"body"});
-        assert!(
-            send_destination(&app, &destination, "title", "body", &payload, "event", None,)
-                .await
-                .is_ok()
-        );
+        assert!(send_destination(
+            &app,
+            "",
+            &destination,
+            "title",
+            "body",
+            &payload,
+            "event",
+            None,
+        )
+        .await
+        .is_ok());
         let policy = NotificationPolicy {
             mode: NotificationMode::Custom,
             rules: vec![NotificationRule {
@@ -506,11 +526,18 @@ mod tests {
             app.store.notification_outcomes("").unwrap()["fixture"]["delivered"],
             false
         );
-        assert!(
-            send_destination(&app, &destination, "title", "body", &payload, "event", None,)
-                .await
-                .is_err()
-        );
+        assert!(send_destination(
+            &app,
+            "",
+            &destination,
+            "title",
+            "body",
+            &payload,
+            "event",
+            None,
+        )
+        .await
+        .is_err());
         {
             let requests = requests.lock().unwrap();
             assert_eq!(requests.len(), 5);

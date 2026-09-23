@@ -12,6 +12,7 @@ pub mod backup;
 pub mod config;
 #[path = "../../protocol/delivery.rs"]
 pub mod delivery_protocol;
+pub mod egress;
 pub mod lease;
 pub mod logging;
 pub mod notify;

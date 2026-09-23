@@ -94,6 +94,9 @@ pub struct Config {
     /// reverse proxy explicitly is what stops anything else that can reach
     /// the port from choosing its own throttle bucket.
     pub trusted_proxies: Vec<IpCidr>,
+    /// Internal networks a named tenant's notification destinations and
+    /// delivery webhook may reach. Empty means public addresses only.
+    pub tenant_private_networks: Vec<IpCidr>,
     /// OIDC single sign-on for the admin dashboard. None when unset.
     pub oidc: Option<OidcConfig>,
 }
@@ -523,6 +526,7 @@ const KNOWN_ENVIRONMENT_NAMES: &[&str] = &[
     "VOTPORT_SSO_SESSION_SECS",
     "VOTPORT_STANDBY_INTERVAL_SECS",
     "VOTPORT_STANDBY_SOURCE",
+    "VOTPORT_TENANT_PRIVATE_NETWORKS",
     "VOTPORT_TRUSTED_PROXIES",
     "VOTPORT_UPLOAD_RETENTION_DAYS",
     "VOTPORT_URL",
@@ -721,6 +725,15 @@ pub fn from_env() -> Result<Config, String> {
         }
     };
 
+    let tenant_private_networks = env::var("VOTPORT_TENANT_PRIVATE_NETWORKS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(IpCidr::parse)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("VOTPORT_TENANT_PRIVATE_NETWORKS: {error}"))?;
+
     let audit_retention_days = env_u64("VOTPORT_AUDIT_RETENTION_DAYS", 400)?;
 
     let default_max_total_bytes = optional_positive_u64("VOTPORT_DEFAULT_MAX_TOTAL_BYTES")?;
@@ -831,6 +844,7 @@ pub fn from_env() -> Result<Config, String> {
         max_link_sessions,
         sso_session_secs,
         trusted_proxies,
+        tenant_private_networks,
         oidc,
     };
     config.validate()?;

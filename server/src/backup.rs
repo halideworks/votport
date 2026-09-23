@@ -1279,6 +1279,7 @@ fn prepare_restored_database(
             "UPDATE links SET active=0, retention_days=NULL;
              UPDATE tenants SET retention_days=NULL;
              DELETE FROM upload_session_files;
+             DELETE FROM meta WHERE key LIKE 'interrupted_session:%';
              DELETE FROM upload_sessions;
              DELETE FROM outbound_fetch_tickets;
              UPDATE delivery_storage SET document=json_set(document,'$.enabled',json('false'));

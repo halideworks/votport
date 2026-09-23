@@ -283,6 +283,8 @@ pub struct App {
     pub signer: Arc<crate::receipt::ReceiptSigner>,
     /// Outbound client for upload notifications.
     pub http: reqwest::Client,
+    /// `http` limited to the addresses a named tenant may reach.
+    pub tenant_http: reqwest::Client,
     /// OIDC configuration when SSO is enabled; the client discovers lazily.
     pub sso_config: Option<crate::config::OidcConfig>,
     pub sso_client: SsoSlot,
@@ -1118,10 +1120,16 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
     if let Ok(active) = &mut receiving {
         resume_upload_sessions(&config, &store, &signer, &sessions, &session_ended, active)?;
     }
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .referer(false)
-        .timeout(std::time::Duration::from_secs(15))
+    let http_builder = || {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .referer(false)
+            .timeout(std::time::Duration::from_secs(15))
+    };
+    let http = http_builder()
+        .build()
+        .map_err(|error| format!("http client: {error}"))?;
+    let tenant_http = crate::egress::restrict(http_builder(), &config.tenant_private_networks)
         .build()
         .map_err(|error| format!("http client: {error}"))?;
     let push = config
@@ -1173,6 +1181,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         outbound_upload_locks: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
         signer,
         http,
+        tenant_http,
         sso_config: config.oidc.clone(),
         sso_client: SsoSlot::new(),
         sso_rate: crate::api::session_rate::SessionRate::with_limit(200),
@@ -1601,6 +1610,9 @@ fn restore_upload_sessions(
             &mut session,
         ) {
             Ok(paths) => {
+                if let Err(error) = store.set_interruption_reported(&session.id, false) {
+                    tracing::warn!(session_tag = %session_tag, %error, "clear reported interruption");
+                }
                 if session.committed_upload_id.is_some() {
                     tracing::info!(target: "audit", event = "upload_session_cleaned", session_tag = %session_tag, "cleaned completed upload journals");
                 } else {
@@ -1618,7 +1630,12 @@ fn restore_upload_sessions(
                         // The link can never accept this session again, so the
                         // evidence is dropped: one final interrupted event, then
                         // the record, staging and journals are removed.
-                        session::commit_persisted_interruption(store, ended, &session, &detail);
+                        session::commit_persisted_interruption(
+                            store,
+                            ended,
+                            &session,
+                            &format!("resume after restart failed: {detail}"),
+                        );
                         match session::discard_refused_session(store, destinations, &session) {
                             Ok(()) => {
                                 tracing::info!(target: "audit", event = "upload_session_discarded", link = %session.link_id, session_tag = %session_tag, %error, "discarded a suspended upload whose link can never accept it again")
@@ -1634,7 +1651,19 @@ fn restore_upload_sessions(
                     }
                     None => {
                         tracing::warn!(session_tag = %session_tag, %error, "suspended upload requires recovery");
-                        session::commit_persisted_interruption(store, ended, &session, &error);
+                        // Reported once: the session stays for recovery and
+                        // is refused again on every later boot.
+                        if !store.interruption_reported(&session.id).unwrap_or(false) {
+                            session::commit_persisted_interruption(
+                                store,
+                                ended,
+                                &session,
+                                &format!("resume after restart failed: {error}"),
+                            );
+                            if let Err(error) = store.set_interruption_reported(&session.id, true) {
+                                tracing::warn!(session_tag = %session_tag, %error, "record reported interruption");
+                            }
+                        }
                         for file in &session.files {
                             kept.insert(file.staging_path.clone());
                             kept.insert(file.journal_path.clone());
@@ -3569,6 +3598,19 @@ fn sweep_push_tickets(app: &App) {
 /// failure warns once per interval, paced, instead of skipping silently.
 const PUSH_STAGING_LOCK_ERROR: &str = "lock failed";
 
+/// How long a parked push with file checkpoints keeps its staging and quota
+/// reservation for its sender to resume, counted from its last checkpoint.
+// ponytail: fixed week; make it a setting if facilities need longer outages.
+const PARKED_PUSH_SECS: u64 = 7 * 86_400;
+
+fn parked_push_expired(app: &App, session: &crate::store::PersistedUploadSession) -> bool {
+    session.committed_upload_id.is_none()
+        && matches!(
+            app.store.upload_session_written_at(&session.id),
+            Ok(Some(at)) if crate::store::now_unix().saturating_sub(at) >= PARKED_PUSH_SECS
+        )
+}
+
 fn sweep_push_staging(app: &App) {
     let Ok(destinations) = app.receiving_destinations() else {
         return;
@@ -3584,9 +3626,30 @@ fn sweep_push_staging(app: &App) {
         let Some(key) = &session.push_key else {
             continue;
         };
-        if app.sessions.contains_push_key(key) || !session.files.is_empty() {
+        if app.sessions.contains_push_key(key) {
             continue;
         }
+        let expired = !session.files.is_empty();
+        if expired && !parked_push_expired(app, &session) {
+            continue;
+        }
+        // An expired session is reported (the report needs its record), then
+        // its record goes before its files, so a failed removal leaves only
+        // unreferenced staging for boot cleanup, never a record whose staging
+        // is gone. The mark keeps a retried report from posting twice.
+        let abandon = || -> Result<(), String> {
+            if !app.store.interruption_reported(&session.id)? {
+                session::commit_persisted_interruption(
+                    &app.store,
+                    &app.session_ended,
+                    &session,
+                    "the sender did not resume the push within 7 days",
+                );
+                app.store.set_interruption_reported(&session.id, true)?;
+            }
+            app.store.delete_upload_session(&session.id)?;
+            session::discard_session_files(&destinations, &session)
+        };
         let directory = session
             .dest_dir
             .join(".vot-stage")
@@ -3595,7 +3658,12 @@ fn sweep_push_staging(app: &App) {
             Ok(lock) => lock,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if !app.sessions.contains_push_key(key) {
-                    if let Err(error) = app.store.delete_upload_session(&session.id) {
+                    let removed = if expired {
+                        abandon()
+                    } else {
+                        app.store.delete_upload_session(&session.id)
+                    };
+                    if let Err(error) = removed {
                         tracing::warn!(%error, "delete missing push staging record");
                     }
                 }
@@ -3619,15 +3687,14 @@ fn sweep_push_staging(app: &App) {
         if app.sessions.contains_push_key(key) {
             continue;
         }
-        if let Err(error) = destinations
-            .remove_push_directory(&directory, &_lock)
-            .map_err(std::io::Error::other)
-            .and_then(|_| {
-                app.store
-                    .delete_upload_session(&session.id)
-                    .map_err(std::io::Error::other)
-            })
-        {
+        let removed = if expired {
+            abandon().and_then(|()| destinations.remove_push_directory(&directory, &_lock))
+        } else {
+            destinations
+                .remove_push_directory(&directory, &_lock)
+                .and_then(|()| app.store.delete_upload_session(&session.id))
+        };
+        if let Err(error) = removed {
             tracing::warn!(%error, "remove expired push staging");
         }
     }

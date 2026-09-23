@@ -2405,6 +2405,69 @@ mod push_tests {
     use tower::ServiceExt as _;
 
     #[tokio::test]
+    async fn a_suspended_upload_refused_at_boot_is_reported_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        app.store
+            .insert_link(crate::store::Link {
+                retention_days: None,
+                verification: "default".to_owned(),
+                id: "closed".to_owned(),
+                tenant: String::new(),
+                label: "closed".to_owned(),
+                dest: String::new(),
+                password_hash: None,
+                created_at: 0,
+                expires_at: None,
+                max_bytes: None,
+                active: false,
+                legal_hold: false,
+                notifications: None,
+                uploads: Vec::new(),
+                events: Vec::new(),
+            })
+            .unwrap();
+        let persisted = crate::store::PersistedUploadSession {
+            committed_upload_id: None,
+            id: hex::encode([6; 16]),
+            push_key: None,
+            link_id: "closed".to_owned(),
+            tenant: String::new(),
+            dest_dir: app.config.receive_dir.clone(),
+            dest_rel: String::new(),
+            package: vot_sdk::object::ObjectId {
+                suite: 1,
+                root: [7; 32],
+                length: 12,
+            },
+            max_total_bytes: Some(12),
+            started_at: crate::store::now_unix(),
+            files: Vec::new(),
+        };
+        app.store.insert_upload_session(&persisted).unwrap();
+        for _ in 0..2 {
+            resume_upload_sessions(
+                &app.config,
+                &app.store,
+                &app.signer,
+                &app.sessions,
+                &app.session_ended,
+                app.receiving.lock().unwrap().as_mut().unwrap(),
+            )
+            .unwrap();
+        }
+        let link = app.store.link_by_id("closed").unwrap().unwrap();
+        assert_eq!(link.events.len(), 1, "one interrupted event across boots");
+        assert_eq!(
+            link.events[0].detail,
+            "resume after restart failed: link is no longer accepting uploads"
+        );
+        assert_eq!(app.store.load_upload_sessions().unwrap().len(), 1);
+        app.store.delete_upload_session(&persisted.id).unwrap();
+        assert!(!app.store.interruption_reported(&persisted.id).unwrap());
+    }
+
+    #[tokio::test]
     async fn push_restart_preserves_quota_and_cleanup_waits_for_the_directory_lock() {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
@@ -2501,6 +2564,83 @@ mod push_tests {
         app.store.insert_upload_session(&persisted).unwrap();
         sweep_push_staging(&app);
         assert!(app.store.load_push_sessions().unwrap().is_empty());
+
+        // A parked push with file checkpoints holds its staging and quota for
+        // its sender only until a week passes without a checkpoint.
+        let stage = app
+            .receiving_destinations()
+            .unwrap()
+            .push_directory(&key)
+            .unwrap();
+        std::fs::create_dir_all(stage.join("objects")).unwrap();
+        std::fs::write(&object_path, b"staged bytes").unwrap();
+        // A file's staging and journal sit beside its destination, outside
+        // the push directory.
+        let beside = app.config.receive_dir.join(".vot-stage");
+        let file_stage = beside.join(".vot-clip.stage");
+        let file_journal = beside.join(".vot-clip.journal");
+        std::fs::write(&file_stage, b"staged").unwrap();
+        std::fs::write(&file_journal, b"journal").unwrap();
+        let mut parked = persisted.clone();
+        parked.files.push(crate::store::PersistedUploadFile {
+            entry: 0,
+            display_path: "clip.mov".into(),
+            stored_components: vec!["clip.mov".into()],
+            object: parked.package.clone(),
+            staging_path: file_stage.clone(),
+            journal_path: file_journal.clone(),
+            incarnation: [0; 16],
+            profile: vot_sdk_file::CommitProfile::Balanced,
+            nas_contract: vot_sdk_file::NasContract::Unqualified,
+            prefix_bytes: 6,
+            published: false,
+            receipt: false,
+        });
+        app.store.insert_upload_session(&parked).unwrap();
+        sweep_push_staging(&app);
+        assert_eq!(
+            app.store.load_push_sessions().unwrap(),
+            vec![parked.clone()]
+        );
+        assert!(object_path.exists());
+        app.store
+            .with(|c| {
+                c.execute(
+                    "UPDATE upload_sessions SET created_at=created_at-?1",
+                    [PARKED_PUSH_SECS as i64 - 60],
+                )
+            })
+            .unwrap();
+        sweep_push_staging(&app);
+        assert_eq!(app.store.load_push_sessions().unwrap().len(), 1);
+        // A checkpoint restarts the week.
+        app.store
+            .with(|c| c.execute("UPDATE upload_sessions SET created_at=created_at-60", []))
+            .unwrap();
+        app.store
+            .update_upload_file_progress(&parked.id, [(0, 6, false, false)])
+            .unwrap();
+        sweep_push_staging(&app);
+        assert_eq!(app.store.load_push_sessions().unwrap().len(), 1);
+        app.store
+            .with(|c| {
+                c.execute(
+                    "UPDATE upload_sessions SET created_at=created_at-?1",
+                    [PARKED_PUSH_SECS as i64],
+                )
+            })
+            .unwrap();
+        sweep_push_staging(&app);
+        assert!(app.store.load_push_sessions().unwrap().is_empty());
+        assert!(!stage.exists());
+        assert!(!file_stage.exists() && !file_journal.exists());
+        let link = app.store.link_by_id("resume").unwrap().unwrap();
+        let event = link.events.last().unwrap();
+        assert_eq!(event.outcome, "interrupted");
+        assert_eq!(
+            event.detail,
+            "the sender did not resume the push within 7 days"
+        );
     }
 
     fn push_config(directory: &std::path::Path) -> Config {
