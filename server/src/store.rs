@@ -651,6 +651,7 @@ const OUTBOUND_INDEXES: &str = "
 CREATE INDEX IF NOT EXISTS outbound_fetch_tickets_expires ON outbound_fetch_tickets(expires_at);
 CREATE INDEX IF NOT EXISTS outbound_grants_open_expires
     ON outbound_grants(expires_at) WHERE revoked_at IS NULL;
+CREATE INDEX IF NOT EXISTS outbound_grant_files_source ON outbound_grant_files(source COLLATE NOCASE);
 ";
 
 // Recent pages use rowid order while exports use at,rowid order. Rowid is

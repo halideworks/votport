@@ -4010,10 +4010,10 @@ mod push_tests {
 
     #[test]
     fn six_figure_entry_counts_fit_without_a_large_fixture() {
-        for count in [0, 100_000, 999_999, 1_000_000, 1_999_998, 2_000_000] {
+        for count in [0, 100_000, MAX_SESSION_ENTRIES - 1, MAX_SESSION_ENTRIES] {
             assert!(entry_count_within_limit(count, u64::MAX));
         }
-        for count in [2_000_001, usize::MAX] {
+        for count in [MAX_SESSION_ENTRIES + 1, 2_000_000, usize::MAX] {
             assert!(!entry_count_within_limit(count, u64::MAX));
         }
     }
@@ -4023,8 +4023,7 @@ mod push_tests {
         assert_eq!(max_entries_for_bytes(0), 256);
         assert_eq!(max_entries_for_bytes(1024 * 1024), 512);
         assert!(max_entries_for_bytes(20_000 * 4096) >= 20_000);
-        assert!(max_entries_for_bytes(u64::MAX) <= MAX_ENTRIES);
-        assert_eq!(max_entries_for_bytes(u64::MAX), MAX_ENTRIES);
+        assert_eq!(max_entries_for_bytes(u64::MAX), MAX_SESSION_ENTRIES);
     }
 
     #[test]
@@ -4197,7 +4196,7 @@ mod push_tests {
         let raw = record(vot_manifest::PackagePath::raw([b"file"]).unwrap(), &logical);
         assert!(validate_push_manifest(&setup, summary, &[raw]).is_err());
 
-        assert!(!entry_count_within_limit(MAX_ENTRIES + 1, u64::MAX));
+        assert!(!entry_count_within_limit(MAX_SESSION_ENTRIES + 1, u64::MAX));
     }
 
     #[test]

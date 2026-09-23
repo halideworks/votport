@@ -796,17 +796,20 @@ fn active_library_grants_match_source_with_tenant_and_revocation_scope() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path()).unwrap();
     let mut active = test_outbound_grant("active", "acme", 0);
-    active.files = vec![OutboundGrantFile {
-        source: "project/file.bin".to_owned(),
-        name: "file.bin".to_owned(),
-        suite: "blake3".to_owned(),
-        root: "root".to_owned(),
-        bytes: 1,
-        receipt_b64: "receipt".to_owned(),
-        downloads: 0,
-        first_download_at: None,
-        last_download_at: None,
-    }];
+    active.files = ["project/file.bin", "Caf\u{E9}/Pl\u{E4}n.mov"]
+        .into_iter()
+        .map(|source| OutboundGrantFile {
+            source: source.to_owned(),
+            name: source.rsplit('/').next().unwrap().to_owned(),
+            suite: "blake3".to_owned(),
+            root: "root".to_owned(),
+            bytes: 1,
+            receipt_b64: "receipt".to_owned(),
+            downloads: 0,
+            first_download_at: None,
+            last_download_at: None,
+        })
+        .collect();
     store.insert_outbound_grant(active).unwrap();
 
     let mut other = test_outbound_grant("other", "other", 0);
@@ -853,6 +856,22 @@ fn active_library_grants_match_source_with_tenant_and_revocation_scope() {
     assert!(store
         .has_active_library_grant("acme", "project/file.bin")
         .unwrap());
+    assert!(store
+        .has_active_library_grant("acme", "Project/FILE.bin")
+        .unwrap());
+    // Unicode case and decomposed spellings of a served name.
+    assert!(store
+        .serves_library_file("acme", "CAF\u{C9}/pl\u{E4}n.mov")
+        .unwrap());
+    assert!(store
+        .serves_library_file("acme", "Cafe\u{301}/pla\u{308}n.mov")
+        .unwrap());
+    assert!(!store
+        .serves_library_file("acme", "Caf\u{E9}/other.mov")
+        .unwrap());
+    assert!(store
+        .serves_library_file("acme", "PROJECT/file.bin")
+        .unwrap());
     assert!(!store
         .has_active_library_grant("other", "project/file.bin")
         .unwrap());
@@ -871,6 +890,26 @@ fn active_library_grants_match_source_with_tenant_and_revocation_scope() {
     assert!(!store
         .has_active_library_grant("acme", "ignored/file.bin")
         .unwrap());
+    // Every library upload chunk asks this; it must find the file by its
+    // source index, not walk every grant's file list.
+    let plan = store
+        .with(|connection| {
+            connection
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    crate::store::outbound::ACTIVE_LIBRARY_GRANT
+                ))?
+                .query_map(rusqlite::params!["acme", "x"], |row| {
+                    row.get::<_, String>(3)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("USING INDEX outbound_grant_files_source (source=?)")),
+        "{plan:?}"
+    );
 }
 
 #[test]

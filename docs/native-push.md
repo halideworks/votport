@@ -384,7 +384,9 @@ want one public port, and changes nothing in votport.
 ## Observability
 
 - Events: `push_admitted`, `push_connected`, and `push_refused` with a bounded
-  reason (`rate`, `capability`, `expired`, or `spent`), plus the existing
+  reason (`rate`, `capability`, `expired`, or `spent`); every refusal but
+  `rate` also writes an audit row, since a rate refusal is the flood itself.
+  Plus the existing
   `uploaded`, `cancelled`, and `interrupted`
   lifecycle events. A package root mismatch is recorded as an interrupted
   push rather than a `push_refused` reason: VOT b14 checks the package pin

@@ -270,6 +270,8 @@ pub struct App {
     /// lease expiry. Process-local: after a restart a spent file's lease no
     /// longer passes, the documented limit of resuming across a failover.
     pub counted_leases: Mutex<HashMap<String, u64>>,
+    /// When the short sweep last walked the library for stale upload stages.
+    pub library_stages_swept_at: AtomicU64,
     /// Concurrent byte reservations for outbound staging on the data filesystem.
     pub outbound_stage_budget: Arc<crate::api::outbound::StageBudget>,
     pub(crate) admin_status: crate::api::admin::AdminStatusCache,
@@ -714,6 +716,11 @@ fn refuse_push(
 ) -> Option<vot_cli::PushAdmission> {
     app.push_metrics.refuse(reason);
     tracing::warn!(target: "audit", event = "push_refused", %peer, reason = reason.label(), "native push refused");
+    // A rate refusal is the flood itself; the metric and the log line record
+    // it without an audit row per attempt.
+    if reason == PushRefusalReason::Rate {
+        return None;
+    }
     // The session is not known at refusal time, so like the metric series the
     // row carries only the reason and the peer address.
     app.store.audit(
@@ -1157,6 +1164,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         outbound_active: Mutex::new(HashSet::new()),
         outbound_stream_cancels: Mutex::new(HashMap::new()),
         counted_leases: Mutex::new(HashMap::new()),
+        library_stages_swept_at: AtomicU64::new(0),
         outbound_stage_budget: Arc::new(crate::api::outbound::StageBudget::new()),
         admin_status: crate::api::admin::AdminStatusCache::default(),
         staging_permits: Arc::new(tokio::sync::Semaphore::new(
@@ -3692,10 +3700,19 @@ async fn sweep_short(app: &Arc<App>) {
     )
     .await;
     sweep_task(app, "push staging", sweep_push_staging).await;
-    sweep_task(app, "library staging", |app| {
-        crate::api::outbound::sweep_upload_stages(app, std::time::SystemTime::now());
-    })
-    .await;
+    // The library walk visits every folder of the share, a readdir storm on
+    // NFS or SMB; stages expire only after the session idle window, so a
+    // walk every half window, at most every fifteen minutes, is enough.
+    let now = now_unix();
+    let every = (app.config.session_idle_secs / 2).min(15 * 60);
+    let last = app.library_stages_swept_at.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= every {
+        app.library_stages_swept_at.store(now, Ordering::Relaxed);
+        sweep_task(app, "library staging", |app| {
+            crate::api::outbound::sweep_upload_stages(app, std::time::SystemTime::now());
+        })
+        .await;
+    }
 }
 
 async fn sweep_daily(app: &Arc<App>) {

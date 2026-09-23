@@ -606,6 +606,47 @@ async fn stalled_library_validation_does_not_block_outbound_deletion() {
     assert!(app.store.outbound_grants("acme").unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn library_deletion_refuses_another_unicode_spelling_of_a_served_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = crate::api::testing::build(directory.path());
+    app.store
+        .insert_tenant(crate::store::tests::test_tenant("acme"))
+        .unwrap();
+    let root = library_root(&app, "acme");
+    std::fs::create_dir_all(&root).unwrap();
+    // On a case-insensitive volume both spellings open one file; this
+    // case-sensitive test volume holds a copy under the other spelling.
+    std::fs::write(root.join("Pl\u{E4}n.mov"), b"served").unwrap();
+    std::fs::write(root.join("PL\u{C4}N.mov"), b"served").unwrap();
+    let mut grant = crate::store::tests::test_outbound_grant("served", "acme", 0);
+    grant.files = vec![crate::store::OutboundGrantFile {
+        source: "Pl\u{E4}n.mov".into(),
+        name: "Pl\u{E4}n.mov".into(),
+        suite: "blake3".into(),
+        root: "root".into(),
+        bytes: 6,
+        receipt_b64: String::new(),
+        downloads: 0,
+        first_download_at: None,
+        last_download_at: None,
+    }];
+    app.store.insert_outbound_grant(grant).unwrap();
+    let cookie = named_admin_cookie(&app, "acme");
+    let response = router(app.clone())
+        .oneshot(
+            Request::delete("/api/admin/outbound-files?path=PL%C3%84N.mov")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(root.join("PL\u{C4}N.mov").exists());
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn library_deletion_and_validated_insert_are_strictly_ordered() {
     use std::time::Duration;
@@ -7265,10 +7306,18 @@ async fn a_stalled_preparation_frees_its_session_slot_after_the_stale_cap() {
     };
     assert_eq!(refusal.status, StatusCode::CONFLICT);
 
-    stalled.created_at.store(
-        now_unix().saturating_sub(PREPARATION_STALE_SECS + 1),
-        Ordering::Relaxed,
+    // A long preparation that keeps making progress, or still has many
+    // bytes to hash at the floor rate, is not stale.
+    let quiet = now_unix().saturating_sub(PREPARATION_STALE_SECS + 1);
+    stalled.set_totals(1, 4 * 1024 * 1024 * 1024 * 1024);
+    stalled.touched_at.store(quiet, Ordering::Relaxed);
+    assert!(
+        !stalled.stale(now_unix()),
+        "terabytes still to hash at the floor rate"
     );
+    stalled.record_file_done(Some(4 * 1024 * 1024 * 1024 * 1024));
+    assert!(!stalled.stale(now_unix()), "progress restarts the window");
+    stalled.touched_at.store(quiet, Ordering::Relaxed);
     {
         let mut registry = app.grant_preparations.lock().unwrap();
         sweep_preparations(&mut registry);

@@ -940,6 +940,12 @@ fn refuse(
         target: "audit", event = "serve_refused", %peer, reason = reason.label(),
         "fetch session refused"
     );
+    // A rate refusal is the flood itself: an unauthenticated peer looping
+    // garbage would otherwise buy one fsync'd audit row per attempt. The
+    // metric and the log line record it.
+    if reason == ServeRefusalReason::Rate {
+        return None;
+    }
     // The grant is not always known at refusal time, so like the metric
     // series the row carries only the reason and the peer address. Off the
     // calling thread, like every other admission store write.
@@ -1208,6 +1214,28 @@ pub(crate) fn admit_fetch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rate refusal is counted and logged but writes no audit row, so a
+    /// peer looping garbage cannot buy an fsync per attempt; other refusals
+    /// keep their row.
+    #[test]
+    fn rate_refusals_write_no_audit_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let peer = "10.1.2.3:4".parse().unwrap();
+        for _ in 0..3 {
+            refuse(&app, runtime.handle(), ServeRefusalReason::Rate, peer);
+        }
+        refuse(&app, runtime.handle(), ServeRefusalReason::Capability, peer);
+        let rows = app.store.audit_export(None, 0, 0, 100).unwrap();
+        let refused: Vec<_> = rows
+            .iter()
+            .filter(|row| row.event == "serve_refused")
+            .collect();
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].detail["reason"], "capability");
+    }
 
     #[test]
     fn app_boot_sweeps_revoked_and_deleted_grant_manifests() {

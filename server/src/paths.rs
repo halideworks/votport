@@ -454,11 +454,17 @@ pub fn join_under(base: &Path, components: &[String]) -> Result<PathBuf, String>
     Ok(path)
 }
 
+/// Unicode case fold then NFC: two names equal under it can name one file on
+/// a case-insensitive, normalizing volume.
+pub(crate) fn fold_name(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization as _;
+    unicase::UniCase::new(name).to_folded_case().nfc().collect()
+}
+
 /// Rejects names that cannot remain distinct on portable recipient filesystems.
 pub(crate) fn admit_portable_paths<'a>(
     names: impl IntoIterator<Item = &'a str>,
 ) -> Result<(), String> {
-    use unicode_normalization::UnicodeNormalization as _;
     let mut keyed = Vec::new();
     for name in names {
         crate::protocol_paths::check_payload_name_length(
@@ -470,7 +476,7 @@ pub(crate) fn admit_portable_paths<'a>(
         let key = String::from_utf8(key)
             .map_err(|_| format!("filename {name:?} is not portable; rename it before sharing"))?;
         // Preserve VOT's Turkish-I rule and NUL separators while strengthening Unicode folding.
-        let folded: String = unicase::UniCase::new(key).to_folded_case().nfc().collect();
+        let folded = fold_name(&key);
         keyed.push((folded.into_bytes(), name));
     }
     keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
