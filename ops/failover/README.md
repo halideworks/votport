@@ -106,7 +106,10 @@ ops/failover/planned.sh
 
 Replica topology: `REPOINT_CMD` is required, because a replica-mode standby
 is not in the proxy pool until promoted, and the final drain clear goes
-through `NEW_LIVE_URL`. Shared-volume topology: `PROMOTE_CMD` starts
+through `NEW_LIVE_URL`. Once sessions reach 0 the script also waits, within
+`DRAIN_TIMEOUT`, until the standby's `/readyz` reports an `archive_created_at`
+later than that moment, so uploads that finished during the drain are in the
+promoted copy. Shared-volume topology: `PROMOTE_CMD` starts
 `votport` on the standby host over the same volumes and `REPOINT_CMD` can be
 omitted when the proxy already pools both hosts. If the script aborts while
 the old live is still running, its exit trap clears the drain there; if the

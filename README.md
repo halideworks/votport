@@ -68,7 +68,7 @@ Requirements: Docker with the compose plugin, and Caddy on the host.
 git clone https://github.com/halideworks/votport
 cd votport
 install -m 600 .env.example .env
-# edit .env: set VOTPORT_ADMIN_PASSWORD and the https URL Caddy will serve
+# edit .env: set VOTPORT_ADMIN_PASSWORD, VOTPORT_METRICS_TOKEN and the https URL Caddy will serve
 sudo install -d -o 1000 -g 1000 -m 0700 data received outbound
 docker compose --env-file .env -f docker-compose.example.yml up -d --build
 ```
@@ -85,6 +85,7 @@ browser and builds the server. Then add the site to your Caddyfile (see
 ```caddy
 drop.example.com {
  respond /metrics 404
+ respond /readyz 404
  reverse_proxy 127.0.0.1:8103
 }
 ```

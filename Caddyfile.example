@@ -1,8 +1,26 @@
 # Example Caddy site for votport.
 #
-# Add this to your existing Caddyfile (adjust the hostname and port to match
-# the selected Compose file). Caddy terminates TLS; votport speaks plain HTTP on
-# localhost.
+# Use this as the main Caddyfile, or merge it into yours: the options block
+# below must be the first block of the main Caddyfile (Caddy refuses it
+# anywhere else, including in an imported file), and the site block can go
+# anywhere. Adjust the hostname and port to match the selected Compose file.
+# Caddy terminates TLS; votport speaks plain HTTP on localhost.
+
+# Audit finding 280: bounded timeouts. These are server-wide global options,
+# so they belong in the main Caddyfile's global block, not an imported site
+# file. Each is an absolute per-request bound, not reset as data flows: upload
+# chunks are at most ~9 MiB per request, so an hour to read a body is
+# generous, and no write timeout is set because a single-GET download of a
+# large file can stream for hours.
+{
+	servers {
+		timeouts {
+			read_header 30s
+			read_body 1h
+			idle 5m
+		}
+	}
+}
 
 drop.example.com {
 	# Compresses JS, CSS, and the multi-MB vot-wasm binary (3-4x smaller);
@@ -18,14 +36,6 @@ drop.example.com {
 	# anything reaches votport, even with a bearer token.
 	respond /metrics 404
 	respond /readyz 404
-
-	# Audit finding 280: bounded timeouts. Header reads die in tens of
-	# seconds; transfer windows are generous but finite (Caddy resets
-	# read/write deadlines as data flows); idle keep-alives are minutes.
-	read_header_timeout 30s
-	read_timeout 1h
-	write_timeout 1h
-	idle_timeout 5m
 
 	reverse_proxy 127.0.0.1:8103
 

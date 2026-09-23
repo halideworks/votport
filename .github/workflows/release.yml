@@ -26,11 +26,14 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          server_version="$(sed -n '/^\[package\]/,/^\[/ { s/^version = "\([^"]*\)"/\1/p; }' server/Cargo.toml | head -n 1)"
-          if [[ "$RELEASE_TAG" != "v$server_version" ]]; then
-            echo "tag $RELEASE_TAG does not match server version $server_version" >&2
-            exit 1
-          fi
+          # The MSIX and DMG stamp the client versions, so all three must match.
+          for manifest in server/Cargo.toml client/core/Cargo.toml client/cli/Cargo.toml; do
+            version="$(sed -n '/^\[package\]/,/^\[/ { s/^version = "\([^"]*\)"/\1/p; }' "$manifest" | head -n 1)"
+            if [[ "$RELEASE_TAG" != "v$version" ]]; then
+              echo "tag $RELEASE_TAG does not match $manifest version $version" >&2
+              exit 1
+            fi
+          done
 
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
@@ -51,24 +54,28 @@ jobs:
           # `docker buildx imagetools inspect <image> --format '{{ json .SBOM }}'` reads it.
           sbom: generator=docker/buildkit-syft-scanner:stable-1@sha256:ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9
           cache-from: type=gha,scope=votport-ci
+          # Only the commit tag is pushed here; the release tag is added after
+          # the vulnerability scan passes, so a failing image never carries it.
           tags: |
-            ${{ env.IMAGE }}:${{ env.RELEASE_TAG }}
             ${{ env.IMAGE }}:sha-${{ github.sha }}
           build-args: |
             VOTPORT_VERSION=${{ env.RELEASE_TAG }}
             VOTPORT_REVISION=${{ github.sha }}
 
-      # Scans the tag just pushed to GHCR; the image is not loaded into the
-      # runner daemon, so trivy pulls it with the credentials the login step
-      # stored. Fails the release on CRITICAL,HIGH, matching the CI posture
+      # Scans the commit tag just pushed to GHCR; the image is not loaded into
+      # the runner daemon, so trivy pulls it with the credentials the login
+      # step stored. Fails the release on CRITICAL,HIGH, matching the CI posture
       # of npm audit --audit-level=high.
       - name: Scan the image for critical and high vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ env.IMAGE }}:${{ env.RELEASE_TAG }}
+          image-ref: ${{ env.IMAGE }}@${{ steps.image.outputs.digest }}
           format: table
           exit-code: '1'
           severity: CRITICAL,HIGH
+
+      - name: Tag the scanned image with the release
+        run: docker buildx imagetools create --tag "${IMAGE}:${RELEASE_TAG}" "${IMAGE}@${{ steps.image.outputs.digest }}"
 
       - name: Record image digest
         run: |

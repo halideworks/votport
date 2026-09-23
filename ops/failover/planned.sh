@@ -144,7 +144,9 @@ set_drain() {
 # One field of /readyz as JSON, or null when the instance does not answer.
 readyz_field() {
   local url="$1" field="$2"
-  curl -sS -m 10 "$url/readyz" 2>/dev/null | python3 -c "import json,sys
+  # curl's own failure stays inside the braces: under pipefail it would
+  # otherwise append a second null to the one python prints.
+  { curl -sS -m 10 "$url/readyz" 2>/dev/null || true; } | python3 -c "import json,sys
 try:
     value=json.load(sys.stdin)
 except Exception:
@@ -174,6 +176,26 @@ while :; do
   log "$active active sessions"
   sleep 5
 done
+
+# A replica-mode standby promotes its last pull, which can predate uploads
+# that finished during the drain. Wait for a copy the live instance built
+# after the drain settled; a shared-volume standby reports no archive.
+drained_at=$(date +%s)
+if [[ "$(readyz_field "$NEW_LIVE_HOST_URL" archive_created_at)" =~ ^[0-9]+$ ]]; then
+  log "waiting up to ${DRAIN_TIMEOUT}s for the standby to pull a copy built after the drain"
+  deadline=$((SECONDS + DRAIN_TIMEOUT))
+  while :; do
+    built="$(readyz_field "$NEW_LIVE_HOST_URL" archive_created_at)"
+    if [[ "$built" =~ ^[0-9]+$ ]] && [ "$built" -gt "$drained_at" ] && [ "$(readyz_field "$NEW_LIVE_HOST_URL" last_error)" = null ]; then
+      break
+    fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      log "the standby has no copy built after the drain within ${DRAIN_TIMEOUT}s; aborting (the trap clears the drain)"
+      exit 1
+    fi
+    sleep 5
+  done
+fi
 
 log "stopping the live instance"
 run "$LIVE_STOP_CMD"
@@ -222,7 +244,7 @@ fi
 # is Secure and only https carries it.
 log "signing in to $NEW_LIVE_URL and clearing the drain"
 rm -f "$jar"
-jar="$(mktemp)"
+jar="$jar_dir/cookies-new"
 if login "$NEW_LIVE_URL" && set_drain "$NEW_LIVE_URL" false; then
   log "done: $NEW_LIVE_URL is live and accepting uploads"
 else
