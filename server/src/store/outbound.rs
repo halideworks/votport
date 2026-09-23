@@ -2,6 +2,12 @@
 
 use super::*;
 
+/// Compared without ASCII case: on a case-insensitive library volume another
+/// spelling of a served path names the same file.
+pub(crate) const ACTIVE_LIBRARY_GRANT: &str = "SELECT EXISTS (
+    SELECT 1 FROM outbound_grant_files f JOIN outbound_grants g ON g.id = f.grant_id
+    WHERE f.source = ?2 COLLATE NOCASE AND g.tenant = ?1 AND g.revoked_at IS NULL)";
+
 impl Store {
     pub fn insert_outbound_grant(&self, grant: OutboundGrant) -> Result<(), String> {
         self.insert_outbound_grant_with_operation(grant, None)
@@ -1003,25 +1009,39 @@ impl Store {
     /// include the library source. Finding 380: expiry alone no longer
     /// frees a source, because extend refuses to revive an expired grant,
     /// so deletion and overwrite stay blocked until the grant is revoked.
+    /// Every upload chunk asks, so it reads the source index rather than
+    /// parsing every live grant's file list under the store lock.
     pub fn has_active_library_grant(&self, tenant: &str, source: &str) -> Result<bool, String> {
         self.with(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT files_json
-                 FROM outbound_grants
-                 WHERE tenant = ?1 AND length(trim(files_json)) > 2
-                   AND revoked_at IS NULL",
+            connection
+                .prepare_cached(ACTIVE_LIBRARY_GRANT)?
+                .query_row(rusqlite::params![tenant, source], |row| row.get(0))
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    /// [`Self::has_active_library_grant`] plus, for a non-ASCII path, the
+    /// Unicode case fold and normalization library volumes apply, which
+    /// NOCASE lacks. Delete asks this once; it scans the tenant's live grant
+    /// files, so the per-chunk upload check does not.
+    // ponytail: a non-ASCII source that folds to ASCII (U+212A) is still
+    // missed by an ASCII request.
+    pub fn serves_library_file(&self, tenant: &str, source: &str) -> Result<bool, String> {
+        if self.has_active_library_grant(tenant, source)? {
+            return Ok(true);
+        }
+        if source.is_ascii() {
+            return Ok(false);
+        }
+        let wanted = crate::paths::fold_name(source);
+        self.with(|connection| {
+            let mut statement = connection.prepare_cached(
+                "SELECT f.source FROM outbound_grant_files f JOIN outbound_grants g ON g.id = f.grant_id
+                 WHERE g.tenant = ?1 AND g.revoked_at IS NULL",
             )?;
-            let rows = statement.query_map([tenant], |row| row.get::<_, String>(0))?;
-            for row in rows {
-                let files: Vec<OutboundGrantFile> =
-                    serde_json::from_str(&row?).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            0,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?;
-                if files.iter().any(|file| file.source == source) {
+            let mut rows = statement.query([tenant])?;
+            while let Some(row) = rows.next()? {
+                if crate::paths::fold_name(&row.get::<_, String>(0)?) == wanted {
                     return Ok(true);
                 }
             }

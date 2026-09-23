@@ -4714,6 +4714,21 @@ mod audit_observability_tests {
             .expect("the refused push leaves an audit row");
         assert_eq!(row.detail["reason"], "spent");
         assert_eq!(row.detail["peer"], "10.1.2.3:4");
+        // A rate refusal is the flood itself: counted, with no row per try.
+        for _ in 0..3 {
+            refuse_push(
+                &application,
+                PushRefusalReason::Rate,
+                "10.1.2.3:5".parse().unwrap(),
+            );
+        }
+        let rows = application.store.audit_export(None, 0, 0, 100).unwrap();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.event == "push_refused")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

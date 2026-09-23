@@ -34,7 +34,6 @@ use crate::store::{
 pub const MAX_SEAL_BYTES: usize = 1024 * 1024;
 pub const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_PAGES: u64 = 4096;
-pub const MAX_ENTRIES: usize = 2_000_000;
 /// Per-session bound on stored entries: every entry's state stays resident
 /// for the session's whole life, so the count is capped regardless of the
 /// link byte budget. The browser UI fixture handles 100k files, leaving
@@ -957,12 +956,15 @@ fn handle_seal(setup: &WorkerSetup, phase: &mut Phase, bytes: &[u8]) -> Result<u
 }
 
 /// The count limit follows the byte budget while retaining a small floor for
-/// legitimate empty-file drops, and never exceeds the process-wide ceiling.
+/// legitimate empty-file drops, and never exceeds the per-session cap: the
+/// manifest pages, the push preflight and the advertised link limit all
+/// refuse past it, so a sender learns the limit before hashing and nothing
+/// buffers entries that begin would refuse.
 pub fn max_entries_for_bytes(max_total_bytes: u64) -> usize {
     let budget = max_total_bytes / ENTRY_ADMISSION_BYTES + ENTRY_ADMISSION_FLOOR;
     usize::try_from(budget)
         .unwrap_or(usize::MAX)
-        .min(MAX_ENTRIES)
+        .min(MAX_SESSION_ENTRIES)
 }
 
 fn entry_count_within_limit(count: usize, max_total_bytes: u64) -> bool {

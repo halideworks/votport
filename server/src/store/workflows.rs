@@ -16,6 +16,7 @@ CREATE INDEX IF NOT EXISTS delivery_jobs_ready ON delivery_jobs(state,not_before
 CREATE INDEX IF NOT EXISTS delivery_jobs_tenant ON delivery_jobs(tenant,id);
 CREATE INDEX IF NOT EXISTS delivery_jobs_tenant_created ON delivery_jobs(tenant,created_at,id);
 CREATE INDEX IF NOT EXISTS delivery_jobs_tenant_snapshot ON delivery_jobs(tenant,snapshot_bytes);
+CREATE INDEX IF NOT EXISTS delivery_jobs_received_upload ON delivery_jobs(tenant,json_extract(document,'$.received.upload_id')) WHERE json_extract(document,'$.received') IS NOT NULL;
 CREATE INDEX IF NOT EXISTS delivery_jobs_deadline_pending ON delivery_jobs(deadline) WHERE deadline IS NOT NULL AND escalated=0;
 CREATE INDEX IF NOT EXISTS delivery_jobs_retirement_due ON delivery_jobs(COALESCE(json_extract(document,'$.checks.retirement_attempt_at'),0),id) WHERE state IN ('retiring','failed','cancelled','ready','awaiting_approval');
 ";

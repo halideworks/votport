@@ -145,8 +145,12 @@ const PREPARATION_FAILED: u8 = 2;
 const PREPARATION_TTL_SECS: u64 = 15 * 60;
 // A preparation that never settles (a hash walk hung on dead NAS I/O, say)
 // would otherwise pin its registry entry and the session's one-in-flight 409
-// slot forever; past this age the sweep drops it and the session can retry.
+// slot forever. The sweep drops one that has made no progress for this long
+// plus the time its remaining bytes need at the floor rate: progress lands
+// per finished file, so one very large file hashes for a long time without
+// any, and a slow share must not be mistaken for a hung one.
 const PREPARATION_STALE_SECS: u64 = 60 * 60;
+const PREPARATION_FLOOR_BYTES_PER_SEC: u64 = 32 * 1024 * 1024;
 const PREPARATION_LOST_MESSAGE: &str =
     "This preparation is no longer available; the server may have restarted. Create the link again.";
 
@@ -159,7 +163,8 @@ pub(crate) struct GrantPreparation {
     bytes_total: std::sync::atomic::AtomicU64,
     bytes_done: std::sync::atomic::AtomicU64,
     finished_at: std::sync::atomic::AtomicU64,
-    created_at: std::sync::atomic::AtomicU64,
+    /// When the preparation started or last made progress.
+    touched_at: std::sync::atomic::AtomicU64,
     outcome: Mutex<Option<Result<CreatedGrant, (u16, String)>>>,
 }
 
@@ -178,7 +183,7 @@ impl GrantPreparation {
             bytes_total: std::sync::atomic::AtomicU64::new(PREPARATION_UNKNOWN),
             bytes_done: std::sync::atomic::AtomicU64::new(0),
             finished_at: std::sync::atomic::AtomicU64::new(0),
-            created_at: std::sync::atomic::AtomicU64::new(now_unix()),
+            touched_at: std::sync::atomic::AtomicU64::new(now_unix()),
             outcome: Mutex::new(None),
         }
     }
@@ -194,11 +199,26 @@ impl GrantPreparation {
         if let Some(bytes) = bytes {
             self.bytes_done.fetch_add(bytes, Ordering::Relaxed);
         }
+        self.touched_at.store(now_unix(), Ordering::Relaxed);
     }
 
     fn set_totals(&self, files: u64, bytes: u64) {
         self.files_total.store(files, Ordering::Relaxed);
         self.bytes_total.store(bytes, Ordering::Relaxed);
+        self.touched_at.store(now_unix(), Ordering::Relaxed);
+    }
+
+    /// No progress for the stale window plus the floor-rate time of the
+    /// bytes still to hash; see [`PREPARATION_STALE_SECS`].
+    fn stale(&self, now: u64) -> bool {
+        let total = self.bytes_total.load(Ordering::Relaxed);
+        let remaining = if total == PREPARATION_UNKNOWN {
+            0
+        } else {
+            total.saturating_sub(self.bytes_done.load(Ordering::Relaxed))
+        };
+        let quiet = now.saturating_sub(self.touched_at.load(Ordering::Relaxed));
+        quiet > PREPARATION_STALE_SECS + remaining / PREPARATION_FLOOR_BYTES_PER_SEC
     }
 
     fn complete(&self, created: CreatedGrant) {
@@ -266,12 +286,11 @@ pub(crate) struct GrantPreparationRegistry {
 fn sweep_preparations(registry: &mut GrantPreparationRegistry) {
     let now = now_unix();
     let finished_cutoff = now.saturating_sub(PREPARATION_TTL_SECS);
-    let stale_cutoff = now.saturating_sub(PREPARATION_STALE_SECS);
     registry.by_id.retain(|_, preparation| {
         if preparation.is_terminal() {
             preparation.finished_at.load(Ordering::Relaxed) > finished_cutoff
         } else {
-            preparation.created_at.load(Ordering::Relaxed) > stale_cutoff
+            !preparation.stale(now)
         }
     });
     registry
@@ -1395,7 +1414,7 @@ pub async fn delete_outbound_file(
         }
         if worker
             .store
-            .has_active_library_grant(&tenant, &relative_path_for_worker)
+            .serves_library_file(&tenant, &relative_path_for_worker)
             .map_err(super::store_unavailable)?
         {
             return Err(ApiError::new(
@@ -2945,6 +2964,11 @@ async fn create_library_grant(
                                 "incoming content changed since verification",
                             )
                         })?;
+                    // This pass re-reads whole files after hashing ended;
+                    // each verified file is progress for the stale check.
+                    if let Some(progress) = progress {
+                        progress.touched_at.store(now_unix(), Ordering::Relaxed);
+                    }
                 }
                 _ => {
                     return Err(ApiError::new(

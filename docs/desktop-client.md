@@ -470,7 +470,7 @@ uses the seams listed in the status at the top of this document.
 Reference sender behaviour the core must match, from `upload.js` and
 `upload-entries.js`: dotfiles refused unless `allow_hidden`, `~` and
 reserved names refused, fold-collision paths refused at pick time, the server's
-advertised `max_entries` cap (currently 2,000,000), one package per drop, all
+advertised `max_entries` cap (at most 262,144 per session), one package per drop, all
 files hashed before any send. The 20,000-entry scenarios below are test targets,
 not the admission limit.
 
