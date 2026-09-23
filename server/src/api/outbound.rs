@@ -1995,6 +1995,30 @@ fn outbound_grants_paging(query: OutboundGrantsQuery) -> ApiResult<(usize, usize
     Ok((limit, offset))
 }
 
+/// Whether the caller may see a grant: a workflow job's grant carries its
+/// project's membership rule, the same one the job and evidence routes apply,
+/// while a plain library grant is visible to every operator of the tenant.
+pub(crate) fn grant_visible(
+    app: &App,
+    identity: &auth::AdminIdentity,
+    id: &str,
+) -> ApiResult<bool> {
+    let Some(job) = app
+        .store
+        .delivery_job(id)
+        .map_err(super::store_unavailable)?
+    else {
+        return Ok(true);
+    };
+    Ok(app
+        .store
+        .delivery_project(&identity.tenant, &job.project.id)
+        .map_err(super::store_unavailable)?
+        .is_some_and(|project| {
+            project.allows(&identity.subject, "viewer", identity.role == "admin")
+        }))
+}
+
 pub async fn list_outbound_grants(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -2016,11 +2040,16 @@ pub async fn list_outbound_grants(
         .unwrap_or(u64::MAX)
         .saturating_add(grants.len() as u64)
         < total;
+    // ponytail: filtered after paging, so a viewer's page can come back
+    // short; move the membership rule into the query if that ever matters.
+    let mut visible = Vec::with_capacity(grants.len());
+    for (grant, file_count) in grants {
+        if identity.role == "admin" || grant_visible(&app, &identity, &grant.id)? {
+            visible.push(public_grant_with_file_count(&grant, file_count));
+        }
+    }
     Ok(Json(json!({
-        "grants": grants
-            .into_iter()
-            .map(|(grant, file_count)| public_grant_with_file_count(&grant, file_count))
-            .collect::<Vec<_>>(),
+        "grants": visible,
         "total": total,
         "offset": offset,
         "limit": limit,
@@ -2035,6 +2064,9 @@ pub async fn get_outbound_grant(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = admin::require_operator(&app, &headers)?;
     let _operation = begin_outbound_operation(&app, &identity.tenant)?;
+    if !grant_visible(&app, &identity, &id)? {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "delivery not found"));
+    }
     let (grant, count) = app
         .store
         .outbound_grant_preview(&identity.tenant, &id, OUTBOUND_GRANT_PREVIEW_FILES)
@@ -2050,6 +2082,9 @@ pub async fn outbound_grant_url(
 ) -> ApiResult<Response> {
     let identity = admin::require_operator(&app, &headers)?;
     let _operation = begin_outbound_operation(&app, &identity.tenant)?;
+    if !grant_visible(&app, &identity, &id)? {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "delivery not found"));
+    }
     let token = app.store.outbound_share_token(&identity.tenant, &id)
         .map_err(super::store_unavailable)?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND,

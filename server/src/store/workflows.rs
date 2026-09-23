@@ -200,7 +200,8 @@ fn principal_active(
     actor: &str,
     credential_version: u64,
 ) -> rusqlite::Result<bool> {
-    connection.query_row("SELECT COALESCE((SELECT blocked=0 AND credential_version=?2 FROM principals WHERE subject=?1), ?2=1)", params![actor,credential_version as i64], |row| row.get(0))
+    // A purged subject leaves a tombstone, so its old jobs stay refused.
+    connection.query_row("SELECT COALESCE((SELECT blocked=0 AND credential_version=?2 FROM principals WHERE subject=?1), ?2=1 AND NOT EXISTS (SELECT 1 FROM meta WHERE key=?3))", params![actor,credential_version as i64,super::purged_principal_key(actor)], |row| row.get(0))
 }
 
 fn actor_active(connection: &Connection, job: &Job) -> Result<(), WorkflowMutationError> {
@@ -2587,6 +2588,10 @@ mod tests {
         assert_eq!(recovered.project.revision, later.revision);
         store.provision_principal("sender", None).unwrap();
         store.revoke_principal("sender").unwrap();
+        assert!(actor_active(&store.connection.lock().unwrap(), &recovered).is_err());
+        // Purging the revoked row leaves a tombstone, so the job stays
+        // refused instead of passing as a never-seen subject.
+        store.purge_principal("sender").unwrap();
         assert!(actor_active(&store.connection.lock().unwrap(), &recovered).is_err());
         let blocked = store
             .claim_delivery_job("worker", now_unix())

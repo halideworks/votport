@@ -240,6 +240,20 @@ pub(crate) struct PasswordResource<'a> {
     pub(crate) kind: PasswordResourceKind,
 }
 
+/// The throttle bucket for one client and one protected resource: per v4
+/// address and IPv6 /64, since a client holding a routed prefix would
+/// otherwise get a fresh five-guess budget per address, and per resource,
+/// since a shared bucket let a known password on one link clear the lockout
+/// earned by guessing another.
+fn password_bucket(ip: &str, resource: PasswordResource<'_>) -> String {
+    format!(
+        "{}|{}:{}",
+        super::throttle_key(ip),
+        resource.kind.label(),
+        resource.id
+    )
+}
+
 /// Verifies a public-resource password, throttled per client IP. These are
 /// unauthenticated password checks, so without a throttle they would be an
 /// oracle, and with a global one anyone holding a URL could lock the admin
@@ -255,9 +269,7 @@ pub(crate) async fn check_password(
     let Some(hash) = password_hash else {
         return Ok(());
     };
-    // One bucket per v4 address and per IPv6 /64: a client holding a routed
-    // prefix would otherwise get a fresh five-guess budget per address.
-    let bucket = super::throttle_key(ip);
+    let bucket = password_bucket(ip, resource);
     // Claimed before the verify; see admin_login for why checking and then
     // recording is not enough.
     if !app.link_throttle.claim(&bucket) {
@@ -2630,6 +2642,47 @@ mod push_preflight_tests {
         );
     }
 
+    /// A password the client knows for one link must not clear the lockout
+    /// its guesses earned on another.
+    #[tokio::test]
+    async fn a_known_password_elsewhere_does_not_reset_guessing() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let target_hash = auth::hash_password("target secret").unwrap();
+        let own_hash = auth::hash_password("own secret").unwrap();
+        let resource = |id| PasswordResource {
+            tenant: "acme",
+            id,
+            kind: PasswordResourceKind::Delivery,
+        };
+        let attempt = |id, hash, password| {
+            let application = Arc::clone(&application);
+            async move {
+                check_password(
+                    &application,
+                    resource(id),
+                    Some(hash),
+                    Some(password),
+                    "192.0.2.14",
+                    "wrong delivery password",
+                )
+                .await
+            }
+        };
+        for _ in 0..4 {
+            let refused = attempt("target", &target_hash, "guess").await.unwrap_err();
+            assert_eq!(refused.status, StatusCode::UNAUTHORIZED);
+        }
+        attempt("own", &own_hash, "own secret").await.unwrap();
+        let refused = attempt("target", &target_hash, "guess").await.unwrap_err();
+        assert_eq!(refused.status, StatusCode::UNAUTHORIZED);
+        // The fifth guess locked the target: even the right password waits.
+        let locked = attempt("target", &target_hash, "target secret")
+            .await
+            .unwrap_err();
+        assert_eq!(locked.status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
     #[tokio::test]
     async fn successful_password_clears_throttle_before_blocking_audit() {
         use std::sync::mpsc;
@@ -2639,14 +2692,20 @@ mod push_preflight_tests {
         let application = testing::build(directory.path());
         let hash = auth::hash_password("correct password").unwrap();
         let ip = "192.0.2.13";
+        let resource = PasswordResource {
+            tenant: "acme",
+            id: "password-order",
+            kind: PasswordResourceKind::Receive,
+        };
+        let bucket = password_bucket(ip, resource);
         let permits = Arc::clone(&application.link_verify_permits)
             .acquire_many_owned(2)
             .await
             .unwrap();
         for _ in 0..4 {
-            assert!(application.link_throttle.claim(ip));
+            assert!(application.link_throttle.claim(&bucket));
         }
-        assert!(!application.link_throttle.locked(ip));
+        assert!(!application.link_throttle.locked(&bucket));
 
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
@@ -2671,11 +2730,7 @@ mod push_preflight_tests {
         let check = tokio::spawn(async move {
             check_password(
                 &app_for_check,
-                PasswordResource {
-                    tenant: "acme",
-                    id: "password-order",
-                    kind: PasswordResourceKind::Receive,
-                },
+                resource,
                 Some(&hash_for_check),
                 Some("correct password"),
                 ip,
@@ -2684,7 +2739,7 @@ mod push_preflight_tests {
             .await
         });
         let locked = tokio::time::timeout(Duration::from_secs(5), async {
-            while !application.link_throttle.locked(ip) {
+            while !application.link_throttle.locked(&bucket) {
                 tokio::task::yield_now().await;
             }
         })
@@ -2699,7 +2754,7 @@ mod push_preflight_tests {
         }
         drop(permits);
         let cleared = tokio::time::timeout(Duration::from_secs(5), async {
-            while application.link_throttle.locked(ip) {
+            while application.link_throttle.locked(&bucket) {
                 tokio::task::yield_now().await;
             }
         })
