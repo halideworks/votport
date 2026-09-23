@@ -276,7 +276,7 @@ function renderUpload(link, upload) {
         const url = window.URL.createObjectURL(new window.Blob([JSON.stringify(evidence, null, 2)], { type: 'application/json' }));
         const anchor = document.createElement('a'); anchor.href = url; anchor.download = `trade-route-${upload.id}.json`; anchor.click();
         setTimeout(() => window.URL.revokeObjectURL(url), 1000);
-      } catch (error) { await alertModal('Could not load route evidence', error.message); }
+      } catch (error) { alertModal(`Could not load route evidence: ${error.message}`); }
     }));
   }
   if (upload.partial) {
@@ -573,6 +573,7 @@ function renderLink(link) {
   }
   if (receiveAdministrator) {
     const retention = document.createElement('details');
+    retention.className = 'link-retention';
     retention.setAttribute('data-unsaved', '');
     const retentionSummary = node('summary', 'Upload retention');
     retention.append(retentionSummary);
@@ -812,7 +813,7 @@ async function refreshLinks({ append = false, fromPoll = false } = {}) {
 }
 
 function receptionEditing() {
-  return !!$('links').querySelector('.reception-workflow[open], .reception-workflow[data-dirty], .reception-workflow > button:disabled, .notification-details[open], .notification-details[data-dirty], .notification-details > button:disabled');
+  return !!$('links').querySelector('.reception-workflow[open], .reception-workflow[data-dirty], .reception-workflow > button:disabled, .link-retention[data-dirty], .link-retention > button:disabled, .notification-details[open], .notification-details[data-dirty], .notification-details > button:disabled');
 }
 
 let linksRevision = 0;

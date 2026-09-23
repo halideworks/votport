@@ -57,8 +57,8 @@ function downloadDocument(t, clicked) {
 test('download handoff probes first and leaves refused or unreachable downloads on the page', async (t) => {
   const clicks = [];
   downloadDocument(t, (link) => clicks.push(link));
-  let shown = null;
-  const showError = (message) => { shown = message; };
+  let shown = null, shownStatus = null;
+  const showError = (message, status) => { shown = message; shownStatus = status; };
   t.mock.method(globalThis, 'fetch', async (url, request) => {
     assert.equal(url, '/api/s/t/file');
     assert.equal(request.method, 'HEAD');
@@ -74,10 +74,12 @@ test('download handoff probes first and leaves refused or unreachable downloads 
   assert.equal(await triggerDownload('/api/s/t/file', 'report.pdf', showError), false);
   assert.equal(clicks.length, 1);
   assert.equal(shown, 'not found');
+  assert.equal(shownStatus, 404, 'The refusal status lets the page route a lost password cookie to its gate');
   t.mock.method(globalThis, 'fetch', async () => { throw new TypeError('lost'); });
   assert.equal(await triggerDownload('/api/s/t/file', 'report.pdf', showError), false);
   assert.equal(clicks.length, 1);
   assert.match(shown, /could not be reached/);
+  assert.equal(shownStatus, undefined);
 });
 
 test('anchor requests stop before the next click and report each handoff', async (t) => {

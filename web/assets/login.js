@@ -1,6 +1,6 @@
 // votport sign-in page. VOTPORT PROPRIETARY LICENSE.
 
-import { api } from '/assets/admin-common.js';
+import { api, landingPage } from '/assets/admin-common.js';
 import { collapseLocalPassword } from '/assets/login-disclosure.js';
 import { ssoErrorMessage } from '/assets/login-errors.js';
 import { $, fieldError } from '/assets/object-card.js';
@@ -16,7 +16,7 @@ $('login-form').addEventListener('submit', async (event) => {
       body: JSON.stringify({ password: $('login-password').value }),
     });
     $('login-password').value = '';
-    window.location.replace('/receive');
+    window.location.replace(landingPage(await api('/api/admin/session')));
   } catch (error) {
     loginError.show(error.message);
   }
@@ -24,8 +24,7 @@ $('login-form').addEventListener('submit', async (event) => {
 
 // Already-signed-in visitors skip the form entirely.
 try {
-  await api('/api/admin/session');
-  window.location.replace('/receive');
+  window.location.replace(landingPage(await api('/api/admin/session')));
 } catch {
   /* not signed in: stay here */
 }

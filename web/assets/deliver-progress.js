@@ -35,8 +35,8 @@ function count(done, total) {
   return total !== null && total !== undefined ? `${done ?? 0} of ${total}` : `${done ?? 0}`;
 }
 
-// Polls one preparation to a terminal state, rendering each in-flight
-// snapshot through `render`. The long ceiling matches the job's own idea
+// Polls one preparation to completion, rendering each in-flight snapshot
+// through `render`; a failed preparation throws the server's reason. The long ceiling matches the job's own idea
 // of a few minutes for big libraries; the 15-minute server TTL only
 // applies after a preparation reaches a terminal state.
 export async function pollDeliverPreparation(id, render, api) {
@@ -45,6 +45,7 @@ export async function pollDeliverPreparation(id, render, api) {
     const snapshot = await api(
       `/api/admin/outbound-grants/preparations/${encodeURIComponent(id)}`,
     );
+    if (snapshot.status === 'failed') throw new Error(preparationProgress(snapshot).text);
     if (snapshot.status !== 'preparing') return snapshot;
     render(snapshot);
     await new Promise((resolve) => setTimeout(resolve, 400));

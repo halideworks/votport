@@ -235,6 +235,49 @@ try {
   await page.goto(`${base}/deliver`);
   const grantCard = page.locator('#outbound-grants .card').filter({ has: page.getByRole('heading', { name: 'Keyboard grant', exact: true }) });
   await grantCard.waitFor();
+  const countedDirectory = `${grantDirectory}-counted`;
+  await fs.mkdir(path.join(root, 'library', countedDirectory));
+  for (const name of ['one.txt', 'two.txt']) await fs.writeFile(path.join(root, 'library', countedDirectory, name), `${name} fixture.`);
+  const counted = await request('admin/outbound-grants', { directory: countedDirectory, label: 'Counted grant' });
+  const countedToken = new URL(counted.url).pathname.split('/').pop();
+  const countedFile = await context.request.get(`${base}/api/s/${countedToken}/files/0`);
+  assert.equal(countedFile.status(), 200); await countedFile.body();
+  await page.reload();
+  const countedCard = page.locator('#outbound-grants .card').filter({ has: page.getByRole('heading', { name: 'Counted grant', exact: true }) });
+  await countedCard.getByText(/^1 file request\b/).waitFor();
+  // A link created while the first list read is still in flight appears
+  // once that read settles; the refresh it asked for is not dropped.
+  const queuedName = `${grantDirectory}-queued.txt`;
+  await fs.writeFile(path.join(root, 'library', queuedName), 'Queued refresh fixture.');
+  let releaseList, listHeld;
+  const heldList = new Promise((resolve) => { releaseList = resolve; }), listStarted = new Promise((resolve) => { listHeld = resolve; });
+  await page.route('**/api/admin/outbound-grants?*', async (route) => {
+    const response = await route.fetch(); listHeld(); await heldList; await route.fulfill({ response });
+  }, { times: 1 });
+  await page.goto(`${base}/deliver`); await listStarted;
+  await page.locator(`#library-files input[type=checkbox][value="${queuedName}"]`).check();
+  await page.locator('#deliver-label').fill('Queued refresh link');
+  await page.getByRole('button', { name: 'Create delivery link', exact: true }).click();
+  await page.locator('#outbound-result').waitFor();
+  releaseList();
+  await page.getByRole('heading', { name: 'Queued refresh link', exact: true }).waitFor();
+  const recipient = await context.newPage();
+  // HEAD responses carry no body, so the refusal is reported by status.
+  await recipient.route('**/api/s/*/files/1', (route) => route.request().method() === 'HEAD'
+    ? route.fulfill({ status: 429 })
+    : route.continue());
+  await recipient.goto(counted.url);
+  await recipient.getByRole('button', { name: /^Download file: (.*\/)?two\.txt$/ }).click();
+  await recipient.getByText('The download was refused (429).', { exact: true }).waitFor();
+  assert.ok(await recipient.locator('#download-content').isVisible(), 'One refused file leaves the delivery page usable');
+  assert.ok(await recipient.getByRole('button', { name: /^Download file: (.*\/)?one\.txt$/ }).isVisible());
+  // A revoked link answers 404 per file; the page re-reads the delivery and
+  // shows it as unavailable instead of a bare refusal.
+  await recipient.unroute('**/api/s/*/files/1');
+  await request(`admin/outbound-grants/${counted.grant.id}`, undefined, 'DELETE');
+  await recipient.getByRole('button', { name: /^Download file: (.*\/)?one\.txt$/ }).click();
+  await recipient.getByText('This delivery link was not found or has expired.', { exact: true }).waitFor();
+  await recipient.close();
   await page.route('**/api/admin/outbound-grants?*', async (route) => {
     const response = await route.fetch();
     await page.locator('#global-search-input').focus();

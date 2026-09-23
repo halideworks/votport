@@ -131,6 +131,10 @@ try {
   await page.locator(`#job-${issued.job.id}`).waitFor();
   await page.locator(`#job-${issued.job.id}`).getByRole('button', { name: 'Copy delivery link', exact: true }).waitFor({ state: 'hidden' });
   assert.equal(await page.locator(`#job-${issued.job.id}`).getByRole('button', { name: 'Copy delivery link', exact: true }).count(), 0, 'Changed project rules must remove the cached link');
+  await page.goto(`${base}/workflows#job-${'0'.repeat(32)}`);
+  await page.locator('#workflow-filter-status', { hasText: /The linked delivery could not be shown: / }).waitFor();
+  assert.ok(await page.locator(`#job-${issued.job.id}`).isVisible(), 'An unreadable linked delivery leaves the list in place');
+  await page.goto(`${base}/workflows`); await page.locator(`#job-${issued.job.id}`).waitFor();
   await page.route('**/api/workflows/jobs?*', async (route) => {
     const response = await route.fetch(), body = await response.json();
     body.jobs = body.jobs.filter(({ job }) => job.id !== issued.job.id);
@@ -663,6 +667,20 @@ try {
   assert.equal(listReads, 2, 'The deferred refresh runs after editing finishes');
   await page.unroute('**/api/admin/status?*'); await page.unroute('**/api/admin/links?*'); await page.unroute(`**/api/admin/links/${incoming.id}`);
 
+  const retention = card.locator('.link-retention');
+  await retention.evaluate((node) => { node.open = true; });
+  await retention.locator('input[type=number]').fill('45');
+  await Promise.all([page.waitForResponse('**/api/admin/links?*'), page.click('#links-refresh')]);
+  // The response arrives before the list renders; the old defect threw
+  // during that render, so give it a moment before asserting.
+  await page.waitForTimeout(200);
+  assert.equal(await page.locator('#links-error').isHidden(), true, 'A dirty retention edit does not break the refresh');
+  assert.equal(await page.locator(`#link-${incoming.id}`).count(), 1, 'The edited card is still listed');
+  assert.equal(await retention.locator('input[type=number]').inputValue(), '45', 'A dirty retention edit survives a refresh');
+  await retention.locator('input[type=number]').fill('');
+  await retention.getByRole('button', { name: 'Save retention' }).click();
+  await retention.getByText(/^Saved\./).waitFor();
+  await retention.evaluate((node) => { node.open = false; });
   await editor.evaluate((node) => { node.open = true; });
   await editor.locator('input[data-metadata]').fill('Preserved by manual refresh');
   await page.click('#links-refresh'); await page.waitForLoadState('networkidle');

@@ -54,17 +54,18 @@ test('a failed preparation carries the server error for the page to show', () =>
   assert.equal(view.text, 'library file vanished');
 });
 
-test('preparation polling renders in-flight snapshots and returns either terminal state', async (t) => {
+test('preparation polling renders in-flight snapshots, returns completion and throws the failure reason', async (t) => {
   t.mock.method(globalThis, 'setTimeout', (done) => { done(); });
   for (const status of ['complete', 'failed']) {
-    const snapshots = [{ status: 'preparing', files_done: 1 }, { status, error: status === 'failed' ? 'unavailable' : undefined }];
+    const snapshots = [{ status: 'preparing', files_done: 1 }, { status, error: status === 'failed' ? 'library file vanished' : undefined }];
     const rendered = [];
     let requests = 0;
-    const result = await pollDeliverPreparation('id/with space', (snapshot) => rendered.push(snapshot), async (url) => {
+    const poll = pollDeliverPreparation('id/with space', (snapshot) => rendered.push(snapshot), async (url) => {
       assert.equal(url, '/api/admin/outbound-grants/preparations/id%2Fwith%20space');
       return snapshots[requests++];
     });
-    assert.equal(result, snapshots[1]);
+    if (status === 'failed') await assert.rejects(poll, { message: 'library file vanished' });
+    else assert.equal(await poll, snapshots[1]);
     assert.deepEqual(rendered, [snapshots[0]]);
     assert.equal(requests, 2);
   }

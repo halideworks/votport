@@ -210,6 +210,14 @@ try {
   const receivedJobs = await until(() => destination('workflows/jobs'), (v) => v.jobs.some((v) => v.job.received?.link_id === receiveId && v.job.state === 'awaiting_approval'));
   await source(`trade-routes/${route.id}/test`, {}); await page.click('#trade-refresh');
   await outgoingCard.getByText('Recent deliveries', { exact: true }).click(); await outgoingCard.getByText(/Received and verified · Held for approval/).waitFor();
+  // Incoming rows carry the reception state as workflow, not state.
+  await receiving.route(`${peer}/api/trade-routes`, async (r) => {
+    const response = await r.fetch(), body = await response.json();
+    for (const rows of Object.values(body.deliveries)) for (const row of rows) if ('workflow' in row) row.workflow = 'failed';
+    await r.fulfill({ response, json: body });
+  });
+  await receiving.reload(); await incomingCard.getByText('1 failed or retrying recent delivery', { exact: true }).waitFor();
+  await receiving.unroute(`${peer}/api/trade-routes`);
   const receivedJob = receivedJobs.jobs.find((v) => v.job.received?.link_id === receiveId).job;
   await destination(`workflows/jobs/${receivedJob.id}`, { action: 'approve', manifest: receivedJob.manifest });
   await source(`trade-routes/${route.id}/test`, {}); await page.click('#trade-refresh'); await outgoingCard.getByText('Recent deliveries', { exact: true }).click(); await outgoingCard.getByText(/Received and verified · Released/).waitFor();

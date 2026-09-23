@@ -235,8 +235,11 @@ async function refreshJobs(more = false, background = false, discardEdits = fals
   const requested = /^#job-([a-f0-9]{32})$/.exec(window.location.hash)?.[1];
   const params = new URLSearchParams({ ...jobFilter, limit: '50', after: more ? cursor || '' : '' });
   const page = await api(`/api/workflows/jobs?${params}`);
+  let requestedNote = '';
   if (!more && requested && !page.jobs.some(({ job }) => job.id === requested)) {
-    page.jobs.unshift(await api(`/api/workflows/jobs/${requested}`));
+    // A linked delivery from another tenant or project must not hide the list.
+    try { page.jobs.unshift(await api(`/api/workflows/jobs/${requested}`)); }
+    catch (error) { requestedNote = ` The linked delivery could not be shown: ${error.message}`; }
   }
   if (revision !== jobsRevision) return false;
   if (background && editingJob()) { schedulePoll(); return false; }
@@ -255,7 +258,7 @@ async function refreshJobs(more = false, background = false, discardEdits = fals
   const pagingNote = appendedJobs
     ? ' Updates paused while older deliveries are shown. Refresh to resume.'
     : wasAppended ? ' Updates resumed.' : '';
-  $('workflow-filter-status').textContent = `${jobs.length}${cursor ? '+' : ''} ${jobs.length === 1 ? 'delivery' : 'deliveries'}${Object.values(jobFilter).some(Boolean) ? ' matching these filters' : ''}${pagingNote}`;
+  $('workflow-filter-status').textContent = `${jobs.length}${cursor ? '+' : ''} ${jobs.length === 1 ? 'delivery' : 'deliveries'}${Object.values(jobFilter).some(Boolean) ? ' matching these filters' : ''}${pagingNote}${requestedNote}`;
   if (!jobs.length && Object.values(jobFilter).some(Boolean)) list.append(empty('No deliveries match', 'Try another name, project or status.', button('Clear filters', 'ghost', () => clearFilters())));
   else if (!jobs.length) list.append(empty('Every delivery, in one place', 'Create a delivery to follow preparation, approvals, storage exports, and recipient acceptance.', button('Create delivery', '', () => guard(() => newDelivery()))));
   for (const entry of jobs) {
