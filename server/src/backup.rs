@@ -868,6 +868,18 @@ fn publish_new(source: &Path, destination: &Path) -> Result<(), String> {
     fs::remove_file(source).map_err(|e| e.to_string())
 }
 
+/// Retires the standby's status file once this directory boots as the live
+/// instance. The file marks a promotion: while it exists every boot only
+/// validates the schema instead of migrating, so a promoted primary would
+/// refuse the next upgrade, and the metrics would keep reporting standby lag.
+pub(crate) fn retire_standby_status(data_dir: &Path) -> Result<(), String> {
+    match fs::remove_file(data_dir.join(crate::standby::STATUS_FILE)) {
+        Ok(()) => sync_directory(data_dir),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("remove the standby status file: {error}")),
+    }
+}
+
 fn sync_directory(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -1261,8 +1273,11 @@ fn prepare_restored_database(
                 rusqlite::params![key, value, at],
             ).map_err(|e| e.to_string())?;
         }
+        // Tenant and link retention narrow the platform value, so all three
+        // scopes are cleared or the sweep keeps deleting after a restore.
         transaction.execute_batch(
-            "UPDATE links SET active=0;
+            "UPDATE links SET active=0, retention_days=NULL;
+             UPDATE tenants SET retention_days=NULL;
              DELETE FROM upload_session_files;
              DELETE FROM upload_sessions;
              DELETE FROM outbound_fetch_tickets;
@@ -1575,15 +1590,32 @@ pub(crate) fn survey_restored_payloads(store: &crate::store::Store, receive_dir:
         .map(|(tenant, stored_as)| crate::paths::stored_components(tenant, stored_as).join("/"))
         .collect();
     let mut on_disk = HashSet::new();
-    collect_payload_files(receive_dir, "", &mut on_disk);
-    let missing: Vec<&String> = referenced.difference(&on_disk).collect();
+    let mut unreadable = Vec::new();
+    let walked = collect_payload_files(receive_dir, "", &mut on_disk, &mut unreadable)
+        .map_err(|error| tracing::warn!(%error, "restored payload survey could not read the receive tree"))
+        .is_ok();
+    // A folder the service may not list (lost+found, System Volume
+    // Information) says nothing about the records under it.
+    let missing: Vec<&String> = referenced
+        .difference(&on_disk)
+        .filter(|path| {
+            !unreadable
+                .iter()
+                .any(|prefix| path.starts_with(&format!("{prefix}/")))
+        })
+        .collect();
     let unreferenced: Vec<&String> = on_disk.difference(&referenced).collect();
+    // A tree that could not be read, or that holds no payload at all while
+    // live records exist, is a volume that is not there yet (unmounted, not
+    // restored), not proof every payload is gone; tombstoning then would
+    // erase the index permanently. Report only.
+    let trusted = walked && !(on_disk.is_empty() && !records.is_empty());
     // Audit finding 373: a restored record whose payload is gone would stay
     // listed, charged against quota and targeted by retention on a path that
     // no longer holds its bytes. Tombstone the stat-misses now, while the
     // restored database is still closed to sessions.
     let mut tombstoned = 0usize;
-    if !missing.is_empty() {
+    if trusted && !missing.is_empty() {
         let missing_set: HashSet<&String> = missing.iter().copied().collect();
         let stale: Vec<(&String, &String)> = records
             .iter()
@@ -1618,6 +1650,8 @@ pub(crate) fn survey_restored_payloads(store: &crate::store::Store, receive_dir:
         "unreferenced_count": unreferenced.len(),
         "unreferenced": sample_names(&unreferenced),
         "tombstoned": tombstoned,
+        "receive_tree_trusted": trusted,
+        "unreadable": unreadable.iter().take(8).collect::<Vec<_>>(),
     });
     tracing::warn!(
         target: "audit",
@@ -1633,14 +1667,27 @@ pub(crate) fn survey_restored_payloads(store: &crate::store::Store, receive_dir:
 /// Every payload file under the receive root, as receive-root-relative
 /// paths. Upload staging and the instance lease are machinery, not payloads;
 /// a receipt sidecar rides with its payload, so only the payload is named.
-fn collect_payload_files(directory: &Path, prefix: &str, out: &mut HashSet<String>) {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
+fn collect_payload_files(
+    directory: &Path,
+    prefix: &str,
+    out: &mut HashSet<String>,
+    unreadable: &mut Vec<String>,
+) -> std::io::Result<()> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        // Below the root, a folder the service may not list is noted and
+        // skipped; any other failure, or an unreadable root, stops the walk.
+        Err(error)
+            if !prefix.is_empty() && error.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            unreadable.push(prefix.to_owned());
+            return Ok(());
+        }
+        Err(error) => return Err(error),
     };
-    for entry in entries.flatten() {
-        let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
-            continue;
-        };
+    for entry in entries {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
         let Ok(name) = entry.file_name().into_string() else {
             continue;
         };
@@ -1659,11 +1706,12 @@ fn collect_payload_files(directory: &Path, prefix: &str, out: &mut HashSet<Strin
             format!("{prefix}/{name}")
         };
         if directory {
-            collect_payload_files(&entry.path(), &relative, out);
+            collect_payload_files(&entry.path(), &relative, out, unreadable)?;
         } else if file {
             out.insert(relative);
         }
     }
+    Ok(())
 }
 
 /// Bounds the audit row: a wide mismatch still names a inspectable sample.
@@ -1782,6 +1830,24 @@ fn prune_local_root_protected_at(
         }
     }
     Ok(())
+}
+
+/// While the remote copy of a Both backup keeps failing, each retry adds a
+/// full local archive. Keeps every archive from before the last complete
+/// run untouched, as the restore points the outage must not rotate away,
+/// and of the archives taken since, only the newest (`keep`).
+fn prune_outage_copies(root: &Path, last_success: u64, keep: &str) -> Result<(), String> {
+    for (name, _, created, path) in local_files(root)? {
+        // Whole seconds, like the recorded success, so the archive of that
+        // successful run is never mistaken for a copy taken after it.
+        let created = created
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        if name != keep && created > last_success {
+            fs::remove_file(&path).map_err(|e| e.to_string())?;
+        }
+    }
+    sync_directory(root)
 }
 
 fn local_files(root: &Path) -> Result<Vec<(String, u64, SystemTime, PathBuf)>, String> {
@@ -2295,9 +2361,7 @@ async fn run_inner(
     } else {
         0
     };
-    if matches!(config.destination, Destination::Local | Destination::Both) {
-        final_cleanup.keep();
-        copies_complete = config.destination == Destination::Local;
+    let prune_local = |copies_complete| {
         prune_local_root_protected_at(
             &backups,
             retention_days,
@@ -2305,13 +2369,42 @@ async fn run_inner(
             Some(&id),
             UNIX_EPOCH + std::time::Duration::from_secs(retention.effective_at),
         )
-        .map_err(|error| RunFailure::after(error, copies_complete))?;
+        .map_err(|error| RunFailure::after(error, copies_complete))
+    };
+    if matches!(config.destination, Destination::Local | Destination::Both) {
+        final_cleanup.keep();
+        copies_complete = config.destination == Destination::Local;
+    }
+    if config.destination == Destination::Local {
+        prune_local(copies_complete)?;
     }
     if matches!(config.destination, Destination::S3 | Destination::Both) {
-        upload_s3(&config, &secrets, &final_path, &id)
-            .await
-            .map_err(|error| RunFailure::after(error, copies_complete))?;
+        if let Err(error) = upload_s3(&config, &secrets, &final_path, &id).await {
+            if config.destination == Destination::Both {
+                let last_success = read_status(&app.config.data_dir)
+                    .ok()
+                    .and_then(|status| status.last_success_at);
+                // With no complete run on record (after a restore, or an
+                // unreadable status) nothing marks where the outage began,
+                // so the ordinary count and age rule bounds the copies.
+                let pruned = match last_success {
+                    Some(at) => prune_outage_copies(&backups, at, &id),
+                    None => prune_local(false).map_err(|failure| failure.message),
+                };
+                if let Err(prune) = pruned {
+                    tracing::warn!(error = %prune, "local backups taken during the remote outage could not be pruned");
+                }
+            }
+            return Err(RunFailure::after(error, copies_complete));
+        }
         copies_complete = true;
+    }
+    // With both destinations, local archives rotate only once the remote
+    // copy exists: a failing remote is retried every few minutes, and
+    // pruning by count on each retry would replace every pre-outage restore
+    // point with copies of the current state.
+    if config.destination == Destination::Both {
+        prune_local(copies_complete)?;
     }
     if matches!(config.destination, Destination::S3) {
         fs::remove_file(&final_path).map_err(|error| RunFailure::after(error, copies_complete))?;
@@ -2697,6 +2790,96 @@ mod tests {
             1,
             "an agreeing tree writes no further row"
         );
+    }
+
+    /// A promoted standby boots as the live instance with its status file
+    /// still in place; while it exists every boot skips schema migrations, so
+    /// the live boot retires it and later boots migrate normally.
+    #[test]
+    fn a_live_boot_retires_the_standby_status_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = crate::api::testing::config(directory.path());
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        crate::paths::tighten_private_dir(&config.data_dir).unwrap();
+        drop(crate::store::Store::open(&config.data_dir).unwrap());
+        let status = config.data_dir.join(crate::standby::STATUS_FILE);
+        fs::write(&status, b"{}").unwrap();
+        let app = crate::app::build(config).unwrap();
+        assert!(!status.exists(), "the live boot retired the standby status");
+        drop(app);
+        // A second boot with nothing to retire is fine.
+        retire_standby_status(directory.path().join("data").as_path()).unwrap();
+    }
+
+    /// A receive volume that is not mounted yet at the restore boot shows as
+    /// an empty or unreadable tree; tombstoning then would permanently erase
+    /// the index of payloads that are still on the NAS. Report, never erase.
+    #[cfg(unix)]
+    #[test]
+    fn restored_payload_survey_keeps_records_when_the_tree_is_empty_or_unreadable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (root, store) = initialized_root();
+        let receive = root.path().join("received");
+        std::fs::create_dir_all(&receive).unwrap();
+        store
+            .with(|connection| {
+                connection.execute_batch(
+                    "INSERT INTO files(link_id,tenant,upload_id,file_index,bytes_hi,bytes_lo,
+                        deleted,stored_as,path,suite,root,receipt)
+                     VALUES ('link','','upload',0,0,20,0,'sub/kept.bin','sub/kept.bin','md5','root',0),
+                            ('link','','upload',1,0,20,0,'gone.bin','gone.bin','md5','root',0)",
+                )
+            })
+            .unwrap();
+        let live = |store: &crate::store::Store| {
+            store
+                .with(|connection| {
+                    connection.query_row(
+                        "SELECT COUNT(*) FROM files WHERE deleted = 0",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                })
+                .unwrap()
+        };
+        let latest = |store: &crate::store::Store| {
+            store
+                .audit_export(None, 0, 0, 100)
+                .unwrap()
+                .into_iter()
+                .rfind(|row| row.event == "restore_payload_mismatch")
+                .expect("the gap is reported")
+                .detail
+        };
+        // An empty mountpoint: nothing is tombstoned, the gap is reported.
+        survey_restored_payloads(&store, &receive);
+        assert_eq!(live(&store), 2);
+        assert_eq!(latest(&store)["receive_tree_trusted"], false);
+        assert_eq!(latest(&store)["tombstoned"], 0);
+        // A subfolder the service may not list (lost+found on a volume root)
+        // keeps the records under it, while the rest still reconciles.
+        std::fs::create_dir_all(receive.join("sub")).unwrap();
+        fs::write(receive.join("other.bin"), [0u8; 8]).unwrap();
+        fs::set_permissions(receive.join("sub"), fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = fs::read_dir(receive.join("sub")).is_ok();
+        if !readable {
+            survey_restored_payloads(&store, &receive);
+        }
+        fs::set_permissions(receive.join("sub"), fs::Permissions::from_mode(0o700)).unwrap();
+        if readable {
+            // Running with privileges that ignore the mode; nothing to prove.
+            return;
+        }
+        assert_eq!(
+            live(&store),
+            1,
+            "gone.bin is tombstoned, sub/kept.bin is kept"
+        );
+        let detail = latest(&store);
+        assert_eq!(detail["tombstoned"], 1);
+        assert_eq!(detail["receive_tree_trusted"], true);
+        assert_eq!(detail["unreadable"][0], "sub");
     }
 
     /// Audit finding 373: the survey must tombstone the live records whose
@@ -4107,7 +4290,10 @@ mod tests {
                  INSERT INTO inbound_routes(id,tenant,link_id,issuer,operation_id,source,ancestry,created_at) VALUES ('inbound','','link','peer','operation','{}','[]',1);
                  INSERT INTO outbound_fetch_tickets(token_id,grant_id,manifest_root,expires_at) VALUES ('ticket','grant','root',9223372036854775807);
                  INSERT INTO upload_sessions(id,link_id,tenant,dest_dir,dest_rel,package_suite,package_root,package_length,started_at,created_at) VALUES ('session','link','','dir','dir',1,'root',1,1,1);
-                 INSERT INTO upload_session_files(session_id,entry,display_path,stored_components,object_suite,object_root,object_length,staging_path,journal_path,incarnation) VALUES ('session',0,'file','[]',1,'root',1,'stage','journal','incarnation');"
+                 INSERT INTO upload_session_files(session_id,entry,display_path,stored_components,object_suite,object_root,object_length,staging_path,journal_path,incarnation) VALUES ('session',0,'file','[]',1,'root',1,'stage','journal','incarnation');
+                 INSERT OR IGNORE INTO tenants(key,incarnation,label,created_at) VALUES ('retained','retained-1','Retained',1);
+                 UPDATE tenants SET retention_days=30;
+                 UPDATE links SET retention_days=30;"
             )).unwrap();
             let archive = root.path().join("restore.tar");
             create_archive(&store, root.path(), &archive, crate::store::SCHEMA_VERSION).unwrap();
@@ -4179,6 +4365,19 @@ mod tests {
                     })
                 );
             }
+            // Tenant and link retention narrow the platform value, so a
+            // historical restore clears them too.
+            let scoped: Vec<Option<i64>> = store
+                .with(|c| {
+                    c.prepare("SELECT retention_days FROM links UNION ALL SELECT retention_days FROM tenants")?
+                        .query_map([], |row| row.get(0))?
+                        .collect()
+                })
+                .unwrap();
+            assert!(scoped.len() >= 2);
+            assert!(scoped
+                .iter()
+                .all(|days| *days == if historical { None } else { Some(30) }));
             for (job, source, token) in &jobs {
                 let restored = store.delivery_job(&job.id).unwrap().unwrap();
                 assert_eq!(store.delivery_job_token("", &job.id).unwrap(), *token);
@@ -4736,6 +4935,7 @@ mod tests {
                 s3_bucket: Some("backups".into()),
                 s3_region: Some("us-east-1".into()),
                 s3_path_style: true,
+                retention_count: 1,
                 ..BackupConfig::default()
             };
             write_status(
@@ -4772,6 +4972,43 @@ mod tests {
             let attempt = failed.last_attempt_at.unwrap();
             assert!(!scheduler_due(&config, &failed, attempt + 299));
             assert!(scheduler_due(&config, &failed, attempt + 300));
+            // A retry against the still-failing remote leaves the restore
+            // points from before the last complete run alone, and keeps only
+            // the newest of the copies taken during the outage: rotating by
+            // count would replace the pre-outage points, and keeping every
+            // retry would fill the data volume.
+            let root = config.local_root(&app.config.data_dir).unwrap();
+            let pre_outage = previous.map(|at| {
+                let path = root.join(format!("votport-backup-v2-{at}-{}.tar", "a".repeat(32)));
+                fs::write(&path, b"pre-outage").unwrap();
+                fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    // Written within the second the success was recorded in,
+                    // which the whole-second comparison keeps as pre-outage.
+                    .set_modified(UNIX_EPOCH + std::time::Duration::from_millis(at * 1000 + 400))
+                    .unwrap();
+                path
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            let secrets = BackupSecrets {
+                access_key_id: Some("test-key".into()),
+                secret_access_key: Some("test-secret".into()),
+                ..BackupSecrets::default()
+            };
+            tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                run(Arc::clone(&app), config.clone(), secrets),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            let kept = local_files(&root).unwrap();
+            assert_eq!(kept.len(), 1 + usize::from(pre_outage.is_some()));
+            if let Some(path) = &pre_outage {
+                assert!(path.exists(), "the pre-outage restore point is kept");
+            }
             let local = BackupConfig {
                 destination: Destination::Local,
                 ..config
