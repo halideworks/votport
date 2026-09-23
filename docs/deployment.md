@@ -305,6 +305,16 @@ objects, including unrelated objects under that prefix. Use a dedicated backup
 prefix. A failed or oversized listing deletes no remote snapshots. If other
 maintenance repeatedly blocks the scheduler for a configured backup interval,
 it logs a warning, at most once per interval, while continuing to wait.
+With destination Both, local snapshots are pruned only after the S3 copy
+succeeds, so a remote outage does not rotate away older local restore points;
+while it fails, only the newest local copy taken during the outage is kept
+beside them.
+
+An archive holds the whole database and the signing keys: the SMTP password,
+notification tokens, storage connection credentials, webhook and trade route
+secrets, `receipt.key` and `push-issuer.key`. Without encryption they are in
+clear in every copy, and anyone who can read the bucket can sign receipts as
+this port. Turn encryption on for any S3 or shared destination.
 Keep an external recovery copy of the encryption passphrase. An
 encrypted archive is unrecoverable without it, and storing that passphrase in
 the same deployment backup defeats recovery isolation.
@@ -415,7 +425,8 @@ Trade connections require new invitations. Delivery jobs remain visible as
 evidence remain. Pending transfers and route-control messages do not resume.
 
 Automatic backups, received-file retention, storage exports, notifications and
-webhooks stay disabled until an administrator reviews and re-enables them.
+webhooks stay disabled until an administrator reviews and re-enables them;
+retention is cleared at the platform, tenant and link scopes alike.
 Backup schedule, destination and encryption settings are preserved from the
 snapshot. Backup credentials, the encryption passphrase and previous run status
 are cleared during activation; re-enter secrets before running encrypted or
