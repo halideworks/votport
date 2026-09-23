@@ -179,14 +179,21 @@ fn enqueue(
     Ok(path)
 }
 
-fn cache(directory: &Path, id: &str, base: &str, evidence: &Evidence) -> Result<()> {
+/// Keeps a sent statement. A cached Verified statement keeps its share
+/// token: it is the only copy left once the outbox entry is sent, and
+/// accepting near the authorization's expiry refreshes with that token.
+fn cache(
+    directory: &Path,
+    id: &str,
+    base: &str,
+    evidence: &Evidence,
+    token: Option<String>,
+) -> Result<()> {
     create_directory(directory)?;
     let bytes = serde_json::to_vec(&Pending {
         base: base.into(),
         evidence: evidence.clone(),
-        // Cached copies (accepted statements, retry sources) are never
-        // refreshed, so they carry no share token.
-        token: None,
+        token,
     })
     .map_err(|e| Error::Other(e.to_string()))?;
     identity::write_private(&directory.join(format!("{id}.json")), &bytes)
@@ -213,6 +220,7 @@ fn send_pending(path: &Path) -> Result<()> {
             &pending.evidence.id(),
             &pending.base,
             &pending.evidence,
+            pending.token.clone(),
         )?;
     }
     let recorded = directory.join("recorded");
@@ -339,7 +347,13 @@ fn accept_in(directory: &Path, id: &str, device: &Device) -> Result<String> {
         EvidenceKind::Accepted,
         &device.signing_key(),
     );
-    cache(&directory.join("accepted"), id, &pending.base, &evidence)?;
+    cache(
+        &directory.join("accepted"),
+        id,
+        &pending.base,
+        &evidence,
+        None,
+    )?;
     let path = enqueue(&pending.base, evidence, pending.token, directory)?;
     let status = if send_pending(&path).is_ok() {
         "recorded"
@@ -733,6 +747,7 @@ mod tests {
             &verified.id(),
             base,
             &verified,
+            None,
         )
         .unwrap();
         cache(
@@ -740,6 +755,7 @@ mod tests {
             &verified.id(),
             base,
             &accepted,
+            None,
         )
         .unwrap();
         assert_eq!(report_status(dir.path(), &accepted.id()), "unavailable");
@@ -984,6 +1000,58 @@ mod tests {
             accepted.evidence.authorization.challenge.expires_at,
             fresh.challenge.expires_at
         );
+    }
+
+    /// Once the Verified statement is sent, the cached copy is the only one
+    /// left; it keeps the share token so a late Accept can still refresh.
+    #[test]
+    fn a_sent_verification_still_refreshes_a_near_expiry_acceptance() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = Device::load_or_create_in(&dir.path().join("device")).unwrap();
+        let outbox = dir.path().join("outbox");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (original, id) = near_expiry_pending(&outbox, &base, &device, 100, Some("tok".into()));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let fresh = SignedChallenge::issue(
+            Challenge {
+                origin: original.authorization.challenge.origin.clone(),
+                grant_id: "grant".into(),
+                manifest: "manifest".into(),
+                holder: device.holder_key_hex(),
+                nonce: "fresh".into(),
+                issued_at: now,
+                expires_at: now + 7 * 86400,
+            },
+            &ed25519_dalek::SigningKey::from_bytes(&[1; 32]),
+        );
+        let accepted_id =
+            Evidence::sign(fresh.clone(), EvidenceKind::Accepted, &device.signing_key()).id();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = serve_refresh_then_submit(
+            listener,
+            vec![
+                (
+                    200,
+                    serde_json::json!({"id": id, "recorded": true}).to_string(),
+                ),
+                (200, serde_json::to_value(&fresh).unwrap().to_string()),
+                (
+                    200,
+                    serde_json::json!({"id": accepted_id, "recorded": true}).to_string(),
+                ),
+            ],
+            std::sync::Arc::clone(&seen),
+        );
+        send_pending(&outbox.join(format!("{id}.json"))).unwrap();
+        assert!(!outbox.join(format!("{id}.json")).exists());
+        assert_eq!(accept_in(&outbox, &id, &device).unwrap(), "recorded");
+        server.join().unwrap();
+        let requests = seen.lock().unwrap().clone();
+        assert!(requests[1].0.ends_with("/api/s/tok/evidence-challenge"));
     }
 
     #[test]

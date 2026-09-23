@@ -53,7 +53,7 @@ public sealed class TransferItem : INotifyPropertyChanged
     public bool NeedsPassword
     {
         get => needsPassword;
-        set { needsPassword = value; Changed(); Changed(nameof(ShowPassword)); }
+        set { needsPassword = value; Changed(); Changed(nameof(ShowPassword)); Changed(nameof(CanResumeNow)); }
     }
 
     /// A transfer the journal held at launch, cut by a quit or a failure and
@@ -68,7 +68,7 @@ public sealed class TransferItem : INotifyPropertyChanged
     public bool Journalled
     {
         get => journalled;
-        set { journalled = value; Changed(); Changed(nameof(CanResume)); Changed(nameof(ShowPassword)); }
+        set { journalled = value; Changed(); Changed(nameof(CanResume)); Changed(nameof(ShowPassword)); Changed(nameof(CanResumeNow)); }
     }
 
     public bool CanResume => !running && journalled;
@@ -111,7 +111,7 @@ public sealed class TransferItem : INotifyPropertyChanged
     public bool Running
     {
         get => running;
-        set { running = value; Changed(); Changed(nameof(NotRunning)); Changed(nameof(CanResume)); Changed(nameof(ShowPassword)); Changed(nameof(CanReveal)); Changed(nameof(CanResumeNow)); }
+        set { running = value; Changed(); Changed(nameof(NotRunning)); Changed(nameof(CanResume)); Changed(nameof(ShowPassword)); Changed(nameof(CanReveal)); Changed(nameof(CanResumeNow)); Changed(nameof(Status)); }
     }
 
     public bool NotRunning => !running;

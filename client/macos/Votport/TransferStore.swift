@@ -289,7 +289,8 @@ final class TransferStore: ObservableObject {
     func finished(_ id: UUID, landed: [String]) {
         guard let index = items.firstIndex(where: { $0.id == id }) else { return }
         items[index].running = false
-        Power.transfer(false)
+        // Another transfer may still be moving bytes.
+        Power.transfer(!active.isEmpty)
         if let handle = handles[id] {
             items[index].journalId = handle.journalId()
             // The core keeps the entry only for a failure worth trying again,

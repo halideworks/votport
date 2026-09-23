@@ -188,7 +188,7 @@ impl WatchAdmission {
             .ok_or_else(|| Error::AlreadyShipping {
                 path: path.to_owned(),
             })?;
-        if self.key.0 != watch_id || self.key.1 != path || flight.0 != path {
+        if self.key.0 != watch_id || self.key.1 != path || flight.path != path {
             pending_remove(&self.key);
             drop(flight);
             return Err(Error::Other("watch admission path changed".to_owned()));
@@ -310,7 +310,7 @@ fn scan(
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with('.') || name == SHIPPED {
+        if name.starts_with('.') || name.eq_ignore_ascii_case(SHIPPED) {
             continue;
         }
         let path = entry.path();
@@ -354,7 +354,7 @@ fn scan(
 /// cannot be read counts as one entry, so the drop still settles and the
 /// send says what is wrong rather than the watcher staying silent. Symlinks
 /// are skipped before metadata traversal.
-fn fingerprint(path: &Path) -> Option<(u64, u64, Option<SystemTime>)> {
+pub(crate) fn fingerprint(path: &Path) -> Option<(u64, u64, Option<SystemTime>)> {
     let meta = std::fs::symlink_metadata(path).ok()?;
     let mut count = 0;
     let mut bytes = 0;
@@ -423,8 +423,77 @@ static ADMISSION_RECHECK_GATE: Mutex<Option<AdmissionGate>> = Mutex::new(None);
 #[cfg(test)]
 static ADMISSION_RELEASE_GATE: Mutex<Option<AdmissionGate>> = Mutex::new(None);
 
-/// Holds a path in flight; dropping it releases the path.
-pub(crate) struct Flight(String, bool);
+/// Holds a path in flight; dropping it releases the path. The file is an OS
+/// lock in the shared state folder: the app and the CLI both ship from it,
+/// so the in-memory set alone let two processes ship one drop.
+pub(crate) struct Flight {
+    path: String,
+    watched: bool,
+    _lock: Option<std::fs::File>,
+}
+
+/// The outcome of claiming a path across processes.
+enum Claim {
+    /// Ours; the lock is held until the file closes. `None` when the state
+    /// folder could not hold a lock, which leaves the in-process guard.
+    Free(Option<std::fs::File>),
+    /// Another process is shipping it.
+    Held,
+}
+
+fn flight_lock_path(path: &str) -> PathBuf {
+    use sha2::Digest as _;
+    // ponytail: one small lock file per shipped path is never removed, since
+    // unlinking a lock another process may be opening splits the lock.
+    state_dir().join("flights").join(format!(
+        "{}.lock",
+        hex::encode(sha2::Sha256::digest(path.as_bytes()))
+    ))
+}
+
+fn claim_across_processes(path: &str) -> Claim {
+    let lock = flight_lock_path(path);
+    let opened = lock
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock)
+        });
+    let Ok(file) = opened else {
+        return Claim::Free(None);
+    };
+    // Another process's `shipping_elsewhere` probe holds the lock for an
+    // instant; a few short retries tell that apart from a real ship.
+    for attempt in 0..3 {
+        match fs4::FileExt::try_lock(&file) {
+            Ok(()) => return Claim::Free(Some(file)),
+            Err(fs4::TryLockError::WouldBlock) if attempt < 2 => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(fs4::TryLockError::WouldBlock) => return Claim::Held,
+            Err(fs4::TryLockError::Error(_)) => return Claim::Free(None),
+        }
+    }
+    Claim::Held
+}
+
+/// Whether another process is shipping `path` right now; a path this
+/// process holds is not "elsewhere".
+pub(crate) fn shipping_elsewhere(path: &str) -> bool {
+    // Held across the probe, so a claim this process makes meanwhile is
+    // neither refused by the probe nor read as another process's.
+    let guard = IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.as_ref().is_some_and(|set| set.contains(path)) {
+        return false;
+    }
+    matches!(claim_across_processes(path), Claim::Held)
+}
 
 impl Drop for Flight {
     fn drop(&mut self) {
@@ -433,9 +502,9 @@ impl Drop for Flight {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_mut()
         {
-            set.remove(&self.0);
+            set.remove(&self.path);
         }
-        if self.1 {
+        if self.watched {
             WATCH_IN_FLIGHT.fetch_sub(1, Ordering::Release);
         }
     }
@@ -456,7 +525,19 @@ pub(crate) fn single_flight(path: &str) -> Result<Flight> {
             path: path.to_owned(),
         });
     }
-    Ok(Flight(path.to_owned(), false))
+    match claim_across_processes(path) {
+        Claim::Free(lock) => Ok(Flight {
+            path: path.to_owned(),
+            watched: false,
+            _lock: lock,
+        }),
+        Claim::Held => {
+            set.remove(path);
+            Err(Error::AlreadyShipping {
+                path: path.to_owned(),
+            })
+        }
+    }
 }
 
 fn try_admit(watch_id: &str, path: &str) -> Option<Arc<WatchAdmission>> {
@@ -469,8 +550,16 @@ fn try_admit(watch_id: &str, path: &str) -> Option<Arc<WatchAdmission>> {
         {
             return None;
         }
+        let Claim::Free(lock) = claim_across_processes(path) else {
+            set.remove(path);
+            return None;
+        };
         let admission = Arc::new(WatchAdmission {
-            flight: Mutex::new(Some(Flight(path.to_owned(), true))),
+            flight: Mutex::new(Some(Flight {
+                path: path.to_owned(),
+                watched: true,
+                _lock: lock,
+            })),
             key: (watch_id.to_owned(), path.to_owned()),
         });
         WATCH_IN_FLIGHT.fetch_add(1, Ordering::Release);
@@ -585,6 +674,22 @@ pub(crate) fn credentials(watch_id: &str) -> Result<(String, Option<String>)> {
         })
 }
 
+/// Parks a drop only if it still matches `sent`, the fingerprint taken
+/// before its send began. A writer that added to the drop during the upload
+/// would otherwise have that content moved into `shipped` unsent; left in
+/// place, the drop settles again and ships the rest.
+pub(crate) fn park_if_unchanged(
+    path: &Path,
+    sent: Option<(u64, u64, Option<SystemTime>)>,
+) -> Result<PathBuf> {
+    if sent.is_none() || fingerprint(path) != sent {
+        return Err(Error::Other(
+            "it changed while it was sending, so it stays to ship again".to_owned(),
+        ));
+    }
+    park(path)
+}
+
 /// Moves a shipped drop into the folder's `shipped` subfolder, keeping its
 /// name; a taken name gets a timestamp, a taken timestamp a counter.
 ///
@@ -657,6 +762,55 @@ mod tests {
             self.calls.lock().unwrap().push(path);
             self.admissions.lock().unwrap().push(admission);
         }
+    }
+
+    /// The app and the CLI share one state folder: a path another process
+    /// is shipping is refused here and not listed as interrupted.
+    #[test]
+    fn a_path_shipping_in_another_process_is_refused() {
+        let _test_lock = TEST_LOCK.lock().unwrap();
+        let (_state, _state_scope) = test_state();
+        let path = "/drops/reel.mov";
+        let lock = flight_lock_path(path);
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        // Another process's claim: a separate open file description holding
+        // the lock.
+        let other = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        fs4::FileExt::try_lock(&other).unwrap();
+        assert!(shipping_elsewhere(path));
+        assert!(matches!(
+            single_flight(path),
+            Err(Error::AlreadyShipping { .. })
+        ));
+        drop(other);
+        assert!(!shipping_elsewhere(path));
+        let flight = single_flight(path).unwrap();
+        // Held by this process: in flight here, not elsewhere.
+        assert!(!shipping_elsewhere(path));
+        drop(flight);
+    }
+
+    /// Content written into a drop while it sends stays in the watched
+    /// folder to ship again, instead of riding into `shipped` unsent.
+    #[test]
+    fn a_drop_that_changed_while_sending_is_not_parked() {
+        let dir = tempfile::tempdir().unwrap();
+        let drop = dir.path().join("frames");
+        std::fs::create_dir(&drop).unwrap();
+        std::fs::write(drop.join("0001.exr"), b"frame one").unwrap();
+        let sent = fingerprint(&drop);
+        std::fs::write(drop.join("0002.exr"), b"frame two").unwrap();
+        assert!(park_if_unchanged(&drop, sent).is_err());
+        assert!(drop.join("0002.exr").exists());
+        let sent = fingerprint(&drop);
+        let parked = park_if_unchanged(&drop, sent).unwrap();
+        assert_eq!(parked, dir.path().join(SHIPPED).join("frames"));
+        assert!(parked.join("0002.exr").exists());
     }
 
     #[test]
@@ -857,7 +1011,10 @@ mod tests {
         let settle = Duration::from_millis(50);
         std::fs::write(dir.path().join("a.bin"), b"12345").unwrap();
         std::fs::write(dir.path().join(".hidden"), b"x").unwrap();
-        std::fs::create_dir(dir.path().join(SHIPPED)).unwrap();
+        // The park folder is skipped in any case: on a case-insensitive disk
+        // a user's `Shipped` is where drops are parked.
+        std::fs::create_dir(dir.path().join("Shipped")).unwrap();
+        std::fs::write(dir.path().join("Shipped").join("old.bin"), b"old").unwrap();
         let t0 = Instant::now();
         let wall = aged_wall(settle);
         scan(&watch, settle, t0, wall, &mut seen, seen_list.as_ref());

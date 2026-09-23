@@ -403,6 +403,7 @@ impl votport_client_core::ffi::TransferListener for ViewPrinter {
                     "rate": view.rate_bytes_per_second,
                     "eta": view.eta_seconds,
                     "headline": view.headline,
+                    "detail": view.detail,
                     "status": view.status,
                     "route": view.route,
                 })
@@ -545,16 +546,106 @@ fn signin(args: &[String]) -> Result<(), String> {
         Some(password) => password,
         None => {
             eprint!("password: ");
-            let mut line = String::new();
-            std::io::stdin()
-                .read_line(&mut line)
-                .map_err(|error| error.to_string())?;
-            line.trim_end_matches(['\r', '\n']).to_owned()
+            read_secret_line().map_err(|error| error.to_string())?
         }
     };
     let port = votport_client_core::port::sign_in(base, &password).map_err(human)?;
     out!("signed in to {}{}", port.base, tenant_suffix(&port.tenant));
     Ok(())
+}
+
+/// Reads one line with terminal echo off, so a typed password is neither
+/// shown nor left in scrollback. Input that is not a terminal (a pipe) is
+/// read as it is.
+fn read_secret_line() -> std::io::Result<String> {
+    let echo = EchoOff::new();
+    let mut line = String::new();
+    let read = std::io::stdin().read_line(&mut line);
+    if echo.active() {
+        // The Enter that ended the line was not echoed either.
+        eprintln!();
+    }
+    drop(echo);
+    read?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+/// Terminal echo held off until dropped.
+#[cfg(unix)]
+struct EchoOff(Option<rustix::termios::Termios>);
+
+#[cfg(unix)]
+impl EchoOff {
+    fn new() -> Self {
+        use rustix::termios::{tcgetattr, tcsetattr, LocalModes, OptionalActions};
+        let stdin = std::io::stdin();
+        let Ok(saved) = tcgetattr(&stdin) else {
+            return Self(None);
+        };
+        let mut quiet = saved.clone();
+        quiet.local_modes.remove(LocalModes::ECHO);
+        match tcsetattr(&stdin, OptionalActions::Now, &quiet) {
+            Ok(()) => Self(Some(saved)),
+            Err(_) => Self(None),
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        if let Some(saved) = &self.0 {
+            let _ = rustix::termios::tcsetattr(
+                std::io::stdin(),
+                rustix::termios::OptionalActions::Now,
+                saved,
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+struct EchoOff(Option<(windows_sys::Win32::Foundation::HANDLE, u32)>);
+
+#[cfg(windows)]
+impl EchoOff {
+    fn new() -> Self {
+        use windows_sys::Win32::System::Console::{
+            GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT, STD_INPUT_HANDLE,
+        };
+        // SAFETY: the standard input handle is owned by the process and the
+        // mode is read into a local before it is written back.
+        unsafe {
+            let handle = GetStdHandle(STD_INPUT_HANDLE);
+            let mut mode = 0;
+            if GetConsoleMode(handle, &mut mode) == 0
+                || SetConsoleMode(handle, mode & !ENABLE_ECHO_INPUT) == 0
+            {
+                return Self(None);
+            }
+            Self(Some((handle, mode)))
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+#[cfg(windows)]
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        if let Some((handle, mode)) = self.0 {
+            // SAFETY: restores the mode read in `new` on the same handle.
+            unsafe {
+                windows_sys::Win32::System::Console::SetConsoleMode(handle, mode);
+            }
+        }
+    }
 }
 
 fn tenant_suffix(tenant: &str) -> String {

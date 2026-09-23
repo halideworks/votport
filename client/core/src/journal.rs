@@ -139,10 +139,12 @@ pub fn mark_needs_password(id: &str) {
 
 /// Records the server session after its first successful `begin`. Unlike the
 /// initial journal write, this boundary is required for a resumable send, so
-/// a write failure is returned to the caller.
-pub fn mark_http(id: &str, http: HttpResume) -> Result<()> {
+/// a write failure is returned to the caller. An entry whose first write
+/// failed is written whole here, so the caller sees the write's own error
+/// rather than an unknown transfer.
+pub fn mark_http(started: &Entry, http: HttpResume) -> Result<()> {
     let dir = dir();
-    let mut entry = get_in(&dir, id)?;
+    let mut entry = get_in(&dir, &started.id).unwrap_or_else(|_| started.clone());
     entry.http = Some(http);
     write_in(&dir, &entry)
 }

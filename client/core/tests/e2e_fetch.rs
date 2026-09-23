@@ -407,3 +407,50 @@ fn an_admitted_manifest_cancellation_retries_over_quic_with_its_original_capabil
     assert_eq!(std::fs::read(dest.join("first.bin")).unwrap(), first);
     assert_eq!(std::fs::read(dest.join("second.bin")).unwrap(), second);
 }
+
+/// A destination whose parent cannot hold the fetch stage (a volume root's
+/// root-owned parent, a home folder) still receives, over HTTP, instead of
+/// failing with a bare permission error.
+#[test]
+fn an_unwritable_stage_parent_falls_back_to_http() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let Some(bin) = common::server_binary() else {
+        return;
+    };
+    let serve_port = common::free_port();
+    let server = common::start_server(
+        &bin,
+        &[
+            ("VOTPORT_SERVE_BIND", format!("127.0.0.1:{serve_port}")),
+            ("VOTPORT_SERVE_ADVERTISE", format!("127.0.0.1:{serve_port}")),
+        ],
+    );
+    let files: Vec<(&str, Vec<u8>)> = vec![("note.txt", b"over http".to_vec())];
+    let token = common::deliver(&server.base, &files, None, None);
+    let state = tempfile::tempdir().unwrap();
+    let device = Device::load_or_create_in(state.path()).expect("a device key");
+    let home = tempfile::tempdir().unwrap();
+    let dest = home.path().join("out");
+    std::fs::create_dir(&dest).unwrap();
+    std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::File::create(home.path().join("probe")).is_ok() {
+        // Running with privileges that ignore the mode; nothing to prove.
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let received = receive(
+        &server.base,
+        Delivery {
+            token,
+            password: None,
+        },
+        &device,
+        &dest,
+        &mut Silent,
+    );
+    std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let received = received.expect("the delivery arrives over HTTP");
+    assert_eq!(received.files.len(), 1);
+    assert_eq!(std::fs::read(dest.join("note.txt")).unwrap(), b"over http");
+}

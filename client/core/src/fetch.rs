@@ -174,10 +174,12 @@ fn try_fetch_with_resume_mode(
             })
             .collect(),
     });
+    // A volume root has no parent; its stage goes inside it rather than in
+    // the process's working directory on another disk.
     let staging_parent = dest
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+        .unwrap_or(dest);
     // A token hash keeps this name stable across process restarts while
     // preventing a server-controlled grant id from becoming a path.
     let stage = fetch_stage(staging_parent, client.base(), &delivery.token);
@@ -189,8 +191,22 @@ fn try_fetch_with_resume_mode(
             cookie,
         });
     }
-    fs::create_dir_all(staging_parent)?;
-    let _stage_lock = FetchLock::try_acquire(&stage)?;
+    let stage_lock = fs::create_dir_all(staging_parent)
+        .map_err(Error::from)
+        .and_then(|()| FetchLock::try_acquire(&stage));
+    let _stage_lock = match stage_lock {
+        Ok(lock) => lock,
+        // A parent that cannot hold the stage (a root-owned /Volumes or
+        // /Users, a read-only share) still receives over HTTP, as long as no
+        // fetch of this delivery is already underway here.
+        Err(Error::Io(_)) if !has_stage_state => {
+            return Ok(Outcome::Unreachable {
+                metadata: Box::new(metadata),
+                cookie,
+            })
+        }
+        Err(error) => return Err(error),
+    };
     clone::cleanup(&stage)?;
     let saved_capability = load_saved_holder(
         &capability_path,

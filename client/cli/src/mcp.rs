@@ -28,11 +28,21 @@ fn serve(mut input: impl BufRead, mut output: impl Write) -> Result<(), String> 
         let response = if count > 1024 * 1024 {
             // An oversized line must not end the session: drain the rest of
             // the line, refuse it, and keep serving the next one.
+            // The drain consumes the reader's buffer piece by piece, so a
+            // line with no end costs no memory beyond that buffer.
             if line.last() != Some(&b'\n') {
-                let mut rest = Vec::new();
-                input
-                    .read_until(b'\n', &mut rest)
-                    .map_err(|e| e.to_string())?;
+                loop {
+                    let buffer = input.fill_buf().map_err(|e| e.to_string())?;
+                    if buffer.is_empty() {
+                        break;
+                    }
+                    if let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
+                        input.consume(end + 1);
+                        break;
+                    }
+                    let length = buffer.len();
+                    input.consume(length);
+                }
             }
             Some(rpc_error(None, -32600, "MCP message exceeds 1 MiB"))
         } else {
