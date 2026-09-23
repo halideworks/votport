@@ -309,11 +309,14 @@ job's 30-minute media-check budget (per checker at most five minutes) and a
 with a named reason. Inspect job errors and retry after correcting the problem.
 
 Library media/scanning jobs and S3 imports use private snapshots. Reception jobs
-check their pinned original files directly. A global snapshot reservation budget
-is controlled by `VOTPORT_WORKFLOW_SNAPSHOT_BYTES`, defaulting to four
-times the maximum upload size. Private files are retired seven days after a
-failed/cancelled job, or seven days after grant expiry/revocation. Job history,
-evidence and events remain. Tenant deletion removes that tenant's records.
+check their pinned original files directly. Each tenant has a snapshot
+reservation budget of `VOTPORT_WORKFLOW_SNAPSHOT_BYTES`, defaulting to four
+times the maximum upload size, so the disk the snapshots of all tenants can
+use together is that value times the number of tenants. Private files are
+retired seven days after a failed/cancelled job, or seven days after grant
+expiry/revocation. A job held after a restore keeps its snapshot as history
+without counting against the budget. Job history, evidence and events remain.
+Tenant deletion removes that tenant's records.
 
 ## Events, webhooks and MAM integration
 

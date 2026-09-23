@@ -7516,3 +7516,33 @@ async fn direct_grant_lookup_is_authenticated_tenant_scoped_and_bounded() {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
+
+/// A library file under a project's folder is shared only through its
+/// delivery workflow; a plain link for it is a policy refusal the caller
+/// must not retry, not a 500 "database unavailable".
+#[tokio::test]
+async fn a_protected_directory_refuses_a_plain_link_as_a_conflict() {
+    let (_directory, app, cookie, _bytes) = fixture().await;
+    std::fs::create_dir_all(app.config.outbound_dir.join("project")).unwrap();
+    std::fs::write(app.config.outbound_dir.join("project/file.bin"), b"held").unwrap();
+    app.store
+        .save_delivery_project("", "local", crate::workflow::tests::project())
+        .unwrap();
+    let response = settled_grant_response(
+        app.clone(),
+        &cookie,
+        Request::post("/api/admin/outbound-grants")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"paths":["project/file.bin"]}"#))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let refusal = body(response).await;
+    assert_eq!(
+        refusal["error"],
+        "this directory requires a delivery workflow"
+    );
+}

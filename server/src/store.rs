@@ -1292,14 +1292,16 @@ impl Store {
         })
     }
 
-    /// Bounded per tenant: creation refuses past this many rows, revoked
-    /// tokens included, so the listing stays finite.
+    /// The tenant's usable tokens, which creation bounds: a revoked or
+    /// expired token no longer counts, so revoking one makes room as the
+    /// refusal says. The listing pages, so kept rows stay browsable.
     pub fn automation_token_count(&self, tenant: &str) -> Result<u64, String> {
         self.with(|connection| {
             connection
                 .query_row(
-                    "SELECT COUNT(*) FROM automation_tokens WHERE tenant = ?1",
-                    [tenant],
+                    "SELECT COUNT(*) FROM automation_tokens
+                     WHERE tenant = ?1 AND revoked_at IS NULL AND expires_at > ?2",
+                    rusqlite::params![tenant, now_unix() as i64],
                     |row| row.get::<_, i64>(0),
                 )
                 .map(|count| count.max(0) as u64)

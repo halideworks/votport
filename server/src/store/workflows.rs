@@ -156,21 +156,25 @@ pub(super) fn finish_job(
     job: &Job,
     grant: &OutboundGrant,
     manifest: &str,
-) -> Result<(), String> {
+) -> Result<(), WorkflowMutationError> {
     let mut current = job_in(connection, &job.id)
         .map_err(|e| e.to_string())?
-        .ok_or("job missing")?;
+        .ok_or_else(|| WorkflowMutationError::conflict("job missing"))?;
     if current.state != JobState::Preparing
         || current.attempts != job.attempts
         || current.project != job.project
     {
-        return Err("job changed during preparation".into());
+        return Err(WorkflowMutationError::conflict(
+            "job changed during preparation",
+        ));
     }
     let project = project_in(connection, &job.tenant, &job.project.id)
         .map_err(|e| e.to_string())?
-        .ok_or("project removed")?;
+        .ok_or_else(|| WorkflowMutationError::conflict("project removed"))?;
     if project.revision != job.project.revision {
-        return Err("project policy changed; submit a new job".into());
+        return Err(WorkflowMutationError::conflict(
+            "project policy changed; submit a new job",
+        ));
     }
     actor_active(connection, job)?;
     check_job_storage(connection, job)?;
@@ -193,7 +197,7 @@ pub(super) fn finish_job(
             .map_err(|e| e.to_string())?;
     }
     save_job(connection, &current).map_err(|e| e.to_string())?;
-    evidence::delivery_event(connection, signer, &grant.tenant, &grant.id, &format!("delivery_{}", current.state), &serde_json::json!({"manifest": manifest, "project_id": project.id, "policy_revision": project.revision}), current.updated_at).map_err(|e| e.to_string())
+    evidence::delivery_event(connection, signer, &grant.tenant, &grant.id, &format!("delivery_{}", current.state), &serde_json::json!({"manifest": manifest, "project_id": project.id, "policy_revision": project.revision}), current.updated_at).map_err(|e| WorkflowMutationError::store(e.to_string()))
 }
 
 fn principal_active(
@@ -238,12 +242,14 @@ pub(super) fn check_grant_creation(
     connection: &Connection,
     grant: &OutboundGrant,
     job: Option<&Job>,
-) -> Result<(), String> {
+) -> Result<(), WorkflowMutationError> {
     super::routes::require_shareable(connection, &grant.upload_id)?;
     if !grant.link_id.is_empty()
         && received_requires_workflow(connection, &grant.tenant, &grant.link_id, &grant.upload_id)?
     {
-        return Err("these incoming files require their project delivery link".into());
+        return Err(WorkflowMutationError::conflict(
+            "these incoming files require their project delivery link",
+        ));
     }
     let mut query = connection
         .prepare("SELECT document FROM delivery_projects WHERE tenant=?1")
@@ -259,7 +265,9 @@ pub(super) fn check_grant_creation(
             .any(|file| crate::workflow::within(&project.directory, &file.source))
             && job.is_none_or(|job| job.project.id != project.id)
         {
-            return Err("this directory requires a delivery workflow".into());
+            return Err(WorkflowMutationError::conflict(
+                "this directory requires a delivery workflow",
+            ));
         }
     }
     if grant
@@ -268,7 +276,9 @@ pub(super) fn check_grant_creation(
         .any(|file| file.source.starts_with("received:"))
         && job.is_none_or(|job| job.received.is_none())
     {
-        return Err("received sources require their owning workflow".into());
+        return Err(WorkflowMutationError::conflict(
+            "received sources require their owning workflow",
+        ));
     }
     if let Some(job) = job {
         let received = job
@@ -283,8 +293,8 @@ pub(super) fn check_grant_creation(
                 )
                 .map_err(|e| e.to_string())?
                 .filter(|upload| !upload.partial && upload.completed_at != 0)
-                .ok_or("incoming upload missing")?;
-                Ok::<_, String>(
+                .ok_or_else(|| WorkflowMutationError::conflict("incoming upload missing"))?;
+                Ok::<_, WorkflowMutationError>(
                     upload
                         .files
                         .into_iter()
@@ -312,7 +322,9 @@ pub(super) fn check_grant_creation(
                     }
             })
         {
-            return Err("delivery does not match its workflow".into());
+            return Err(WorkflowMutationError::conflict(
+                "delivery does not match its workflow",
+            ));
         }
     }
     Ok(())
@@ -491,7 +503,9 @@ impl Store {
         if job.state != JobState::Preparing || job.attempts != attempt {
             return Err("job changed during snapshot".into());
         }
-        let reserved: i64 = tx.query_row("SELECT COALESCE(SUM(snapshot_bytes),0) FROM delivery_jobs WHERE tenant=?1 AND id<>?2",params![job.tenant,id],|row| row.get(0)).map_err(|e| e.to_string())?;
+        // A job held after a restore keeps its files as history but never
+        // runs again, so it does not hold budget new deliveries need.
+        let reserved: i64 = tx.query_row("SELECT COALESCE(SUM(snapshot_bytes),0) FROM delivery_jobs WHERE tenant=?1 AND id<>?2 AND state<>'suspended'",params![job.tenant,id],|row| row.get(0)).map_err(|e| e.to_string())?;
         if (reserved as u64)
             .checked_add(bytes)
             .is_none_or(|total| total > limit.min(i64::MAX as u64))
@@ -694,7 +708,7 @@ impl Store {
             .query_row(
                 "SELECT EXISTS (
                      SELECT 1 FROM delivery_jobs
-                     WHERE state <> 'retired'
+                     WHERE state NOT IN ('retired', 'suspended')
                        AND (json_extract(document, '$.request.import.storage_id') = ?1
                             OR EXISTS (SELECT 1 FROM json_each(document, '$.project.destinations')
                                        WHERE value = ?1))
@@ -4147,6 +4161,56 @@ mod tests {
         assert_eq!(
             store.delivery_job(&job.id).unwrap().unwrap().state,
             JobState::Failed
+        );
+    }
+
+    /// A job held after a restore keeps its snapshot files as history but
+    /// never runs again: its bytes do not hold the budget a new delivery
+    /// needs, and it does not pin a storage connection.
+    #[test]
+    fn suspended_jobs_release_snapshot_budget_and_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let project = store
+            .save_delivery_project("", "local", crate::workflow::tests::project())
+            .unwrap();
+        let held = store
+            .enqueue_delivery_job(
+                "",
+                "sender",
+                1,
+                None,
+                project.clone(),
+                crate::workflow::tests::request(),
+            )
+            .unwrap();
+        store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE delivery_jobs SET state='suspended', snapshot_bytes=100,
+                        document=json_set(document,'$.state','suspended','$.checks.snapshot_bytes',100,
+                            '$.request.import',json('{\"storage_id\":\"archive\",\"prefix\":\"p\"}'))
+                     WHERE id=?1",
+                    [&held.id],
+                )
+            })
+            .unwrap();
+        let mut request = crate::workflow::tests::request();
+        request.operation_id = "second".into();
+        let job = store
+            .enqueue_delivery_job("", "sender", 1, None, project, request)
+            .unwrap();
+        let running = store
+            .claim_delivery_job("boot", now_unix())
+            .unwrap()
+            .unwrap();
+        assert_eq!(running.id, job.id);
+        store
+            .reserve_delivery_snapshot(&job.id, running.attempts, 10, 50)
+            .unwrap();
+        assert_ne!(
+            store.delete_delivery_storage("archive").unwrap(),
+            DeliveryStorageRemoval::JobsAttached
         );
     }
 }

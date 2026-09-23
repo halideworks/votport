@@ -152,24 +152,47 @@ impl Drop for SessionHold {
     }
 }
 
-/// One server per (tenant, manifest root): byte-identical packages can be
-/// granted in two tenants, and a server's sources name one tenant's storage.
-type TenantServers = HashMap<(String, [u8; 32]), Arc<vot_cli::BundleServer>>;
+/// A server's tenant, package root and a digest of the file paths it serves.
+/// Grants of one folder share a server; byte-identical packages at other
+/// paths (another tenant, another snapshot job) get their own, so one
+/// retiring cannot leave the other serving from files that are gone.
+type SourceKey = (String, [u8; 32], [u8; 32]);
+
+#[derive(Default)]
+struct GrantServers {
+    shared: HashMap<SourceKey, Arc<vot_cli::BundleServer>>,
+    grants: HashMap<String, SourceKey>,
+}
 
 /// The servers assembled this process and the slots fetches hold.
 #[derive(Default)]
 pub(crate) struct ServeRegistry {
-    servers: Mutex<TenantServers>,
+    servers: Mutex<GrantServers>,
     slots: Mutex<HashMap<[u8; 16], FetchSlot>>,
 }
 
 impl ServeRegistry {
-    fn server(&self, tenant: &str, root: [u8; 32]) -> Option<Arc<vot_cli::BundleServer>> {
-        self.servers
-            .lock()
-            .expect("serve registry poisoned")
-            .get(&(tenant.to_owned(), root))
+    fn server(&self, grant_id: &str) -> Option<Arc<vot_cli::BundleServer>> {
+        let servers = self.servers.lock().expect("serve registry poisoned");
+        servers
+            .grants
+            .get(grant_id)
+            .and_then(|key| servers.shared.get(key))
             .cloned()
+    }
+
+    /// Serves `grant_id` from the server already built for `key`, if any.
+    fn link(&self, grant_id: &str, key: &SourceKey) -> Option<Arc<vot_cli::BundleServer>> {
+        let mut servers = self.servers.lock().expect("serve registry poisoned");
+        let server = servers.shared.get(key).cloned()?;
+        servers.grants.insert(grant_id.to_owned(), key.clone());
+        Some(server)
+    }
+
+    fn insert(&self, grant_id: &str, key: SourceKey, server: Arc<vot_cli::BundleServer>) {
+        let mut servers = self.servers.lock().expect("serve registry poisoned");
+        servers.grants.insert(grant_id.to_owned(), key.clone());
+        servers.shared.insert(key, server);
     }
 
     /// Takes the fetch's slot on its first session, counts every later one.
@@ -217,13 +240,15 @@ impl ServeRegistry {
             .sum()
     }
 
-    /// Keeps servers for `roots` as (tenant, root) pairs. Slots are released
-    /// by their sessions, never here.
-    fn retain(&self, roots: &HashSet<(String, [u8; 32])>) {
-        self.servers
-            .lock()
-            .expect("serve registry poisoned")
-            .retain(|key, _| roots.contains(key));
+    /// Keeps the servers of `grants`. Slots are released by their sessions,
+    /// never here.
+    fn retain(&self, grants: &HashSet<String>) {
+        let mut servers = self.servers.lock().expect("serve registry poisoned");
+        servers
+            .grants
+            .retain(|grant_id, _| grants.contains(grant_id));
+        let live: HashSet<SourceKey> = servers.grants.values().cloned().collect();
+        servers.shared.retain(|key, _| live.contains(key));
     }
 }
 
@@ -695,7 +720,8 @@ pub(crate) fn ensure_server(
     let entries = grant_entries(app, grant)?;
     let directory = manifest_directory(app, &grant.id);
     let root = ensure_manifest(app, grant, &entries)?;
-    if let Some(server) = serve.registry.server(&grant.tenant, root) {
+    let key = (grant.tenant.clone(), root, sources_digest(&entries));
+    if let Some(server) = serve.registry.link(&grant.id, &key) {
         return Ok((root, server));
     }
     let proofs = proof_root(app);
@@ -725,13 +751,24 @@ pub(crate) fn ensure_server(
             return Err(ApiError::internal("delivery preparation failed"));
         }
     };
-    serve
-        .registry
-        .servers
-        .lock()
-        .expect("serve registry poisoned")
-        .insert((grant.tenant.clone(), root), Arc::clone(&server));
+    serve.registry.insert(&grant.id, key, Arc::clone(&server));
     Ok((root, server))
+}
+
+/// Digest of the object-to-path map a grant's server would serve.
+fn sources_digest(entries: &[GrantEntry]) -> [u8; 32] {
+    use sha2::Digest as _;
+    let sources: BTreeMap<_, _> = entries
+        .iter()
+        .map(|entry| (entry.object.root, entry.path.as_os_str()))
+        .collect();
+    let mut hasher = sha2::Sha256::new();
+    for (root, path) in sources {
+        hasher.update(root);
+        hasher.update(path.as_encoded_bytes());
+        hasher.update([0]);
+    }
+    hasher.finalize().into()
 }
 
 /// Assembles a server for every unexpired ticket, so capabilities minted
@@ -775,18 +812,14 @@ pub(crate) fn prune(app: &App) {
         return;
     };
     let now = now_unix();
-    let servable = match app.store.servable_manifest_roots(now) {
+    let servable = match app.store.servable_grant_ids(now) {
         Ok(servable) => servable,
         Err(error) => {
-            tracing::warn!(%error, "servable roots unavailable; registry kept");
+            tracing::warn!(%error, "servable grants unavailable; registry kept");
             return;
         }
     };
-    let roots: HashSet<(String, [u8; 32])> = servable
-        .into_iter()
-        .filter_map(|(tenant, root)| decode_root(&root).map(|root| (tenant, root)))
-        .collect();
-    serve.registry.retain(&roots);
+    serve.registry.retain(&servable.into_iter().collect());
     if let Err(error) = app
         .store
         .prune_fetch_tickets(now.saturating_sub(TICKET_RETENTION_SECS))
@@ -1065,7 +1098,7 @@ pub(crate) fn admit_fetch(
     if !grant_open(&grant, presentation.now) {
         return refuse_closed_fetch(app, runtime, token, peer);
     }
-    let Some(server) = serve.registry.server(&grant.tenant, root) else {
+    let Some(server) = serve.registry.server(&grant.id) else {
         // Built at mint and warmed off-thread after a restart, so a server
         // can be briefly absent for a valid ticket while warming, or absent
         // because a build failed; both refuse unknown, both are in the log.
@@ -1878,7 +1911,16 @@ mod tests {
         let serve = app.serve.as_ref().unwrap();
         let mut servers = Vec::new();
         let mut shared_root = None;
-        for (id, tenant) in [("shared-a", "acme"), ("shared-b", "other")] {
+        // The third grant shares the first one's files, so it shares its
+        // server. The fourth serves the same package from another path (a
+        // second snapshot job) and gets its own, so the first retiring
+        // cannot leave it serving deleted paths.
+        for (id, tenant, source) in [
+            ("shared-a", "acme", "file.bin"),
+            ("shared-b", "other", "file.bin"),
+            ("shared-c", "acme", "file.bin"),
+            ("shared-d", "acme", "copy/file.bin"),
+        ] {
             let library = if tenant.is_empty() {
                 app.config.outbound_dir.clone()
             } else {
@@ -1887,8 +1929,8 @@ mod tests {
                     .join(crate::paths::TENANT_STORAGE_DIR)
                     .join(tenant)
             };
-            std::fs::create_dir_all(&library).unwrap();
-            std::fs::write(library.join("file.bin"), bytes).unwrap();
+            std::fs::create_dir_all(library.join("copy")).unwrap();
+            std::fs::write(library.join(source), bytes).unwrap();
             let mut grant = crate::store::tests::test_outbound_grant(id, tenant, 0);
             let mut builder = vot_sdk::object::InMemoryObjectBuilder::new(
                 Suite::Blake3Bao64,
@@ -1903,7 +1945,7 @@ mod tests {
             grant.bytes = bytes.len() as u64;
             grant.expires_at = now + 600;
             grant.files = vec![crate::store::OutboundGrantFile {
-                source: "file.bin".into(),
+                source: source.into(),
                 name: "file.bin".into(),
                 suite: "blake3".into(),
                 root: hex::encode(object.root),
@@ -1925,10 +1967,32 @@ mod tests {
             !Arc::ptr_eq(&servers[0], &servers[1]),
             "each tenant keeps its own server"
         );
-        assert!(serve
+        assert!(
+            Arc::ptr_eq(&servers[0], &servers[2]),
+            "grants of the same files share a server"
+        );
+        assert!(
+            !Arc::ptr_eq(&servers[0], &servers[3]),
+            "the same package at other paths keeps its own server"
+        );
+        assert!(shared_root.is_some());
+        assert!(serve.registry.server("unrelated").is_none());
+        let live = |ids: &[&str]| ids.iter().map(|id| (*id).to_owned()).collect();
+        serve
             .registry
-            .server("unrelated", shared_root.unwrap())
-            .is_none());
+            .retain(&live(&["shared-b", "shared-c", "shared-d"]));
+        assert!(Arc::ptr_eq(
+            &serve.registry.server("shared-c").unwrap(),
+            &servers[0]
+        ));
+        assert!(serve.registry.server("shared-a").is_none());
+        serve.registry.retain(&live(&["shared-b", "shared-d"]));
+        assert!(serve.registry.server("shared-c").is_none());
+        assert_eq!(
+            serve.registry.servers.lock().unwrap().shared.len(),
+            2,
+            "a server no grant uses is dropped"
+        );
     }
 
     /// The admission tests' shared fixture: the app keeps the temporary

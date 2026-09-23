@@ -108,6 +108,18 @@ fn write_route(connection: &Connection, route: &TradeRoute) -> Result<(), String
         .map_err(|e| e.to_string())
 }
 
+/// Routes that hold one of the tenant's 100 slots: revoked routes stay as
+/// history but no longer count, so revoking one makes room.
+fn live_route_count(connection: &Connection, tenant: &str) -> Result<i64, String> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM trade_routes WHERE tenant=?1 AND COALESCE(json_extract(document,'$.state'),'')<>'revoked'",
+            [tenant],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())
+}
+
 impl Store {
     /// Routes a peer has marked unreachable in its own state document.
     /// Drives the votport_trade_routes_unreachable gauge.
@@ -232,14 +244,7 @@ impl Store {
         if expires <= now as i64 {
             return Err("invitation expired".into());
         }
-        let count: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM trade_routes WHERE tenant=?1",
-                [&tenant],
-                |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-        if count >= 100 {
+        if live_route_count(&tx, &tenant)? >= 100 {
             return Err("route limit reached".into());
         }
         let endpoint: TradeEndpoint = tx
@@ -374,14 +379,7 @@ impl Store {
             return Err("this peer has a different saved address; verify and change its connection address first".into());
         }
 
-        let count: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM trade_routes WHERE tenant=?1",
-                [&route.tenant],
-                |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-        if count >= 100 {
+        if live_route_count(&tx, &route.tenant)? >= 100 {
             return Err("route limit reached".into());
         }
         let storage = crate::api::outbound::workflows::storage::Storage {
@@ -817,6 +815,17 @@ impl Store {
         tx.commit().map_err(|e| e.to_string())?;
         Ok(next)
     }
+    /// The next credential of a rotation that has not been confirmed, if any.
+    pub fn trade_rotation_in_flight(&self, id: &str) -> Result<Option<String>, String> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT credential FROM trade_rotations WHERE route_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()
+        })
+    }
     pub fn clear_trade_rotation(&self, id: &str, next: &str) -> Result<(), String> {
         self.with(|c| {
             c.execute(
@@ -991,6 +1000,64 @@ mod tests {
             plan.iter().any(|step| step
                 .contains("USING INDEX delivery_jobs_received_upload (tenant=? AND <expr>=?)")),
             "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn revoked_routes_do_not_hold_a_route_slot() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        // 98 active, one with no state (counted as live) and one revoked.
+        for index in 0..100 {
+            let state = match index {
+                0 => serde_json::json!({ "state": "revoked" }),
+                1 => serde_json::json!({}),
+                _ => serde_json::json!({ "state": "active" }),
+            };
+            store
+                .with(|c| {
+                    c.execute(
+                        "INSERT INTO trade_routes(id,tenant,direction,peer_key,endpoint,document,credential) VALUES (?1,'','outgoing','peer','endpoint',?2,'credential')",
+                        params![format!("route-{index}"), state.to_string()],
+                    )
+                })
+                .unwrap();
+        }
+        let proof = store.event_signer.port_message(
+            "enroll",
+            "",
+            crate::auth::random_token(),
+            now_unix() + 300,
+            serde_json::json!({}),
+        );
+        let route = |id: &str| TradeRoute {
+            id: id.into(),
+            revision: 1,
+            tenant: String::new(),
+            direction: "outgoing".into(),
+            name: "Remote".into(),
+            peer_name: "Remote".into(),
+            peer_key: "other".into(),
+            address: "http://localhost".into(),
+            endpoint: "endpoint".into(),
+            endpoint_name: "Endpoint".into(),
+            category: "external".into(),
+            forwarding: false,
+            metadata_keys: vec![],
+            state: "active".into(),
+            notifications: crate::store::NotificationPolicy::default(),
+            last_contact: None,
+            error: None,
+            remote_grant: String::new(),
+            remote_state: "enrolling".into(),
+            cancel_active: false,
+        };
+        store
+            .save_outgoing_trade(&route("fills"), &crate::auth::random_token(), &proof)
+            .unwrap();
+        assert_eq!(
+            store.save_outgoing_trade(&route("over"), &crate::auth::random_token(), &proof),
+            Err("route limit reached".into())
         );
     }
 

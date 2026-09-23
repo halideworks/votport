@@ -95,7 +95,7 @@ fn conflict(error: String) -> ApiError {
     ApiError::new(StatusCode::CONFLICT, error)
 }
 
-fn workflow_store_error(error: crate::store::WorkflowMutationError) -> ApiError {
+pub(crate) fn workflow_store_error(error: crate::store::WorkflowMutationError) -> ApiError {
     match error {
         crate::store::WorkflowMutationError::Invalid(message) => {
             ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, message)
@@ -1734,7 +1734,12 @@ async fn retire_snapshot(app: &Arc<App>) -> Result<bool, String> {
         return Ok(false);
     };
     let _operation = begin_outbound_operation(app, &job.tenant).map_err(|error| error.message)?;
+    // A reception job has no snapshot of its own (it serves the received
+    // files), but its exports are retired like any other job's.
     if job.received.is_some() {
+        if let Err(error) = storage::mark_exports_retired(app, &job).await {
+            tracing::warn!(job_id = %job.id, %error, "retired export marker failed");
+        }
         return app
             .store
             .complete_snapshot_retirement(&job.id, now_unix())

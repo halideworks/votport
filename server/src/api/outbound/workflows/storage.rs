@@ -122,6 +122,28 @@ pub struct SaveStorage {
     credentials: Option<Credentials>,
 }
 
+/// Client settings for delivery storage and backup S3. The default 30 second
+/// total timeout covers the body too, so an import or restore of a
+/// multi-gigabyte object failed on every retry; a stall is caught by the
+/// read timeout instead. It restarts per downloaded chunk, but on an upload it
+/// spans the whole part until the response headers: 15 minutes lets a 128 MiB
+/// export part through at 150 KB/s. Set key by key: with_client_options would
+/// replace the whole set, including any AWS_* client settings from_env read.
+pub(crate) fn client_settings(builder: AmazonS3Builder, endpoint: &str) -> AmazonS3Builder {
+    use object_store::ClientConfigKey;
+    builder
+        .with_allow_http(endpoint.starts_with("http://"))
+        .with_config(AmazonS3ConfigKey::Client(ClientConfigKey::Timeout), "30d")
+        .with_config(
+            AmazonS3ConfigKey::Client(ClientConfigKey::ConnectTimeout),
+            "30s",
+        )
+        .with_config(
+            AmazonS3ConfigKey::Client(ClientConfigKey::ReadTimeout),
+            "900s",
+        )
+}
+
 impl Storage {
     pub fn validate(&self) -> Result<(), String> {
         if !crate::workflow::valid_id(&self.id)
@@ -231,8 +253,8 @@ impl Storage {
         .with_config(AmazonS3ConfigKey::S3Endpoint, &self.endpoint)
         .with_bucket_name(&self.bucket)
         .with_region(&self.region)
-        .with_virtual_hosted_style_request(!self.path_style)
-        .with_allow_http(self.endpoint.starts_with("http://"));
+        .with_virtual_hosted_style_request(!self.path_style);
+        builder = client_settings(builder, &self.endpoint);
         if !explicit {
             if let Ok(token) = std::env::var(format!("{prefix}_SESSION_TOKEN")) {
                 builder = builder.with_token(token);
@@ -736,16 +758,23 @@ fn skip_directory_markers(
     // whose key is a directory prefix of a sibling key is such a marker, the
     // sibling naming the directory: skip it. A lone 0-byte file is a real
     // object and stays.
-    let keys: Vec<String> = listed
+    // Only 0-byte keys can be markers; each key's directory prefixes are
+    // looked up in that set, so memory scales with the empty objects.
+    let empty: std::collections::HashSet<String> = listed
         .iter()
+        .filter(|(object, _)| object.size == 0)
         .map(|(object, _)| object.location.as_ref().to_owned())
         .collect();
-    listed.retain(|(object, _)| {
-        object.size != 0
-            || !keys
-                .iter()
-                .any(|key| key.starts_with(&format!("{}/", object.location.as_ref())))
-    });
+    let mut markers = std::collections::HashSet::new();
+    for (object, _) in &listed {
+        let key = object.location.as_ref();
+        for (at, _) in key.match_indices('/') {
+            if let Some(marker) = empty.get(&key[..at]) {
+                markers.insert(marker.as_str());
+            }
+        }
+    }
+    listed.retain(|(object, _)| !markers.contains(object.location.as_ref()));
     listed
 }
 
@@ -794,6 +823,11 @@ pub(super) async fn import(app: &Arc<App>, job: &Job) -> ApiResult<Option<u64>> 
                 continue;
             };
             listed.push((object, name));
+            // Stop reading a prefix that cannot fit, instead of listing
+            // millions of keys first; markers are at most one per folder.
+            if listed.len() > 2 * MAX_LIBRARY_PROJECT_FILES {
+                return Err(conflict("S3 source has too many files".into()));
+            }
         }
         let mut objects = vec![];
         let mut total = 0u64;
@@ -1564,6 +1598,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn client_settings_keep_other_client_options() {
+        use object_store::ClientConfigKey;
+        let client = |key| AmazonS3ConfigKey::Client(key);
+        let builder = client_settings(
+            AmazonS3Builder::new()
+                .with_config(client(ClientConfigKey::ProxyUrl), "http://proxy:3128"),
+            "https://s3.example.test",
+        );
+        assert_eq!(
+            builder
+                .get_config_value(&client(ClientConfigKey::ProxyUrl))
+                .as_deref(),
+            Some("http://proxy:3128")
+        );
+        assert_eq!(
+            builder
+                .get_config_value(&client(ClientConfigKey::ReadTimeout))
+                .as_deref(),
+            Some("900s")
+        );
+        assert_eq!(
+            builder
+                .get_config_value(&client(ClientConfigKey::AllowHttp))
+                .as_deref(),
+            Some("false")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_http_s3_endpoint_is_contacted() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let config: Storage = serde_json::from_value(json!({
+            "id":"plain","revision":0,"label":"Plain","kind":"s3",
+            "endpoint":format!("http://{}", listener.local_addr().unwrap()),
+            "bucket":"test","region":"us-east-1","path_style":true,"tenants":[""],"enabled":true
+        }))
+        .unwrap();
+        let config = app
+            .store
+            .save_delivery_storage(
+                "local",
+                config,
+                Some(Credentials::AccessKey {
+                    access_key_id: "test-access".into(),
+                    secret_access_key: "test-secret".into(),
+                    session_token: None,
+                }),
+            )
+            .unwrap();
+        let store = config.connect(&app.store).unwrap();
+        let request = tokio::spawn(async move {
+            let _ = store.head(&object_store::path::Path::from("probe")).await;
+        });
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await;
+        request.abort();
+        assert!(accepted.is_ok(), "an http:// endpoint must be allowed");
+    }
+
     #[tokio::test]
     async fn cached_s3_inventory_still_requires_portable_names() {
         let directory = tempfile::tempdir().unwrap();
@@ -1801,5 +1897,31 @@ mod tests {
             .is_some_and(|signature| !signature.is_empty()));
         // Retirement retries after a crash must not fail on their own marker.
         mark_exports_retired(&app, &stored).await.unwrap();
+
+        // A reception job has no snapshot to remove, but its exports are
+        // retired through the same sweep.
+        let marker_path = directory
+            .path()
+            .join("destination/deliveries/existing/frozen/retired.json");
+        std::fs::remove_file(&marker_path).unwrap();
+        let mut reception = stored.clone();
+        reception.received = Some(crate::workflow::Received {
+            link_id: "link".into(),
+            upload_id: "upload".into(),
+        });
+        reception.state = crate::workflow::JobState::Retiring;
+        app.store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE delivery_jobs SET state='retiring', document=?2 WHERE id=?1",
+                    rusqlite::params![reception.id, serde_json::to_string(&reception).unwrap()],
+                )
+            })
+            .unwrap();
+        assert!(super::super::retire_snapshot(&app).await.unwrap());
+        assert!(
+            marker_path.exists(),
+            "the reception job's export is marked retired"
+        );
     }
 }
