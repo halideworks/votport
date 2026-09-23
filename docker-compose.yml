@@ -5,9 +5,11 @@ services:
     restart: unless-stopped
     # Worst-case queued-body memory for the default session caps: 32
     # sessions x 8 in-flight chunks x ~9 MiB is roughly 2.3 GiB
-    # (docs/deployment.md, session limits). Raise this together with
-    # VOTPORT_MAX_TOTAL_SESSIONS; the queued bodies scale linearly with it.
-    mem_limit: 2304m
+    # (docs/deployment.md, session limits), on top of the process baseline
+    # (SQLite cache and map, ZIP, backup and push buffers). Raise this
+    # together with VOTPORT_MAX_TOTAL_SESSIONS; the queued bodies scale
+    # linearly with it.
+    mem_limit: 4g
     # The runtime's blocking pool alone can grow to 512 threads; 1024 leaves
     # headroom for workers and helpers while bounding a runaway fork.
     pids_limit: 1024
@@ -43,6 +45,8 @@ services:
     # published port is host-local only, for debugging.
     ports:
       - "127.0.0.1:8103:8080"
+      - "8322:8322/udp"
+      - "8323:8323/udp"
     networks:
       - media-server_default
     environment:
@@ -53,7 +57,7 @@ services:
       # socket address. 172.16.0.0/12 is the Docker user-bridge range; name
       # the proxy's exact address instead if other containers are untrusted
       # (docs/deployment.md, Client addresses).
-      VOTPORT_TRUSTED_PROXIES: "172.16.0.0/12"
+      VOTPORT_TRUSTED_PROXIES: "${VOTPORT_TRUSTED_PROXIES:-172.16.0.0/12}"
       # 500 GiB per upload session.
       VOTPORT_MAX_UPLOAD_BYTES: "536870912000"
       VOTPORT_ALLOW_HIDDEN: "1"
@@ -62,11 +66,16 @@ services:
       # up where they stopped, until the session has been idle this long.
       # 4h proved too short: a sender who stalls overnight loses the partial.
       VOTPORT_SESSION_IDLE_SECS: "172800"
-      # Deployment knobs: set both in .env. Without a metrics token /metrics
-      # is served unauthenticated; without trusted proxies every private
-      # peer's X-Forwarded-For is believed (docs/deployment.md).
+      # Set in .env. Without a metrics token /metrics is served
+      # unauthenticated (docs/deployment.md).
       VOTPORT_METRICS_TOKEN: "${VOTPORT_METRICS_TOKEN:-}"
-      VOTPORT_TRUSTED_PROXIES: "${VOTPORT_TRUSTED_PROXIES:-}"
+      # Native push and deliver-over-QUIC listen only when their bind is set
+      # (docs/native-push.md, docs/deliver-over-quic.md); the UDP ports
+      # below must match the binds.
+      VOTPORT_PUSH_BIND: "${VOTPORT_PUSH_BIND:-}"
+      VOTPORT_PUSH_ADVERTISE: "${VOTPORT_PUSH_ADVERTISE:-}"
+      VOTPORT_SERVE_BIND: "${VOTPORT_SERVE_BIND:-}"
+      VOTPORT_SERVE_ADVERTISE: "${VOTPORT_SERVE_ADVERTISE:-}"
     volumes:
       # votport state (links, secrets) — keep this private.
       - ./data:/data

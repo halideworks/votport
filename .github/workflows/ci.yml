@@ -201,6 +201,14 @@ jobs:
         run: |
           for f in web/assets/*.js; do node --check "$f"; done
 
+      # A duplicated environment key once made the tracked compose file
+      # unloadable; both files must parse with only the required values set.
+      - name: Validate the compose files
+        run: |
+          VOTPORT_ADMIN_PASSWORD=ci VOTPORT_METRICS_TOKEN=ci VOTPORT_PUBLIC_URL=https://drop.example.com \
+            docker compose -f docker-compose.example.yml config --quiet
+          VOTPORT_ADMIN_PASSWORD=ci docker compose -f docker-compose.yml config --quiet
+
       - name: Install pinned JavaScript tooling
         run: npm ci
 

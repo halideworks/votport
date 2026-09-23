@@ -116,9 +116,9 @@ Received files retain their original publication receipts when shared.
 ## Quick start
 
 ```sh
-cp Caddyfile.example /etc/caddy/sites/votport   # adjust host + port
+cp Caddyfile.example /etc/caddy/Caddyfile   # or merge it into yours; adjust host + port
 install -m 600 .env.example .env
-# edit .env: VOTPORT_ADMIN_PASSWORD and VOTPORT_PUBLIC_URL
+# edit .env: VOTPORT_ADMIN_PASSWORD, VOTPORT_METRICS_TOKEN and VOTPORT_PUBLIC_URL
 sudo install -d -o 1000 -g 1000 -m 0700 data received outbound
 docker compose --env-file .env -f docker-compose.example.yml up -d --build
 curl -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8103/r/x   # expect 200
@@ -143,10 +143,12 @@ remain retained while in flight.
 HTTP connections are bounded on both sides. The server itself caps how long a
 connection may spend sending request headers (30 seconds per connection,
 enforced by the HTTP/1 listener); there are no server-side limits on transfer
-duration. The Caddy examples add the outer bounds: header reads 30 seconds,
-read and write windows of 1 hour (reset as data flows), and 5-minute idle
-keep-alives. Large uploads and downloads ride chunked multi-MiB requests, so
-per-request windows stay well inside these limits.
+duration. The Caddy example adds outer bounds in its global options block:
+header reads 30 seconds, request bodies 1 hour, and 5-minute idle keep-alives.
+These are absolute per-request limits. Uploads ride chunked requests of at most
+about 9 MiB, well inside them; the example sets no write timeout because a
+single-GET download of a large file can stream for hours. Global options must
+be in the main Caddyfile, not an imported site file.
 
 For a customer release, use the GHCR image reference and digest recorded in the
 GitHub release notes and workflow summary instead of rebuilding from source:
@@ -963,7 +965,7 @@ Layout:
 drop.example.com {
 	respond /metrics 404
 	respond /readyz 404
-	reverse_proxy live:8321 standby:8321 {
+	reverse_proxy live:8103 standby:8103 {
 		lb_policy first
 		health_uri /healthz
 		health_interval 5s
@@ -979,8 +981,9 @@ senders keep matching.
 
 Planned failover: turn on **Drain for restart** so new upload sessions are
 refused and `/readyz` goes 503, poll `/readyz` on the live host directly (not
-through the proxy) until `sessions_active` reaches 0, stop the live container
-(a clean stop yields the lease), move or restore `data/`, start the standby,
+through the proxy) until `sessions_active` reaches 0, and in the replica
+topology until the standby's `/readyz` shows an `archive_created_at` after
+that moment, stop the live container (a clean stop yields the lease), move or restore `data/`, start the standby,
 turn drain off. Unplanned failover
 skips the drain: in-flight uploads whose worker checkpointed resume from that
 offset once the standby is up, uploads killed before a checkpoint start over,
