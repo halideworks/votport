@@ -552,9 +552,7 @@ $('principal-load-more').addEventListener('click', () =>
 // Authenticate before platform list requests. Named-tenant admins use
 // this route only for their own branding.
 const session = await requireSession();
-if (!session.pages.includes('tenants')) {
-  window.location.replace('/receive');
-} else if (session.tenant) {
+if (session.tenant) {
   $('page-title').textContent = 'Branding';
   document.title = 'VOTPort · Branding';
   $('self-branding').hidden = false;

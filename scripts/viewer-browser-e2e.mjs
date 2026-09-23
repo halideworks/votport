@@ -113,6 +113,16 @@ try {
   }
   assert.ok(await adminPage.locator('#create-form').isVisible());
   assert.match(await adminPage.locator('#create-error').textContent(), /Could not load reception projects/);
+  // An audit-only session is sent to the one page it may open instead of
+  // polling Receive's operator APIs into 403s.
+  await adminPage.route(`${base}/receive`, async (route) => {
+    const response = await route.fetch();
+    const html = (await response.text()).replace(/("role":)"admin"/, '$1"auditor"').replace(/"pages":\[[^\]]*\]/, '"pages":["audit"]');
+    await route.fulfill({ response, body: html });
+  });
+  await adminPage.goto(`${base}/receive`);
+  await adminPage.waitForURL(`${base}/audit`);
+  await adminPage.unroute(`${base}/receive`);
   await adminPage.close();
   const uploader = await admin.newPage();
   await uploader.goto(link.url);

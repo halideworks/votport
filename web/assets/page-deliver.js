@@ -131,7 +131,7 @@ function renderGrants() {
         const item = node('li', '', 'upload-file');
         const fileName = node('span', file.name, 'mono');
         const fileMeta = node('span', '', 'muted');
-        const fileDownloads = file.downloads ?? 0;
+        const fileDownloads = file.download_starts ?? 0;
         const fileParts = [
           `${fileDownloads} file request${fileDownloads === 1 ? '' : 's'}`,
         ];
@@ -235,8 +235,11 @@ function renderGrants() {
   }
 }
 
+// A reset requested while a read is in flight (a link created during the
+// first page load) runs after it, so the new link is never dropped.
+let grantRefreshQueued = false;
 async function refreshGrants(reset = true) {
-  if (grantLoading) return;
+  if (grantLoading) { grantRefreshQueued ||= reset; return; }
   grantLoading = true;
   const offset = reset ? 0 : grantRows.length;
   const loadMore = $('outbound-grants-load-more');
@@ -263,6 +266,7 @@ async function refreshGrants(reset = true) {
   } finally {
     grantLoading = false;
     loadMore.disabled = false;
+    if (grantRefreshQueued) { grantRefreshQueued = false; refreshGrants(); }
   }
 }
 

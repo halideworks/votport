@@ -128,6 +128,25 @@ function showError(message) {
   $('status').textContent = 'Download unavailable';
 }
 
+// One refused handoff (a rate limit, a drain, a rotated password cookie)
+// reports beside the download controls and leaves the rest of the page usable.
+// A 404 re-reads the delivery, so a revoked or expired link still shows as
+// unavailable while a single spent file reports inline.
+function downloadRefused(message, status) {
+  if (status === 401 && metadataHasPassword) {
+    showPasswordGate();
+    return;
+  }
+  if (status === 404) {
+    fetchMetadataPage(0).then(
+      () => setSeparateDownloadStatus(message),
+      (error) => { if (error.message !== 'delivery password required') showError(error.message); },
+    );
+    return;
+  }
+  setSeparateDownloadStatus(message);
+}
+
 function showPasswordGate() {
   $('download-content').hidden = true;
   $('download-gate').hidden = false;
@@ -141,7 +160,7 @@ function downloadButton(text, url, classes, name) {
   button.className = classes;
   button.textContent = text;
   button.setAttribute('aria-label', `${text}: ${name}`);
-  button.addEventListener('click', () => { triggerDownload(url, name, showError); });
+  button.addEventListener('click', () => { triggerDownload(url, name, downloadRefused); });
   return button;
 }
 
@@ -474,7 +493,7 @@ async function loadMetadata() {
   manifestStatus();
   const bundle = $('bundle-download');
   bundle.hidden = !body.bundle_url;
-  if (body.bundle_url) $('bundle-download-button').onclick = () => triggerDownload(body.bundle_url, undefined, showError);
+  if (body.bundle_url) $('bundle-download-button').onclick = () => triggerDownload(body.bundle_url, undefined, downloadRefused);
   const separateNote = $('separate-download-note');
   const separateButton = $('separate-download-button');
   setSeparateDownloadStatus('');
@@ -495,7 +514,7 @@ async function loadMetadata() {
     separateNote.textContent = '';
     const only = metadataFiles[0];
     separateButton.onclick = async () => {
-      if (!(await triggerDownload(only.download_url, only.name, showError))) return;
+      if (!(await triggerDownload(only.download_url, only.name, downloadRefused))) return;
       setSeparateDownloadStatus('Download handed to the browser. Check browser downloads for completion.');
     };
   }

@@ -35,6 +35,13 @@ export async function requireSession() {
     window.location.replace('/');
     return new Promise(() => {}); // never resolves; page is leaving
   }
+  // A page outside the principal's list (an auditor on /receive) would only
+  // answer 403s, so send the session to the first page it may open.
+  const current = NAV_ITEMS.find(([, href]) => href === window.location.pathname || (href === '/receive' && window.location.pathname === '/links'));
+  if (current && !session.pages.includes(current[0])) {
+    window.location.replace(landingPage(session));
+    return new Promise(() => {}); // never resolves; page is leaving
+  }
   buildNav(session);
   mountSearch(session);
   mountHints();
@@ -281,6 +288,10 @@ const NAV_ITEMS = [
   ['audit', '/audit', 'Audit', 'Review who did what on this port. An auditor session sees only this page.'],
   ['system', '/system', 'System', 'Manage branding, sign-in, email, backups and port settings.'],
 ];
+
+export function landingPage(session) {
+  return NAV_ITEMS.find(([page]) => session.pages?.includes(page))?.[1] ?? '/receive';
+}
 
 function buildNav(session) {
   const nav = document.getElementById('nav');

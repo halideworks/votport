@@ -330,7 +330,7 @@ export async function triggerDownload(url, name, showError) {
   }
   if (!response.ok) {
     const body = await response.json().catch(() => null);
-    showError(body?.error || `The download was refused (${response.status}).`);
+    showError(body?.error || `The download was refused (${response.status}).`, response.status);
     return false;
   }
   const link = document.createElement('a');
