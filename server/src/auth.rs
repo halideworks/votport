@@ -116,7 +116,15 @@ fn verify_token(secret: &[u8; 32], context: &[&[u8]], token: &str) -> bool {
     let (Some(expires), Some(nonce), Some(mac)) = (parts.next(), parts.next(), parts.next()) else {
         return false;
     };
-    let Ok(expires) = expires.parse::<u64>() else {
+    // Only the canonical spelling verifies: the MAC covers the number, so
+    // "0E" or "+E" would otherwise be distinct strings for one token.
+    let Ok(expires) = expires.parse::<u64>().map_err(drop).and_then(|value| {
+        if value.to_string() == expires {
+            Ok(value)
+        } else {
+            Err(())
+        }
+    }) else {
         return false;
     };
     if now_unix() >= expires {
@@ -334,34 +342,52 @@ pub fn verify_link_token(secret: &[u8; 32], link_id: &str, phc: &str, token: &st
 /// in the current grant-token generation has already been counted. The
 /// token rides the file URL query for individual files and one cookie for
 /// the bundle sentinel lease.
+/// A download lease names the enrolled recipient it was minted for (empty
+/// when the delivery has none), so removing that recipient ends it. The
+/// holder is a lowercase hex key and rides as a fourth dotted field.
 pub fn issue_download_lease(
     secret: &[u8; 32],
     grant_id: &str,
     token_hash: &str,
     file_index: usize,
+    holder: &str,
     lifetime_secs: u64,
 ) -> String {
     let index = file_index.to_string();
-    issue_token(
+    let token = issue_token(
         secret,
         &[
             b"votport-download-lease",
             grant_id.as_bytes(),
             token_hash.as_bytes(),
             index.as_bytes(),
+            holder.as_bytes(),
         ],
         lifetime_secs,
-    )
+    );
+    if holder.is_empty() {
+        token
+    } else {
+        format!("{token}.{holder}")
+    }
 }
 
+/// The holder a valid lease was minted for, or `None` for an invalid one.
 pub fn verify_download_lease(
     secret: &[u8; 32],
     grant_id: &str,
     token_hash: &str,
     file_index: usize,
-    token: &str,
-) -> bool {
+    lease: &str,
+) -> Option<String> {
     let index = file_index.to_string();
+    let (token, holder) = match lease.match_indices('.').nth(2) {
+        // An empty holder is spelled without the dot, so each lease has one
+        // spelling.
+        Some((at, _)) if at + 1 < lease.len() => (&lease[..at], &lease[at + 1..]),
+        Some(_) => return None,
+        None => (lease, ""),
+    };
     verify_token(
         secret,
         &[
@@ -369,9 +395,11 @@ pub fn verify_download_lease(
             grant_id.as_bytes(),
             token_hash.as_bytes(),
             index.as_bytes(),
+            holder.as_bytes(),
         ],
         token,
     )
+    .then(|| holder.to_owned())
 }
 
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -659,11 +687,43 @@ mod tests {
     #[test]
     fn a_download_lease_refuses_at_its_expiry_edge() {
         let secret = [9u8; 32];
-        let live = issue_download_lease(&secret, "grant", "hash", 2, 60);
-        assert!(verify_download_lease(&secret, "grant", "hash", 2, &live));
+        let live = issue_download_lease(&secret, "grant", "hash", 2, "", 60);
+        assert_eq!(
+            verify_download_lease(&secret, "grant", "hash", 2, &live).as_deref(),
+            Some("")
+        );
         // Zero lifetime expires at issuance: now >= expires refuses.
-        let dead = issue_download_lease(&secret, "grant", "hash", 2, 0);
-        assert!(!verify_download_lease(&secret, "grant", "hash", 2, &dead));
+        let dead = issue_download_lease(&secret, "grant", "hash", 2, "", 0);
+        assert!(verify_download_lease(&secret, "grant", "hash", 2, &dead).is_none());
+    }
+
+    #[test]
+    fn a_download_lease_carries_its_recipient_under_the_mac() {
+        let secret = [9u8; 32];
+        let lease = issue_download_lease(&secret, "grant", "hash", 2, "ab12", 60);
+        assert!(lease.ends_with(".ab12"));
+        assert_eq!(
+            verify_download_lease(&secret, "grant", "hash", 2, &lease).as_deref(),
+            Some("ab12")
+        );
+        // Relabeling the holder, or dropping it, breaks the MAC.
+        let relabeled = format!("{}.cd34", lease.strip_suffix(".ab12").unwrap());
+        assert!(verify_download_lease(&secret, "grant", "hash", 2, &relabeled).is_none());
+        let stripped = lease.strip_suffix(".ab12").unwrap();
+        assert!(verify_download_lease(&secret, "grant", "hash", 2, stripped).is_none());
+        // Each lease has exactly one spelling, so no rewrite can pass as a
+        // second lease: padded or signed expiry, or an empty holder field.
+        let plain = issue_download_lease(&secret, "grant", "hash", 2, "", 60);
+        for variant in [
+            format!("0{plain}"),
+            format!("+{plain}"),
+            format!("{plain}."),
+        ] {
+            assert!(
+                verify_download_lease(&secret, "grant", "hash", 2, &variant).is_none(),
+                "{variant}"
+            );
+        }
     }
 
     #[cfg(unix)]
