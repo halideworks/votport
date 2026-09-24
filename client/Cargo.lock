@@ -534,7 +534,23 @@ dependencies = [
  "cpufeatures 0.2.17",
  "curve25519-dalek-derive",
  "digest 0.10.7",
- "fiat-crypto",
+ "fiat-crypto 0.2.9",
+ "rustc_version",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "curve25519-dalek"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5eed333089e2e1c1ac8c6c0398e5e2497b4c9926ca6d0365ed1e099afa5bc23"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.1",
+ "curve25519-dalek-derive",
+ "digest 0.11.3",
+ "fiat-crypto 0.3.0",
  "rustc_version",
  "subtle",
  "zeroize",
@@ -648,7 +664,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
 dependencies = [
  "pkcs8",
- "signature",
+ "signature 2.2.0",
+]
+
+[[package]]
+name = "ed25519"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29fcf32e6c73d1079f83ab4d782de2d81620346a5f38c6237a86a22f8368980a"
+dependencies = [
+ "signature 3.0.0",
 ]
 
 [[package]]
@@ -657,10 +682,23 @@ version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
- "curve25519-dalek",
- "ed25519",
+ "curve25519-dalek 4.1.3",
+ "ed25519 2.2.3",
  "serde",
  "sha2 0.10.9",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "ed25519-dalek"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ebaa1a2bf1290ab3bfe5a7b771d050ebffab2711c19a81691c683a5144a25de"
+dependencies = [
+ "curve25519-dalek 5.0.0",
+ "ed25519 3.0.0",
+ "sha2 0.11.0",
  "subtle",
  "zeroize",
 ]
@@ -716,6 +754,12 @@ name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
+
+[[package]]
+name = "fiat-crypto"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 
 [[package]]
 name = "find-msvc-tools"
@@ -1962,6 +2006,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "signature"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
+
+[[package]]
 name = "siphasher"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2500,7 +2550,7 @@ name = "vot-capability"
 version = "0.0.1"
 source = "git+https://github.com/halideworks/VOT?rev=fff2b842aae2fd40f5fc2fc5e26c82cf8256d448#fff2b842aae2fd40f5fc2fc5e26c82cf8256d448"
 dependencies = [
- "ed25519-dalek",
+ "ed25519-dalek 2.2.0",
  "vot-cbor",
  "vot-codec",
  "vot-transport-api",
@@ -2518,7 +2568,7 @@ source = "git+https://github.com/halideworks/VOT?rev=fff2b842aae2fd40f5fc2fc5e26
 dependencies = [
  "base64 0.23.1",
  "blake3",
- "ed25519-dalek",
+ "ed25519-dalek 2.2.0",
  "getrandom 0.4.3",
  "rcgen",
  "rustix",
@@ -2657,7 +2707,7 @@ name = "vot-receipt"
 version = "0.0.1"
 source = "git+https://github.com/halideworks/VOT?rev=fff2b842aae2fd40f5fc2fc5e26c82cf8256d448#fff2b842aae2fd40f5fc2fc5e26c82cf8256d448"
 dependencies = [
- "ed25519-dalek",
+ "ed25519-dalek 2.2.0",
  "hmac",
  "sha2 0.11.0",
  "vot-cbor",
@@ -2795,7 +2845,7 @@ name = "votport-client-core"
 version = "0.1.2"
 dependencies = [
  "base64 0.23.1",
- "ed25519-dalek",
+ "ed25519-dalek 3.0.0",
  "fs4",
  "hex",
  "percent-encoding",
