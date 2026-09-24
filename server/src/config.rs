@@ -852,12 +852,12 @@ pub fn from_env() -> Result<Config, String> {
 }
 
 fn validate_admin_password_hash(phc: &str) -> Result<(), String> {
-    use argon2::{password_hash::PasswordHash, Algorithm, Params, Version};
+    use argon2::{password_hash::phc::PasswordHash, Algorithm, Params, Version};
 
     let invalid =
         || "VOTPORT_ADMIN_PASSWORD_HASH must be a complete supported Argon2 PHC string".to_owned();
     let hash = PasswordHash::new(phc).map_err(|_| invalid())?;
-    Algorithm::try_from(hash.algorithm).map_err(|_| invalid())?;
+    Algorithm::try_from(hash.algorithm.as_str()).map_err(|_| invalid())?;
     if let Some(version) = hash.version {
         Version::try_from(version).map_err(|_| invalid())?;
     }
@@ -865,9 +865,7 @@ fn validate_admin_password_hash(phc: &str) -> Result<(), String> {
     if hash.hash.is_none() {
         return Err(invalid());
     }
-    let salt = hash.salt.ok_or_else(invalid)?;
-    let mut decoded = [0u8; 64];
-    if salt.decode_b64(&mut decoded).map_err(|_| invalid())?.len() < argon2::MIN_SALT_LEN {
+    if hash.salt.as_ref().ok_or_else(invalid)?.len() < argon2::MIN_SALT_LEN {
         return Err(invalid());
     }
     Ok(())
@@ -1359,13 +1357,13 @@ mod tests {
     }
 
     fn test_password_hash(algorithm: argon2::Algorithm, version: argon2::Version) -> String {
-        use argon2::password_hash::{PasswordHasher as _, SaltString};
+        use argon2::password_hash::PasswordHasher as _;
         argon2::Argon2::new(
             algorithm,
             version,
             argon2::Params::new(8, 1, 1, Some(16)).unwrap(),
         )
-        .hash_password(b"short", &SaltString::encode_b64(b"test salt").unwrap())
+        .hash_password_with_salt(b"short", b"test salt")
         .unwrap()
         .to_string()
     }

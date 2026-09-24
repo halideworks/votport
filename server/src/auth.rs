@@ -3,8 +3,8 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use argon2::password_hash::rand_core::OsRng;
-use argon2::password_hash::{PasswordHash, PasswordHasher as _, PasswordVerifier as _, SaltString};
+use argon2::password_hash::phc::PasswordHash;
+use argon2::password_hash::{PasswordHasher as _, PasswordVerifier as _};
 use argon2::Argon2;
 use hmac::{Hmac, Mac as _};
 use rand::RngCore as _;
@@ -18,9 +18,8 @@ const LOCKOUT_THRESHOLD: u32 = 5;
 const LOCKOUT_SECS: u64 = 60;
 
 pub fn hash_password(password: &str) -> Result<String, String> {
-    let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map(|hash| hash.to_string())
         .map_err(|error| error.to_string())
 }
@@ -589,6 +588,16 @@ pub fn cookie_value<'header>(header: &'header str, name: &str) -> Option<&'heade
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stored admin, link and delivery password hashes predate any
+    /// argon2 upgrade; this one was made by argon2 0.5.
+    #[test]
+    fn a_hash_from_an_earlier_argon2_release_still_verifies() {
+        let stored = "$argon2id$v=19$m=19456,t=2,p=1$dm90cG9ydC1jb21wYXQtc2FsdA$d6drTrTeJFp1Yo4xDayR5hCAEatsO9SoWHpFPH/TIXc";
+        assert!(verify_password("correct horse", stored));
+        assert!(!verify_password("wrong horse", stored));
+        assert!(verify_password("fresh", &hash_password("fresh").unwrap()));
+    }
 
     #[test]
     fn valid_hex_requires_the_minted_lowercase_form() {

@@ -147,7 +147,7 @@ impl Device {
         if let Some(device) = read()? {
             return Ok(device);
         }
-        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let key = SigningKey::from_bytes(&rand::random());
         write_private(&path, &key.to_bytes())?;
         Ok(Self { key })
     }
