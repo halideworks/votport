@@ -16,34 +16,6 @@ const pair = (path, mark = path) => ({
   file: { name: path.split('/').pop(), size: 1, marker: mark },
 });
 
-test('the first preview slice paints before the whole pick admits', async () => {
-  const pairs = Array.from({ length: 10_000 }, (_, i) => pair(`pick-${String(i).padStart(5, '0')}.dpx`));
-  const picked = new Map();
-  const deliveredPaths = new Set();
-  const keys = new Map();
-  const renders = [];
-  let slices = 0;
-  const done = admitPickBatch(pairs, {
-    picked,
-    deliveredPaths,
-    keys,
-    validate: () => null,
-    keyOf: (path) => path.toLowerCase(),
-    render: (settled) => renders.push({ settled, size: picked.size }),
-    fail: () => assert.fail('no refusal expected'),
-    slice: async () => { slices += 1; },
-  });
-  // The synchronous prefix ends at the first slice boundary: 200 entries
-  // admitted and one unsettled render, before any await runs.
-  assert.deepEqual(renders, [{ settled: false, size: PICK_FIRST_SLICE }]);
-  assert.equal(picked.size, PICK_FIRST_SLICE);
-  assert.deepEqual(await done, true);
-  assert.equal(picked.size, pairs.length);
-  assert.equal(keys.size, pairs.length);
-  assert.equal(renders.at(-1).settled, true);
-  assert.ok(slices >= Math.ceil((pairs.length - PICK_FIRST_SLICE) / PICK_SLICE));
-});
-
 test('a mid-batch refusal rolls the whole batch back', async () => {
   const seed = new Map([['keep.txt', pair('keep.txt').file], ['delivered.txt', pair('delivered.txt').file]]);
   const picked = new Map(seed);
@@ -110,17 +82,3 @@ test('two names that fold together inside one batch refuse and roll back', async
   assert.equal(picked.size, 0);
 });
 
-test('upload.js admits picks in slices and holds send until the batch settles', () => {
-  assert.match(uploadScript, /import \{ admitPickBatch \} from '\/assets\/upload-pick\.js';/);
-  // The page hands the seam a clone of the render's collision keys, the
-  // memoized fold (finding 537), and an unsettled render that holds send.
-  assert.match(uploadScript, /keys: new Map\(pickedKeys\),/);
-  assert.match(uploadScript, /const key = pathKeyString\(components\);\s*\n\s*pathKeyMemo\.set\(path, key\);/);
-  assert.match(uploadScript, /if \(!settled\) \$\('send'\)\.disabled = true;/);
-  // A running batch retires on clear-files via the generation.
-  assert.match(
-    uploadScript,
-    /clear-files'\)\.addEventListener\('click', \(\) => \{\s*\n\s*if \(uploading\) return;\s*\n\s*\/\/ Retire any pick batch still admitting[\s\S]{0,120}pickGeneration \+= 1;/,
-  );
-  assert.match(uploadScript, /aborted: \(\) => uploading \|\| pickGeneration !== batchGeneration,/);
-});

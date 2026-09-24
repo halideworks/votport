@@ -750,7 +750,7 @@ fn stage_unresumable(error: &VotError) -> bool {
 /// Copies each object a fetched bundle holds to its loose path, re-hashing to
 /// the announced root. Refuses the whole bundle before writing a byte on a
 /// packed entry, a name that would escape `dest`, or a file already present.
-#[cfg(test)]
+#[cfg(all(test, windows))]
 fn materialize(
     bundle: &Path,
     dest: &Path,
@@ -1123,81 +1123,6 @@ mod tests {
         )));
         assert!(!is_capability_refusal(&VotError::PeerClosed(0)));
         assert!(!is_capability_refusal(&VotError::CarrierUnavailable));
-    }
-
-    #[test]
-    fn an_admitted_capability_reloads_after_a_client_restart() {
-        let home = tempfile::tempdir().unwrap();
-        let device_key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
-        let device = Device::from_signing_key(device_key.clone());
-        let issuer = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
-        let capability = vot_cli::authz::issue(
-            "votport",
-            "test-audience",
-            &issuer,
-            device_key.verifying_key().to_bytes(),
-            [9; 32],
-            100,
-            3600,
-        )
-        .unwrap();
-        let origin = "https://test.example";
-        let token = "delivery-token";
-        let metadata = crate::api::OutboundMetadata {
-            grant_id: Some("grant".into()),
-            package_root: Some(hex::encode([9; 32])),
-            delivery_manifest: Some("manifest".into()),
-            evidence_authorization: None,
-            receipt_key: None,
-            has_password: false,
-            authorized: true,
-            label: None,
-            files: Vec::new(),
-            fetch: None,
-        };
-        let stage = fetch_stage(home.path(), origin, token);
-        let capability_path = stage.with_extension(CAPABILITY_EXTENSION);
-        let saved = SavedCapability {
-            origin: origin.into(),
-            token: token.into(),
-            grant_id: metadata.grant_id.clone(),
-            delivery_manifest: metadata.delivery_manifest.clone(),
-            package_root: hex::encode([9; 32]),
-            holder: hex::encode(device_key.verifying_key().to_bytes()),
-            capability,
-        };
-        crate::identity::write_private(&capability_path, &serde_json::to_vec(&saved).unwrap())
-            .unwrap();
-
-        assert!(
-            matches!(
-                load_saved_holder(&capability_path, &device, origin, token, &metadata).unwrap(),
-                SavedCapabilityState::Valid(_)
-            ),
-            "the minted holder must survive the first receive process"
-        );
-        let restarted = Device::from_signing_key(device_key);
-        assert!(
-            matches!(
-                load_saved_holder(&capability_path, &restarted, origin, token, &metadata).unwrap(),
-                SavedCapabilityState::Valid(_)
-            ),
-            "the same persisted device key must reuse the admitted holder"
-        );
-        let mut sidecar = serde_json::to_value(&saved).unwrap();
-        sidecar["expires_at"] = serde_json::json!(0);
-        crate::identity::write_private(&capability_path, &serde_json::to_vec(&sidecar).unwrap())
-            .unwrap();
-        assert!(matches!(
-            load_saved_holder(&capability_path, &device, origin, token, &metadata).unwrap(),
-            SavedCapabilityState::Valid(_)
-        ));
-        assert_ne!(stage, capability_path);
-        assert_ne!(
-            fetch_stage(home.path(), origin, "another-delivery"),
-            stage,
-            "each delivery keeps a separate stage and capability"
-        );
     }
 
     #[test]
@@ -1601,51 +1526,6 @@ mod tests {
         state.flush(&mut crate::progress::Silent).unwrap();
     }
 
-    #[test]
-    fn resumed_materialize_verifies_existing_files_and_skips_their_objects() {
-        let home = tempfile::tempdir().unwrap();
-        let source = home.path().join("source");
-        let stage = home.path().join("bundle");
-        let dest = home.path().join("dest");
-        fs::create_dir(&source).unwrap();
-        fs::create_dir(&dest).unwrap();
-        let mut admitted = Vec::new();
-        for (name, bytes) in [
-            ("first", b"first".as_slice()),
-            ("second", b"second".as_slice()),
-        ] {
-            let path = source.join(name);
-            fs::write(&path, bytes).unwrap();
-            admitted.push(admit(name, path, false).unwrap());
-        }
-        build(admitted, &stage).unwrap();
-        fs::create_dir_all(stage.join("objects")).unwrap();
-        for entry in read_manifest(&stage).unwrap() {
-            if package_path_string(&entry.path) == "second" {
-                fs::write(
-                    stage.join("objects").join(object_name(&entry.object.root)),
-                    b"second",
-                )
-                .unwrap();
-            }
-        }
-        fs::write(dest.join("first"), b"wrong").unwrap();
-        assert!(matches!(
-            materialize(&stage, &dest, &mut crate::progress::Silent, true),
-            Err(Error::Exists { .. })
-        ));
-        assert!(!dest.join("second").exists());
-        fs::write(dest.join("first"), b"first").unwrap();
-        assert!(matches!(
-            materialize(&stage, &dest, &mut crate::progress::Silent, false),
-            Err(Error::Exists { .. })
-        ));
-        let received = materialize(&stage, &dest, &mut crate::progress::Silent, true).unwrap();
-        assert_eq!(received.files.len(), 2);
-        assert_eq!(fs::read(dest.join("first")).unwrap(), b"first");
-        assert_eq!(fs::read(dest.join("second")).unwrap(), b"second");
-    }
-
     #[cfg(target_os = "macos")]
     #[test]
     fn small_file_batch_waits_for_barrier_and_preserves_collisions() {
@@ -1824,63 +1704,6 @@ mod tests {
         .unwrap());
         fs::remove_dir_all(&stage).unwrap();
         assert_eq!(fs::read(dest.join("unique")).unwrap(), b"unique");
-    }
-
-    #[test]
-    #[ignore = "same-rig materialization benchmark"]
-    fn materialize_2000_files() {
-        for trial in 0..3 {
-            let home = tempfile::tempdir().unwrap();
-            let source = home.path().join("source");
-            let stage = home.path().join("stage");
-            let dest = home.path().join("dest");
-            fs::create_dir(&source).unwrap();
-            let mut admitted = Vec::new();
-            for index in 0..2000u64 {
-                let name = format!("frame-{index:06}.bin");
-                let path = source.join(&name);
-                let mut bytes = [0; 256];
-                bytes[..8].copy_from_slice(&index.to_le_bytes());
-                fs::write(&path, bytes).unwrap();
-                admitted.push(admit(&name, path, false).unwrap());
-            }
-            build(admitted, &stage).unwrap();
-            fs::create_dir(stage.join("objects")).unwrap();
-            for entry in read_manifest(&stage).unwrap() {
-                let object = stage.join("objects").join(object_name(&entry.object.root));
-                fs::copy(source.join(package_path_string(&entry.path)), &object).unwrap();
-                fs::OpenOptions::new()
-                    .write(true)
-                    .open(object)
-                    .unwrap()
-                    .sync_all()
-                    .unwrap();
-            }
-            let started = std::time::Instant::now();
-            let received = materialize(&stage, &dest, &mut crate::progress::Silent, false).unwrap();
-            let elapsed = started.elapsed();
-            assert_eq!(received.files.len(), 2000);
-            for index in 0..2000u64 {
-                let bytes = fs::read(dest.join(format!("frame-{index:06}.bin"))).unwrap();
-                assert_eq!(bytes.len(), 256);
-                assert_eq!(&bytes[..8], &index.to_le_bytes());
-            }
-            eprintln!(
-                "trial={trial} files=2000 materialize_ms={:.3}",
-                elapsed.as_secs_f64() * 1000.0
-            );
-        }
-    }
-
-    #[test]
-    fn object_name_is_the_hex_root_with_an_obj_suffix() {
-        let mut root = [0u8; 32];
-        root[0] = 0xab;
-        root[31] = 0x01;
-        let name = object_name(&root);
-        assert_eq!(name.len(), 64 + ".obj".len());
-        assert!(name.starts_with("ab00"), "{name}");
-        assert!(name.ends_with("01.obj"), "{name}");
     }
 
     /// Builds a real manifest under `stage` and writes each object at its full

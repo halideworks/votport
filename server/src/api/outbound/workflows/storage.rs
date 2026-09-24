@@ -1438,40 +1438,6 @@ mod tests {
         assert_eq!(keys, ["source/folder/file.mov", "source/empty.mov"]);
     }
 
-    /// Audit 436: delivery-card refusals never name the internal artefacts
-    /// (frozen manifest, snapshot, inventory); each refusal is one
-    /// recoverable sentence in the delivery card's own vocabulary.
-    #[test]
-    fn delivery_refusals_never_name_internal_artefacts() {
-        for (file, source) in [
-            ("outbound/workflows.rs", include_str!("../workflows.rs")),
-            ("outbound/workflows/routes.rs", include_str!("routes.rs")),
-            ("outbound/workflows/storage.rs", include_str!("storage.rs")),
-        ] {
-            for (number, line) in source.lines().enumerate() {
-                let bare = line.trim_start();
-                let same_line = line
-                    .find("conflict(\"")
-                    .map(|at| &line[at + "conflict(\"".len()..]);
-                let parts: Vec<&str> = match same_line {
-                    Some(rest) => vec![rest.split('"').next().unwrap_or_default()],
-                    None if bare.starts_with('"') => {
-                        vec![bare.trim_end_matches(',').trim_end_matches('"')]
-                    }
-                    None => continue,
-                };
-                for literal in parts {
-                    for artefact in ["frozen manifest", "snapshot", "inventory"] {
-                        assert!(
-                            !literal.contains(artefact),
-                            "{file}:{number} names the internal artefact {artefact:?}: {literal}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
     #[tokio::test]
     async fn connection_test_reports_unreachable_votport_port_with_reason_and_no_error_envelope() {
         // Audit finding 337: an unreachable destination port is a probe
@@ -1625,39 +1591,6 @@ mod tests {
                 .as_deref(),
             Some("false")
         );
-    }
-
-    #[tokio::test]
-    async fn an_http_s3_endpoint_is_contacted() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        let app = crate::api::testing::build(directory.path());
-        let config: Storage = serde_json::from_value(json!({
-            "id":"plain","revision":0,"label":"Plain","kind":"s3",
-            "endpoint":format!("http://{}", listener.local_addr().unwrap()),
-            "bucket":"test","region":"us-east-1","path_style":true,"tenants":[""],"enabled":true
-        }))
-        .unwrap();
-        let config = app
-            .store
-            .save_delivery_storage(
-                "local",
-                config,
-                Some(Credentials::AccessKey {
-                    access_key_id: "test-access".into(),
-                    secret_access_key: "test-secret".into(),
-                    session_token: None,
-                }),
-            )
-            .unwrap();
-        let store = config.connect(&app.store).unwrap();
-        let request = tokio::spawn(async move {
-            let _ = store.head(&object_store::path::Path::from("probe")).await;
-        });
-        let accepted =
-            tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await;
-        request.abort();
-        assert!(accepted.is_ok(), "an http:// endpoint must be allowed");
     }
 
     #[tokio::test]

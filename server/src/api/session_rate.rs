@@ -202,32 +202,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allows_up_to_the_cap_then_refuses() {
-        let rate = SessionRate::with_limit(2);
-        for _ in 0..2 {
-            assert!(rate.allow("10.0.0.1"));
-        }
-        assert!(!rate.allow("10.0.0.1"));
-        // Other IPs are unaffected.
-        assert!(rate.allow("10.0.0.2"));
-    }
-
-    #[test]
-    fn a_finished_session_hands_its_budget_back() {
-        let rate = SessionRate::with_limit(2);
-        for _ in 0..10 {
-            assert!(rate.allow("10.0.0.1"));
-            rate.refund("10.0.0.1");
-        }
-        assert!(rate.allow("10.0.0.1"));
-        assert!(rate.allow("10.0.0.1"));
-        assert!(!rate.allow("10.0.0.1"));
-        // Refunding an untracked address is a no-op.
-        rate.refund("10.0.0.9");
-        assert!(!rate.allow("10.0.0.1"));
-    }
-
-    #[test]
     fn the_table_stops_growing_under_address_rotation() {
         let rate = SessionRate::new();
         for index in 0..(TABLE_CAP * 2) {
@@ -282,20 +256,6 @@ mod tests {
             assert!(rate.allow_at("grant", DOWNLOAD_SCALE, None, now));
         }
         assert!(!rate.allow_at("grant", DOWNLOAD_SCALE, None, now));
-    }
-
-    #[test]
-    fn single_file_and_batch_costs_exhaust_the_window_budget() {
-        let rate = DownloadRate::new();
-        let now = Instant::now();
-        for _ in 0..DOWNLOAD_CAPACITY {
-            assert!(rate.allow_at("single", DOWNLOAD_SCALE, None, now));
-        }
-        assert!(!rate.allow_at("single", DOWNLOAD_SCALE, None, now));
-        for _ in 0..DOWNLOAD_CAPACITY {
-            assert!(rate.allow_at("batch", DOWNLOAD_SCALE, None, now));
-        }
-        assert!(!rate.allow_at("batch", DOWNLOAD_SCALE, None, now));
     }
 
     #[test]

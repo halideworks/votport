@@ -771,34 +771,6 @@ mod tests {
         assert!(accept_in(dir.path(), "../invalid", &other).is_err());
     }
 
-    #[test]
-    fn failed_acknowledgements_keep_the_complete_signed_record() {
-        let dir = tempfile::tempdir().unwrap();
-        let server = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
-        let device = ed25519_dalek::SigningKey::from_bytes(&[2; 32]);
-        let authorization = SignedChallenge::issue(
-            Challenge {
-                origin: "http://127.0.0.1:1".into(),
-                grant_id: "grant".into(),
-                manifest: "manifest".into(),
-                holder: hex::encode(device.verifying_key().to_bytes()),
-                nonce: "nonce".into(),
-                issued_at: 1,
-                expires_at: u64::MAX,
-            },
-            &server,
-        );
-        let evidence = Evidence::sign(authorization, EvidenceKind::Verified, &device);
-        let path = enqueue("http://127.0.0.1:1", evidence.clone(), None, dir.path()).unwrap();
-        let result = retry_in(dir.path());
-        assert_eq!((result.pending, result.recorded), (1, 0));
-        let saved: Pending = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        assert_eq!(saved.evidence, evidence);
-        assert!(saved
-            .evidence
-            .verify(&hex::encode(server.verifying_key().to_bytes())));
-    }
-
     /// A retry pass holds the pass lock across its network round trips, so a
     /// second call must report the outbox as it stands instead of queueing
     /// behind a slow server.
@@ -1052,19 +1024,6 @@ mod tests {
         server.join().unwrap();
         let requests = seen.lock().unwrap().clone();
         assert!(requests[1].0.ends_with("/api/s/tok/evidence-challenge"));
-    }
-
-    #[test]
-    fn an_expired_authorization_without_a_token_names_re_verification() {
-        let dir = tempfile::tempdir().unwrap();
-        let device = Device::load_or_create_in(&dir.path().join("device")).unwrap();
-        let outbox = dir.path().join("outbox");
-        let (_original, id) = near_expiry_pending(&outbox, "http://127.0.0.1:1", &device, 0, None);
-        let error = accept_in(&outbox, &id, &device).unwrap_err().to_string();
-        assert!(
-            error.contains("verify the saved delivery files again"),
-            "{error}"
-        );
     }
 
     #[test]

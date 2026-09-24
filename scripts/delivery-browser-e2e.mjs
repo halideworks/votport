@@ -297,6 +297,39 @@ try {
     if (action === 'Replace link') assert.match(await page.inputValue('#outbound-url'), /^https?:\/\//);
   }
   await page.getByText('Deliveries could not be loaded.', { exact: true }).waitFor();
+
+  // A password-protected delivery: a recipient without the password sees the
+  // gate, a wrong password is refused without listing files, and the right
+  // one opens the delivery.
+  const gatedFolder = `${project}-gated`;
+  await fs.mkdir(path.join(root, 'library', gatedFolder), { recursive: true });
+  await fs.writeFile(path.join(root, 'library', gatedFolder, 'saved.bin'), 'Password-gated fixture.\n');
+  const preparation = await request('admin/outbound-grants/preparations', {
+    paths: [`${gatedFolder}/saved.bin`], password: 'correct horse', expires_days: 1,
+  });
+  let gated;
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    gated = await request(`admin/outbound-grants/preparations/${preparation.preparation_id}`);
+    if (gated.status === 'complete' || gated.status === 'failed') break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(gated.status, 'complete', JSON.stringify(gated));
+  const outsider = await browser.newContext();
+  const gatePage = await outsider.newPage();
+  gatePage.on('pageerror', (error) => errors.push(error.message));
+  await gatePage.goto(gated.url);
+  await gatePage.locator('#download-gate').waitFor();
+  assert.equal(await gatePage.locator('#download-content').isVisible(), false);
+  await gatePage.fill('#download-password', 'wrong horse');
+  await gatePage.click('#download-password-submit');
+  await gatePage.locator('#download-password-error').waitFor();
+  assert.notEqual((await gatePage.textContent('#download-password-error')).trim(), '');
+  assert.equal(await gatePage.locator('#download-content').isVisible(), false);
+  await gatePage.fill('#download-password', 'correct horse');
+  await gatePage.click('#download-password-submit');
+  await gatePage.locator('#download-content').waitFor();
+  await gatePage.locator('#object').getByText('saved.bin').first().waitFor();
+  await outsider.close();
   assert.deepEqual(errors, []);
   console.log('Project UI, recipient-key admission, copy/open actions, saved-file verification, revoked-link recovery and queued acceptance: passed');
 } finally {

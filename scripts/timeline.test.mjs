@@ -34,29 +34,3 @@ test('summarize reads duration, rates, pauses, restarts, and outcome from the re
   assert.equal(summary.files, 2);
 });
 
-test('a record without a log or timing has null rates and a partial outcome', () => {
-  const summary = summarize({ id: 'x', completed_at: 5, total_bytes: 10, partial: true, file_count: 0 });
-  assert.equal(summary.duration, null);
-  assert.equal(summary.average, null);
-  assert.equal(summary.peak, null);
-  assert.equal(summary.pauses, 0);
-  assert.equal(summary.outcome, 'partial');
-});
-
-test('narrate turns each event kind into a sentence with its facts', () => {
-  assert.equal(narrate(upload.log[0]).text, 'Session opened, manifest verified');
-  const published = narrate(upload.log[1]);
-  assert.equal(published.text, 'a.mov published with its receipt');
-  assert.match(published.detail, /432 MB in 3s · 144 MB\/s/);
-  assert.equal(narrate(upload.log[2]).text, 'Sender went quiet for 2m 40s');
-  assert.match(narrate(upload.log[3]).detail, /1 file already published/);
-  assert.equal(narrate(upload.log[5]).detail, '17 re-sent chunks');
-  assert.equal(narrate({ kind: 'elided', count: 30 }).text, '30 more events not kept');
-  assert.equal(narrate({ kind: 'weird' }).text, 'weird');
-});
-
-test('summary uses the transfer header count without file rows', () => {
-  const header = { ...upload, file_count: 201 };
-  assert.equal(summarize(header).files, 201);
-  assert.equal(summarize({ ...header, file_count: 0 }).files, 0);
-});

@@ -192,6 +192,27 @@ try {
   await page.unroute('**/api/admin/outbound-grants/preparations/*');
   const grants = await api('admin/outbound-grants'); const grant = grants.grants.find((grant) => grant.label === downloadLabel);
   assert.deepEqual(grant.notifications.rules, [{ destination_id: incoming.id, events: ['outbound_download_started'] }]);
+  // The first file request notifies Incoming, and the notification's link
+  // reveals that delivery's card on the Deliver page.
+  const deliveryToken = new URL(await page.inputValue('#outbound-url')).pathname.split('/').pop();
+  const beforeDownload = messages.length;
+  assert.equal((await context.request.get(`${base}/api/s/${deliveryToken}/files/0`)).status(), 200);
+  // Incoming is a chat destination, so the deep link travels in the text.
+  const deepLink = () => messages.slice(beforeDownload)
+    .filter((message) => message.path === '/incoming')
+    .map((message) => JSON.stringify(message.payload).match(/https?:[^\s"\\]*\/deliver#grant-[0-9a-f]+/)?.[0])
+    .find(Boolean);
+  for (let attempt = 0; attempt < 100 && !deepLink(); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.ok(deepLink(), 'the routed delivery notified Incoming with a link');
+  assert.ok(deepLink().endsWith(`#grant-${grant.id}`));
+  await page.goto(deepLink());
+  const revealed = page.locator(`[id="grant-${grant.id}"]`);
+  await revealed.waitFor();
+  await revealed.getByRole('heading', { name: downloadLabel, exact: true }).waitFor();
+  await page.waitForFunction((id) => {
+    const box = document.getElementById(id)?.getBoundingClientRect();
+    return box && box.top < window.innerHeight && box.bottom > 0;
+  }, `grant-${grant.id}`);
   await page.goto(`${base}/workflows#projects`);
   await page.click('#workflow-new-project');
   await page.fill('#wp-label', 'Notification workflow'); await openAncestors(page.locator('#wp-id'));  await page.fill('#wp-id', id); await page.fill('#wp-directory', id);

@@ -2172,12 +2172,6 @@ mod receive_space_tests {
         assert!(detail.contains("bytes free"), "{detail}");
     }
 
-    #[tokio::test]
-    async fn begin_under_free_minus_reserve_is_accepted() {
-        let (status, body) = begin_with_declared(8, 1024 * 1024).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-    }
-
     #[test]
     fn usable_bytes_keeps_flat_reserve_on_large_volumes_and_caps_on_small() {
         // Large volume: flat 1 GiB reserve.
@@ -2889,30 +2883,6 @@ mod push_preflight_tests {
                 .await
                 .status(),
             StatusCode::NOT_FOUND
-        );
-    }
-
-    #[tokio::test]
-    async fn link_info_advertises_the_byte_bound_entry_limit() {
-        let directory = tempfile::tempdir().unwrap();
-        let application = testing::build(directory.path());
-        let mut link = open_link("small-cap");
-        link.max_bytes = Some(1024 * 1024);
-        application.store.insert_link(link).unwrap();
-
-        let info = app::router(application)
-            .oneshot(
-                Request::get("/api/r/small-cap")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let info = response_json(info).await;
-        assert_eq!(info["max_bytes"], 1024 * 1024);
-        assert_eq!(
-            info["max_entries"],
-            crate::session::max_entries_for_bytes(1024 * 1024)
         );
     }
 

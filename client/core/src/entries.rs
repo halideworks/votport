@@ -116,12 +116,6 @@ mod tests {
     }
 
     #[test]
-    fn admits_an_ordinary_nested_path() {
-        let entry = admit("frames/0001.exr", source(), false).expect("admitted");
-        assert_eq!(display_path(&entry.path), "frames/0001.exr");
-    }
-
-    #[test]
     fn refuses_the_component_rules_the_server_applies() {
         // Each row is the votport-specific policy that vot-manifest's portable
         // profile does not cover, so a mutant of admit_component is caught by

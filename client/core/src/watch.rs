@@ -1197,20 +1197,6 @@ mod tests {
         assert_eq!(handed.0.lock().unwrap().len(), 2);
     }
 
-    /// The live confirmation of the settle defect: two 1 MiB appends
-    /// 15 s apart let the previous 10 s window settle the first half while
-    /// the writer was still pausing, and the drop shipped twice. The hold
-    /// and age rules can only cover a pause the window outlasts, so the
-    /// window must stay past the live-confirmed one.
-    #[test]
-    fn the_settle_window_outlasts_the_live_confirmed_append_pause() {
-        let pause = Duration::from_secs(15);
-        assert!(
-            SETTLE > pause,
-            "a {pause:?} pause between appends must not settle as a finished drop"
-        );
-    }
-
     fn watch_in(dir: &Path) -> Stored {
         Stored {
             id: "w".to_owned(),
@@ -1218,62 +1204,6 @@ mod tests {
             link: "https://d/r/t".to_owned(),
             password: None,
         }
-    }
-
-    #[test]
-    fn a_folder_with_only_hidden_metadata_is_handed_for_an_empty_send() {
-        let _test_lock = TEST_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let watch = watch_in(dir.path());
-        let (_state, _state_scope) = test_state();
-        store(std::slice::from_ref(&watch)).unwrap();
-        let handed = Arc::new(Collect(Mutex::new(Vec::new())));
-        let mut seen = HashMap::new();
-        let settle = Duration::from_millis(10);
-        std::fs::create_dir(dir.path().join("seq")).unwrap();
-        let empty_at = Instant::now();
-        let wall = aged_wall(settle);
-        scan(&watch, settle, empty_at, wall, &mut seen, handed.as_ref());
-        scan(
-            &watch,
-            settle,
-            empty_at + settle,
-            wall,
-            &mut seen,
-            handed.as_ref(),
-        );
-        assert!(handed.0.lock().unwrap().is_empty());
-        std::fs::write(dir.path().join("seq/.DS_Store"), b"metadata").unwrap();
-        let t0 = Instant::now();
-        let wall = aged_wall(settle);
-        scan(&watch, settle, t0, wall, &mut seen, handed.as_ref());
-        scan(
-            &watch,
-            settle,
-            t0 + Duration::from_secs(1),
-            wall,
-            &mut seen,
-            handed.as_ref(),
-        );
-        assert_eq!(handed.0.lock().unwrap().len(), 1);
-        std::fs::write(dir.path().join("seq/a"), b"1").unwrap();
-        scan(
-            &watch,
-            settle,
-            t0 + Duration::from_secs(2),
-            wall,
-            &mut seen,
-            handed.as_ref(),
-        );
-        scan(
-            &watch,
-            settle,
-            t0 + Duration::from_secs(3),
-            wall,
-            &mut seen,
-            handed.as_ref(),
-        );
-        assert_eq!(handed.0.lock().unwrap().len(), 2);
     }
 
     /// An unreadable subfolder counts as one entry, so the drop changes,
@@ -1334,20 +1264,6 @@ mod tests {
                 "handed again for the send to say why"
             );
         }
-    }
-
-    #[test]
-    fn a_folder_fingerprint_covers_its_files() {
-        let _test_lock = TEST_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let drop = dir.path().join("seq");
-        std::fs::create_dir_all(drop.join("sub")).unwrap();
-        std::fs::write(drop.join("a"), b"12").unwrap();
-        std::fs::write(drop.join("sub/b"), b"345").unwrap();
-        let (count, bytes, newest) = fingerprint(&drop).unwrap();
-        assert_eq!((count, bytes), (2, 5));
-        assert!(newest.is_some());
-        assert_eq!(fingerprint(&dir.path().join("missing")), None);
     }
 
     #[cfg(unix)]

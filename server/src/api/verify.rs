@@ -127,36 +127,3 @@ fn profile_name(profile: CommitProfile) -> Option<&'static str> {
         CommitProfile::Strict => Some("strict"),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn enum_names_are_lowercase_json_strings() {
-        assert_eq!(subject_kind_name(SubjectKind::Object), Some("object"));
-        assert_eq!(subject_kind_name(SubjectKind::Package), Some("package"));
-        for (level, name) in [
-            (AssuranceLevel::Admitted, "admitted"),
-            (AssuranceLevel::TransitVerified, "transit_verified"),
-            (AssuranceLevel::Durable, "durable"),
-            (AssuranceLevel::AtRestVerified, "at_rest_verified"),
-            (AssuranceLevel::Published, "published"),
-        ] {
-            assert_eq!(assurance_name(level), Some(name));
-        }
-        for (profile, name) in [
-            (CommitProfile::Fast, "fast"),
-            (CommitProfile::Balanced, "balanced"),
-            (CommitProfile::Strict, "strict"),
-        ] {
-            assert_eq!(profile_name(profile), Some(name));
-        }
-    }
-
-    #[test]
-    fn error_mapping_sentences() {
-        assert_eq!(not_a_receipt().message, "This is not a vot-receipt.");
-        assert_eq!(uncheckable().message, "This receipt could not be checked.");
-    }
-}

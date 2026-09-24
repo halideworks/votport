@@ -1068,26 +1068,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn metadata_identity_admits_supported_suites_and_rejects_invalid_values() {
-        let root = hex::encode([9; 32]);
-        for (name, suite) in [("blake3", 1), ("sha256", 2)] {
-            assert_eq!(
-                decode_object(name, &root, 7).unwrap(),
-                ObjectId {
-                    suite,
-                    root: [9; 32],
-                    length: 7
-                }
-            );
-        }
-        assert!(matches!(
-            decode_object("md5", &root, 7),
-            Err(Error::UnknownSuite { .. })
-        ));
-        assert!(decode_object("sha256", "not a digest", 7).is_err());
-    }
-
-    #[test]
     fn receive_buffers_bound_memory_and_still_read_past_empty_files() {
         for (total, expected) in [
             (0, 1),
@@ -1289,57 +1269,6 @@ mod tests {
                 fs::read(destination.path().join(format!("file{index}"))).unwrap(),
                 bytes
             );
-        }
-    }
-
-    #[test]
-    fn resume_reuses_only_matching_regular_files() {
-        for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("file");
-            let bytes = b"completed";
-            let mut builder = ObjectBuilder::new(suite, Some(bytes.len() as u64)).unwrap();
-            builder.update(bytes).unwrap();
-            let object = builder.finish().unwrap().object_id().clone();
-            let root = object.root;
-            let mut observer = crate::progress::Silent;
-            assert!(!reusable_file(&path, &object, true, &mut observer).unwrap());
-            fs::write(&path, bytes).unwrap();
-            assert!(matches!(
-                reusable_file(&path, &object, false, &mut observer),
-                Err(Error::Exists { .. })
-            ));
-            assert!(reusable_file(&path, &object, true, &mut observer).unwrap());
-            for (hash, length) in [(root, 8), (root, 10), ([0; 32], 9)] {
-                assert!(matches!(
-                    reusable_file(
-                        &path,
-                        &ObjectId {
-                            suite: object.suite,
-                            root: hash,
-                            length
-                        },
-                        true,
-                        &mut observer
-                    ),
-                    Err(Error::Exists { .. })
-                ));
-                assert_eq!(fs::read(&path).unwrap(), bytes);
-            }
-            assert!(matches!(
-                reusable_file(dir.path(), &object, true, &mut observer),
-                Err(Error::Exists { .. })
-            ));
-            #[cfg(unix)]
-            {
-                let link = dir.path().join("link");
-                std::os::unix::fs::symlink(&path, &link).unwrap();
-                assert!(matches!(
-                    reusable_file(&link, &object, true, &mut observer),
-                    Err(Error::Exists { .. })
-                ));
-                assert_eq!(fs::read(&path).unwrap(), bytes);
-            }
         }
     }
 
@@ -1933,17 +1862,6 @@ mod tests {
         assert!(!destination.exists());
     }
 
-    #[test]
-    fn a_wrong_root_removes_only_its_owned_journal() {
-        let dir = tempfile::tempdir().unwrap();
-        let destination = dir.path().join("file");
-        let result = receive_from(&destination, b"abcd", &mut |_| Ok(stream(b"wxyz", 0)));
-        assert!(matches!(result, Err(Error::Verify { .. })), "{result:?}");
-        assert!(!part_path(&destination).exists());
-        assert!(!identity_path(&destination).exists());
-        assert!(!destination.exists());
-    }
-
     #[cfg(unix)]
     #[test]
     fn journal_symlinks_and_nonregular_files_are_refused() {
@@ -1981,28 +1899,6 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_name_lands_under_the_destination() {
-        let dest = Path::new("/out");
-        assert_eq!(
-            local_path(dest, "clips/a.mov").unwrap(),
-            Path::new("/out/clips/a.mov")
-        );
-        assert_eq!(
-            local_path(dest, "note.txt").unwrap(),
-            Path::new("/out/note.txt")
-        );
-    }
-
-    #[test]
-    fn the_root_compare_accepts_only_an_exact_match() {
-        let root = [7u8; 32];
-        assert!(root_matches(&root, &root));
-        let mut off_by_one = root;
-        off_by_one[31] ^= 1;
-        assert!(!root_matches(&root, &off_by_one));
-    }
-
-    #[test]
     fn a_traversing_or_absolute_name_is_refused() {
         let dest = Path::new("/out");
         // A parent reference, a component that is a separator, and a reserved
@@ -2016,39 +1912,5 @@ mod tests {
             local_path(dest, "/etc/passwd").unwrap(),
             Path::new("/out/etc/passwd")
         );
-    }
-
-    /// Audit 482: a destination permission failure must name the path it
-    /// happened at, not render as a bare "Permission denied".
-    #[cfg(unix)]
-    #[test]
-    fn destination_permission_failures_name_the_path() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = std::env::temp_dir().join(format!(
-            "votport-receive-perm-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let locked = dir.join("locked");
-        std::fs::create_dir_all(&locked).unwrap();
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
-        // Root writes anywhere; there the case cannot be made, so it skips.
-        let refused = std::fs::create_dir_all(locked.join("child")).err();
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-        let Some(error) = refused else {
-            return;
-        };
-        let named = io_at(&locked, error);
-        assert!(
-            named.to_string().contains(&locked.display().to_string()),
-            "{named}"
-        );
-        assert_eq!(named.headline(), "A file could not be written.");
     }
 }

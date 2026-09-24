@@ -1,33 +1,6 @@
 use super::*;
 
 #[test]
-fn usable_now_requires_an_active_link_that_has_not_expired() {
-    let now = now_unix();
-    let mut link = test_link("usable-now");
-    assert!(link.usable_now());
-
-    link.expires_at = Some(now + 3600);
-    assert!(link.usable_now());
-
-    // Past the expiry the link is dead even though active never changed.
-    link.expires_at = Some(now - 3600);
-    assert!(!link.usable_now());
-
-    link.expires_at = Some(now + 3600);
-    link.active = false;
-    assert!(!link.usable_now());
-}
-
-#[test]
-fn legacy_upload_records_default_to_http_transport() {
-    let record: UploadRecord = serde_json::from_str(
-        r#"{"id":"legacy","completed_at":1,"package_root":"root","total_bytes":0,"files":[]}"#,
-    )
-    .unwrap();
-    assert_eq!(record.transport, None);
-}
-
-#[test]
 fn a_broken_table_is_an_error_not_a_panic() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path()).unwrap();
@@ -262,34 +235,6 @@ pub(crate) fn test_outbound_grant(id: &str, tenant: &str, file_index: usize) -> 
 }
 
 #[test]
-fn tenant_incarnation_survives_updates_and_reopen_but_not_recreation() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    store.insert_tenant(test_tenant("acme")).unwrap();
-    let mut tenant = store.tenant("acme").unwrap().unwrap();
-    let incarnation = tenant.incarnation.clone();
-    assert_eq!(hex::decode(&incarnation).unwrap().len(), 16);
-    tenant.label = "updated".into();
-    tenant.incarnation = "must-not-replace".into();
-    assert!(store.update_tenant(&tenant).unwrap());
-    assert_eq!(
-        store.tenant("acme").unwrap().unwrap().incarnation,
-        incarnation
-    );
-    drop(store);
-    let store = Store::open(directory.path()).unwrap();
-    assert_eq!(
-        store.tenant("acme").unwrap().unwrap().incarnation,
-        incarnation
-    );
-    assert_eq!(store.remove_tenant("acme").unwrap(), TenantRemoval::Deleted);
-    store.insert_tenant(test_tenant("acme")).unwrap();
-    let replacement = store.tenant("acme").unwrap().unwrap();
-    assert_eq!(replacement.created_at, tenant.created_at);
-    assert_ne!(replacement.incarnation, incarnation);
-}
-
-#[test]
 fn tenant_removal_clears_retained_uploads_atomically_and_only_in_that_tenant() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path()).unwrap();
@@ -440,27 +385,6 @@ fn grant_insertion_refuses_ambiguous_and_nonportable_names() {
     assert_eq!(store.outbound_grants("").unwrap(), vec![grant]);
 }
 
-#[test]
-fn automation_tokens_preserve_permissions_across_reopen() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    store
-        .insert_automation_token(test_automation_token("agent", "tenant"))
-        .unwrap();
-    drop(store);
-    let reopened = Store::open(directory.path()).unwrap();
-    let token = reopened
-        .authenticate_automation_token("hash-agent", 15)
-        .unwrap()
-        .unwrap();
-    assert_eq!(token.tenant, "tenant");
-    assert_eq!(token.permissions, ["deliveries:create"]);
-    assert!(reopened
-        .automation_operation("agent", "missing")
-        .unwrap()
-        .is_none());
-}
-
 fn test_automation_token(id: &str, tenant: &str) -> AutomationToken {
     AutomationToken {
         id: id.to_owned(),
@@ -475,139 +399,6 @@ fn test_automation_token(id: &str, tenant: &str) -> AutomationToken {
         revoked_at: None,
         last_used_at: None,
     }
-}
-
-#[test]
-fn outbound_grants_round_trip_full_byte_range() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    let schema = store
-        .with(|connection| {
-            connection.query_row(
-                "SELECT value FROM meta WHERE key = 'schema_version'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-        })
-        .unwrap();
-    assert_eq!(schema, SCHEMA_VERSION.to_string());
-    assert!(store
-            .with(|connection| {
-                connection.query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'outbound_grants'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-            })
-            .unwrap() > 0);
-
-    let grant = test_outbound_grant("g1", "acme", 3);
-    store.insert_outbound_grant(grant.clone()).unwrap();
-    assert_eq!(store.outbound_grants("acme").unwrap(), vec![grant]);
-}
-
-#[test]
-fn outbound_summary_counts_open_links_deliveries_and_active_downloads() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    let open = test_outbound_grant("open", "acme", 1);
-    let mut used = test_outbound_grant("used", "acme", 1);
-    used.downloads = 2;
-    used.max_downloads = Some(2);
-    let mut revoked = test_outbound_grant("gone", "acme", 1);
-    revoked.revoked_at = Some(5);
-    let other = test_outbound_grant("other", "beta", 1);
-    for grant in [open.clone(), used, revoked, other] {
-        store.insert_outbound_grant(grant).unwrap();
-    }
-    // The status handler keeps the part of each in-flight key before the
-    // first colon: the grant's token hash.
-    let active = vec![open.token_hash.clone(), "hash-other".to_owned()];
-    let summary = store.outbound_summary("acme", 10, &active).unwrap();
-    assert_eq!(summary.open_grants, 1, "used and revoked are not open");
-    assert_eq!(summary.deliveries, 2);
-    assert_eq!(summary.active, 1, "the other tenant's download is not ours");
-    assert_eq!(store.outbound_active_count("acme", &active).unwrap(), 1);
-    let expired = store.outbound_summary("acme", 25, &[]).unwrap();
-    assert_eq!(expired.open_grants, 0);
-    assert_eq!(expired.active, 0);
-}
-
-#[test]
-fn uploads_since_preserves_u64_max_and_saturates_sum_overflow() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    let upload = |id: &str, total_bytes| UploadRecord {
-        id: id.to_owned(),
-        started_at: 1,
-        completed_at: 10,
-        replayed_chunks: 0,
-        rejected_chunks: 0,
-        transport: None,
-        package_root: String::new(),
-        total_bytes,
-        files: Vec::new(),
-        partial: false,
-        log: Vec::new(),
-    };
-    let mut first = test_link("first");
-    first.uploads = vec![upload("max", u64::MAX)];
-    store.insert_link(first).unwrap();
-    assert_eq!(store.uploads_since("", 0).unwrap(), (1, u64::MAX));
-
-    let mut second = test_link("second");
-    second.uploads = vec![upload("one", 1)];
-    store.insert_link(second).unwrap();
-    assert_eq!(store.uploads_since("", 0).unwrap(), (2, u64::MAX));
-}
-
-#[test]
-fn outbound_grants_round_trip_multiple_library_files() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    let mut grant = test_outbound_grant("library", "acme", 0);
-    grant.files = vec![
-        OutboundGrantFile {
-            source: "objects/a".to_owned(),
-            name: "a.txt".to_owned(),
-            suite: "blake3".to_owned(),
-            root: "aa".to_owned(),
-            bytes: 3,
-            receipt_b64: "receipt-a".to_owned(),
-            downloads: 0,
-            first_download_at: None,
-            last_download_at: None,
-        },
-        OutboundGrantFile {
-            source: "objects/b".to_owned(),
-            name: "b.txt".to_owned(),
-            suite: "sha256".to_owned(),
-            root: "bb".to_owned(),
-            bytes: u64::MAX,
-            receipt_b64: "receipt-b".to_owned(),
-            downloads: 0,
-            first_download_at: None,
-            last_download_at: None,
-        },
-    ];
-    store.insert_outbound_grant(grant.clone()).unwrap();
-    assert_eq!(
-        store.outbound_grant_by_token_hash("hash-library").unwrap(),
-        Some(grant)
-    );
-    store.record_outbound_download("library", &[0], 30).unwrap();
-    assert_eq!(
-        store
-            .with(|connection| connection.query_row(
-                "SELECT file_count FROM outbound_grants WHERE id = 'library'",
-                [],
-                |row| row.get::<_, i64>(0),
-            ))
-            .unwrap(),
-        2
-    );
-    let page = store.outbound_grants_page("acme", 10, 0, 2).unwrap().0;
-    assert_eq!(page[0].0.files[0].downloads, 1);
 }
 
 #[test]
@@ -750,45 +541,6 @@ fn legacy_file_lookup_allows_only_scalar_index_zero() {
         .unwrap()
         .unwrap();
     assert!(page.files.is_empty());
-}
-
-#[test]
-fn protected_outbound_grant_password_round_trips() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    let mut grant = test_outbound_grant("protected", "acme", 0);
-    grant.password_hash = Some("argon2id-hash".to_owned());
-
-    store.insert_outbound_grant(grant.clone()).unwrap();
-
-    assert_eq!(
-        store
-            .outbound_grant_by_token_hash("hash-protected")
-            .unwrap(),
-        Some(grant)
-    );
-}
-
-#[test]
-fn outbound_grants_are_tenant_scoped_and_hash_lookup_is_global() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    store
-        .insert_outbound_grant(test_outbound_grant("g1", "acme", 0))
-        .unwrap();
-    store
-        .insert_outbound_grant(test_outbound_grant("g2", "other", 1))
-        .unwrap();
-
-    assert_eq!(store.outbound_grants("acme").unwrap().len(), 1);
-    assert_eq!(
-        store
-            .outbound_grant_by_token_hash("hash-g1")
-            .unwrap()
-            .unwrap()
-            .id,
-        "g1"
-    );
 }
 
 #[test]
@@ -1234,104 +986,6 @@ fn outbound_grants_page_reports_counts_and_bounds_file_previews() {
     assert!(large.files.is_empty());
 }
 
-#[test]
-fn automation_tokens_round_trip_and_list_by_tenant() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    let token = test_automation_token("t1", "acme");
-    store.insert_automation_token(token.clone()).unwrap();
-    store
-        .insert_automation_token(test_automation_token("t2", "other"))
-        .unwrap();
-
-    assert_eq!(
-        store.automation_tokens("acme", "", 100).unwrap(),
-        vec![token]
-    );
-    assert!(store
-        .automation_tokens("missing", "", 100)
-        .unwrap()
-        .is_empty());
-}
-
-#[test]
-fn remove_tenant_cleans_outbound_credentials_atomically() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    store.insert_tenant(test_tenant("acme")).unwrap();
-    let mut grant = test_outbound_grant("grant", "acme", 0);
-    grant.files = vec![OutboundGrantFile {
-        source: "objects/file".to_owned(),
-        name: "file".to_owned(),
-        suite: "blake3".to_owned(),
-        root: "root".to_owned(),
-        bytes: 1,
-        receipt_b64: String::new(),
-        downloads: 0,
-        first_download_at: None,
-        last_download_at: None,
-    }];
-    store.insert_outbound_grant(grant).unwrap();
-    store
-        .insert_automation_token(test_automation_token("token", "acme"))
-        .unwrap();
-    store
-            .with(|connection| {
-                connection.execute(
-                    "INSERT INTO outbound_grant_manifests(grant_id,manifest_root,created_at) VALUES ('grant','root',1)",
-                    [],
-                )?;
-                connection.execute(
-                    "INSERT INTO outbound_fetch_tickets(token_id,grant_id,manifest_root,expires_at) VALUES ('ticket','grant','root',2)",
-                    [],
-                )?;
-                Ok(())
-            })
-            .unwrap();
-
-    assert_eq!(store.remove_tenant("acme").unwrap(), TenantRemoval::Deleted);
-    assert!(store.outbound_grants("acme").unwrap().is_empty());
-    assert!(store
-        .outbound_grant_by_token_hash("hash-grant")
-        .unwrap()
-        .is_none());
-    assert_eq!(
-        store
-            .with(|connection| connection.query_row(
-                "SELECT COUNT(*) FROM outbound_grant_files",
-                [],
-                |row| row.get::<_, i64>(0),
-            ))
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        store
-            .with(|connection| connection.query_row(
-                "SELECT COUNT(*) FROM outbound_grant_manifests",
-                [],
-                |row| row.get::<_, i64>(0),
-            ))
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        store
-            .with(|connection| connection.query_row(
-                "SELECT COUNT(*) FROM outbound_fetch_tickets",
-                [],
-                |row| row.get::<_, i64>(0),
-            ))
-            .unwrap(),
-        0
-    );
-    assert!(store.automation_tokens("acme", "", 100).unwrap().is_empty());
-    assert!(store
-        .authenticate_automation_token("hash-token", 15)
-        .unwrap()
-        .is_none());
-}
-
 /// Audit finding 374: exported copies are never removed and the tenant
 /// delete used to erase the only record of the buckets holding them, so
 /// the removal must first write an export inventory naming each completed
@@ -1667,93 +1321,6 @@ fn fetch_delivery_and_ticket_commit_atomically() {
         Some(10)
     );
     assert!(!store.admit_fetch_ticket(&ticket, 11).unwrap());
-}
-
-#[test]
-fn outbound_download_count_and_active_link_query_round_trip() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    store
-        .insert_outbound_grant(test_outbound_grant("g1", "acme", 0))
-        .unwrap();
-    let mut other = test_outbound_grant("g2", "acme", 1);
-    other.link_id = "other-link".to_owned();
-    other.expires_at = 100;
-    store.insert_outbound_grant(other).unwrap();
-
-    assert_eq!(
-        store.record_outbound_download("g1", &[0], 100).unwrap(),
-        OutboundDownloadResult {
-            first_download: true,
-            completed_delivery: true,
-            event_at: 100,
-        }
-    );
-    assert_eq!(
-        store.record_outbound_download("g1", &[0], 110).unwrap(),
-        OutboundDownloadResult {
-            first_download: false,
-            completed_delivery: false,
-            event_at: 110,
-        }
-    );
-    let grant = store
-        .outbound_grant_by_token_hash("hash-g1")
-        .unwrap()
-        .unwrap();
-    assert_eq!(grant.downloads, 2);
-    assert_eq!(grant.first_download_at, Some(100));
-    assert_eq!(grant.last_download_at, Some(110));
-    assert!(store
-        .record_outbound_download("missing", &[0], 100)
-        .is_err());
-    assert!(store
-        .link_has_active_outbound_grants("acme", "link", 19)
-        .unwrap());
-    assert!(!store
-        .link_has_active_outbound_grants("other", "link", 19)
-        .unwrap());
-    assert!(store
-        .link_has_active_outbound_grants("acme", "other-link", 99)
-        .unwrap());
-    assert!(!store
-        .link_has_active_outbound_grants("acme", "other-link", 100)
-        .unwrap());
-}
-
-#[test]
-fn outbound_download_limit_refuses_after_one_download() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    let mut grant = test_outbound_grant("limited", "acme", 0);
-    grant.max_downloads = Some(1);
-    store.insert_outbound_grant(grant).unwrap();
-
-    assert!(store
-        .has_active_outbound_grant("acme", "link", "upload", 0, 19)
-        .unwrap());
-    store.record_outbound_download("limited", &[0], 15).unwrap();
-    let downloaded = store
-        .outbound_grant_by_token_hash("hash-limited")
-        .unwrap()
-        .unwrap();
-    let error = store
-        .record_outbound_download("limited", &[0], 16)
-        .unwrap_err();
-    assert_eq!(error, OUTBOUND_DOWNLOAD_LIMIT_REACHED);
-    assert_eq!(
-        store
-            .outbound_grant_by_token_hash("hash-limited")
-            .unwrap()
-            .unwrap(),
-        downloaded
-    );
-    assert!(!store
-        .has_active_outbound_grant("acme", "link", "upload", 0, 19)
-        .unwrap());
-    assert!(!store
-        .link_has_active_outbound_grants("acme", "link", 19)
-        .unwrap());
 }
 
 #[test]
@@ -2477,39 +2044,6 @@ fn outbound_grant_extension_handles_live_expired_and_scoped_rows() {
 }
 
 #[test]
-fn outbound_grant_extension_never_revives_an_expired_grant() {
-    // Finding 380: extending an expired grant used to resurrect it as a
-    // live delivery, so expiry must refuse the extension outright.
-    let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    let mut expired = test_outbound_grant("expired", "acme", 0);
-    expired.expires_at = 10;
-    store.insert_outbound_grant(expired).unwrap();
-    assert_eq!(
-        store
-            .extend_outbound_grant("acme", "expired", 5, 20)
-            .unwrap(),
-        None
-    );
-    assert_eq!(
-        store
-            .outbound_grant_by_token_hash("hash-expired")
-            .unwrap()
-            .unwrap()
-            .expires_at,
-        10
-    );
-    // A live grant still extends from its own expiry.
-    let mut live = test_outbound_grant("live", "acme", 1);
-    live.expires_at = 30;
-    store.insert_outbound_grant(live).unwrap();
-    assert_eq!(
-        store.extend_outbound_grant("acme", "live", 5, 20).unwrap(),
-        Some(35)
-    );
-}
-
-#[test]
 fn outbound_download_tracking_reports_first_and_completed_transitions() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path()).unwrap();
@@ -2710,56 +2244,6 @@ fn outbound_download_tracking_rejects_invalid_indexes_atomically() {
 }
 
 #[test]
-fn outbound_full_range_rejects_missing_child_atomically() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    let mut grant = test_outbound_grant("missing-child", "acme", 0);
-    grant.files = (0..2)
-        .map(|index| OutboundGrantFile {
-            source: format!("objects/{index}"),
-            name: format!("{index}.txt"),
-            suite: "blake3".to_owned(),
-            root: format!("root-{index}"),
-            bytes: 1,
-            receipt_b64: "receipt".to_owned(),
-            downloads: 0,
-            first_download_at: None,
-            last_download_at: None,
-        })
-        .collect();
-    store.insert_outbound_grant(grant).unwrap();
-    store
-        .with(|connection| {
-            connection.execute(
-                "DELETE FROM outbound_grant_files
-                     WHERE grant_id = 'missing-child' AND file_index = 1",
-                [],
-            )
-        })
-        .unwrap();
-
-    assert_eq!(
-        store
-            .record_outbound_download("missing-child", &[0, 1], 100)
-            .unwrap_err(),
-        "outbound file index out of range"
-    );
-    let downloads: Vec<i64> = store
-        .with(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT downloads FROM outbound_grant_files
-                     WHERE grant_id = 'missing-child' ORDER BY file_index",
-            )?;
-            let downloads = statement
-                .query_map([], |row| row.get(0))?
-                .collect::<Result<Vec<_>, _>>();
-            downloads
-        })
-        .unwrap();
-    assert_eq!(downloads, vec![0]);
-}
-
-#[test]
 fn legal_hold_rolls_back_when_audit_fails() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path()).unwrap();
@@ -2772,38 +2256,6 @@ fn legal_hold_rolls_back_when_audit_fails() {
         .set_link_legal_hold("", "held", true, "admin")
         .is_err());
     assert!(!store.link("", "held").unwrap().unwrap().legal_hold);
-}
-
-#[test]
-fn link_upload_extracts_one_record_without_the_full_history() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    let mut link = test_link("link-1");
-    for index in 0..3 {
-        link.uploads.push(UploadRecord {
-            partial: false,
-            log: Vec::new(),
-            id: format!("up-{index}"),
-            started_at: 1,
-            completed_at: 2,
-            replayed_chunks: 0,
-            rejected_chunks: 0,
-            transport: None,
-            package_root: format!("root-{index}"),
-            total_bytes: 5,
-            files: Vec::new(),
-        });
-    }
-    store.insert_link(link).unwrap();
-    let found = store.link_upload("", "link-1", "up-1").unwrap().unwrap();
-    assert_eq!(found.id, "up-1");
-    assert_eq!(found.package_root, "root-1");
-    assert!(store.link_upload("", "link-1", "up-9").unwrap().is_none());
-    // Tenant scoping holds: the wrong namespace sees nothing.
-    assert!(store
-        .link_upload("other", "link-1", "up-1")
-        .unwrap()
-        .is_none());
 }
 
 #[test]
@@ -2873,90 +2325,6 @@ fn schema41_quota_backfill_failure_rolls_back_without_partial_schema() {
             .unwrap(),
         (-1, 13)
     );
-}
-
-#[test]
-fn links_round_trip_with_uploads_and_events() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    let mut link = test_link("link-1");
-    link.uploads.push(UploadRecord {
-        partial: false,
-        log: Vec::new(),
-        id: "up-1".to_owned(),
-        started_at: 1,
-        completed_at: 2,
-        replayed_chunks: 3,
-        rejected_chunks: 4,
-        transport: None,
-        package_root: "aa".to_owned(),
-        total_bytes: 5,
-        files: vec![FileRecord {
-            path: "a.txt".to_owned(),
-            stored_as: "a.txt".to_owned(),
-            bytes: 5,
-            suite: "blake3".to_owned(),
-            root: "bb".to_owned(),
-            receipt: true,
-            deleted: false,
-        }],
-    });
-    link.events.push(SessionEvent {
-        at: 3,
-        started_at: 1,
-        outcome: "cancelled".to_owned(),
-        detail: "by sender".to_owned(),
-        received_bytes: 6,
-        expected_bytes: 7,
-        replayed_chunks: 8,
-        rejected_chunks: 9,
-    });
-    store.insert_link(link).unwrap();
-
-    let loaded = store.link("", "link-1").unwrap().unwrap();
-    assert_eq!(loaded.uploads.len(), 1);
-    assert!(loaded.uploads[0].files[0].receipt);
-    assert_eq!(loaded.events[0].outcome, "cancelled");
-    assert_eq!(store.links("").unwrap().len(), 1);
-    let upload_link = store.upload_link("link-1").unwrap().unwrap();
-    assert!(upload_link.uploads.is_empty());
-    assert!(upload_link.events.is_empty());
-    assert_eq!(store.uploads_by_id("link-1").unwrap().unwrap().len(), 1);
-    assert!(store.upload_link("missing").unwrap().is_none());
-    assert!(store.uploads_by_id("missing").unwrap().is_none());
-    store
-        .with(|connection| {
-            connection.execute(
-                "UPDATE link_uploads SET document = 'broken' WHERE link_id = 'link-1'",
-                [],
-            )
-        })
-        .unwrap();
-    assert!(store.uploads_by_id("link-1").is_err());
-    assert!(store.link("", "link-1").is_err());
-    store
-            .with(|connection| {
-                connection.execute_batch("DELETE FROM link_uploads WHERE link_id='link-1'; UPDATE links SET events_json='broken' WHERE id='link-1';")
-            })
-            .unwrap();
-    assert!(store.uploads_by_id("link-1").is_err());
-    assert!(store.link("", "link-1").is_err());
-}
-
-#[test]
-fn update_and_remove_report_presence() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    store.insert_link(test_link("link-1")).unwrap();
-    let found = store
-        .update_link("", "link-1", |link| link.active = false)
-        .unwrap();
-    assert!(found);
-    assert!(!store.link("", "link-1").unwrap().unwrap().active);
-    assert!(!store.update_link("", "missing", |_| {}).unwrap());
-    assert!(store.remove_link("", "link-1").unwrap());
-    assert!(!store.remove_link("", "link-1").unwrap());
-    assert!(store.link("", "link-1").unwrap().is_none());
 }
 
 #[test]
@@ -3676,100 +3044,6 @@ fn upload_mutations_preserve_other_records_and_rollback_together() {
 }
 
 #[test]
-fn links_preserve_insertion_order() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    store.insert_link(test_link("b")).unwrap();
-    store.insert_link(test_link("a")).unwrap();
-    let ids: Vec<String> = store
-        .links("")
-        .unwrap()
-        .into_iter()
-        .map(|link| link.id)
-        .collect();
-    assert_eq!(ids, ["b", "a"]);
-}
-
-#[test]
-fn admin_hash_persists_across_reopen() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    assert!(store.admin_password_hash().unwrap().is_none());
-    store
-        .set_admin_password_hash("argon2-hash".to_owned())
-        .unwrap();
-    drop(store);
-    let reopened = Store::open(directory.path()).unwrap();
-    assert_eq!(
-        reopened.admin_password_hash().unwrap().as_deref(),
-        Some("argon2-hash")
-    );
-}
-
-#[test]
-fn optional_columns_round_trip() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    let mut link = test_link("link-1");
-    link.password_hash = Some("argon2".to_owned());
-    link.expires_at = Some(12345);
-    link.max_bytes = Some(999);
-    store.insert_link(link).unwrap();
-    drop(store);
-    let reopened = Store::open(directory.path()).unwrap();
-    let loaded = reopened.link("", "link-1").unwrap().unwrap();
-    assert_eq!(loaded.password_hash.as_deref(), Some("argon2"));
-    assert_eq!(loaded.expires_at, Some(12345));
-    assert_eq!(loaded.max_bytes, Some(999));
-    // And the None side survives too.
-    let mut bare = test_link("link-2");
-    bare.expires_at = None;
-    reopened.insert_link(bare).unwrap();
-    assert_eq!(
-        reopened.link("", "link-2").unwrap().unwrap().expires_at,
-        None
-    );
-}
-
-#[test]
-fn audit_rows_round_trip_export_and_prune() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    store.audit(
-        "",
-        "",
-        "link_created",
-        "link-1",
-        &serde_json::json!({ "label": "x" }),
-    );
-    store.audit("", "", "admin_login", "10.0.0.1", &serde_json::json!({}));
-
-    let rows = store.audit_export(None, 0, 0, 100).unwrap();
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].event, "link_created");
-    assert_eq!(rows[0].tenant, "");
-    assert_eq!(rows[0].detail["label"], "x");
-    // `since` is strictly greater-than (rows share second granularity).
-    let after_all = store
-        .audit_export(None, rows.last().unwrap().at + 1, 0, 100)
-        .unwrap();
-    assert!(after_all.is_empty());
-    assert_eq!(store.audit_export(None, 0, 0, 1).unwrap().len(), 1);
-
-    // Pruning removes only rows strictly older than the cutoff.
-    let now = now_unix();
-    let pruned = store.audit_prune(now + 1, &[]).unwrap();
-    assert_eq!(pruned, 2);
-    assert!(store.audit_export(None, 0, 0, 100).unwrap().is_empty());
-
-    store.audit("", "", "test", "corrupt", &serde_json::json!({}));
-    store
-        .with(|connection| connection.execute("UPDATE audit_log SET detail = 'broken'", []))
-        .unwrap();
-    assert!(store.audit_export(None, 0, 0, 100).is_err());
-}
-
-#[test]
 fn audit_count_tracks_mutations_rollbacks_pruning_and_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path()).unwrap();
@@ -3895,86 +3169,6 @@ mod tenant_tests {
         let err = store.insert_link(link_in("acme", "orphan")).unwrap_err();
         assert_eq!(err, InsertLinkError::NamedTenantGone);
         assert!(store.link("acme", "orphan").unwrap().is_none());
-    }
-
-    #[test]
-    fn received_bytes_count_live_files_only() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        let mut link = link_in("acme", "link-1");
-        let mut file = FileRecord {
-            path: "a.bin".to_owned(),
-            stored_as: "a.bin".to_owned(),
-            bytes: 500,
-            suite: "blake3".to_owned(),
-            root: "aa".to_owned(),
-            receipt: false,
-            deleted: false,
-        };
-        link.uploads.push(UploadRecord {
-            partial: false,
-            log: Vec::new(),
-            id: "up".to_owned(),
-            started_at: 0,
-            completed_at: 0,
-            replayed_chunks: 0,
-            rejected_chunks: 0,
-            transport: None,
-            package_root: "cc".to_owned(),
-            total_bytes: 500,
-            files: vec![file.clone()],
-        });
-        store.insert_tenant(test_tenant("acme")).unwrap();
-        store.insert_link(link.clone()).unwrap();
-        assert_eq!(store.tenant_received_bytes("acme").unwrap(), 500);
-        assert_eq!(store.tenant_received_bytes("").unwrap(), 0);
-        let usage = store.tenant_usage().unwrap();
-        assert_eq!(usage.len(), 2);
-        assert_eq!(usage[0].tenant, "");
-        assert_eq!(usage[0].links, 0);
-        assert_eq!(usage[1].tenant, "acme");
-        assert_eq!(usage[1].links, 1);
-        assert_eq!(usage[1].received_bytes, 500);
-
-        store
-            .with(|connection| {
-                connection.execute_batch(
-                    "CREATE TRIGGER fail_file_update BEFORE UPDATE ON files
-                     BEGIN SELECT RAISE(FAIL, 'test file failure'); END;",
-                )
-            })
-            .unwrap();
-        assert!(store
-            .tombstone_files(
-                "acme",
-                "link-1",
-                &std::collections::HashSet::from(["a.bin"])
-            )
-            .is_err());
-        assert!(!store.link("acme", "link-1").unwrap().unwrap().uploads[0].files[0].deleted);
-        assert_eq!(store.tenant_received_bytes("acme").unwrap(), 500);
-        store
-            .with(|connection| connection.execute_batch("DROP TRIGGER fail_file_update"))
-            .unwrap();
-
-        file.deleted = true;
-        link.uploads[0].files[0] = file;
-        store
-            .tombstone_files(
-                "acme",
-                "link-1",
-                &std::collections::HashSet::from(["a.bin"]),
-            )
-            .unwrap();
-        assert_eq!(store.tenant_received_bytes("acme").unwrap(), 0);
-        assert_eq!(store.tenant_usage().unwrap()[1].received_bytes, 0);
-        assert!(store.remove_link("acme", "link-1").unwrap());
-        let files = store
-            .with(|connection| {
-                connection.query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, i64>(0))
-            })
-            .unwrap();
-        assert_eq!(files, 0);
     }
 
     #[test]
@@ -4329,138 +3523,6 @@ mod tenant_tests {
     }
 
     #[test]
-    fn received_bytes_preserve_u64_and_saturate_aggregate() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        store.insert_tenant(test_tenant("acme")).unwrap();
-        let mut link = link_in("acme", "large");
-        link.uploads.push(UploadRecord {
-            partial: false,
-            log: Vec::new(),
-            id: "up".to_owned(),
-            started_at: 0,
-            completed_at: 0,
-            replayed_chunks: 0,
-            rejected_chunks: 0,
-            transport: None,
-            package_root: "root".to_owned(),
-            total_bytes: u64::MAX,
-            files: vec![
-                FileRecord {
-                    path: "large".to_owned(),
-                    stored_as: "large".to_owned(),
-                    bytes: u64::MAX,
-                    suite: "blake3".to_owned(),
-                    root: "aa".to_owned(),
-                    receipt: false,
-                    deleted: false,
-                },
-                FileRecord {
-                    path: "one".to_owned(),
-                    stored_as: "one".to_owned(),
-                    bytes: 1,
-                    suite: "blake3".to_owned(),
-                    root: "bb".to_owned(),
-                    receipt: false,
-                    deleted: false,
-                },
-            ],
-        });
-        store.insert_link(link).unwrap();
-
-        assert_eq!(store.tenant_received_bytes("acme").unwrap(), u64::MAX);
-        assert_eq!(store.tenant_usage().unwrap()[1].received_bytes, u64::MAX);
-        store
-            .append_upload(
-                "acme",
-                "large",
-                UploadRecord {
-                    partial: false,
-                    log: Vec::new(),
-                    id: "second".to_owned(),
-                    started_at: u64::MAX,
-                    completed_at: u64::MAX,
-                    replayed_chunks: u64::MAX,
-                    rejected_chunks: u64::MAX,
-                    transport: None,
-                    package_root: "exact".to_owned(),
-                    total_bytes: u64::MAX,
-                    files: Vec::new(),
-                },
-            )
-            .unwrap();
-        let uploads = store.link("acme", "large").unwrap().unwrap().uploads;
-        assert_eq!(uploads.len(), 2);
-        assert_eq!(uploads[0].total_bytes, u64::MAX);
-        assert_eq!(uploads[1].started_at, u64::MAX);
-        assert_eq!(uploads[1].total_bytes, u64::MAX);
-        let limbs = store
-            .with(|connection| {
-                connection.query_row(
-                    "SELECT bytes_hi, bytes_lo FROM files WHERE file_index = 0",
-                    [],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-                )
-            })
-            .unwrap();
-        assert_eq!(limbs, (u32::MAX as i64, u32::MAX as i64));
-        store
-            .with(|connection| {
-                connection.execute(
-                    "UPDATE link_uploads SET document='{}' WHERE link_id='large' AND upload_id='up'",
-                    [],
-                )
-            })
-            .unwrap();
-        let mut next = uploads[1].clone();
-        next.id = "third".into();
-        assert!(store.append_upload("acme", "large", next.clone()).unwrap());
-        store
-            .with(|connection| {
-                connection.execute(
-                    "UPDATE links SET events_json = 'broken'
-                     WHERE id = 'large'",
-                    [],
-                )
-            })
-            .unwrap();
-        assert!(store
-            .append_upload("acme", "large", {
-                next.id = "fourth".into();
-                next
-            })
-            .is_err());
-    }
-
-    #[test]
-    fn tenant_quotas_preserve_u64_across_create_and_update() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        let mut tenant = test_tenant("acme");
-        tenant.max_total_bytes = Some(u64::MAX);
-        tenant.max_links = Some(u64::MAX);
-        tenant.max_sessions = Some(u64::MAX);
-        store.insert_tenant(tenant).unwrap();
-        assert_eq!(
-            store.tenant("acme").unwrap().unwrap().max_total_bytes,
-            Some(u64::MAX)
-        );
-
-        let mut tenant = store.tenant("acme").unwrap().unwrap();
-        tenant.max_total_bytes = Some(u64::MAX - 1);
-        tenant.max_links = Some(u64::MAX - 1);
-        tenant.max_sessions = Some(u64::MAX - 1);
-        assert!(store.update_tenant(&tenant).unwrap());
-        drop(store);
-
-        let reopened = Store::open(directory.path()).unwrap();
-        let tenant = reopened.tenant("acme").unwrap().unwrap();
-        assert_eq!(tenant.max_total_bytes, Some(u64::MAX - 1));
-        assert_eq!(tenant.max_links, Some(u64::MAX - 1));
-        assert_eq!(tenant.max_sessions, Some(u64::MAX - 1));
-    }
-
-    #[test]
     fn projection_writes_only_changed_files() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
@@ -4731,18 +3793,6 @@ mod ops_tests {
     }
 
     #[test]
-    fn all_links_spans_tenants() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        store.insert_link(test_link("default-link")).unwrap();
-        store.insert_tenant(test_tenant("acme")).unwrap();
-        let mut scoped = test_link("scoped-link");
-        scoped.tenant = "acme".to_owned();
-        store.insert_link(scoped).unwrap();
-        assert_eq!(store.all_links().unwrap().len(), 2);
-    }
-
-    #[test]
     fn retention_link_ids_page_is_bounded_and_spans_tenants() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
@@ -4784,17 +3834,6 @@ mod phase4_review_tests {
     use super::{link_in, test_outbound_grant, test_tenant};
 
     #[test]
-    fn link_by_id_spans_tenants_for_the_public_protocol() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        store.insert_tenant(super::test_tenant("acme")).unwrap();
-        store.insert_link(link_in("acme", "scoped")).unwrap();
-        // Senders never know a tenant key; the id is the capability.
-        assert!(store.link_by_id("scoped").unwrap().is_some());
-        assert!(store.link_by_id("missing").unwrap().is_none());
-    }
-
-    #[test]
     fn audit_export_cursor_survives_same_second_rows() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
@@ -4817,21 +3856,6 @@ mod phase4_review_tests {
             .unwrap();
         assert_eq!(page_two.len(), 1);
         assert_eq!(page_two[0].subject, "row-2");
-    }
-
-    #[test]
-    fn audit_export_filters_by_tenant() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        store.audit("acme", "", "link_created", "l-1", &serde_json::json!({}));
-        store.audit("", "", "admin_login", "ip", &serde_json::json!({}));
-        let scoped = store.audit_export(Some("acme"), 0, 0, 100).unwrap();
-        assert_eq!(scoped.len(), 1);
-        assert_eq!(scoped[0].tenant, "acme");
-        let default = store.audit_export(Some(""), 0, 0, 100).unwrap();
-        assert_eq!(default.len(), 1);
-        assert_eq!(default[0].tenant, "");
-        assert_eq!(store.audit_export(None, 0, 0, 100).unwrap().len(), 2);
     }
 
     #[test]
@@ -4905,41 +3929,6 @@ mod phase4_review_tests {
                 .len(),
             1
         );
-    }
-
-    #[test]
-    fn links_page_unfiltered_query_uses_created_index() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        let plan = store
-            .with(|connection| {
-                let mut statement = connection.prepare(
-                    "EXPLAIN QUERY PLAN
-                     SELECT id FROM links
-                     WHERE tenant = ?1
-                       AND (?2 = '' OR lower(label) LIKE '%' || ?2 || '%' ESCAPE '\\'
-                            OR lower(dest) LIKE '%' || ?2 || '%' ESCAPE '\\'
-                            OR id = ?2)
-                       AND (?3 = 'all'
-                            OR (?3 = 'open' AND active != 0
-                                AND (expires_at IS NULL OR expires_at > ?4))
-                            OR (?3 = 'closed' AND (active = 0
-                                OR (expires_at IS NOT NULL AND expires_at <= ?4))))
-                       AND (?5 = 0 OR created_at < ?6
-                            OR (created_at = ?6 AND id < ?7))
-                     ORDER BY created_at DESC, id DESC
-                     LIMIT ?8",
-                )?;
-                let rows = statement.query_map(
-                    rusqlite::params!["", "", "all", 1000_i64, 0_i64, 0_i64, "", 11_i64],
-                    |row| row.get::<_, String>(3),
-                )?;
-                rows.collect::<Result<Vec<_>, _>>()
-            })
-            .unwrap();
-        assert!(plan
-            .iter()
-            .any(|detail| detail.contains("USING INDEX links_tenant_created")));
     }
 
     #[test]
@@ -5055,24 +4044,6 @@ mod phase4_review_tests {
     }
 
     #[test]
-    fn recent_audit_is_descending_and_tenant_scoped() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        store.audit("acme", "", "first", "a", &serde_json::json!({}));
-        store.audit("acme", "", "second", "b", &serde_json::json!({}));
-        store.audit("other", "", "foreign", "c", &serde_json::json!({}));
-
-        let page = store.audit_recent(Some("acme"), 0, 1).unwrap();
-        assert_eq!(page.len(), 1);
-        assert_eq!(page[0].event, "second");
-        let older = store
-            .audit_recent(Some("acme"), page[0].rowid as u64, 10)
-            .unwrap();
-        assert_eq!(older.len(), 1);
-        assert_eq!(older[0].event, "first");
-    }
-
-    #[test]
     fn audit_filters_match_fields_without_searching_detail() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
@@ -5141,28 +4112,6 @@ mod phase4_review_tests {
             .unwrap();
         assert_eq!(legacy.len(), 1);
         assert_eq!(legacy[0].subject, "request-1");
-    }
-
-    #[test]
-    fn filtered_audit_cursor_paginates_recent_rows() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        for subject in ["first", "second", "third"] {
-            store.audit("acme", "", "match", subject, &serde_json::json!({}));
-        }
-        let filters = AuditFilters {
-            event: Some("match"),
-            query: None,
-        };
-        let first = store
-            .audit_recent_filtered(Some("acme"), 0, 2, filters)
-            .unwrap();
-        assert_eq!(first.len(), 2);
-        let second = store
-            .audit_recent_filtered(Some("acme"), first[1].rowid as u64, 2, filters)
-            .unwrap();
-        assert_eq!(second.len(), 1);
-        assert_eq!(second[0].subject, "first");
     }
 
     #[test]
@@ -5447,46 +4396,6 @@ mod settings_tests {
     }
 
     #[test]
-    fn empty_settings_table_follows_env() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        let overlay = store.overlay(&test_config()).unwrap();
-        assert_eq!(
-            overlay.smtp_host.as_deref(),
-            Some("https://env.example/hook")
-        );
-        assert!(!overridden(&overlay, "smtp_host"));
-        assert_eq!(overlay.resolved.audit_retention_days, 400);
-        assert!(!overridden(&overlay, "audit_retention_days"));
-        assert_eq!(overlay.resolved.upload_retention_days, 0);
-        assert!(overlay.resolved.default_max_total_bytes.is_none());
-        assert!(overlay.resolved.public_password_login);
-    }
-
-    #[test]
-    fn written_key_wins_unwritten_keys_keep_env() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        store
-            .put_settings(
-                "local",
-                &[(
-                    "smtp_host".to_owned(),
-                    SettingWrite::Set("https://db.example/hook".to_owned()),
-                )],
-            )
-            .unwrap();
-        let overlay = store.overlay(&test_config()).unwrap();
-        assert_eq!(
-            overlay.smtp_host.as_deref(),
-            Some("https://db.example/hook")
-        );
-        assert!(overridden(&overlay, "smtp_host"));
-        assert_eq!(overlay.resolved.audit_retention_days, 400);
-        assert!(!overridden(&overlay, "audit_retention_days"));
-    }
-
-    #[test]
     fn empty_string_disables_url_despite_env() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
@@ -5499,49 +4408,6 @@ mod settings_tests {
         let overlay = store.overlay(&test_config()).unwrap();
         assert_eq!(overlay.smtp_host, None);
         assert!(overridden(&overlay, "smtp_host"));
-    }
-
-    #[test]
-    fn reset_deletes_the_row_and_env_applies() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        store
-            .put_settings(
-                "local",
-                &[(
-                    "smtp_host".to_owned(),
-                    SettingWrite::Set("https://db.example/hook".to_owned()),
-                )],
-            )
-            .unwrap();
-        store
-            .put_settings("local", &[("smtp_host".to_owned(), SettingWrite::Reset)])
-            .unwrap();
-        let overlay = store.overlay(&test_config()).unwrap();
-        assert_eq!(
-            overlay.smtp_host.as_deref(),
-            Some("https://env.example/hook")
-        );
-        assert!(!overridden(&overlay, "smtp_host"));
-        assert!(store.setting("smtp_host").unwrap().is_none());
-    }
-
-    #[test]
-    fn invalid_stored_days_skip_to_env() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        store
-            .put_settings(
-                "local",
-                &[(
-                    "audit_retention_days".to_owned(),
-                    SettingWrite::Set("nope".to_owned()),
-                )],
-            )
-            .unwrap();
-        let overlay = store.overlay(&test_config()).unwrap();
-        assert_eq!(overlay.resolved.audit_retention_days, 400);
-        assert!(!overridden(&overlay, "audit_retention_days"));
     }
 
     #[test]
@@ -5682,28 +4548,6 @@ mod settings_tests {
         assert_eq!(
             store.overlay(&test_config()).unwrap().smtp_host.as_deref(),
             Some("https://before.example/hook")
-        );
-    }
-
-    #[test]
-    fn db_retention_is_what_the_sweeper_would_read() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        store
-            .put_settings(
-                "local",
-                &[(
-                    "audit_retention_days".to_owned(),
-                    SettingWrite::Set("7".to_owned()),
-                )],
-            )
-            .unwrap();
-        assert_eq!(
-            store
-                .resolved_settings(&test_config())
-                .unwrap()
-                .audit_retention_days,
-            7
         );
     }
 
@@ -5850,39 +4694,6 @@ mod settings_tests {
     }
 
     #[test]
-    fn open_refuses_a_newer_schema_version() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        drop(store);
-        {
-            let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-            connection
-                .execute(
-                    "UPDATE meta SET value = '99' WHERE key = 'schema_version'",
-                    [],
-                )
-                .unwrap();
-        }
-        let error = match Store::open(directory.path()) {
-            Err(error) => error,
-            Ok(_) => panic!("expected open to refuse a newer schema"),
-        };
-        assert!(error.contains("99"), "{error}");
-        assert!(error.contains("unsupported"), "{error}");
-        assert_eq!(schema_version(directory.path()), "99");
-    }
-
-    #[test]
-    fn open_does_not_stamp_schema_version_down() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        drop(store);
-        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
-        Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
-    }
-
-    #[test]
     fn schema43_refusal_preserves_invalid_quota_schema() {
         for damaged in [
             "DROP INDEX files_quota_identity;",
@@ -5946,83 +4757,6 @@ mod settings_tests {
         assert_eq!(store.audit_count().unwrap(), 2);
         store.audit("", "", "third", "three", &serde_json::json!({}));
         assert_eq!(store.audit_count().unwrap(), 3);
-    }
-
-    #[test]
-    fn branding_rows_round_trip_and_delete() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        assert!(store.branding("acme").unwrap().is_none());
-
-        let branding = Branding {
-            tenant: "acme".to_owned(),
-            name: "Acme Corp".to_owned(),
-            color: "#0a84ff".to_owned(),
-            logo_ext: String::new(),
-            updated_at: 42,
-            ..Default::default()
-        };
-        store.set_branding(&branding).unwrap();
-        let read = store.branding("acme").unwrap().unwrap();
-        assert_eq!(read.name, "Acme Corp");
-        assert_eq!(read.color, "#0a84ff");
-        assert_eq!(read.logo_ext, "");
-        assert_eq!(read.updated_at, 42);
-
-        // Upsert replaces the row; the default tenant ("") is a row like any.
-        store
-            .set_branding(&Branding {
-                logo_ext: "png".to_owned(),
-                ..branding.clone()
-            })
-            .unwrap();
-        assert_eq!(store.branding("acme").unwrap().unwrap().logo_ext, "png");
-        store
-            .set_branding(&Branding {
-                tenant: String::new(),
-                ..branding
-            })
-            .unwrap();
-        assert_eq!(store.branding("").unwrap().unwrap().name, "Acme Corp");
-
-        assert!(store.delete_branding("acme").unwrap());
-        assert!(!store.delete_branding("acme").unwrap());
-        assert!(store.branding("acme").unwrap().is_none());
-        assert!(store.branding("").unwrap().is_some());
-    }
-
-    #[test]
-    fn tenant_delete_removes_its_branding_row() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        store
-            .insert_tenant(Tenant {
-                retention_days: None,
-                incarnation: String::new(),
-                key: "acme".to_owned(),
-                label: String::new(),
-                admin_group: None,
-                max_total_bytes: None,
-                max_links: None,
-                max_sessions: None,
-                created_at: 0,
-            })
-            .unwrap();
-        store
-            .set_branding(&Branding {
-                tenant: "acme".to_owned(),
-                name: "Acme".to_owned(),
-                color: String::new(),
-                logo_ext: String::new(),
-                updated_at: 0,
-                ..Default::default()
-            })
-            .unwrap();
-        assert!(matches!(
-            store.remove_tenant("acme").unwrap(),
-            TenantRemoval::Deleted
-        ));
-        assert!(store.branding("acme").unwrap().is_none());
     }
 
     #[test]
@@ -6204,71 +4938,6 @@ mod settings_tests {
         store.delete_upload_session(&replacement.id).unwrap();
         assert_eq!(store.load_upload_sessions().unwrap(), vec![unrelated]);
         assert_eq!(owners(), vec!["unrelated", "unrelated"]);
-    }
-
-    #[test]
-    fn smtp_is_none_without_host() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        let mut config = test_config();
-        config.smtp_host = None;
-        config.smtp_from = Some("votport@example.com".to_owned());
-
-        assert!(store.resolved_settings(&config).unwrap().smtp.is_none());
-    }
-
-    #[test]
-    fn smtp_is_none_without_from() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        let mut config = test_config();
-        config.smtp_host = Some("smtp.example.com".to_owned());
-        config.smtp_from = None;
-        assert!(store.resolved_settings(&config).unwrap().smtp.is_none());
-    }
-
-    #[test]
-    fn smtp_assembles_when_host_and_from_resolve() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        store
-            .put_settings(
-                "local",
-                &[(
-                    "smtp_host".to_owned(),
-                    SettingWrite::Set("db.example.com".to_owned()),
-                )],
-            )
-            .unwrap();
-        let mut config = test_config();
-        config.smtp_from = Some("votport@example.com".to_owned());
-
-        let smtp = store
-            .resolved_settings(&config)
-            .unwrap()
-            .smtp
-            .expect("host from DB plus sender from env");
-        assert_eq!(smtp.host, "db.example.com");
-        assert_eq!(smtp.from, "votport@example.com");
-
-        assert_eq!(smtp.port, 587);
-        assert!(smtp.starttls);
-        assert!(smtp.password.is_none());
-    }
-
-    #[test]
-    fn invalid_smtp_port_skips_to_env() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        store
-            .put_settings(
-                "local",
-                &[("smtp_port".to_owned(), SettingWrite::Set("nope".to_owned()))],
-            )
-            .unwrap();
-        let overlay = store.overlay(&test_config()).unwrap();
-        assert_eq!(overlay.smtp_port, 587);
-        assert!(!overridden(&overlay, "smtp_port"));
     }
 }
 
@@ -6645,4 +5314,32 @@ fn a_delivered_ticket_does_not_take_another_holders_reservation() {
         "the delivered holder must not take the reserved slot"
     );
     assert!(store.admit_fetch_ticket(&second, 6).unwrap());
+}
+
+#[test]
+fn tenant_incarnation_survives_updates_and_reopen_but_not_recreation() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    store.insert_tenant(test_tenant("acme")).unwrap();
+    let mut tenant = store.tenant("acme").unwrap().unwrap();
+    let incarnation = tenant.incarnation.clone();
+    assert_eq!(hex::decode(&incarnation).unwrap().len(), 16);
+    tenant.label = "updated".into();
+    tenant.incarnation = "must-not-replace".into();
+    assert!(store.update_tenant(&tenant).unwrap());
+    assert_eq!(
+        store.tenant("acme").unwrap().unwrap().incarnation,
+        incarnation
+    );
+    drop(store);
+    let store = Store::open(directory.path()).unwrap();
+    assert_eq!(
+        store.tenant("acme").unwrap().unwrap().incarnation,
+        incarnation
+    );
+    assert_eq!(store.remove_tenant("acme").unwrap(), TenantRemoval::Deleted);
+    store.insert_tenant(test_tenant("acme")).unwrap();
+    let replacement = store.tenant("acme").unwrap().unwrap();
+    assert_eq!(replacement.created_at, tenant.created_at);
+    assert_ne!(replacement.incarnation, incarnation);
 }

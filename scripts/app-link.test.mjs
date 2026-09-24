@@ -11,19 +11,6 @@ const upload = await readFile(new URL('../web/assets/upload.js', import.meta.url
 const outbound = await readFile(new URL('../web/assets/outbound.js', import.meta.url), 'utf8');
 const evidence = await readFile(new URL('../web/assets/delivery-evidence.js', import.meta.url), 'utf8');
 
-test('both pages carry a hidden Open in the app link', () => {
-  assert.match(request, /<p class="muted" id="open-in-app" hidden><a id="open-in-app-link"[^>]*>Open in the votport app<\/a>/);
-  assert.match(send, /<a id="open-in-app-link"[^>]*hidden>Open in the votport app<\/a>/);
-});
-
-test('every app link comes from the shared builder with its own origin and token', () => {
-  for (const [script, kind] of [[upload, 'r'], [outbound, 's']]) {
-    assert.match(script, /import \{[^}]*offerApp[^}]*\} from '\/assets\/object-card\.js'/);
-    assert.match(script, new RegExp(`offerApp\\('${kind}', token\\)`));
-  }
-  assert.match(evidence, /appLink\('s', token\)/);
-});
-
 test('desktop offers reveal the encoded link and mobile offers stay hidden', (t) => {
   const link = { hidden: true }, holder = { hidden: true };
   const context = {

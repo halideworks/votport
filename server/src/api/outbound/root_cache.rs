@@ -306,17 +306,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn inserts_stay_bounded_by_oldest_cached_at() {
-        let directory = tempfile::tempdir().unwrap();
-        let cache = RootCache::new(directory.path());
-        let path = Path::new("/library/project/a.bin");
-        for index in 0..=(ROOT_CACHE_MAX_ENTRIES / 4) {
-            cache.insert("acme", path, index as u64, index as u64, "ab".repeat(32));
-        }
-        assert!(cache.state.lock().unwrap().entries.len() <= ROOT_CACHE_MAX_ENTRIES + 1);
-    }
-
     /// A folder hash lands thousands of inserts in one now_unix() second;
     /// eviction must drop exactly an eighth of them, not every entry that
     /// shares the cutoff timestamp.

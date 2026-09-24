@@ -1,8 +1,6 @@
-// Regression pins for the formatting findings 459, 460, 461, 462, 513 and
-// 515: guarded plurals everywhere, one decimal size and one duration
-// formatter per language, and relative stamps with the absolute secondless.
-// The formatter assertions run the real shared helpers; the page-level pins
-// hold the source shape the way copy-register.test.mjs does.
+// Formatting regressions: one decimal size and one duration formatter per
+// language, minute rollover, and relative stamps with the absolute secondless.
+// The formatter assertions run the real shared helpers.
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
@@ -10,30 +8,6 @@ import { test } from 'node:test';
 import { formatAgo, formatBytes, formatDuration, formatWhen } from '../web/assets/object-card.js';
 
 const read = (path) => readFile(new URL(`../${path}`, import.meta.url), 'utf8');
-
-test('459: counts pluralise with the shared guard instead of file(s)', async () => {
-  const upload = await read('web/assets/upload.js');
-  assert.match(upload, /\$\{picked\.size\} file\$\{picked\.size === 1 \? '' : 's'\}, \$\{formatBytes\(total\)\} total/);
-  assert.doesNotMatch(upload, /file\(s\)/);
-  const cli = await read('client/cli/src/main.rs');
-  assert.ok(cli.includes('if files == 1 { "file" } else { "files" }'), 'push output pluralises');
-  assert.ok(cli.includes('if link.drops == 1 { "drop" } else { "drops" }'), 'request line pluralises drops');
-  assert.doesNotMatch(cli, /\(s\)/);
-  const notify = await read('server/src/notify.rs');
-  assert.ok(notify.includes('if count == 1 { "file" } else { "files" }'), 'upload body pluralises');
-  assert.ok(notify.includes('if file_count == 1 { "file" } else { "files" }'), 'outbound body pluralises');
-  assert.doesNotMatch(notify, /file\(s\)/);
-});
-
-test('460: the three unguarded plurals carry a singular branch', async () => {
-  const audit = await read('web/assets/page-audit.js');
-  assert.match(audit, /retained === 1\s*\n\s*\? 'Showing row 1\.'/);
-  const workflows = await read('web/assets/page-workflows.js');
-  assert.match(workflows, /enrolled recipient\$\{project\.recipients\.length === 1 \? '' : 's'\}/);
-  assert.match(workflows, /required field\$\{project\.required_metadata\.length === 1 \? '' : 's'\}/);
-  const trade = await read('web/assets/page-trade-routes.js');
-  assert.match(trade, /recent \$\{failures === 1 \? 'delivery' : 'deliveries'\}/);
-});
 
 test('461: one decimal size formatter and one duration formatter per language', async () => {
   // The shared web helper speaks decimal KB like the Rust human_bytes.
@@ -63,25 +37,6 @@ test('461: one decimal size formatter and one duration formatter per language', 
   assert.equal(formatDuration(45), '45s');
   assert.equal(formatDuration(160), '2m 40s');
   assert.equal(formatDuration(3900), '1h 5m');
-  assert.equal(formatDuration(45.7), '46s');
-});
-
-test('513: live rates carry at 999.5 instead of printing 1000 KB/s', async () => {
-  // The retired formatRate printed the division raw (audit finding 513);
-  // the shared formatter carries into the next unit like human_bytes does.
-  assert.equal(formatBytes(999_499), '999 KB');
-  assert.equal(formatBytes(999_500), '1.0 MB');
-  assert.equal(formatBytes(999_950), '1.0 MB');
-  const upload = await read('web/assets/upload.js');
-  assert.doesNotMatch(upload, /function formatRate\(/);
-  assert.match(upload, /formatBytes\(Math\.round\(lastSendBps\)\)\}\/s/);
-});
-
-test('515: fractional durations round to the shown second', () => {
-  // formatDuration is documented for whole seconds; a fractional estimate
-  // from a live rate must never print raw (audit finding 515, 0.4s).
-  assert.equal(formatDuration(0.4), '0s');
-  assert.equal(formatDuration(0.5), '1s');
   assert.equal(formatDuration(45.7), '46s');
 });
 

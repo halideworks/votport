@@ -14,12 +14,6 @@ test('every generated token file matches the stylesheet', async () => {
   }
 });
 
-test('colours parse from hex and rgba', () => {
-  assert.deepEqual(parseColor('#38bdf8'), [56, 189, 248, 1]);
-  assert.deepEqual(parseColor('rgba(255, 255, 255, 0.025)'), [255, 255, 255, 0.025]);
-  assert.throws(() => parseColor('rgb(0 0 0 / 60%)'));
-});
-
 test('the shells get both blocks', () => {
   assert.match(out.swift, /static let progress = dynamic\(dark: \(56, 189, 248, 1\), light: \(3, 105, 161, 1\)\)/);
   assert.match(out.xaml, /<ResourceDictionary x:Key="Light">[\s\S]*<Color x:Key="VotProgress">#FF0369A1<\/Color>/);

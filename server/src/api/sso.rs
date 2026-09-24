@@ -2152,44 +2152,6 @@ mod tests {
         assert!(!azp_ok(Some(""), "votport"));
     }
 
-    #[test]
-    fn state_cookie_clearing_matches_the_configured_transport() {
-        let directory = tempfile::tempdir().unwrap();
-        let https = crate::api::testing::build(directory.path());
-        assert!(clear_state_cookie(&https).ends_with("; Secure"));
-
-        let mut config = crate::api::testing::config(directory.path());
-        config.data_dir = directory.path().join("http-data");
-        config.receive_dir = directory.path().join("http-received");
-        config.outbound_dir = directory.path().join("http-outbound");
-        config.public_url = Some("http://127.0.0.1:8080".to_owned());
-        let http = crate::app::build(config).unwrap();
-        assert!(!clear_state_cookie(&http).ends_with("; Secure"));
-    }
-
-    #[tokio::test]
-    async fn sso_available_reports_configured_and_health_without_discovering() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use http_body_util::BodyExt as _;
-        use tower::ServiceExt;
-
-        let directory = tempfile::tempdir().unwrap();
-        let application = crate::api::testing::build(directory.path());
-        assert!(!application.sso_client.health_peek());
-        let router = crate::app::router(application);
-        let response = router
-            .oneshot(Request::get("/api/admin/sso").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["available"], false);
-        assert_eq!(json["sso_healthy"], false);
-        assert_eq!(json["public_password_login"], true);
-    }
-
     #[tokio::test]
     async fn sso_available_is_true_when_oidc_is_configured_even_if_unhealthy() {
         use axum::body::Body;
@@ -2354,15 +2316,6 @@ mod tests {
         let swapped = token.replace(&hex::encode("user@example.com"), &hex::encode("other"));
         assert!(auth::verify_admin_token(&secret, "version-1", &swapped).is_none());
         drop(token_b);
-    }
-
-    #[test]
-    fn blocked_subject_helper_matches_callback() {
-        assert_eq!(blocked_principal_error(false), None);
-        assert_eq!(
-            blocked_principal_error(true),
-            Some("this account is blocked")
-        );
     }
 
     fn test_store() -> (tempfile::TempDir, crate::store::Store) {

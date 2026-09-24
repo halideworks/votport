@@ -1587,6 +1587,24 @@ async fn oversized_payload_names_are_refused_before_staging() {
             .contains("242 UTF-8 bytes; shorten"));
         assert!(!server.receive_dir.join(&parent).exists());
     }
+    // One byte less fits: 242 bytes leaves room for the 12-byte receipt
+    // suffix under the 255-byte component limit.
+    let fits = ["a".repeat(242), format!("{}ab", "ア".repeat(80))];
+    let files: Vec<ClientFile> = fits
+        .iter()
+        .map(|name| prepare(vec![&parent, name], b"payload".to_vec()))
+        .collect();
+    let token = create_open_link(&client, &server.base, "filename fits", "", None).await;
+    run_upload(&client, &server.base, &token, "", &files).await;
+    for name in &fits {
+        let published = server.receive_dir.join(&parent).join(name);
+        assert_eq!(std::fs::read(&published).unwrap(), b"payload");
+        assert!(server
+            .receive_dir
+            .join(&parent)
+            .join(format!("{name}.vot-receipt"))
+            .exists());
+    }
 }
 
 /// Every published file gets a signed receipt sidecar that verifies against
@@ -6726,6 +6744,223 @@ async fn search_finds_requests_files_and_downloads() {
     assert!(hit["files"].as_array().unwrap().is_empty(), "{hit:?}");
     let hit = search("poster").await;
     assert!(hit["downloads"].as_array().unwrap().is_empty(), "{hit:?}");
+}
+
+/// Deleting a tenant and recreating its key starts clean: the old tenant's
+/// automation token and delivery link stop working, and its grants,
+/// tokens, library files and branding do not carry over.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recreated_tenant_inherits_nothing_from_the_deleted_one() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    client
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let send = |request: reqwest::RequestBuilder| async move {
+        let response = request.header("x-votport", "1").send().await.unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert!(status.is_success(), "{status} {body}");
+        serde_json::from_str::<Value>(&body).unwrap_or(Value::Null)
+    };
+    let enter = |tenant: &'static str| {
+        client
+            .post(format!("{base}/api/admin/tenant"))
+            .json(&json!({ "tenant": tenant }))
+    };
+    send(
+        client
+            .post(format!("{base}/api/admin/tenants"))
+            .json(&json!({ "key": "acme", "label": "Acme" })),
+    )
+    .await;
+    send(enter("acme")).await;
+    let automation = send(
+        client
+            .post(format!("{base}/api/admin/automation-tokens"))
+            .json(&json!({ "label": "agent", "expires_days": 1 })),
+    )
+    .await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    send(
+        client
+            .post(format!("{base}/api/admin/outbound-files?path=reel.bin"))
+            .body(b"reel".to_vec()),
+    )
+    .await;
+    let grant = settle_grant(
+        &client,
+        &base,
+        json!({ "paths": ["reel.bin"], "expires_days": 1 }),
+    )
+    .await;
+    let link = grant["url"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    send(
+        client
+            .put(format!("{base}/api/admin/branding/acme"))
+            .json(&json!({ "name": "Acme Post", "color": "#224466" })),
+    )
+    .await;
+    let bearer = |path: &str| {
+        client
+            .get(format!("{base}{path}"))
+            .bearer_auth(&automation)
+            .send()
+    };
+    assert_eq!(
+        bearer("/api/automation/session").await.unwrap().status(),
+        200
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/api/s/{link}"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let listed = |value: Value, key: &str| value[key].as_array().map_or(0, Vec::len);
+    assert_eq!(
+        listed(
+            send(client.get(format!("{base}/api/admin/automation-tokens"))).await,
+            "tokens"
+        ),
+        1
+    );
+    let files = send(client.get(format!("{base}/api/admin/outbound-files?directory="))).await;
+    assert!(files.to_string().contains("reel.bin"), "{files}");
+    assert_eq!(
+        send(client.get(format!("{base}/api/admin/branding/acme"))).await["name"],
+        "Acme Post"
+    );
+
+    send(enter("")).await;
+    send(client.delete(format!("{base}/api/admin/tenants/acme"))).await;
+    send(
+        client
+            .post(format!("{base}/api/admin/tenants"))
+            .json(&json!({ "key": "acme", "label": "Acme" })),
+    )
+    .await;
+    send(enter("acme")).await;
+
+    assert_eq!(
+        bearer("/api/automation/session").await.unwrap().status(),
+        401
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/api/s/{link}"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    let grants = send(client.get(format!("{base}/api/admin/outbound-grants"))).await;
+    assert_eq!(grants["total"], 0, "{grants}");
+    let tokens = send(client.get(format!("{base}/api/admin/automation-tokens"))).await;
+    assert!(
+        tokens["tokens"].as_array().is_some_and(Vec::is_empty),
+        "{tokens}"
+    );
+    let files = send(client.get(format!("{base}/api/admin/outbound-files?directory="))).await;
+    assert!(!files.to_string().contains("reel.bin"), "{files}");
+    let branding = send(client.get(format!("{base}/api/admin/branding/acme"))).await;
+    assert_eq!(branding["name"], "", "{branding}");
+}
+
+/// The Deliver list pages the real grant table: the default page is 50,
+/// newest first, and the next page holds the rest.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_grant_list_pages_fifty_newest_first() {
+    let server = start_server().await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    client
+        .post(format!("{}/api/admin/login", server.base))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    client
+        .post(format!(
+            "{}/api/admin/outbound-files?path=reel.bin",
+            server.base
+        ))
+        .header("x-votport", "1")
+        .body(b"reel".to_vec())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let mut created = Vec::new();
+    for _ in 0..51 {
+        let grant = settle_grant(
+            &client,
+            &server.base,
+            json!({ "paths": ["reel.bin"], "expires_days": 1 }),
+        )
+        .await;
+        created.push(grant["grant"]["id"].as_str().unwrap().to_owned());
+    }
+    let list = |query: &'static str| {
+        let client = client.clone();
+        let base = server.base.clone();
+        async move {
+            client
+                .get(format!("{base}/api/admin/outbound-grants{query}"))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        }
+    };
+    let ids = |page: &Value| -> Vec<String> {
+        page["grants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|grant| grant["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let first = list("").await;
+    assert_eq!(
+        (first["total"].as_u64(), first["has_more"].as_bool()),
+        (Some(51), Some(true))
+    );
+    let newest_first: Vec<String> = created.iter().rev().cloned().collect();
+    assert_eq!(ids(&first), newest_first[..50]);
+    let rest = list("?offset=50").await;
+    assert_eq!(rest["has_more"], false);
+    assert_eq!(ids(&rest), newest_first[50..]);
 }
 
 /// Deliver over VOT QUIC: a library grant is minted a fetch capability and

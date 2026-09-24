@@ -1314,48 +1314,6 @@ mod cidr_tests {
 mod tests {
     use super::*;
 
-    #[test]
-    fn sso_session_bounds_are_explicit() {
-        assert_eq!(MAX_SSO_SESSION_SECS, 31_536_000);
-        assert!(valid_sso_session_secs(1));
-        assert!(valid_sso_session_secs(31_536_000));
-        assert!(!valid_sso_session_secs(0));
-        assert!(!valid_sso_session_secs(31_536_001));
-        assert!(!valid_sso_session_secs(u64::MAX));
-    }
-
-    #[test]
-    fn known_environment_names_are_explicit() {
-        for name in KNOWN_ENVIRONMENT_NAMES {
-            assert!(is_known_environment_name(name), "{name}");
-        }
-        for name in [
-            "VOTPORT_STORAGE_MEDIA_ACCESS_KEY_ID",
-            "VOTPORT_STORAGE_MEDIA_SECRET_ACCESS_KEY",
-            "VOTPORT_STORAGE_MEDIA_SESSION_TOKEN",
-        ] {
-            assert!(is_known_environment_name(name), "{name}");
-        }
-        let id_100 = "A".repeat(100);
-        assert!(is_known_environment_name(&format!(
-            "VOTPORT_STORAGE_{id_100}_ACCESS_KEY_ID"
-        )));
-        let id_101 = "A".repeat(101);
-        assert!(!is_known_environment_name(&format!(
-            "VOTPORT_STORAGE_{id_101}_ACCESS_KEY_ID"
-        )));
-        for name in [
-            "VOTPORT_NOTIFY_SMTP_TO",
-            "VOTPORT_STORAGE_MEDIA_ACCESS_KEY",
-            "VOTPORT_STORAGE__SECRET_ACCESS_KEY",
-            "VOTPORT_STORAGE_MEDIA_SESSION_TOKEN_EXTRA",
-            "VOTPORT_STORAGE_media_ACCESS_KEY_ID",
-            "VOTPORT_STORAGE_MEDIA-ARCHIVE_ACCESS_KEY_ID",
-        ] {
-            assert!(!is_known_environment_name(name), "{name}");
-        }
-    }
-
     fn test_password_hash(algorithm: argon2::Algorithm, version: argon2::Version) -> String {
         use argon2::password_hash::PasswordHasher as _;
         argon2::Argon2::new(

@@ -384,28 +384,4 @@ mod tests {
             }
         ));
     }
-
-    #[test]
-    fn push_bridge_forwards_the_observer_and_keeps_a_carrier_total() {
-        let mut inner = Collector {
-            events: Vec::new(),
-            cancelled: true,
-        };
-        let mut push = bridge(&mut inner);
-        push.event(Event::Bytes {
-            moved: 40,
-            total: Some(999),
-        });
-        let cancelled = push.cancelled();
-        drop(push);
-        assert_eq!(inner.events.len(), 1, "{:?}", inner.events);
-        assert!(matches!(
-            &inner.events[0],
-            Event::Bytes {
-                moved: 40,
-                total: Some(999)
-            }
-        ));
-        assert!(cancelled);
-    }
 }

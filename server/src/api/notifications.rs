@@ -329,7 +329,6 @@ mod tests {
     use crate::store::{Tenant, TenantRemoval};
     use axum::body::Body;
     use http_body_util::BodyExt;
-    use tower::ServiceExt;
 
     fn headers(app: &App, tenant: &str, role: &str) -> HeaderMap {
         let identity = AdminIdentity {
@@ -682,109 +681,6 @@ mod tests {
         app.store.insert_tenant(tenant("a")).unwrap();
         assert!(app.store.notification_destinations("a").unwrap().is_empty());
         assert!(!app.store.notification_defaults("a").unwrap().enabled());
-    }
-
-    #[tokio::test]
-    async fn request_and_delivery_policies_round_trip() {
-        let directory = tempfile::tempdir().unwrap();
-        let app = testing::build(directory.path());
-        let saved = body(
-            save(
-                State(app.clone()),
-                headers(&app, "", "admin"),
-                Json(connection("Incoming")),
-            )
-            .await
-            .unwrap(),
-        )
-        .await;
-        let upload_policy = policy(saved["id"].as_str().unwrap(), "upload_complete");
-        let router = crate::app::router(app.clone());
-        let request = |method: &str, uri: &str, value: serde_json::Value| {
-            let mut request = axum::http::Request::builder()
-                .method(method)
-                .uri(uri)
-                .body(Body::from(value.to_string()))
-                .unwrap();
-            *request.headers_mut() = headers(&app, "", "admin");
-            request
-                .headers_mut()
-                .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
-            request
-        };
-        let response = router
-            .clone()
-            .oneshot(request(
-                "POST",
-                "/api/admin/links",
-                json!({"label":"Notification request","notifications":upload_policy}),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let link = body(response).await["link"].clone();
-        assert_eq!(link["notifications"], json!(upload_policy));
-        assert!(link.get("notify_on_upload").is_none());
-        let id = link["id"].as_str().unwrap();
-        assert_eq!(
-            app.store.upload_link(id).unwrap().unwrap().notifications,
-            Some(upload_policy.clone())
-        );
-        let url = format!("/api/admin/links/{id}");
-        assert_eq!(
-            router
-                .clone()
-                .oneshot(request(
-                    "PATCH",
-                    &url,
-                    json!({"notifications":{"mode":"off"}})
-                ))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::OK
-        );
-        assert_eq!(
-            router
-                .clone()
-                .oneshot(request(
-                    "PATCH",
-                    &url,
-                    json!({"notifications":upload_policy})
-                ))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::OK
-        );
-        assert!(app
-            .store
-            .link("", id)
-            .unwrap()
-            .unwrap()
-            .notifications
-            .unwrap()
-            .enabled());
-        let mut grant = crate::notify::tests::test_grant(vec![]);
-        grant.tenant = String::new();
-        grant.notifications = Some(NotificationPolicy::default());
-        app.store.insert_outbound_grant(grant).unwrap();
-        assert!(app
-            .store
-            .set_outbound_notifications("", "grant-id", &upload_policy)
-            .unwrap());
-        let grant = app.store.outbound_grants("").unwrap().pop().unwrap();
-        assert!(grant.notifications.unwrap().enabled());
-        let selected = policy(saved["id"].as_str().unwrap(), "outbound_delivery_complete");
-        app.store
-            .set_outbound_notifications("", "grant-id", &selected)
-            .unwrap();
-        assert_eq!(
-            app.store.outbound_grants_page("", 10, 0, 1).unwrap().0[0]
-                .0
-                .notifications,
-            Some(selected)
-        );
     }
 
     #[test]

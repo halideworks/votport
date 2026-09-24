@@ -94,6 +94,8 @@ fn an_operator_runs_the_port_from_the_core() {
     .expect("sign in");
     assert_eq!(port.base, server.base);
     assert_eq!(port.tenant, "");
+    // The session's role reaches the stored port the shells gate screens on.
+    assert_eq!(port.role, "admin");
     assert_eq!(ffi::port(), Some(port.clone()));
     assert_eq!(ffi::check_port().unwrap(), Some(port));
     // The session file never holds the password.

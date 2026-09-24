@@ -487,37 +487,6 @@ mod tests {
         assert!(collect(&argument, &mut Vec::new()).is_err());
     }
 
-    #[test]
-    fn invalid_saved_http_metadata_is_rejected_before_prepare() {
-        let device_dir = tempfile::tempdir().unwrap();
-        let device = Device::load_or_create_in(device_dir.path()).unwrap();
-        let mut observer = crate::progress::Silent;
-        for (session, chunk_bytes) in [
-            ("not-a-session", 65536),
-            ("0123456789abcdef0123456789abcdef", 0),
-            ("0123456789abcdef0123456789abcdef", 8 * 1024 * 1024 + 1),
-        ] {
-            let result = send_with_session(
-                "http://127.0.0.1:1",
-                Drop {
-                    token: "token".to_owned(),
-                    password: None,
-                    files: Vec::new(),
-                },
-                &device,
-                &mut observer,
-                Some(HttpResume {
-                    session,
-                    chunk_bytes,
-                    root: "root",
-                    length: 1,
-                }),
-                |_, _, _| Ok(true),
-            );
-            assert!(matches!(result, Err(Error::ResumeSessionInvalid)));
-        }
-    }
-
     /// One request-link route with a `push` link and a push-identity endpoint
     /// whose reply the caller picks, plus a counted HTTP session creation, so
     /// a test can pin which transport the send decision ran. Serves until

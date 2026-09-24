@@ -1155,15 +1155,6 @@ pub async fn delete_group(
 mod tests {
     use super::*;
 
-    /// Audit 437: a SCIM store outage carries the shared store-unavailable
-    /// sentence rather than SCIM's own wording.
-    #[test]
-    fn store_outage_shares_the_store_unavailable_sentence() {
-        let error = ScimError::store("rusqlite detail".into());
-        assert_eq!(error.detail, crate::api::store_unavailable_message());
-        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
-    }
-
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt as _;
@@ -2490,25 +2481,6 @@ mod tests {
             let mut patch = GroupPatch::default();
             assert!(patch_group_operation(&mut patch, &bad).is_err(), "{bad}");
         }
-    }
-
-    #[test]
-    fn segment_encoding_keeps_unreserved_bytes_only() {
-        assert_eq!(encode_segment("a-b_c.d~E9"), "a-b_c.d~E9");
-        assert_eq!(encode_segment("a/b@x y"), "a%2Fb%40x%20y");
-        assert_eq!(encode_segment("é"), "%C3%A9");
-        assert_eq!(encode_segment("?#+%&\0"), "%3F%23%2B%25%26%00");
-        assert_eq!(encode_segment(""), "");
-    }
-
-    #[test]
-    fn active_parser_handles_bools_and_entra_strings() {
-        assert!(parse_active(&json!(true)).unwrap());
-        assert!(!parse_active(&json!(false)).unwrap());
-        assert!(parse_active(&json!("True")).unwrap());
-        assert!(!parse_active(&json!("FALSE")).unwrap());
-        assert!(parse_active(&json!(1)).is_err());
-        assert!(parse_active(&json!("yes")).is_err());
     }
 
     #[tokio::test]

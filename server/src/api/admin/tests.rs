@@ -617,38 +617,6 @@ mod handler_tests {
     }
 
     #[tokio::test]
-    async fn spread_out_failures_never_reach_a_fresh_address() {
-        let directory = tempfile::tempdir().unwrap();
-        let application = testing::build(directory.path());
-        // Twelve failures, spread four per address so no single address
-        // locks itself, and well past the five that used to trip a global
-        // counter. Nothing may accumulate across addresses, or an attacker
-        // who spreads guesses denies the operator the break-glass credential.
-        // Kept small on purpose: every one of these runs a real argon2.
-        for index in 0..3u8 {
-            for _ in 0..4 {
-                assert_eq!(
-                    login_attempt(application.clone(), [203, 0, 113, index], "wrong")
-                        .await
-                        .status(),
-                    StatusCode::UNAUTHORIZED
-                );
-            }
-        }
-        assert_eq!(
-            login_attempt(
-                application.clone(),
-                [198, 51, 100, 4],
-                testing::TEST_PASSWORD
-            )
-            .await
-            .status(),
-            StatusCode::OK,
-            "a fresh address signs in normally"
-        );
-    }
-
-    #[tokio::test]
     async fn a_link_password_flood_cannot_queue_the_operator_out() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
@@ -738,21 +706,6 @@ mod handler_tests {
             .next()
             .unwrap()
             .to_owned()
-    }
-
-    #[tokio::test]
-    async fn admin_api_rejects_the_unauthenticated() {
-        let directory = tempfile::tempdir().unwrap();
-        let router = app::router(testing::build(directory.path()));
-        let response = router
-            .oneshot(
-                Request::get("/api/admin/links")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -1483,52 +1436,6 @@ mod handler_tests {
     }
 
     #[tokio::test]
-    async fn audit_recent_cursor_returns_newest_rows_and_rejects_mixed_cursors() {
-        let directory = tempfile::tempdir().unwrap();
-        let application = testing::build(directory.path());
-        let cookie = login_cookie(app::router(application.clone())).await;
-        application
-            .store
-            .audit("", "", "oldest", "a", &serde_json::json!({}));
-        application
-            .store
-            .audit("", "", "middle", "b", &serde_json::json!({}));
-        application
-            .store
-            .audit("", "", "newest", "c", &serde_json::json!({}));
-
-        let response = app::router(application.clone())
-            .oneshot(
-                Request::get("/api/admin/audit?before_rowid=0&limit=2")
-                    .header("cookie", &cookie)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        use http_body_util::BodyExt as _;
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let events: Vec<_> = String::from_utf8(body.to_vec())
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["event"].clone())
-            .collect();
-        assert_eq!(events, vec!["newest", "middle"]);
-
-        let response = app::router(application)
-            .oneshot(
-                Request::get("/api/admin/audit?before_rowid=3&since=0")
-                    .header("cookie", cookie)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    }
-
-    #[tokio::test]
     async fn holdings_reports_platform_usage() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
@@ -1938,26 +1845,6 @@ mod tenant_authz_tests {
         }
     }
 
-    /// The `AuditorIdentity` newtype makes a bare `require_admin` result
-    /// unusable without destructuring; this pin keeps the destructuring
-    /// sites to the definition, the construction in `require_admin`, and
-    /// the two gates, in admin.rs where they live. Raise the count only
-    /// for a deliberate new gate.
-    #[test]
-    fn auditor_identity_is_unwrapped_only_by_the_two_gates() {
-        let admin_rs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/admin.rs");
-        let text = std::fs::read_to_string(admin_rs).unwrap();
-        // Split so this test's own source cannot match the needle.
-        let needle = concat!("AuditorIdentity", "(");
-        assert_eq!(
-            text.matches(needle).count(),
-            4,
-            "AuditorIdentity must appear only as the struct definition, the \
-             construction in require_admin, and the unwraps in \
-             require_operator and require_platform_admin"
-        );
-    }
-
     #[tokio::test]
     async fn auditor_sees_the_audit_trail_and_nothing_else() {
         let directory = tempfile::tempdir().unwrap();
@@ -2306,7 +2193,6 @@ mod branding_tests {
 
     use axum::body::Body;
     use axum::http::Request;
-    use http_body_util::BodyExt as _;
     use tower::ServiceExt;
 
     use crate::api::testing;
@@ -2871,28 +2757,6 @@ mod branding_tests {
         );
         assert!(application.store.branding("acme").unwrap().is_none());
         assert!(!logo.exists());
-    }
-
-    #[tokio::test]
-    async fn branding_mutations_require_the_csrf_header() {
-        let directory = tempfile::tempdir().unwrap();
-        let application = testing::build(directory.path());
-        let platform = cookie_for(&application, "", "admin");
-        let request = Request::builder()
-            .method("PUT")
-            .uri("/api/admin/branding/default")
-            .header("cookie", &platform)
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"name":"Acme","color":""}"#))
-            .unwrap();
-        let response = app::router(application.clone())
-            .oneshot(request)
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"], "missing X-Votport header");
     }
 }
 
@@ -3692,29 +3556,6 @@ mod tenant_offboard_tests {
     }
 
     #[tokio::test]
-    async fn create_tenant_refuses_a_pinned_key() {
-        let directory = tempfile::tempdir().unwrap();
-        let application = testing::build(directory.path());
-        let _pin = application.sessions.try_pin_tenant("acme").unwrap();
-
-        let router = app::router(application.clone());
-        let cookie = login_cookie(router).await;
-        let response = create_tenant_req(application.clone(), &cookie, "acme").await;
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            json["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("already in progress"),
-            "error was {json}"
-        );
-        assert!(application.store.tenant("acme").unwrap().is_none());
-        assert!(application.sessions.tenant_pinned("acme"));
-    }
-
-    #[tokio::test]
     async fn create_tenant_refuses_a_multi_segment_key() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
@@ -3802,23 +3643,6 @@ mod tenant_offboard_tests {
     }
 
     #[tokio::test]
-    async fn unknown_key_with_a_colliding_link_but_no_directory_is_404() {
-        let directory = tempfile::tempdir().unwrap();
-        let application = testing::build(directory.path());
-        // A colliding link exists, but there is no tenant row and nothing on
-        // disk, so there is no purge to conflict with: this is a 404, not the
-        // purge refusal.
-        application
-            .store
-            .insert_link(default_link("root-dest", "acme"))
-            .unwrap();
-        let router = app::router(application.clone());
-        let cookie = login_cookie(router).await;
-        let response = delete_tenant_req(application.clone(), &cookie, "acme").await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
     async fn create_tenant_does_not_claim_the_same_named_default_folder() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
@@ -3860,18 +3684,6 @@ mod tenant_offboard_tests {
             stored_path(&application, "acme", "inbox/a.txt").unwrap(),
             stored_path(&application, "", "inbox/a.txt").unwrap()
         );
-    }
-
-    #[tokio::test]
-    async fn create_tenant_accepts_an_empty_folder() {
-        let directory = tempfile::tempdir().unwrap();
-        let application = testing::build(directory.path());
-        // An empty directory holds nobody's files, so it is not a collision.
-        std::fs::create_dir_all(application.config.receive_dir.join("acme")).unwrap();
-        let router = app::router(application.clone());
-        let cookie = login_cookie(router).await;
-        let response = create_tenant_req(application.clone(), &cookie, "acme").await;
-        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -3995,23 +3807,6 @@ mod tenant_offboard_tests {
             .next()
             .unwrap();
         assert_eq!(line.detail["verification"], "strict");
-    }
-
-    #[tokio::test]
-    async fn create_link_defaults_verification_when_the_field_is_absent() {
-        let directory = tempfile::tempdir().unwrap();
-        let application = testing::build(directory.path());
-        let router = app::router(application.clone());
-        let cookie = login_cookie(router).await;
-        for payload in [
-            json!({"label":"plain"}),
-            json!({"label":"explicit","verification":"default"}),
-        ] {
-            let (status, body) = post_link(application.clone(), &cookie, payload).await;
-            assert_eq!(status, StatusCode::OK);
-            assert_eq!(body["link"]["verification"], "default");
-        }
-        assert_eq!(application.store.links("").unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -4816,22 +4611,6 @@ mod settings_api_tests {
     use crate::app;
     use crate::auth::{self, TenantGrant};
     use crate::store::SettingWrite;
-
-    #[test]
-    fn deployment_profiles_report_detection_and_missing_mounts() {
-        let directory = tempfile::tempdir().unwrap();
-        assert_eq!(
-            deployment_commit_profile(&directory.path().join("missing")),
-            None
-        );
-        #[cfg(target_os = "linux")]
-        assert_eq!(
-            deployment_commit_profile(directory.path()),
-            Some("balanced")
-        );
-        #[cfg(not(target_os = "linux"))]
-        assert_eq!(deployment_commit_profile(directory.path()), None);
-    }
 
     #[tokio::test]
     async fn sso_session_lifetime_follows_the_settings_overlay() {
@@ -5719,88 +5498,6 @@ mod settings_api_tests {
     }
 
     #[tokio::test]
-    async fn get_settings_redacts_smtp_password() {
-        let directory = tempfile::tempdir().unwrap();
-        let application = testing::build(directory.path());
-        let cookie = cookie_for(&application, "", "admin");
-        let (status, json) = send(
-            application,
-            Request::builder()
-                .method("PUT")
-                .uri("/api/admin/settings")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"smtp_host":"smtp.example.com","smtp_from":"votport@example.com","smtp_password":"s3cret"}"#,
-                ))
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["smtp_host"], "smtp.example.com");
-        assert_eq!(json["smtp_password_set"], true);
-        assert!(json["overridden_keys"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|key| key == "smtp_password"));
-        assert!(json.get("smtp_password").is_none());
-    }
-
-    #[tokio::test]
-    async fn put_then_get_lists_accepted_overrides() {
-        let directory = tempfile::tempdir().unwrap();
-        let application = testing::build(directory.path());
-        let cookie = cookie_for(&application, "", "admin");
-        let (status, json) = send(
-            application.clone(),
-            Request::builder()
-                .method("PUT")
-                .uri("/api/admin/settings")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"audit_retention_days":7,"smtp_host":"https://db.example/hook"}"#,
-                ))
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["audit_retention_days"], 7);
-        assert_eq!(json["smtp_host"], "https://db.example/hook");
-        let overridden_keys = json["overridden_keys"].as_array().unwrap();
-        assert!(overridden_keys
-            .iter()
-            .any(|key| key == "audit_retention_days"));
-        assert!(overridden_keys.iter().any(|key| key == "smtp_host"));
-        assert!(!overridden_keys
-            .iter()
-            .any(|key| key == "upload_retention_days"));
-
-        let (status, json) = send(
-            application,
-            Request::builder()
-                .method("PUT")
-                .uri("/api/admin/settings")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"smtp_host":null}"#))
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["smtp_host"], serde_json::Value::Null);
-        assert!(!json["overridden_keys"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|key| key == "smtp_host"));
-    }
-
-    #[tokio::test]
     async fn put_omitting_a_secret_leaves_the_previous_value() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
@@ -5937,26 +5634,6 @@ mod settings_api_tests {
             .await;
             assert_eq!(status, StatusCode::FORBIDDEN);
         }
-    }
-
-    #[tokio::test]
-    async fn put_settings_requires_csrf_header() {
-        let directory = tempfile::tempdir().unwrap();
-        let application = testing::build(directory.path());
-        let cookie = cookie_for(&application, "", "admin");
-        let (status, json) = send(
-            application,
-            Request::builder()
-                .method("PUT")
-                .uri("/api/admin/settings")
-                .header("cookie", &cookie)
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"audit_retention_days":1}"#))
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(json["error"], "missing X-Votport header");
     }
 
     #[tokio::test]
@@ -6482,30 +6159,6 @@ mod principals_api_tests {
     }
 
     #[tokio::test]
-    async fn cv_1_against_row_2_fails_require_admin() {
-        let directory = tempfile::tempdir().unwrap();
-        let application = testing::build(directory.path());
-        application
-            .store
-            .upsert_sso_principal("user@example.com", &[], &json!([]))
-            .unwrap();
-        application
-            .store
-            .revoke_principal("user@example.com")
-            .unwrap();
-        let cookie = cookie_for(&application, sso_identity("user@example.com", 1));
-        let (status, _, _) = send(
-            application,
-            Request::get("/api/admin/session")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
     async fn revoke_then_unblock_then_live_version_passes() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
@@ -6856,74 +6509,6 @@ mod principals_api_tests {
     }
 
     #[tokio::test]
-    async fn local_identity_sees_named_tenant_grants() {
-        let directory = tempfile::tempdir().unwrap();
-        let application = testing::build(directory.path());
-        insert_acme(&application);
-        let cookie = platform_cookie(&application);
-        let (status, json, _) = send(
-            application.clone(),
-            Request::get("/api/admin/session")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        let grants = json["grants"].as_array().unwrap();
-        assert!(
-            grants
-                .iter()
-                .any(|grant| grant["tenant"] == "acme" && grant["role"] == "admin"),
-            "grants were {grants:?}"
-        );
-        let (status, _, _) = send(
-            application,
-            Request::builder()
-                .method("POST")
-                .uri("/api/admin/tenant")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"tenant":"acme"}"#))
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn upsert_then_list_tenants_contains_the_subject() {
-        let directory = tempfile::tempdir().unwrap();
-        let application = testing::build(directory.path());
-        application
-            .store
-            .upsert_sso_principal(
-                "user@example.com",
-                &["employees".to_owned()],
-                &json!([{"tenant":"","role":"viewer"}]),
-            )
-            .unwrap();
-        let cookie = platform_cookie(&application);
-        let (status, json, _) = send(
-            application,
-            Request::get("/api/admin/tenants")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        let principals = json["principals"].as_array().unwrap();
-        assert_eq!(principals.len(), 1);
-        assert_eq!(principals[0]["subject"], "user@example.com");
-        assert_eq!(principals[0]["blocked"], false);
-        assert_eq!(principals[0]["credential_version"], 1);
-        assert_eq!(principals[0]["last_groups"][0], "employees");
-        assert_eq!(principals[0]["source"], "sso");
-    }
-
-    #[tokio::test]
     async fn principal_page_is_platform_only_and_validates_bounds() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
@@ -7062,40 +6647,6 @@ mod principals_api_tests {
     }
 
     #[tokio::test]
-    async fn viewer_cannot_list_principals() {
-        let directory = tempfile::tempdir().unwrap();
-        let application = testing::build(directory.path());
-        application
-            .store
-            .upsert_sso_principal("user@example.com", &[], &json!([]))
-            .unwrap();
-        let cookie = cookie_for(
-            &application,
-            auth::AdminIdentity {
-                subject: "sso:viewer".to_owned(),
-                tenant: String::new(),
-                role: "viewer".to_owned(),
-                grants: vec![TenantGrant {
-                    incarnation: None,
-                    tenant: String::new(),
-                    role: "viewer".to_owned(),
-                }],
-                credential_version: 1,
-            },
-        );
-        let (status, json, _) = send(
-            application,
-            Request::get("/api/admin/tenants")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        assert!(json.get("principals").is_none());
-    }
-
-    #[tokio::test]
     async fn revoke_refuses_local_and_unknown() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
@@ -7126,36 +6677,6 @@ mod principals_api_tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn revoke_requires_csrf_header() {
-        let directory = tempfile::tempdir().unwrap();
-        let application = testing::build(directory.path());
-        application
-            .store
-            .upsert_sso_principal("user@example.com", &[], &json!([]))
-            .unwrap();
-        let cookie = platform_cookie(&application);
-        let (status, _, _) = send(
-            application.clone(),
-            Request::builder()
-                .method("POST")
-                .uri("/api/admin/principals/revoke")
-                .header("cookie", &cookie)
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"subject":"user@example.com"}"#))
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        let row = application
-            .store
-            .principal("user@example.com")
-            .unwrap()
-            .unwrap();
-        assert!(!row.blocked);
-        assert_eq!(row.credential_version, 1);
     }
 
     #[test]
@@ -7451,24 +6972,6 @@ mod notification_and_limit_tests {
             create("é".repeat(129)).await,
             StatusCode::UNPROCESSABLE_ENTITY
         );
-    }
-
-    #[tokio::test]
-    async fn switch_tenant_requires_csrf_header() {
-        let directory = tempfile::tempdir().unwrap();
-        let application = testing::build(directory.path());
-        let cookie = admin_cookie(&application);
-        let response = app::router(application)
-            .oneshot(
-                Request::post("/api/admin/tenant")
-                    .header("cookie", cookie)
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"tenant":""}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }
 

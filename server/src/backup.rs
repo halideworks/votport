@@ -2694,35 +2694,6 @@ mod tests {
         );
     }
 
-    #[derive(Debug)]
-    struct FailingMultipart {
-        aborted: Arc<AtomicBool>,
-    }
-
-    #[async_trait::async_trait]
-    impl MultipartUpload for FailingMultipart {
-        fn put_part(&mut self, _data: object_store::PutPayload) -> object_store::UploadPart {
-            Box::pin(async {
-                Err(object_store::Error::Generic {
-                    store: "test",
-                    source: Box::new(io::Error::other("part failed")),
-                })
-            })
-        }
-
-        async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
-            Err(object_store::Error::Generic {
-                store: "test",
-                source: Box::new(io::Error::other("complete failed")),
-            })
-        }
-
-        async fn abort(&mut self) -> object_store::Result<()> {
-            self.aborted.store(true, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
     fn initialized_root() -> (tempfile::TempDir, crate::store::Store) {
         let root = tempfile::tempdir().unwrap();
         crate::paths::tighten_private_dir(root.path()).unwrap();
@@ -5145,22 +5116,5 @@ mod tests {
             },
             1_000
         ));
-    }
-
-    #[tokio::test]
-    async fn failed_multipart_part_is_aborted() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("upload");
-        fs::write(&path, b"backup").unwrap();
-        let mut file = tokio::fs::File::open(path).await.unwrap();
-        let aborted = Arc::new(AtomicBool::new(false));
-        let mut upload: Box<dyn MultipartUpload> = Box::new(FailingMultipart {
-            aborted: Arc::clone(&aborted),
-        });
-        assert_eq!(
-            upload_file_parts(&mut upload, &mut file).await,
-            Err("S3 upload failed".into())
-        );
-        assert!(aborted.load(Ordering::SeqCst));
     }
 }

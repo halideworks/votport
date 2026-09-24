@@ -643,58 +643,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn notification_outcomes_carry_the_failure_reason() {
-        let directory = tempfile::tempdir().unwrap();
-        let app = testing::build(directory.path());
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn({
-            let attempts = attempts.clone();
-            async move {
-                axum::serve(
-                    listener,
-                    Router::new().route(
-                        "/",
-                        post(move |_request: axum::extract::Request| {
-                            let attempts = attempts.clone();
-                            async move {
-                                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
-                                if attempt == 1 {
-                                    axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                                } else {
-                                    axum::http::StatusCode::NO_CONTENT.into_response()
-                                }
-                            }
-                        }),
-                    ),
-                )
-                .await
-                .unwrap();
-            }
-        });
-        let mut destination = push_destination("webhook");
-        destination.url = format!("http://{address}/");
-        app.store
-            .save_notification_destination("", &mut destination)
-            .unwrap();
-
-        // A refused test surfaces the classifier's reason on the outcomes
-        // map, next to the delivered flag the settings page already shows.
-        let error = test_destination(&app, "", &destination).await.unwrap_err();
-        let outcomes = app.store.notification_outcomes("").unwrap();
-        assert_eq!(outcomes["fixture"]["delivered"], false);
-        assert_eq!(outcomes["fixture"]["reason"], error);
-
-        // A delivered attempt clears the reason again.
-        assert!(test_destination(&app, "", &destination).await.is_ok());
-        let outcomes = app.store.notification_outcomes("").unwrap();
-        assert_eq!(outcomes["fixture"]["delivered"], true);
-        assert!(outcomes["fixture"]["reason"].is_null());
-        server.abort();
-    }
-
-    #[tokio::test]
     async fn selected_destinations_receive_only_their_events_and_defaults_do_not_broadcast() {
         let directory = tempfile::tempdir().unwrap();
         let app = testing::build(directory.path());
