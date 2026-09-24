@@ -148,7 +148,6 @@ pub struct SsoLogin {
 }
 
 pub fn begin_sso(base: &str) -> Result<std::sync::Arc<SsoLogin>> {
-    use rand::RngCore as _;
     use sha2::Digest as _;
     let base = origin(base)?;
     let client = Client::authentication(&base)?;
@@ -158,12 +157,8 @@ pub fn begin_sso(base: &str) -> Result<std::sync::Arc<SsoLogin>> {
             "SSO is not configured on this port".to_owned(),
         ));
     }
-    let mut verifier = [0; 32];
-    let mut state = [0; 16];
-    rand::rngs::OsRng.fill_bytes(&mut verifier);
-    rand::rngs::OsRng.fill_bytes(&mut state);
-    let verifier = hex::encode(verifier);
-    let state = hex::encode(state);
+    let verifier = hex::encode(rand::random::<[u8; 32]>());
+    let state = hex::encode(rand::random::<[u8; 16]>());
     let challenge = hex::encode(sha2::Sha256::digest(verifier.as_bytes()));
     let authorization_url =
         format!("{base}/api/admin/sso/start?desktop_challenge={challenge}&desktop_state={state}");

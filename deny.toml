@@ -81,12 +81,14 @@ deny = [
 skip = [
     # age's rust-embed-utils and i18n-embed use sha2 0.11; votport and the VOT
     # proof crates use 0.10.
-    { name = "sha2", version = "0.11", reason = "age pulls sha2 0.11 through rust-embed-utils/i18n-embed" },
+    { name = "sha2", version = "0.11", reason = "age (rust-embed-utils/i18n-embed) and the client core use sha2 0.11" },
     # vot-receipt (VOT fork) signs with hmac 0.13; votport's webhook
     # signatures use 0.12.
     { name = "hmac", version = "0.13", reason = "vot-receipt uses hmac 0.13" },
-    # object_store 0.14 uses rand 0.10; votport, age, and openidconnect use 0.8.
-    { name = "rand", version = "0.10", reason = "object_store uses rand 0.10" },
+    # object_store 0.14 and the client core use rand 0.10; the server, age and
+    # openidconnect use 0.8. The client tree alone has one rand, so cargo-deny
+    # reports these skips as unnecessary there.
+    { name = "rand", version = "0.10", reason = "object_store and the client core use rand 0.10" },
     # rand 0.10 (object_store) and getrandom 0.4 (tempfile) use rand_core 0.10;
     # the rest of the tree is on 0.6.
     { name = "rand_core", version = "0.10", reason = "rand 0.10 and getrandom 0.4 use rand_core 0.10" },
