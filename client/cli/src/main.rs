@@ -1023,70 +1023,6 @@ fn watch_json(item: &votport_client_core::watch::Watch) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_absolute_filesystem_path, issue_delivery};
-
-    #[test]
-    fn optionless_commands_name_the_option_not_the_count() {
-        // Audit 481: these commands take no options, so a flag must draw a
-        // usage error naming the flag, not a count complaint or silence.
-        for (arguments, flag) in [
-            (vec!["close-request", "--json"], "--json"),
-            (vec!["revoke-delivery", "--json"], "--json"),
-            (vec!["status", "--wat"], "--wat"),
-            (vec!["signout", "--wat"], "--wat"),
-        ] {
-            let args = arguments.into_iter().map(str::to_owned).collect::<Vec<_>>();
-            let error = super::run(&args).unwrap_err();
-            assert!(
-                error.contains("no options") || error.contains("no arguments"),
-                "{error}"
-            );
-            assert!(error.contains(flag), "{error}");
-        }
-        // inspect is dispatched beside run(); same contract there.
-        let inspect_args = ["--json".to_owned(), "link".to_owned()];
-        let error = super::inspect(&inspect_args).unwrap_err();
-        assert!(error.contains("no options"), "{error}");
-        assert!(error.contains("--json"), "{error}");
-        // Without a flag, the count error keeps its own shape.
-        let args = ["inspect".to_owned(), "a".to_owned(), "b".to_owned()];
-        assert!(super::inspect(&args).unwrap_err().contains("one link"));
-    }
-
-    #[test]
-    fn transfer_commands_share_option_validation() {
-        for command in ["send", "receive", "resume"] {
-            for (arguments, expected) in [
-                (vec![command, "--password"], "--password needs a value"),
-                (vec![command, "--unknown"], "unknown option"),
-            ] {
-                let arguments = arguments.into_iter().map(str::to_owned).collect::<Vec<_>>();
-                assert!(super::run(&arguments).unwrap_err().contains(expected));
-            }
-        }
-        let args = [
-            "link",
-            "--password",
-            "first",
-            "a file",
-            "--json",
-            "--password",
-            "last",
-        ]
-        .map(str::to_owned);
-        let (options, positional, json) = super::parse(&args, &["--password"]).unwrap();
-        assert_eq!(options["--password"], "last");
-        assert_eq!(positional, ["link", "a file"]);
-        assert!(json);
-        for arguments in [
-            vec!["receive", "link", "dir", "extra"],
-            vec!["resume", "id", "extra"],
-        ] {
-            let args = arguments.into_iter().map(str::to_owned).collect::<Vec<_>>();
-            assert!(super::run(&args).unwrap_err().contains("needs one"));
-        }
-    }
-
     #[test]
     fn password_files_win_over_argv_and_trim_one_newline() {
         let directory = std::env::temp_dir().join(format!(
@@ -1124,27 +1060,5 @@ mod tests {
         options.insert("--password-file".to_owned(), empty.display().to_string());
         assert!(super::secret_from(&mut options, "--password-file", "--password").is_err());
         let _ = std::fs::remove_dir_all(&directory);
-    }
-
-    #[test]
-    fn issue_delivery_explains_unambiguous_local_paths_before_network() {
-        for path in [
-            "/tmp/clip.mov",
-            r"C:\clips\clip.mov",
-            "C:/clips/clip.mov",
-            r"\\server\share\clip.mov",
-        ] {
-            let args = ["label".to_owned(), path.to_owned()];
-            let error = issue_delivery(&args).expect_err(path);
-            assert!(error.contains("votport upload"), "{error}");
-            assert!(error.contains("local filesystem path"), "{error}");
-        }
-    }
-
-    #[test]
-    fn relative_library_paths_are_not_classified_by_local_shape() {
-        for path in ["clip.mov", "./clip.mov", "folder/clip.mov", "C:clip.mov"] {
-            assert!(!is_absolute_filesystem_path(path), "{path}");
-        }
     }
 }

@@ -1002,7 +1002,7 @@ for (const mode of browserEngine === "chromium" ? ["unreadable", "short", "short
   if (!changed || aborts !== 1 || buildChecks === 0 || (mode === "short-busy" && busy === 0)
     || message !== `"${changedName}" changed while uploading; pick it again. The one already delivered is kept. Fix the rest and send them again.`
     || await page.locator("#resume-note").isVisible()
-    || await page.evaluate((key) => localStorage.getItem(key), `votport-resume-${linkToken}`) !== null
+    || await page.evaluate((prefix) => Object.keys(localStorage).some((key) => key.startsWith(prefix)), `votport-resume-${linkToken}-`)
     || fs.readFileSync(path.join(receiveDir, dest, keptName), "utf8") !== keptBytes
     || !fs.existsSync(path.join(receiveDir, dest, `${keptName}.vot-receipt`))
     || fs.existsSync(path.join(receiveDir, dest, changedName))) {
@@ -1047,7 +1047,7 @@ for (const mode of ["retry", "cancel"]) {
     await page.waitForFunction(() => !document.getElementById("upload-error").hidden
       && document.getElementById("upload-error").textContent === "Transfer cancelled.");
     if (fs.existsSync(path.join(receiveDir, dest, name)) || await page.locator("#resume-note").isVisible()
-      || await page.evaluate((key) => localStorage.getItem(key), `votport-resume-${linkToken}`) !== null) {
+      || await page.evaluate((prefix) => Object.keys(localStorage).some((key) => key.startsWith(prefix)), `votport-resume-${linkToken}-`)) {
       throw new Error("cancelled snapshot retry left a delivery or resume record");
     }
   }
@@ -1080,7 +1080,7 @@ for (const status of [409, 422]) {
   await page.waitForSelector("#upload-error:not([hidden])", { timeout: 10000 });
   if (!busy || await page.textContent("#upload-error") !== "range refused. Any files already delivered are kept. Fix the selection and send again."
     || await page.locator("#resume-note").isVisible()
-    || await page.evaluate((key) => localStorage.getItem(key), `votport-resume-${linkToken}`) !== null) {
+    || await page.evaluate((prefix) => Object.keys(localStorage).some((key) => key.startsWith(prefix)), `votport-resume-${linkToken}-`)) {
     throw new Error(`${status} refusal did not stop the busy sibling`);
   }
   await page.unroute("**/api/session/*/chunk?*", refuseWithBusySibling);
@@ -1110,7 +1110,7 @@ await page.click("#send");
 await page.waitForSelector("#upload-error:not([hidden])", { timeout: 10000 });
 if (rebeginAborts !== 1 || !(await page.textContent("#upload-error")).startsWith("range refused after restart.")
   || await page.locator("#resume-note").isVisible()
-  || await page.evaluate((key) => localStorage.getItem(key), `votport-resume-${linkToken}`) !== null
+  || await page.evaluate((prefix) => Object.keys(localStorage).some((key) => key.startsWith(prefix)), `votport-resume-${linkToken}-`)
   || fs.readFileSync(path.join(receiveDir, dest, "rebegin-a.bin"), "utf8") !== "rebegin-a"
   || !fs.existsSync(path.join(receiveDir, dest, "rebegin-a.bin.vot-receipt"))) {
   throw new Error(`earlier rebegin hid the terminal refusal: aborts=${rebeginAborts}`);
@@ -1148,7 +1148,7 @@ try {
     && fs.existsSync(path.join(receiveDir, dest, "held-a.bin.vot-receipt"));
   if (!kept || message !== "range refused with a held reply. Any files already delivered are kept. Fix the selection and send again."
     || await page.locator("#resume-note").isVisible()
-    || await page.evaluate((key) => localStorage.getItem(key), `votport-resume-${linkToken}`) !== null) {
+    || await page.evaluate((prefix) => Object.keys(localStorage).some((key) => key.startsWith(prefix)), `votport-resume-${linkToken}-`)) {
     throw new Error(`held publication feedback was wrong: kept=${kept}, message=${message}`);
   }
 } finally {

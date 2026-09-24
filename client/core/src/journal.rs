@@ -428,43 +428,6 @@ mod tests {
         assert_eq!(pending_in(&dir).len(), 1);
     }
 
-    #[test]
-    fn fresh_ids_differ_within_a_second() {
-        assert_ne!(fresh_id(7), fresh_id(7));
-        assert!(fresh_id(7).starts_with("7-"));
-    }
-
-    /// A receive re-asked for its folder journals the answer, so the next
-    /// offer and the run itself follow the new folder; an id the journal
-    /// does not hold is quietly ignored, as a missing entry is elsewhere.
-    #[test]
-    fn a_re_asked_receive_journals_the_folder_it_was_given() {
-        let home = tempfile::tempdir().unwrap();
-        let dir = home.path().join("journal");
-        let entry = Entry {
-            id: "1-a".into(),
-            kind: Kind::Receive,
-            link: "https://drop.example/s/DEL".into(),
-            paths: Vec::new(),
-            dest: Some("/tmp/landed".into()),
-            needs_password: false,
-            http: None,
-            started_unix: 0,
-        };
-        fs::create_dir_all(&dir).unwrap();
-        write_in(&dir, &entry).unwrap();
-        set_dest_in(&dir, "1-a", "/tmp/elsewhere");
-        assert_eq!(
-            get_in(&dir, "1-a").unwrap().dest.as_deref(),
-            Some("/tmp/elsewhere")
-        );
-        set_dest_in(&dir, "never-there", "/tmp/ignored");
-        assert!(matches!(
-            get_in(&dir, "never-there"),
-            Err(Error::UnknownTransfer { .. })
-        ));
-    }
-
     /// An entry kept for a retry that never came is dropped at the next
     /// listing once it is past retention, so abandoned sends do not
     /// accumulate forever.

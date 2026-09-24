@@ -245,6 +245,28 @@ try {
   assert.equal(await page.locator('#audit-retention-source').textContent(), 'from environment');
   assert.equal(await page.locator('[data-reset=audit_retention_days]').isVisible(), false);
 
+  // Backups: run one now, see it reach the restore picker, back out of the
+  // restore confirmation, and download the database snapshot (which needs the
+  // CSRF header the page adds).
+  await page.waitForFunction(() => !document.getElementById('backup-run').disabled);
+  await page.click('#backup-run');
+  await page.waitForFunction(() => !document.getElementById('backup-restore-snapshot').disabled
+    && document.querySelectorAll('#backup-restore-snapshot option:not([value=""])').length > 0);
+  assert.equal(await page.locator('#backup-status-error').isVisible(), false);
+  const snapshot = await page.locator('#backup-restore-snapshot option:not([value=""])').first().getAttribute('value');
+  const restoreRequests = [];
+  const trackRestore = (request) => { if (new URL(request.url()).pathname === '/api/admin/backups/restore') restoreRequests.push(request.url()); };
+  page.on('request', trackRestore);
+  await page.selectOption('#backup-restore-snapshot', snapshot);
+  await page.locator('#confirm-cancel').click();
+  await page.waitForFunction(() => document.getElementById('backup-restore-snapshot').value === '');
+  page.off('request', trackRestore);
+  assert.deepEqual(restoreRequests, [], 'cancelling the confirmation stages no restore');
+  await api('admin/settings');
+  const [snapshotDownload] = await Promise.all([page.waitForEvent('download'), page.click('#backup-download')]);
+  const header = (await fs.readFile(await snapshotDownload.path())).subarray(0, 16).toString('latin1');
+  assert.equal(header, 'SQLite format 3\0');
+
   const clockPage = await context.newPage();
   const clockSettings = structuredClone(await api('admin/settings'));
   let clockPayload = { raw_wall_at: 1_700_000_000, held: true, capped: false };

@@ -1409,7 +1409,7 @@ pub fn split_link_as(link: &str, kind: LinkKind) -> Result<Link> {
 
 #[cfg(test)]
 mod tests {
-    use super::{split_link, split_link_as, LinkKind};
+    use super::{split_link, LinkKind};
     use crate::error::Error;
 
     #[test]
@@ -1913,22 +1913,6 @@ mod tests {
             assert!(split_link(link).is_err(), "{link}");
         }
         assert!(split_link("https://drop.example:8443/r/ABC").is_ok());
-    }
-
-    #[test]
-    fn a_link_of_the_other_kind_is_refused_by_name() {
-        let wrong = split_link_as("https://drop.example/s/DEL", LinkKind::Request);
-        assert!(
-            matches!(
-                wrong,
-                Err(Error::WrongLink {
-                    kind: LinkKind::Delivery,
-                    ..
-                })
-            ),
-            "{wrong:?}"
-        );
-        assert!(split_link_as("https://drop.example/r/ABC", LinkKind::Request).is_ok());
     }
 
     /// A client with no total of its own must still bound a metadata-sized

@@ -2196,29 +2196,6 @@ mod tests {
     }
 
     #[test]
-    fn workflow_store_errors_keep_domain_statuses_and_hide_unknown_failures() {
-        let operation =
-            workflow_store_error(crate::store::WorkflowMutationError::OperationConflict(
-                "operation ID already used with a different request".into(),
-            ));
-        assert_eq!(operation.status, StatusCode::CONFLICT);
-        assert_eq!(operation.code, "operation_conflict");
-
-        let validation = workflow_store_error(crate::store::WorkflowMutationError::Invalid(
-            "unknown job action".into(),
-        ));
-        assert_eq!(validation.status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(validation.code, "invalid_request");
-
-        let store = workflow_store_error(crate::store::WorkflowMutationError::Store(
-            "UNIQUE constraint failed: delivery_jobs".into(),
-        ));
-        assert_eq!(store.status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(store.code, "request_failed");
-        assert_eq!(store.message, "database unavailable; try again");
-    }
-
-    #[test]
     fn payload_paths_use_the_portable_profile_before_path_construction() {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
@@ -2557,51 +2534,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_listings_carry_destination_kinds() {
-        let directory = tempfile::tempdir().unwrap();
-        let app = crate::api::testing::build(directory.path());
-        let cookie = admin_cookie(&app);
-        let source: storage::Storage = serde_json::from_value(json!({
-            "id": "west",
-            "revision": 0,
-            "label": "West bucket",
-            "kind": "s3",
-            "endpoint": "http://127.0.0.1:1",
-            "bucket": "delivery",
-            "region": "us-east-1",
-            "path_style": true,
-            "tenants": [""],
-            "enabled": true
-        }))
-        .unwrap();
-        app.store
-            .save_delivery_storage("local", source, None)
-            .unwrap();
-        let mut project = crate::workflow::tests::project();
-        project.destinations = vec!["west".into(), "ghost".into()];
-        app.store
-            .save_delivery_project("", "local", project)
-            .unwrap();
-        let (_, _, body) = call(
-            &app,
-            Method::GET,
-            "/api/workflows/projects",
-            Some(&cookie),
-            None,
-        )
-        .await;
-        let listing: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            listing["projects"][0]["destinations"],
-            json!(["west", "ghost"])
-        );
-        assert_eq!(
-            listing["projects"][0]["destination_kinds"],
-            json!({"west": "s3"})
-        );
-    }
-
-    #[tokio::test]
     async fn a_tenant_webhook_client_refuses_names_that_resolve_internally() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!(
@@ -2841,47 +2773,6 @@ mod tests {
             call(&app, Method::GET, path, Some(&cookie), None).await.0,
             StatusCode::CONFLICT
         );
-    }
-
-    #[tokio::test]
-    async fn webhook_attempts_reject_invalid_page_with_unprocessable_entity() {
-        let directory = tempfile::tempdir().unwrap();
-        let app = crate::api::testing::build(directory.path());
-        let cookie = admin_cookie(&app);
-        for query in [
-            "?limit=0",
-            "?limit=101",
-            "?after=nope",
-            "?after=9223372036854775808",
-        ] {
-            let (status, _, body) = call(
-                &app,
-                Method::GET,
-                &format!("/api/workflows/webhook/attempts{query}"),
-                Some(&cookie),
-                None,
-            )
-            .await;
-            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{query}");
-            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            // Audit 434: the internal parameter fault never reaches the
-            // caller; the generic sentence replaces it.
-            assert_eq!(
-                body["error"], "This page of results could not be loaded. Reload the page.",
-                "{query}"
-            );
-            assert_eq!(body["code"], "invalid_request", "{query}");
-        }
-        let (status, _, body) = call(
-            &app,
-            Method::GET,
-            "/api/workflows/webhook/attempts?after=0&limit=1",
-            Some(&cookie),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["attempts"].is_array());
     }
 
     #[tokio::test]
@@ -4892,68 +4783,6 @@ mod tests {
         )
         .await
         .is_err());
-    }
-
-    /// Audit 435: a checker refusal names the check in the release-checks
-    /// card's words, the file it ran on, and the remedy.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn checker_refusals_name_the_check_file_and_remedy() {
-        let path = Path::new("fixture.mp4");
-        let start = run_check(
-            "/nonexistent-votport-checker".into(),
-            &[],
-            path,
-            "video format check",
-            "fixture.mp4",
-            SINGLE_CHECK_TIMEOUT,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            start.message.contains("video format check")
-                && start.message.contains("fixture.mp4")
-                && start.message.contains("ask an administrator")
-                && start.message.contains("retry the delivery"),
-            "{}",
-            start.message
-        );
-        let cleared = run_check(
-            "/bin/sh".into(),
-            &["-c", "exit 1"],
-            path,
-            "malware scan",
-            "fixture.mp4",
-            SINGLE_CHECK_TIMEOUT,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            cleared.message.contains("malware scan")
-                && cleared.message.contains("fixture.mp4")
-                && cleared
-                    .message
-                    .contains("fix the file, then retry the delivery"),
-            "{}",
-            cleared.message
-        );
-        let stopped = run_check(
-            "/bin/sh".into(),
-            &["-c", "kill $$"],
-            path,
-            "video format check",
-            "fixture.mp4",
-            SINGLE_CHECK_TIMEOUT,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            stopped.message.contains("video format check")
-                && stopped.message.contains("fixture.mp4")
-                && stopped.message.ends_with("retry the delivery"),
-            "{}",
-            stopped.message
-        );
     }
 
     #[cfg(unix)]

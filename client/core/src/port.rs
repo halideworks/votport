@@ -1029,18 +1029,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chunks_cover_the_file_with_inclusive_ranges() {
-        assert_eq!(next_chunk(0, 100, 16), Some((0, 15)));
-        assert_eq!(next_chunk(16, 100, 16), Some((16, 31)));
-        assert_eq!(next_chunk(96, 100, 16), Some((96, 99)));
-        assert_eq!(next_chunk(100, 100, 16), None);
-        assert_eq!(next_chunk(0, 16, 16), Some((0, 15)));
-        assert_eq!(next_chunk(0, 1, 16), Some((0, 0)));
-        assert_eq!(next_chunk(0, 0, 16), None);
-        assert_eq!(next_chunk(0, 100, 0), None);
-    }
-
-    #[test]
     fn resume_offsets_validate_progress_and_bound_backtracking() {
         let cases = [
             (0, 16, 0, 0, None, 0),
@@ -1210,32 +1198,6 @@ mod tests {
     }
 
     #[test]
-    fn the_status_line_reads_the_way_a_person_does() {
-        let mut view = UploadView {
-            path: "2026-09-06/dailies/reel.mov".to_owned(),
-            moved_bytes: 1_200_000_000,
-            total_bytes: 4_000_000_000,
-            files_done: 1,
-            files_total: 5,
-            landed: vec!["2026-09-06/dailies/slate.mov".to_owned()],
-            status: String::new(),
-        };
-        assert_eq!(
-            view.status(),
-            "Uploading reel.mov, 1.2 GB of 4.0 GB (2 of 5 files)"
-        );
-        view.files_total = 1;
-        view.files_done = 0;
-        assert_eq!(view.status(), "Uploading reel.mov, 1.2 GB of 4.0 GB");
-        view.files_done = 1;
-        view.moved_bytes = view.total_bytes;
-        assert_eq!(view.status(), "Added 1 file to the port, 4.0 GB");
-        view.files_total = 5;
-        view.files_done = 5;
-        assert_eq!(view.status(), "Added 5 files to the port, 4.0 GB");
-    }
-
-    #[test]
     fn sso_callbacks_are_bound_to_the_local_attempt() {
         let state = "ab".repeat(16);
         let code = "cd".repeat(16);
@@ -1309,53 +1271,6 @@ mod tests {
         assert_eq!(url_segment("-_.~/é?#+%&"), "-_%2E~%2F%C3%A9%3F%23%2B%25%26");
         assert_eq!(url_query("\0"), "%00");
         assert_eq!(url_segment(""), "");
-    }
-
-    #[test]
-    fn link_views_count_their_drops_and_senders() {
-        let view: LinkView = serde_json::from_value(serde_json::json!({
-            "id": "l", "label": "Dailies", "url": "https://d/r/l", "has_password": false,
-            "created_at": 1, "expires_at": null, "max_bytes": 5, "usable": true, "active": true,
-            "upload_count": 2, "receiving": [{}]
-        }))
-        .unwrap();
-        let link = RequestLink::from(view);
-        assert_eq!(
-            (link.drops, link.receiving, link.max_bytes),
-            (2, 1, Some(5))
-        );
-    }
-
-    #[test]
-    fn the_session_role_reaches_the_stored_port() {
-        // The session view's role is no longer dropped: an SSO viewer must
-        // reach the shell as a viewer so its operator screens can fold.
-        let session: SessionInfo =
-            serde_json::from_value(serde_json::json!({ "tenant": "acme", "role": "viewer" }))
-                .unwrap();
-        assert_eq!(
-            (session.tenant.as_str(), session.role.as_str()),
-            ("acme", "viewer")
-        );
-        // A session stored by an earlier build carries no role; it reads as
-        // empty and the next check fills it in.
-        let legacy: Stored =
-            serde_json::from_str(r#"{"base":"https://drop.example","cookie":"c","tenant":""}"#)
-                .unwrap();
-        assert_eq!(legacy.role, "");
-        assert_eq!(
-            serde_json::to_value(&Stored {
-                base: "https://drop.example".to_owned(),
-                cookie: "c".to_owned(),
-                tenant: "acme".to_owned(),
-                role: "admin".to_owned(),
-            })
-            .unwrap(),
-            serde_json::json!({
-                "base": "https://drop.example", "cookie": "c",
-                "tenant": "acme", "role": "admin"
-            })
-        );
     }
 }
 

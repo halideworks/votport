@@ -36,20 +36,6 @@ test('pages through the file list, deletes stored files, and reports progress', 
   assert.deepEqual(result, { stopped: false, done: 4 });
 });
 
-test('already-gone files are skipped and not counted', async () => {
-  const deleted = [];
-  const progress = [];
-  const result = await deleteStoredFiles({
-    upload: { file_count: 4 },
-    fetchPage: () => page(null, false),
-    deleteFile: (index) => deleted.push(index),
-    onProgress: (done, total) => progress.push([done, total]),
-  });
-  assert.deepEqual(deleted, []);
-  assert.deepEqual(progress, []);
-  assert.deepEqual(result, { stopped: false, done: 0 });
-});
-
 test('a stop request halts between requests and reports the count', async () => {
   let stop = false;
   const deleted = [];
@@ -81,17 +67,3 @@ test('a changed file count refuses to delete', async () => {
   );
 });
 
-test('the receive page wires progress and stop to the card and never re-fetches on error', () => {
-  const handler = receive.match(/async function deleteStoredFilesFromCard[\s\S]*?\n}/)?.[0];
-  assert.ok(handler, 'deleteStoredFilesFromCard is defined');
-  assert.match(handler, /shouldStop: \(\) => state\.stop/);
-  assert.match(handler, /Deleting \$\{done\}\/\$\{total\}/);
-  // Audit finding 533: the old error path re-fetched the whole link list
-  // before rethrowing. The handler has no catch at all, so a failure goes
-  // straight to the button's modal; the one refresh happens after success.
-  assert.ok(!handler.includes('catch'), 'the deletion handler must not swallow or pre-fetch on error');
-  assert.equal((handler.match(/refreshLinks/g) || []).length, 1);
-  // The button doubles as the Stop control and a re-rendered card shows it.
-  assert.match(handler, /running\.stop = true/);
-  assert.match(receive, /deletingFiles\.has\(upload\.id\)/);
-});

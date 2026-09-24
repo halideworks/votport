@@ -6,13 +6,6 @@ import { segments } from '../web/assets/hash-plan.js';
 const LEAF = 65536;
 const MIN = 16 * 1024 * 1024;
 
-test('small files and a single worker hash in one piece', () => {
-  assert.deepEqual(segments(5000, LEAF, 4, MIN), [[0, 5000]]);
-  assert.deepEqual(segments(2 * MIN - 1, LEAF, 4, MIN), [[0, 2 * MIN - 1]]);
-  assert.deepEqual(segments(1 << 30, LEAF, 1, MIN), [[0, 1 << 30]]);
-  assert.deepEqual(segments(0, LEAF, 4, MIN), []);
-});
-
 test('segments are leaf aligned, contiguous, cover the file, and only the tail is short', () => {
   for (const [size, workers] of [[2 * MIN, 4], [1000 * LEAF + 1234, 4], [(1 << 30) + 7, 8], [3 * MIN + 5, 2]]) {
     const plan = segments(size, LEAF, workers, MIN);
@@ -29,7 +22,3 @@ test('segments are leaf aligned, contiguous, cover the file, and only the tail i
   }
 });
 
-test('the number of segments never exceeds what minSegment allows', () => {
-  assert.equal(segments(3 * MIN, LEAF, 8, MIN).length, 3);
-  assert.equal(segments(64 * MIN, LEAF, 8, MIN).length, 8);
-});

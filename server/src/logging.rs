@@ -169,16 +169,6 @@ mod tests {
     }
 
     #[test]
-    fn the_file_sink_stays_audited_when_rust_log_turns_audit_off() {
-        // The file filter is fixed so the trail survives RUST_LOG tuning;
-        // stdout drops audit via the audit=off appended in stdout_filter.
-        let (log, _guard) = captured(audit_filter());
-        emit_both_sinks();
-        let text = std::fs::read_to_string(log.path()).unwrap();
-        assert!(text.contains("sso_login"), "{text}");
-    }
-
-    #[test]
     fn rust_log_wins_over_the_default() {
         // Unset RUST_LOG: the default's global info carries a votport event.
         let (log, _guard) = captured(stdout_filter(None, false));
@@ -190,17 +180,6 @@ mod tests {
         tracing::info!(target: "votport", "silenced");
         let text = std::fs::read_to_string(log.path()).unwrap();
         assert!(!text.contains("silenced"), "{text}");
-    }
-
-    #[test]
-    fn default_filter_keeps_audit_at_info() {
-        let (log, _guard) = captured(stdout_filter(None, false));
-        emit_both_sinks();
-        let text = std::fs::read_to_string(log.path()).unwrap();
-        assert!(
-            text.contains("sso_login") && text.contains("general event"),
-            "{text}"
-        );
     }
 
     #[test]

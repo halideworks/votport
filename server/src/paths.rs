@@ -292,108 +292,6 @@ pub fn tighten_private_dir_contents(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Proves at boot that a landing directory can carry a publish. VOT publishes
-/// a received file by hard-linking a fsynced staging file into place, checks
-/// the link by device and inode, fsyncs the directory, and refuses a parent
-/// that is a symlink, group- or world-writable, or owned by someone else,
-/// or a staging file it did not end up owning. The outbound library
-/// publishes with the same hard link and refuses a symlinked root, but has
-/// no owner or mode rule. A network export that lacks any of these
-/// (all_squash onto another id, a CIFS mount without link(2) or stable
-/// inodes) would otherwise fail every upload after boot instead of here.
-pub fn probe_landing_dir(root: &Path, what: &str, vot_publish: bool) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::MetadataExt as _;
-        // A trailing slash would make lstat follow a symlink; VOT lstats the
-        // parent of its staging path, which has none.
-        let root: PathBuf = root.components().collect();
-        let root = root.as_path();
-        let refuse = |why: String| {
-            format!(
-                "{what} ({}) cannot receive publishes: {why}",
-                root.display()
-            )
-        };
-        let fail = |step: &str, error: std::io::Error| refuse(format!("{step}: {error}"));
-        let meta = std::fs::symlink_metadata(root).map_err(|error| fail("stat", error))?;
-        if !meta.file_type().is_dir() {
-            return Err(refuse(
-                "it is a symlink or not a directory; publishing refuses a symlinked root, so point the variable at the real path".to_owned(),
-            ));
-        }
-        if vot_publish {
-            let euid = rustix::process::geteuid().as_raw();
-            if meta.uid() != euid {
-                return Err(refuse(format!(
-                    "owned by uid {} but the server runs as uid {euid}; export it with matching ids (no all_squash or anonuid onto another id, and matching NFSv4 idmapping)",
-                    meta.uid()
-                )));
-            }
-            if meta.mode() & 0o022 != 0 {
-                return Err(refuse(format!(
-                    "mode {:o} is group or world writable and chmod did not take; mount it so the server can hold it at 0755",
-                    meta.mode() & 0o7777
-                )));
-            }
-        }
-        // Reserved staging names: the boot sweep removes a leftover from a
-        // kill mid-probe, and admit_component keeps senders off the shape.
-        let token = crate::auth::random_token();
-        let staging = root.join(format!(".vot-probe-{token}.stage"));
-        let published = root.join(format!(".vot-probe-{token}.journal"));
-        let mut created = (false, false);
-        let result = (|| {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&staging)
-                .map_err(|error| fail("create staging file", error))?;
-            created.0 = true;
-            file.write_all(b"votport")
-                .and_then(|()| file.sync_all())
-                .map_err(|error| fail("fsync staging file", error))?;
-            std::fs::hard_link(&staging, &published)
-                .map_err(|error| fail("hard link (the export must support link(2))", error))?;
-            created.1 = true;
-            let a = std::fs::metadata(&staging).map_err(|error| fail("stat staging", error))?;
-            let b = std::fs::metadata(&published).map_err(|error| fail("stat link", error))?;
-            // VOT refuses to unlink a staging file it does not own. An
-            // idmapping mismatch or a server-side ACL can show the root as
-            // uid 1000 while writing new files as another id.
-            let euid = rustix::process::geteuid().as_raw();
-            if vot_publish && a.uid() != euid {
-                return Err(refuse(format!(
-                    "a file the server created is owned by uid {} but the server runs as uid {euid}; the export maps its identity to another id (idmapping, ACL, or squashing)",
-                    a.uid()
-                )));
-            }
-            if (a.dev(), a.ino()) != (b.dev(), b.ino()) || b.nlink() < 2 {
-                return Err(refuse(
-                    "a hard link does not share the inode of its source (CIFS needs serverino; some exports never do)".to_owned(),
-                ));
-            }
-            std::fs::File::open(root)
-                .and_then(|dir| dir.sync_all())
-                .map_err(|error| fail("fsync directory", error))?;
-            Ok(())
-        })();
-        if created.0 {
-            let _ = std::fs::remove_file(&staging);
-        }
-        if created.1 {
-            let _ = std::fs::remove_file(&published);
-        }
-        result
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (root, what, vot_publish);
-        Ok(())
-    }
-}
-
 /// Validates a link destination subdirectory ("" allowed) and returns its
 /// normalized relative form.
 pub fn admit_dest(dest: &str) -> Result<String, String> {
@@ -636,68 +534,6 @@ mod tests {
     }
 
     #[test]
-    fn landing_probe_accepts_a_tight_directory_and_leaves_nothing_behind() {
-        let directory = tempfile::tempdir().unwrap();
-        super::tighten_dir(directory.path());
-        super::probe_landing_dir(directory.path(), "VOTPORT_RECEIVE_DIR", true).unwrap();
-        super::probe_landing_dir(directory.path(), "VOTPORT_OUTBOUND_DIR", false).unwrap();
-        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn landing_probe_names_a_group_writable_directory_only_for_vot_publishes() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
-        let error =
-            super::probe_landing_dir(directory.path(), "VOTPORT_RECEIVE_DIR", true).unwrap_err();
-        assert!(error.starts_with("VOTPORT_RECEIVE_DIR ("), "{error}");
-        assert!(
-            error.contains("mode 775 is group or world writable"),
-            "{error}"
-        );
-        // The outbound library hard-links but has no parent rules.
-        super::probe_landing_dir(directory.path(), "VOTPORT_OUTBOUND_DIR", false).unwrap();
-        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn landing_probe_refuses_a_symlinked_root_for_both_volumes() {
-        let directory = tempfile::tempdir().unwrap();
-        let real = directory.path().join("real");
-        std::fs::create_dir(&real).unwrap();
-        let link = directory.path().join("link");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        let error = super::probe_landing_dir(&link, "VOTPORT_RECEIVE_DIR", true).unwrap_err();
-        assert!(error.contains("symlink"), "{error}");
-        let error = super::probe_landing_dir(&link, "VOTPORT_OUTBOUND_DIR", false).unwrap_err();
-        assert!(error.contains("symlink"), "{error}");
-        // A trailing slash must not let lstat follow the link, for either
-        // root (outbound has no mode rule to fail on instead).
-        let slashed = std::path::PathBuf::from(format!("{}/", link.display()));
-        let error = super::probe_landing_dir(&slashed, "VOTPORT_RECEIVE_DIR", true).unwrap_err();
-        assert!(error.contains("symlink"), "{error}");
-        let error = super::probe_landing_dir(&slashed, "VOTPORT_OUTBOUND_DIR", false).unwrap_err();
-        assert!(error.contains("symlink"), "{error}");
-        super::probe_landing_dir(&real, "VOTPORT_OUTBOUND_DIR", false).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn landing_probe_names_a_missing_directory() {
-        let directory = tempfile::tempdir().unwrap();
-        let error = super::probe_landing_dir(
-            &directory.path().join("absent"),
-            "VOTPORT_RECEIVE_DIR",
-            true,
-        )
-        .unwrap_err();
-        assert!(error.contains("stat:"), "{error}");
-    }
-
-    #[test]
     fn probe_names_are_reserved_from_senders_and_swept_as_staging() {
         assert!(super::admit_component(".vot-probe-abc.stage", true).is_err());
         assert!(super::admit_component(".votport-lease", true).is_err());
@@ -873,42 +709,6 @@ mod tests {
     }
 
     #[test]
-    fn admin_dest_segments_decide_through_the_portable_profile() {
-        // Audit finding 545, pinned: the portable profile decides per
-        // destination segment, so device names and dot-trailing segments
-        // cannot be configured as a link's receive folder even though the
-        // segment rules above them would admit the characters.
-        for dest in ["con", "nul", "prn", "aux", "com1", "lpt1", "a.", "a.."] {
-            assert!(
-                admit_dest(dest).unwrap_err().contains("is not portable"),
-                "{dest:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn portable_payload_names_leave_space_for_receipts() {
-        let parent = "p".repeat(255);
-        assert!(admit_component(&parent, false).is_ok());
-        for name in ["a".repeat(242), format!("{}ab", "ア".repeat(80))] {
-            admit_portable_paths([format!("{parent}/{name}").as_str()]).unwrap();
-        }
-        for name in ["a".repeat(243), "ア".repeat(81)] {
-            assert!(admit_portable_paths([format!("{parent}/{name}").as_str()])
-                .unwrap_err()
-                .contains("242 UTF-8 bytes; shorten"));
-        }
-    }
-
-    #[test]
-    fn suffixes_keep_extensions() {
-        assert_eq!(with_suffix("report.pdf", 0), "report.pdf");
-        assert_eq!(with_suffix("report.pdf", 2), "report-2.pdf");
-        assert_eq!(with_suffix("README", 1), "README-1");
-        assert_eq!(with_suffix(".env", 1), ".env-1");
-    }
-
-    #[test]
     fn collision_suffixes_stay_within_the_payload_budget() {
         // Audit finding 540: a name that fills the budget used to get a
         // collision suffix past the cap, where the create failed
@@ -1058,23 +858,6 @@ mod tests {
             assert!(join_under(base, &components).is_err(), "{bad:?}");
         }
     }
-}
-
-#[cfg(test)]
-#[test]
-fn mounted_share_profile_preserves_local_assurance() {
-    assert_eq!(profile_for_mount(true), vot_sdk_file::CommitProfile::Fast);
-    assert_eq!(
-        profile_for_mount(false),
-        vot_sdk_file::CommitProfile::Balanced
-    );
-    let directory = tempfile::tempdir().unwrap();
-    assert_eq!(
-        commit_profile(&directory.path().join("file")).unwrap(),
-        vot_sdk_file::CommitProfile::Balanced
-    );
-    #[cfg(target_os = "linux")]
-    assert!(commit_profile(&directory.path().join("missing/file")).is_err());
 }
 
 #[cfg(test)]

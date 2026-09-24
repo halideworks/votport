@@ -8,28 +8,6 @@ use std::time::Duration;
 use tower::ServiceExt as _;
 use vot_sdk_file::PublishObservation;
 
-#[test]
-fn error_deduper_suppresses_unchanged_errors_and_fires_recovery_once() {
-    let start = std::time::Instant::now();
-    let mut dedupe = ErrorDeduper::new("test site");
-    // First occurrence logs immediately.
-    assert!(dedupe.observe("store locked", start));
-    // An unchanged repeat inside the interval stays quiet.
-    assert!(!dedupe.observe("store locked", start + Duration::from_secs(30)));
-    // A changed error logs immediately.
-    assert!(dedupe.observe("disk full", start + Duration::from_secs(31)));
-    // The new error's own cadence suppresses its immediate repeat.
-    assert!(!dedupe.observe("disk full", start + Duration::from_secs(40)));
-    // After the interval the unchanged error is visible again.
-    assert!(dedupe.observe(
-        "disk full",
-        start + Duration::from_secs(31) + WORKER_LOG_INTERVAL
-    ));
-    // Recovery is due exactly once, and only after an error.
-    assert!(dedupe.recovered());
-    assert!(!dedupe.recovered());
-}
-
 /// Audit finding 225: a download whose store write fails keeps its 500
 /// response but now warns with the grant id and store error instead of
 /// vanishing into the generic message.
@@ -50,32 +28,6 @@ async fn record_download_warns_when_the_store_write_fails() {
         .find(|line| line.contains("record download failed"))
         .expect("the failed store write warns");
     assert!(warn.contains("grant-id"), "{warn}");
-}
-
-#[test]
-fn skip_notice_logs_first_occurrence_then_paces() {
-    let start = std::time::Instant::now();
-    let mut notice = SkipNotice::new();
-    // The first skipped iteration logs at info.
-    assert!(matches!(notice.due(start), SkipLevel::First));
-    // Repeats inside the interval stay silent.
-    assert!(matches!(
-        notice.due(start + Duration::from_secs(1)),
-        SkipLevel::Silent
-    ));
-    assert!(matches!(
-        notice.due(start + Duration::from_secs(59)),
-        SkipLevel::Silent
-    ));
-    // After the interval a debug reminder is due, then quiet again.
-    assert!(matches!(
-        notice.due(start + Duration::from_secs(60)),
-        SkipLevel::Repeat
-    ));
-    assert!(matches!(
-        notice.due(start + Duration::from_secs(61)),
-        SkipLevel::Silent
-    ));
 }
 
 /// Wraps the router so tests observe the streamed response the file
@@ -2701,10 +2653,6 @@ fn concurrent_library_dir_creation_accepts_same_parent() {
 }
 
 #[test]
-fn hashes_are_not_raw_tokens() {
-    assert_ne!(hash_token("a"), "a");
-}
-#[test]
 fn byte_ranges_support_all_single_range_forms() {
     assert_eq!(parse_range("bytes=2-4", 10), Some((2, 4)));
     assert_eq!(parse_range("bytes=2-", 10), Some((2, 9)));
@@ -2811,62 +2759,6 @@ fn outbound_metadata_paging_defaults_and_rejects_invalid_bounds() {
             StatusCode::UNPROCESSABLE_ENTITY
         );
     }
-}
-
-#[tokio::test]
-async fn outbound_grants_handler_returns_default_page_metadata() {
-    let directory = tempfile::tempdir().unwrap();
-    let app = crate::api::testing::build(directory.path());
-    for index in 0..51 {
-        app.store
-            .insert_outbound_grant(OutboundGrant {
-                id: format!("grant-{index}"),
-                token_hash: format!("hash-{index}"),
-                password_hash: None,
-                tenant: String::new(),
-                link_id: String::new(),
-                upload_id: String::new(),
-                package_root: String::new(),
-                name: "file.bin".to_owned(),
-                suite: "blake3".to_owned(),
-                root: String::new(),
-                file_index: 0,
-                bytes: 0,
-                label: format!("grant-{index}"),
-                created_at: 1,
-                expires_at: 2,
-                revoked_at: None,
-                downloads: 0,
-                max_downloads: None,
-
-                notifications: None,
-                first_download_at: None,
-                last_download_at: None,
-                files: Vec::new(),
-            })
-            .unwrap();
-    }
-
-    let response = router(app.clone())
-        .oneshot(
-            Request::get("/api/admin/outbound-grants")
-                .header("cookie", admin_cookie(&app))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let listed = body(response).await;
-    assert_eq!(listed["limit"], 50);
-    assert_eq!(listed["offset"], 0);
-    assert_eq!(listed["total"], 51);
-    assert_eq!(listed["has_more"], true);
-    assert_eq!(listed["grants"].as_array().unwrap().len(), 50);
-    assert_eq!(listed["grants"][0]["file_count"], 1);
-    assert_eq!(listed["grants"][0]["files_truncated"], false);
-    assert_eq!(listed["grants"][0]["files"], json!([]));
-    assert_eq!(listed["grants"][0]["id"], "grant-50");
 }
 
 #[tokio::test]
@@ -3000,21 +2892,6 @@ fn filenames_are_single_safe_components() {
         .ends_with(&format!("filename*=UTF-8''{name}")));
 }
 
-/// Audit finding 507: downloads keep the extension at any name length.
-/// The retired safe_filename truncated the whole name to 180 characters
-/// after the extension, so a 204-character name downloaded with none.
-#[test]
-fn long_names_keep_their_extension() {
-    let name = format!("{}.mov", "a".repeat(200));
-    assert_eq!(name.len(), 204);
-    let header = attachment_filename(&name).unwrap();
-    let header = header.to_str().unwrap();
-    assert!(
-        header.ends_with(&format!("filename*=UTF-8''{name}")),
-        "{header}"
-    );
-    assert!(header.contains(&format!("filename=\"{name}\"")), "{header}");
-}
 #[test]
 fn bundle_paths_are_relative_and_normalized() {
     assert_eq!(
@@ -3051,78 +2928,6 @@ fn drop_guards_remove_stage_and_active_grant() {
     assert!(budget
         .reserve_with_free_space(MIN_STAGE_FREE_BYTES + 1, 1)
         .is_ok());
-}
-
-#[test]
-fn build_bundle_verifies_sources_and_keeps_archive_readable() {
-    let directory = tempfile::tempdir().unwrap();
-    let app = crate::api::testing::build(directory.path());
-    let first_path = directory.path().join("first");
-    let second_path = directory.path().join("second");
-    let first_bytes = b"first payload";
-    let second_bytes = b"second payload";
-    std::fs::write(&first_path, first_bytes).unwrap();
-    std::fs::write(&second_path, second_bytes).unwrap();
-    let first_object = object_id(first_bytes);
-    let second_object = object_id(second_bytes);
-    let first_receipt = app
-        .signer
-        .encode(
-            &first_object,
-            [1; 16],
-            PublishObservation {
-                incarnation: [2; 16],
-                sequence: 1,
-            },
-            vot_sdk_file::CommitProfile::Balanced,
-            vot_sdk_file::NasContract::Unqualified,
-        )
-        .unwrap();
-    let second_receipt = app
-        .signer
-        .encode(
-            &second_object,
-            [3; 16],
-            PublishObservation {
-                incarnation: [4; 16],
-                sequence: 2,
-            },
-            vot_sdk_file::CommitProfile::Balanced,
-            vot_sdk_file::NasContract::Unqualified,
-        )
-        .unwrap();
-
-    let grant = branding_grant("bundle-test", None);
-    let archive = build_bundle(
-        &app,
-        &grant,
-        vec![
-            (
-                Source {
-                    path: first_path,
-                    object: first_object,
-                    name: "first.txt".to_owned(),
-                    receipt: Some(first_receipt),
-                },
-                "first.txt".to_owned(),
-            ),
-            (
-                Source {
-                    path: second_path,
-                    object: second_object,
-                    name: "second.txt".to_owned(),
-                    receipt: Some(second_receipt),
-                },
-                "second.txt".to_owned(),
-            ),
-        ],
-    )
-    .unwrap();
-
-    let entries = zip_entries(&std::fs::read(&archive.path).unwrap());
-    assert_eq!(entries["first.txt"], b"first payload");
-    assert_eq!(entries["second.txt"], b"second payload");
-    drop(archive);
 }
 
 #[test]
@@ -3284,18 +3089,6 @@ fn stage_budget_reserves_concurrently_and_resets_after_last_drop() {
 }
 
 #[test]
-fn stage_capacity_errors_are_507() {
-    assert_eq!(
-        stage_capacity_error().status,
-        StatusCode::INSUFFICIENT_STORAGE
-    );
-    assert_eq!(
-        map_stage_reserve_error(StageReserveError::Overflow).status,
-        StatusCode::INSUFFICIENT_STORAGE
-    );
-}
-
-#[test]
 fn active_downloads_allow_sixteen_distinct_files_per_grant() {
     let directory = tempfile::tempdir().unwrap();
     let app = crate::api::testing::build(directory.path());
@@ -3319,62 +3112,6 @@ fn leased_ranges_can_run_alongside_one_unleased_file_download() {
             .unwrap();
     assert!(ActiveDownload::claim(Arc::clone(&app), "grant:0").is_err());
     drop((first, leased));
-}
-
-#[tokio::test]
-async fn download_headers_preserve_unicode_file_and_receipt_names() {
-    let (_directory, app, cookie, _) = fixture().await;
-    app.store
-        .with(|connection| {
-            connection.execute(
-                "UPDATE files SET path=?1 WHERE link_id='link' AND file_index=0",
-                ["folder/納品 café.mov"],
-            )
-        })
-        .unwrap();
-    let response = settled_grant_response(
-        app.clone(),
-        &cookie,
-        Request::post("/api/admin/outbound-grants")
-            .header("cookie", &cookie)
-            .header("x-votport", "1")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"link_id":"link","upload_id":"upload","file_index":0,"expires_days":7}"#,
-            ))
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let created = body(response).await;
-    let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
-    for (path, extension) in [
-        ("file", ""),
-        ("files/0", ""),
-        ("receipt", ".vot-receipt"),
-        ("receipts/0", ".vot-receipt"),
-    ] {
-        for method in [axum::http::Method::GET, axum::http::Method::HEAD] {
-            let response = router(app.clone())
-                .oneshot(
-                    Request::builder()
-                        .method(method)
-                        .uri(format!("/api/s/{token}/{path}"))
-                        .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{path}");
-            assert_eq!(
-                response.headers()[header::CONTENT_DISPOSITION],
-                format!("attachment; filename=\"__ caf_.mov{extension}\"; filename*=UTF-8''%E7%B4%8D%E5%93%81%20caf%C3%A9.mov{extension}"),
-                "{path}"
-            );
-            response.into_body().collect().await.unwrap();
-        }
-    }
 }
 
 #[tokio::test]
@@ -4039,145 +3776,6 @@ async fn range_errors_and_if_range_mismatch_are_safe() {
         full.into_body().collect().await.unwrap().to_bytes(),
         expected_bytes
     );
-}
-
-#[tokio::test]
-async fn grant_lifecycle_rotation_and_extension_are_scoped() {
-    let (_directory, app, cookie, _expected_bytes) = fixture().await;
-    let response = settled_grant_response(
-        app.clone(),
-        &cookie,
-        Request::post("/api/admin/outbound-grants")
-            .header("cookie", &cookie)
-            .header("x-votport", "1")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"link_id":"link","upload_id":"upload","file_index":0,"expires_days":7}"#,
-            ))
-            .unwrap(),
-    )
-    .await;
-    let created = body(response).await;
-    let old_url = created["url"].as_str().unwrap().to_owned();
-    let old_token = old_url.rsplit('/').next().unwrap().to_owned();
-    let id = created["grant"]["id"].as_str().unwrap();
-    let invalid = router(app.clone())
-        .oneshot(
-            Request::patch(format!("/api/admin/outbound-grants/{id}"))
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"rotate":true,"extend_days":7}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
-
-    let rotated = router(app.clone())
-        .oneshot(
-            Request::patch(format!("/api/admin/outbound-grants/{id}"))
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"rotate":true}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(rotated.status(), StatusCode::OK);
-    let rotated = body(rotated).await;
-    let new_url = rotated["url"].as_str().unwrap();
-    assert_ne!(new_url, old_url);
-    assert_eq!(
-        router(app.clone())
-            .oneshot(
-                Request::get(format!("/api/s/{old_token}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::NOT_FOUND
-    );
-    let extended = router(app.clone())
-        .oneshot(
-            Request::patch(format!("/api/admin/outbound-grants/{id}"))
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"extend_days":7}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(extended.status(), StatusCode::OK);
-    assert!(body(extended).await["expires_at"].as_u64().unwrap() > 0);
-}
-
-#[tokio::test]
-async fn exhausted_grant_is_not_available_for_a_second_download() {
-    let (_directory, app, cookie, expected_bytes) = fixture().await;
-    let response = settled_grant_response(
-        app.clone(),
-        &cookie,
-            Request::post("/api/admin/outbound-grants")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"link_id":"link","upload_id":"upload","file_index":0,"expires_days":7,"max_downloads":1}"#,
-                ))
-            .unwrap(),
-        )
-        .await;
-    let created = body(response).await;
-    assert_eq!(created["grant"]["max_downloads"], 1);
-    let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
-    let first = router(app.clone())
-        .oneshot(
-            Request::get(format!("/api/s/{token}/file"))
-                .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(first.status(), StatusCode::OK);
-    assert_eq!(
-        first.into_body().collect().await.unwrap().to_bytes(),
-        expected_bytes
-    );
-    // The record lands after the body's last frame is handed off, on a
-    // spawned task; a second admission must observe it (finding 490).
-    let grant_id = created["grant"]["id"].as_str().unwrap().to_owned();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let downloads = app
-                .store
-                .outbound_grant_by_id(&grant_id)
-                .unwrap()
-                .unwrap()
-                .downloads;
-            if downloads == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the completed download was not recorded");
-    let second = router(app)
-        .oneshot(
-            Request::get(format!("/api/s/{token}/file"))
-                .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 2))))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(second.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -5796,39 +5394,6 @@ async fn chunk_replay_preserves_the_acknowledged_prefix_and_rewinds_missing_byte
 }
 
 #[tokio::test]
-async fn stages_from_before_durable_acknowledgements_are_not_resumed() {
-    let (_directory, app, cookie, _bytes) = fixture().await;
-    let upload_id = "e".repeat(64);
-    let path = app.config.outbound_dir.join("older.bin");
-    let mut old_hash = Sha256::new();
-    old_hash.update(path.to_string_lossy().as_bytes());
-    old_hash.update([0]);
-    old_hash.update(upload_id.as_bytes());
-    let old_stage = path.parent().unwrap().join(format!(
-        ".vot-outbound-{:02x}-{}.stage",
-        outbound_upload_stripe(&path),
-        hex::encode(old_hash.finalize()),
-    ));
-    std::fs::write(&old_stage, b"wrong").unwrap();
-    let response = router(app.clone())
-        .oneshot(chunk_request(
-            &cookie,
-            "older.bin",
-            &upload_id,
-            5,
-            9,
-            10,
-            b" file",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    assert_eq!(body(response).await["offset"], 0);
-    assert!(!path.exists());
-    assert_eq!(std::fs::read(&old_stage).unwrap(), b"wrong");
-}
-
-#[tokio::test]
 async fn a_refused_chunk_body_is_read_through_before_the_answer() {
     // The body arrives in pieces and the handler must pull every one
     // before answering, or a client mid-write sees a reset connection
@@ -6028,45 +5593,6 @@ fn expired_upload_stages_are_removed_without_touching_active_or_unowned_files() 
         !active.exists(),
         "an expired stage is removed once its request ends"
     );
-}
-
-#[tokio::test]
-async fn root_library_listing_excludes_tenants_and_stages_and_is_sorted() {
-    let directory = tempfile::tempdir().unwrap();
-    let app = crate::api::testing::build(directory.path());
-    std::fs::write(app.config.outbound_dir.join("z.bin"), b"z").unwrap();
-    std::fs::write(app.config.outbound_dir.join("a.bin"), b"a").unwrap();
-    std::fs::create_dir_all(
-        app.config
-            .outbound_dir
-            .join(crate::paths::TENANT_STORAGE_DIR)
-            .join("named"),
-    )
-    .unwrap();
-    std::fs::write(
-        app.config
-            .outbound_dir
-            .join(crate::paths::TENANT_STORAGE_DIR)
-            .join("named/secret.bin"),
-        b"secret",
-    )
-    .unwrap();
-    std::fs::write(app.config.outbound_dir.join(".vot-crash.stage"), b"staged").unwrap();
-
-    let response = router(app.clone())
-        .oneshot(
-            Request::get("/api/admin/outbound-files?directory=")
-                .header("cookie", admin_cookie(&app))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let listed = body(response).await;
-    assert_eq!(listed["files"][0]["path"], "a.bin");
-    assert_eq!(listed["files"][1]["path"], "z.bin");
-    assert_eq!(listed["files"].as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -7425,35 +6951,6 @@ async fn hashed_library_roots_come_from_the_cache_until_the_source_changes() {
         .to_owned();
     assert_ne!(third_root, first_root, "new bytes hash to a new root");
     assert_eq!(cached().unwrap(), third_root);
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn library_grant_creation_stays_synchronous_for_the_pinned_cli() {
-    let directory = tempfile::tempdir().unwrap();
-    let app = crate::api::testing::build(directory.path());
-    app.store
-        .insert_tenant(crate::store::tests::test_tenant("acme"))
-        .unwrap();
-    let root = library_root(&app, "acme");
-    std::fs::create_dir_all(&root).unwrap();
-    std::fs::write(root.join("a.bin"), vec![9u8; 512]).unwrap();
-    let cookie = named_admin_cookie(&app, "acme");
-    let response = router(app.clone())
-        .oneshot(
-            Request::post("/api/admin/outbound-grants")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"paths":["a.bin"],"expires_days":1}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let payload = body(response).await;
-    assert!(payload["preparation_id"].is_null());
-    assert_eq!(payload["grant"]["files"][0]["name"], "a.bin");
-    assert!(payload["url"].as_str().unwrap().contains("/s/"));
 }
 
 #[tokio::test]

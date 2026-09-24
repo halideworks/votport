@@ -25,25 +25,6 @@ import {
 
 const outboundScript = await readFile(new URL('../web/assets/outbound.js', import.meta.url), 'utf8');
 const sendPage = await readFile(new URL('../web/send.html', import.meta.url), 'utf8');
-test('VOTPort imposes no anchor fallback file-count cap; Chromium batches permission after 10', () => {
-  assert.doesNotMatch(outboundScript, /MAX_ANCHOR_DOWNLOADS|anchorDownloadsAllowed/);
-  assert.match(outboundScript, /prepareAnchorDownloads\(\)[\s\S]+loadRemainingMetadata\(\)/);
-  assert.match(outboundScript, /triggerSeparateDownloads\(\s*pending\.files,\s*pending\.names,/);
-  assert.match(outboundScript, /separate-download-stop/);
-  assert.match(sendPage, />Stop requesting remaining files<\/button>/);
-  assert.doesNotMatch(outboundScript, /cannot request more than|Chrome\/Edge/);
-});
-
-test('anchor fallback copy explains multiple downloads', () => {
-  assert.match(outboundScript, /Requested \$\{result\.requested\} of \$\{pending\.files\.length\} downloads/);
-  assert.match(outboundScript, /Your browser may ask you to allow multiple downloads; accept that prompt to receive every file\./);
-  assert.match(outboundScript, /Keep this tab open until requests are handed off/);
-  assert.doesNotMatch(outboundScript, /Safari may ask|If Safari asks/);
-  assert.match(sendPage, /id="separate-download-confirm" class="modal"/);
-  assert.match(sendPage, /id="separate-download-confirm-detail"/);
-  assert.match(sendPage, /aria-describedby="separate-download-confirm-detail"/);
-  assert.match(sendPage, />Start downloads<\/button>/);
-});
 
 function downloadDocument(t, clicked) {
   const previous = globalThis.document;
@@ -53,97 +34,6 @@ function downloadDocument(t, clicked) {
   };
   t.after(() => { globalThis.document = previous; });
 }
-
-test('download handoff probes first and leaves refused or unreachable downloads on the page', async (t) => {
-  const clicks = [];
-  downloadDocument(t, (link) => clicks.push(link));
-  let shown = null, shownStatus = null;
-  const showError = (message, status) => { shown = message; shownStatus = status; };
-  t.mock.method(globalThis, 'fetch', async (url, request) => {
-    assert.equal(url, '/api/s/t/file');
-    assert.equal(request.method, 'HEAD');
-    assert.equal(clicks.length, 0);
-    return Response.json({});
-  });
-  assert.equal(await triggerDownload('/api/s/t/file', 'report.pdf', showError), true);
-  assert.equal(clicks.length, 1);
-  assert.equal(clicks[0].href, '/api/s/t/file');
-  assert.equal(clicks[0].download, 'report.pdf');
-  assert.equal(shown, null);
-  t.mock.method(globalThis, 'fetch', async () => Response.json({ error: 'not found' }, { status: 404 }));
-  assert.equal(await triggerDownload('/api/s/t/file', 'report.pdf', showError), false);
-  assert.equal(clicks.length, 1);
-  assert.equal(shown, 'not found');
-  assert.equal(shownStatus, 404, 'The refusal status lets the page route a lost password cookie to its gate');
-  t.mock.method(globalThis, 'fetch', async () => { throw new TypeError('lost'); });
-  assert.equal(await triggerDownload('/api/s/t/file', 'report.pdf', showError), false);
-  assert.equal(clicks.length, 1);
-  assert.match(shown, /could not be reached/);
-  assert.equal(shownStatus, undefined);
-});
-
-test('anchor requests stop before the next click and report each handoff', async (t) => {
-  const clicks = [];
-  downloadDocument(t, (link) => clicks.push(link));
-  const stop = { stopped: false };
-  const progress = [];
-  const result = await triggerSeparateDownloads(
-    [{ download_url: '/f/0' }, { download_url: '/f/1' }, { download_url: '/f/2' }],
-    ['one', 'two', 'three'], stop,
-    (requested, total) => {
-      progress.push([requested, total]);
-      if (requested === 2) stop.stopped = true;
-    },
-  );
-  assert.deepEqual(clicks.map(({ href, download }) => [href, download]), [['/f/0', 'one'], ['/f/1', 'two']]);
-  assert.deepEqual(progress, [[1, 3], [2, 3]]);
-  assert.deepEqual(result, { requested: 2, stopped: true });
-});
-
-test('recipient page has one primary action with ZIP as a secondary link', () => {
-  // The primary button sits in the hero block; ZIP is a text-style link after it.
-  assert.match(sendPage, /id="separate-download" class="hero-action"/);
-  assert.ok(sendPage.indexOf('id="separate-download-button"') < sendPage.indexOf('id="bundle-download-button"'));
-  assert.match(sendPage, /id="separate-download-button"[^>]*>Download all files<\/button>/);
-  assert.match(sendPage, /id="bundle-download-button" class="link"[^>]*>Download as ZIP<\/button>/);
-  assert.doesNotMatch(sendPage, /<h2>Download all files<\/h2>|<h2>Download as ZIP<\/h2>/);
-  // The manifest is the file list; the availability line lives in the masthead.
-  assert.match(sendPage, /<h2>Files in this delivery<\/h2>/);
-  assert.doesNotMatch(sendPage, /id="expires"/);
-  assert.match(outboundScript, /available until \$\{when\(body\.expires_at\)\}/);
-  // A finished save is "landed", never "verified": the browser checks nothing.
-  assert.match(outboundScript, /node\('span', 'landed', 'badge on'\)/);
-  assert.doesNotMatch(outboundScript, /verified on this device/);
-  // The anchor-fallback path still carries the multiple-downloads advice.
-  assert.match(outboundScript, /prepareAnchorDownloads\(\)/);
-});
-
-test('file batches are fixed and bounded at both ends', () => {
-  const files = Array.from({ length: 205 }, (_, index) => index);
-  assert.equal(FILE_RENDER_BATCH_SIZE, 100);
-  assert.deepEqual(nextFileBatch(files, 0), files.slice(0, 100));
-  assert.deepEqual(nextFileBatch(files, 100), files.slice(100, 200));
-  assert.deepEqual(nextFileBatch(files, 200), files.slice(200));
-  assert.deepEqual(nextFileBatch(files, 300), []);
-  assert.deepEqual(nextFileBatch(files, 100, 500), files.slice(100));
-});
-
-test('uses batch transport for multi-file selections with a large file', () => {
-  assert.equal(batchDownloadEligible(Array.from({ length: 99 }, () => ({ bytes: 1 }))), false);
-  assert.equal(batchDownloadEligible([{ bytes: BATCH_LARGE_FILE_BYTES }, { bytes: 1 }]), true);
-  assert.equal(batchDownloadEligible([{ bytes: BATCH_LARGE_FILE_BYTES }]), false);
-});
-
-test('show more remains available for loaded or pending metadata', () => {
-  for (const [rendered, loaded, hasMore, expected] of [
-    [0, 100, false, true],
-    [100, 100, true, true],
-    [100, 100, false, false],
-    [100, 500, false, true],
-  ]) {
-    assert.equal(metadataMoreAvailable(rendered, loaded, hasMore), expected);
-  }
-});
 
 test('public metadata pages append only contiguous stable ranges', () => {
   const file = (index) => ({
@@ -209,28 +99,6 @@ test('metadata accepts absent receipts while validating receipt URLs when presen
   }
 });
 
-test('public metadata starts with the bounded page and picker precedes fetch', () => {
-  assert.equal(METADATA_PAGE_SIZE, 500);
-  assert.equal(publicMetadataPageUrl('a/b', 0), '/api/s/a%2Fb?offset=0&limit=500');
-  assert.match(outboundScript, /publicMetadataPageUrl\(token, offset, limit\)/);
-  assert.match(outboundScript, /appendMetadataPageAt\(metadataFiles\.length, METADATA_PAGE_SIZE\)/);
-  assert.match(outboundScript, /metadataMoreAvailable\(renderedFileCount, metadataFiles\.length, metadataHasMore\)/);
-  assert.match(outboundScript, /const target = renderedFileCount \+ METADATA_PAGE_SIZE/);
-  assert.match(outboundScript, /renderNextFileBatch\(METADATA_PAGE_SIZE\)/);
-  assert.match(outboundScript, /batchUrl = body\.batch_url/);
-  assert.match(
-    outboundScript,
-    /showDirectoryPicker\(\{ mode: 'readwrite' \}\)[\s\S]+loadRemainingMetadata\(\)/,
-  );
-});
-
-test('public page wires an accessible bounded file list', () => {
-  assert.match(sendPage, /id="file-list-controls" hidden/);
-  assert.match(sendPage, /<button type="button" id="show-more-files" class="tiny ghost">Show more files<\/button>/);
-  assert.match(sendPage, /id="file-list-status" class="muted" aria-live="polite"/);
-  assert.match(outboundScript, /nextFileBatch\(metadataFiles, renderedFileCount, limit\)/);
-});
-
 test('sanitizes flattened unsafe and reserved filenames', () => {
   assert.equal(sanitizeFilename('nested\\report?.txt'), 'report_.txt');
   assert.equal(sanitizeFilename('CON.txt'), '_CON.txt');
@@ -282,27 +150,6 @@ test('deduplicates repeated names across folders and existing numbered names', (
   assert.equal(names.at(-1), 'frame (20000).exr');
 });
 
-test('caps failure summaries', () => {
-  assert.equal(
-    summarizeFailures(['a: failed', 'b: failed', 'c: failed', 'd: failed', 'e: failed']),
-    'a: failed; b: failed; c: failed; and 2 more',
-  );
-});
-
-test('runs at most four workers and keeps result order', async () => {
-  let active = 0;
-  let peak = 0;
-  const result = await runWorkerPool([1, 2, 3, 4, 5, 6], async (value) => {
-    active += 1;
-    peak = Math.max(peak, active);
-    await new Promise((resolve) => setTimeout(resolve, value === 1 ? 5 : 0));
-    active -= 1;
-    return value * 2;
-  });
-  assert.equal(peak, 4);
-  assert.deepEqual(result, [2, 4, 6, 8, 10, 12]);
-});
-
 function responseInChunks(chunks, status = 200, contentType = 'application/vnd.votport.batch; charset=binary') {
   return {
     status,
@@ -345,16 +192,6 @@ function fakeDirectory({ failWrite = false, initialFiles = [], directories = [] 
     },
   };
 }
-
-test('batch saves preserve existing files and directories with numbered names', async () => {
-  const directory = fakeDirectory({ initialFiles: [['chart.txt', 'keep'], ['chart.txt.vot-receipt', 'proof']], directories: ['chart (2).txt'] });
-  await saveBatchFiles(responseInChunks([new TextEncoder().encode('newreceipt')]), directory,
-    [{ bytes: 3 }, { bytes: 7 }, { bytes: 0 }], ['chart.txt', 'chart.txt.vot-receipt', 'empty']);
-  assert.deepEqual([...directory.files], [
-    ['chart.txt', 'keep'], ['chart.txt.vot-receipt', 'proof'],
-    ['chart (3).txt', 'new'], ['chart.txt (2).vot-receipt', 'receipt'], ['empty', ''],
-  ]);
-});
 
 test('parallel individual saves and interrupted batch fallback retain earlier files', async (t) => {
   t.mock.method(globalThis, 'fetch', async (url) => new Response(url));

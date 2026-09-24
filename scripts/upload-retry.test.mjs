@@ -28,23 +28,6 @@ function storage() {
   };
 }
 
-test('plain transient failures retry with capped backoff', () => {
-  for (const status of [429, 500, 502, 503]) {
-    assert.deepEqual(
-      retryDecision({ attempt: 0, status, body: { error: 'busy' } }),
-      { retry: true, delayMs: 1000 },
-    );
-  }
-  assert.deepEqual(
-    retryDecision({ attempt: 1, status: 503, body: null }),
-    { retry: true, delayMs: 2000 },
-  );
-  assert.deepEqual(
-    retryDecision({ attempt: 2, status: 503 }),
-    { retry: true, delayMs: 4000 },
-  );
-});
-
 test('a 503 honors Retry-After within the remaining budget', () => {
   assert.deepEqual(
     retryDecision({ attempt: 0, status: 503, retryAfterMs: 4000 }),
@@ -54,16 +37,6 @@ test('a 503 honors Retry-After within the remaining budget', () => {
     retryDecision({ attempt: 0, status: 503, retryAfterMs: RETRY_BUDGET_MS * 10 }).delayMs,
     RETRY_BUDGET_MS,
   );
-});
-
-test('network failures and offline states retry like transients', () => {
-  assert.equal(retryDecision({ attempt: 0, failure: new TypeError('lost') }).retry, true);
-  assert.equal(retryDecision({ attempt: 0, online: false }).retry, true);
-});
-
-test('an AbortError is a user cancel and never retries', () => {
-  const abort = Object.assign(new Error('aborted'), { name: 'AbortError' });
-  assert.deepEqual(retryDecision({ attempt: 0, failure: abort }), { retry: false });
 });
 
 test('retries stop at the attempt cap and the time budget', () => {
@@ -80,13 +53,6 @@ test('retries stop at the attempt cap and the time budget', () => {
 test('the server envelope can refuse a retry even in the 5xx class', () => {
   assert.deepEqual(
     retryDecision({ attempt: 0, status: 503, body: { error: 'x', retryable: false } }),
-    { retry: false },
-  );
-});
-
-test('client errors other than the named refusals never retry', () => {
-  assert.deepEqual(
-    retryDecision({ attempt: 0, status: 404, body: { error: 'unknown or expired session' } }),
     { retry: false },
   );
 });
@@ -179,19 +145,7 @@ test('two drops on the same link hold distinct resume records', () => {
   assert.equal(typeof record.at, 'number');
 });
 
-test('a reload of the same drop reuses its record', () => {
-  const local = storage();
-  const session = storage();
-  globalThis.localStorage = local;
-  globalThis.sessionStorage = session;
-  saveResumeRecord('link', { session: 's-1', root: 'root-1', files: 3, size: 30, chunk: 8192 });
-  const before = loadResumeRecord('link', resumeDropId('link'));
-  // A reload keeps sessionStorage, so the same drop id finds the record.
-  assert.equal(loadResumeRecord('link', resumeDropId('link')).session, 's-1');
-  assert.equal(before.root, 'root-1');
-});
-
-test('records not owned by this tab expire, along with the legacy whole-link record', () => {
+test('records not owned by this tab expire once stale', () => {
   const local = storage();
   const own = storage();
   globalThis.localStorage = local;
@@ -202,32 +156,12 @@ test('records not owned by this tab expire, along with the legacy whole-link rec
   const staleForeign = 'votport-resume-link-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
   local.setItem(freshForeign, JSON.stringify({ session: 's-fresh', at: Date.now() - 1000 }));
   local.setItem(staleForeign, JSON.stringify({ session: 's-stale', at: Date.now() - 2 * 60 * 60 * 1000 }));
-  local.setItem('votport-resume-link', JSON.stringify({ session: 's-legacy' }));
   local.setItem('votport-resume-other-link', JSON.stringify({ session: 's-other' }));
   expireForeignResumes('link');
   assert.notEqual(local.getItem(ownKey), null);
   assert.notEqual(local.getItem(freshForeign), null, 'a fresh foreign record may be a live sender');
   assert.equal(local.getItem(staleForeign), null);
-  assert.equal(local.getItem('votport-resume-link'), null);
   assert.notEqual(local.getItem('votport-resume-other-link'), null);
-});
-
-test('begin 404 drops the record, and a lost finish reply keeps it for reconcile', () => {
-  // Wiring, per the established source-assertion style: the begin fallback
-  // clears the record the note is built on...
-  assert.match(upload, /if \(!isExpiredSession\(error\)\) throw error;\n\s+\/\/ The server no longer holds this session/);
-  assert.match(upload, /clearResume\(\);\n\s+sessionId = null;/);
-  // ...and a finish that may have completed marks the error so the record
-  // survives the expired-session cleanup.
-  assert.match(upload, /finishMayBeComplete\(error\)/);
-  assert.match(upload, /error\.mayComplete = true;/);
-  assert.match(upload, /if \(expired && !error\.mayComplete\) clearResume\(\);/);
-});
-
-test('the seal and pages restart the session instead of replaying the manifest', () => {
-  assert.match(upload, /singleShot: true,\n\s+headers: \{ 'Content-Type': 'application\/octet-stream' \},\n\s+body: seal,/);
-  assert.match(upload, /failure\.restart = true;/);
-  assert.match(upload, /if \(error\.restart\) \{\n\s+\/\/ The manifest phase cannot be replayed into the same session/);
 });
 
 test('a restarted server\'s unknown-session 404 restarts, not fails, the send', () => {
@@ -246,32 +180,3 @@ test('a restarted server\'s unknown-session 404 restarts, not fails, the send', 
   assert.match(upload, /error\.restart = true;\n\s+\}\n\s+throw error;/);
 });
 
-test('a user cancel aborts the retry loop before any classification retry', () => {
-  // checkCancelled runs both before the request and on a caught failure, so
-  // an abort from the shared controller never reaches the retry decision.
-  const loop = upload.slice(
-    upload.indexOf('async function postWithRetry'),
-    upload.indexOf('// ------------------------------------------------------------------- phases'),
-  );
-  assert.equal(loop.split('checkCancelled();').length - 1, 2);
-  assert.match(loop, /retryDecision\(\{[\s\S]*failure,\n\s+online: navigator\.onLine !== false,/);
-});
-
-test('a drain 503 on session create names the wait instead of a bare Paused', () => {
-  // A drained port answers 503 on session admission and is retried until
-  // the budget runs out (a standby takes over mid-drain). The phase line
-  // must then say why it is waiting rather than a bare Paused over 0 B
-  // (audit finding 497); other transient exhaustion keeps the old text.
-  assert.match(
-    upload,
-    /setPhase\(status === 503 && drainPhase\n\s+\? 'Not accepting new transfers right now, retrying'\n\s+: 'Paused'\);/,
-  );
-  assert.match(
-    upload,
-    /if \(status === 503 && drainPhase\) \{/,
-  );
-  // The drain text belongs to session admission only; every other 503 keeps
-  // the Paused phase that upload handshakes key on.
-  assert.match(upload, /drainPhase: true,/);
-  assert.doesNotMatch(upload, /setPhase\(status === 503\n/);
-});

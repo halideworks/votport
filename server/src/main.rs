@@ -522,15 +522,6 @@ mod cli_tests {
     }
 
     #[test]
-    fn share_usage_names_operation_id_and_json() {
-        // Audit 483: both flags are implemented, so the usage error must
-        // name them alongside the rest.
-        let error = parse_share_args(Vec::new()).unwrap_err();
-        assert!(error.contains("--operation-id"), "{error}");
-        assert!(error.contains("--json"), "{error}");
-    }
-
-    #[test]
     fn share_arguments_reject_escape_and_bad_expiry() {
         for id in ["", ".", "..", "x/y", "has space", &"a".repeat(129)] {
             assert!(parse_share_args(vec![

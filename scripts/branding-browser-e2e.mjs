@@ -120,6 +120,21 @@ try {
   await page.locator('#title').getByText('Named tenant', { exact: true }).waitFor();
   assert.equal(await page.locator('.footer-custom').innerText(), 'Named footer');
   await api('admin/tenant', { tenant: '' });
+
+  // Tenant switcher: each switch reloads into the chosen namespace with the
+  // reissued cookie in place, so the tenant's own link is listed exactly when
+  // that tenant is selected. Repeated to catch a reload that beats the cookie.
+  const seesNamedLink = async () => (await api('admin/links')).links
+    .some((link) => link.label === 'Named footer fixture');
+  await page.goto(`${base}/receive`);
+  for (const target of [tenant, '', tenant, '']) {
+    await page.locator('#tenant-switcher:not([disabled])').waitFor();
+    const reloaded = page.waitForEvent('load');
+    await page.selectOption('#tenant-switcher', target);
+    await reloaded;
+    await page.waitForFunction((value) => document.getElementById('tenant-switcher').value === value, target);
+    assert.equal(await seesNamedLink(), target === tenant, `switched to ${target || 'default'}`);
+  }
   assert.deepEqual(errors, []);
   console.log('Footer and hint browser checks passed: save/reload, recipient branding, safe text, credits, clear, local connection labels, mouse, keyboard, touch, and responsive layout.');
 } finally { await browser.close(); }

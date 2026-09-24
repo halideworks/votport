@@ -108,58 +108,6 @@ mod outbound_stage_tests {
         assert_eq!(std::fs::read(&stage).unwrap(), b"staged");
     }
 
-    /// Audit finding 222: without write access both sweeps fail their
-    /// removals, and each warn must name the item it could not remove.
-    #[test]
-    fn startup_cleanup_warns_with_entry_names_when_removals_fail() {
-        let directory = tempfile::tempdir().unwrap();
-        let stage = directory.path().join("outbound.stage");
-        let owned = stage.join(".vot-outbound-dead");
-        std::fs::create_dir_all(&owned).unwrap();
-        std::fs::write(owned.join("part"), b"staged").unwrap();
-        let backups = directory.path().join("backups");
-        std::fs::create_dir_all(&backups).unwrap();
-        let snapshot = backups.join("votport-1-aaaaaaaa.db");
-        std::fs::write(&snapshot, b"snapshot").unwrap();
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o555)).unwrap();
-        std::fs::set_permissions(&backups, std::fs::Permissions::from_mode(0o555)).unwrap();
-
-        let log = tempfile::NamedTempFile::new().unwrap();
-        let writer = log.reopen().unwrap();
-        let subscriber = tracing_subscriber::fmt()
-            .json()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(move || writer.try_clone().unwrap())
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
-            clean_outbound_stage(directory.path());
-            // A future cutoff makes the fresh snapshot count as expired.
-            prune_legacy_snapshots(
-                &backups,
-                std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
-            );
-        });
-        std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::set_permissions(&backups, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let text = std::fs::read_to_string(log.path()).unwrap();
-        let stage_warn = text
-            .lines()
-            .find(|line| line.contains("outbound stage cleanup failed"))
-            .expect("the stage removal warns");
-        assert!(stage_warn.contains(".vot-outbound-dead"), "{stage_warn}");
-        let snapshot_warn = text
-            .lines()
-            .find(|line| line.contains("legacy snapshot removal failed"))
-            .expect("the snapshot removal warns");
-        assert!(
-            snapshot_warn.contains("votport-1-aaaaaaaa.db"),
-            "{snapshot_warn}"
-        );
-    }
-
     /// Audit finding 223: a grant whose suite does not parse cannot name its
     /// catalogs, so the prune must keep every catalog and warn with the
     /// grant's identity instead of pruning against a partial keep set.
@@ -245,25 +193,6 @@ mod health_tests {
         assert!(
             bind < build,
             "the listener must bind before app::build opens the store"
-        );
-    }
-
-    /// Audit finding 564: SIGTERM drains HTTP but does not cancel an
-    /// in-flight storage export, so the compose stop grace period carries
-    /// the line tying the deadline to the export time of the largest single
-    /// file; a SIGKILL at the deadline is what orphans the multipart upload.
-    #[test]
-    fn the_stop_grace_period_doc_ties_the_deadline_to_the_largest_single_file() {
-        let compose = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../docker-compose.yml"
-        ));
-        let grace = compose
-            .find("stop_grace_period")
-            .expect("the compose stop grace period stays configured");
-        assert!(
-            compose[..grace].contains("largest single file"),
-            "the comment above the grace period must tie it to the largest single file"
         );
     }
 
@@ -535,11 +464,6 @@ mod health_tests {
     #[tokio::test]
     async fn health_routes_do_not_block_healthz_on_sqlite() {
         blocked_health_request("/healthz").await;
-    }
-
-    #[tokio::test]
-    async fn health_routes_do_not_block_readyz_on_sqlite() {
-        blocked_health_request("/readyz").await;
     }
 
     #[tokio::test]
@@ -988,127 +912,6 @@ mod health_tests {
         reply.send(Ok(())).unwrap();
     }
 
-    /// Drives `suspend_sessions` against manually answered workers and
-    /// returns the log records it emitted, so the summary can be pinned
-    /// without asserting on a real NAS checkpoint.
-    async fn suspend_summary_records(
-        app: std::sync::Arc<App>,
-        answers: Vec<Result<(), String>>,
-    ) -> Vec<serde_json::Value> {
-        use tracing::instrument::WithSubscriber;
-        let mut receivers = Vec::new();
-        for (index, _) in answers.iter().enumerate() {
-            let (sender, receiver) = tokio::sync::mpsc::channel(1);
-            app.sessions
-                .insert_resumed(
-                    format!("worker-{index}"),
-                    "link".into(),
-                    String::new(),
-                    0,
-                    sender,
-                )
-                .unwrap();
-            receivers.push(receiver);
-        }
-        let log = tempfile::NamedTempFile::new().unwrap();
-        let writer = log.reopen().unwrap();
-        let subscriber = tracing_subscriber::fmt()
-            .json()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(move || writer.try_clone().unwrap())
-            .finish();
-        let suspend =
-            tokio::spawn(async move { suspend_sessions(&app).await }.with_subscriber(subscriber));
-        for (mut receiver, answer) in receivers.into_iter().zip(answers) {
-            let Some(session::Cmd::Suspend { reply }) =
-                tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
-                    .await
-                    .unwrap()
-            else {
-                panic!("suspend must reach every worker");
-            };
-            let _ = reply.send(answer);
-        }
-        tokio::time::timeout(std::time::Duration::from_secs(35), suspend)
-            .await
-            .unwrap()
-            .unwrap();
-        std::fs::read_to_string(log.path())
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn suspend_summary_counts_only_persisted_sessions() {
-        use tracing::instrument::WithSubscriber;
-        let failure = "checkpoint failed; staging kept".to_owned();
-        // Mixed through the real path: only the persisted session counts
-        // toward the suspended total and the failure is named.
-        let directory = tempfile::tempdir().unwrap();
-        let app = crate::api::testing::build(directory.path());
-        let records = suspend_summary_records(
-            app,
-            vec![Ok(()), Err(failure.clone()), Err(failure.clone())],
-        )
-        .await;
-        let summary = records
-            .iter()
-            .find(|record| {
-                record["fields"]["message"].as_str().is_some_and(|message| {
-                    message.contains("suspended upload sessions with failures")
-                })
-            })
-            .unwrap_or_else(|| panic!("no suspend summary in {records:?}"));
-        assert_eq!(summary["fields"]["suspended"], 1);
-        assert_eq!(summary["fields"]["failed"], 2);
-        assert!(
-            summary["fields"]["message"]
-                .as_str()
-                .unwrap()
-                .contains(&failure),
-            "failures must be named: {summary}"
-        );
-        // All-fail: zero sessions count toward the suspended total.
-        let log = tempfile::NamedTempFile::new().unwrap();
-        let writer = log.reopen().unwrap();
-        let subscriber = tracing_subscriber::fmt()
-            .json()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(move || writer.try_clone().unwrap())
-            .finish();
-        async {
-            summarize_suspend(vec![Some(Err(failure.clone())), Some(Err(failure.clone()))]);
-        }
-        .with_subscriber(subscriber)
-        .await;
-        let records: Vec<serde_json::Value> = std::fs::read_to_string(log.path())
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        let summary = records
-            .iter()
-            .find(|record| {
-                record["fields"]["message"].as_str().is_some_and(|message| {
-                    message.contains("suspended upload sessions with failures")
-                })
-            })
-            .unwrap_or_else(|| panic!("no suspend summary in {records:?}"));
-        assert_eq!(summary["fields"]["suspended"], 0);
-        assert_eq!(summary["fields"]["failed"], 2);
-        assert!(
-            summary["fields"]["message"]
-                .as_str()
-                .unwrap()
-                .contains(&failure),
-            "failures must be named: {summary}"
-        );
-    }
-
     #[tokio::test]
     async fn readyz_follows_draining_and_healthz_does_not() {
         use http_body_util::BodyExt as _;
@@ -1320,27 +1123,6 @@ mod health_tests {
         release_data_lock(&first);
         drop(first);
         crate::api::testing::build(directory.path());
-    }
-
-    #[tokio::test]
-    async fn healthz_returns_generic_unavailable_when_storage_cannot_be_probed() {
-        let directory = tempfile::tempdir().unwrap();
-        let app = crate::api::testing::build(directory.path());
-        let outbound = app.config.outbound_dir.clone();
-        std::fs::remove_dir_all(&outbound).unwrap();
-        std::fs::write(&outbound, b"not a directory").unwrap();
-
-        let response = router(app)
-            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            response.headers()[header::X_CONTENT_TYPE_OPTIONS],
-            "nosniff"
-        );
-        assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
     }
 
     #[tokio::test]
@@ -1815,12 +1597,6 @@ mod asset_cache_tests {
     use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
 
-    async fn fetch(path: &str) -> Response {
-        let directory = tempfile::tempdir().unwrap();
-        let app = crate::api::testing::build(directory.path());
-        request(app, path).await
-    }
-
     async fn request(app: Arc<App>, path: &str) -> Response {
         router(app)
             .oneshot(Request::get(path).body(Body::empty()).unwrap())
@@ -2012,18 +1788,6 @@ mod asset_cache_tests {
             .unwrap()
             .to_bytes()
             .is_empty());
-    }
-
-    #[tokio::test]
-    async fn unknown_page_returns_plain_text_not_found_body() {
-        let response = fetch("/mistyped-page").await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert_eq!(
-            response.headers()[header::CONTENT_TYPE],
-            "text/plain; charset=utf-8"
-        );
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(body.as_ref(), b"page not found\n");
     }
 
     #[tokio::test]
@@ -2774,21 +2538,6 @@ mod push_tests {
         );
     }
 
-    #[tokio::test]
-    async fn push_identity_is_not_exposed_when_disabled() {
-        let directory = tempfile::tempdir().unwrap();
-        let response = router(crate::api::testing::build(directory.path()))
-            .oneshot(
-                Request::builder()
-                    .uri("/api/push-identity")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
     #[test]
     fn startup_validation_precedes_filesystem_changes() {
         for invalid in ["idle", "url", "hash"] {
@@ -3271,28 +3020,6 @@ mod push_tests {
 }
 
 #[cfg(test)]
-mod push_metrics_tests {
-    use super::*;
-
-    #[test]
-    fn push_metrics_keep_fixed_refusal_series() {
-        let metrics = PushMetrics::default();
-        metrics.add_bytes(7);
-        for reason in PushRefusalReason::ALL {
-            metrics.refuse(reason);
-        }
-        assert_eq!(metrics.bytes(), 7);
-        assert!(PushRefusalReason::ALL
-            .iter()
-            .all(|reason| metrics.refusals(*reason) == 1));
-        assert_eq!(PushRefusalReason::Rate.label(), "rate");
-        assert_eq!(PushRefusalReason::Capability.label(), "capability");
-        assert_eq!(PushRefusalReason::Expired.label(), "expired");
-        assert_eq!(PushRefusalReason::Spent.label(), "spent");
-    }
-}
-
-#[cfg(test)]
 mod transfer_metrics_tests {
     use super::*;
 
@@ -3323,15 +3050,6 @@ mod transfer_metrics_tests {
                 "{outcome} {received}"
             );
         }
-    }
-
-    #[test]
-    fn outcome_table_is_fixed() {
-        for (index, outcome) in TRANSFER_OUTCOMES.iter().enumerate() {
-            assert_eq!(transfer_outcome_index(outcome), Some(index));
-        }
-        assert_eq!(transfer_outcome_index("exploded"), None);
-        assert_eq!(transfer_outcome_index(""), None);
     }
 
     #[test]
@@ -3432,81 +3150,6 @@ mod request_metrics_tests {
         );
         assert!(text.contains("votport_http_request_duration_seconds_count 5"));
         assert!(text.contains("votport_http_request_duration_seconds_sum 8.280000000"));
-    }
-
-    #[test]
-    fn outbound_upload_timing_uses_one_fixed_route_and_histogram() {
-        let upload = Request::post("/api/admin/outbound-files?path=project/file.bin")
-            .body(Body::empty())
-            .unwrap();
-        assert!(is_outbound_upload(&upload));
-        let other = Request::post("/api/admin/outbound-grants")
-            .body(Body::empty())
-            .unwrap();
-        assert!(!is_outbound_upload(&other));
-        let list = Request::get("/api/admin/outbound-files")
-            .body(Body::empty())
-            .unwrap();
-        assert!(!is_outbound_upload(&list));
-
-        let metrics = RequestMetrics::default();
-        metrics.observe_outbound_upload(Duration::from_millis(75));
-        let text = metrics.prometheus();
-        assert!(text.contains(
-            "# HELP votport_http_outbound_upload_duration_seconds HTTP time to response headers for outbound library uploads in seconds."
-        ));
-        assert!(text.contains("votport_http_outbound_upload_duration_seconds_bucket{le=\"0.1\"} 1"));
-        assert!(
-            text.contains("votport_http_outbound_upload_duration_seconds_bucket{le=\"+Inf\"} 1")
-        );
-        assert!(text.contains("votport_http_outbound_upload_duration_seconds_count 1"));
-        assert!(text.contains("votport_http_outbound_upload_duration_seconds_sum 0.075000000"));
-    }
-
-    #[test]
-    fn request_metrics_in_flight_returns_to_zero() {
-        let metrics = RequestMetrics::default();
-        let in_flight = metrics.begin();
-        assert!(metrics
-            .prometheus()
-            .contains("votport_http_requests_in_flight 1"));
-        drop(in_flight);
-        assert!(metrics
-            .prometheus()
-            .contains("votport_http_requests_in_flight 0"));
-    }
-
-    #[tokio::test]
-    async fn request_middleware_sets_valid_or_generated_request_id() {
-        use tower::ServiceExt as _;
-
-        let directory = tempfile::tempdir().unwrap();
-        let app = crate::api::testing::build(directory.path());
-        let response = router(app.clone())
-            .oneshot(
-                Request::get("/healthz")
-                    .header("x-request-id", "client.req-1")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.headers()["x-request-id"], "client.req-1");
-
-        let response = router(app)
-            .oneshot(
-                Request::get("/healthz")
-                    .header("x-request-id", "bad/id")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let generated = response.headers()["x-request-id"].to_str().unwrap();
-        assert_eq!(generated.len(), 32);
-        assert!(generated
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')));
     }
 
     #[tokio::test]

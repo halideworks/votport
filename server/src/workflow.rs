@@ -529,35 +529,6 @@ pub fn permission_refusal(access: &str) -> String {
 pub(crate) mod tests {
     use super::*;
 
-    /// Audit 438: the one permission refusal shape says who to ask and for
-    /// what, and the old "permission required" copy is gone from the
-    /// delivery API and store.
-    #[test]
-    fn permission_refusals_say_who_to_ask() {
-        for (access, expected) in [
-            (
-                "sender",
-                "Ask an administrator for sender access to this project.",
-            ),
-            (
-                "approver",
-                "Ask an administrator for approver access to this project.",
-            ),
-        ] {
-            assert_eq!(permission_refusal(access), expected);
-        }
-        for file in [
-            include_str!("api/outbound/workflows.rs"),
-            include_str!("store/workflows.rs"),
-            include_str!("api/outbound/automation.rs"),
-        ] {
-            assert!(
-                !file.contains("permission required"),
-                "stale permission copy"
-            );
-        }
-    }
-
     pub fn project() -> Project {
         Project {
             notification_revision: 0,

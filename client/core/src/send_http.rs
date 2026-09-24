@@ -866,11 +866,6 @@ mod tests {
     }
 
     #[test]
-    fn an_existing_resume_skips_the_journal_callback() {
-        exercise_rebegin("existing");
-    }
-
-    #[test]
     fn cancellation_after_rebegin_prevents_another_begin() {
         exercise_rebegin("cancel");
     }

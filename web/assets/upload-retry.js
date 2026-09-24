@@ -137,8 +137,8 @@ export function clearResumeRecord(token, dropId) {
   } catch { /* private mode */ }
 }
 
-// Expires the records other tabs left behind (and the whole-link single
-// record an older build wrote), so they cannot claim held bytes forever.
+// Expires the records other tabs left behind, so they cannot claim held
+// bytes forever.
 // A record fresh enough to belong to a live sender is left alone.
 export function expireForeignResumes(token) {
   try {
@@ -149,10 +149,7 @@ export function expireForeignResumes(token) {
     for (let index = 0; index < localStorage.length; index += 1) {
       const key = localStorage.key(index);
       if (key === null) continue;
-      if (key === `${RESUME_PREFIX}${token}`) {
-        // Legacy single-record key from before per-drop keying.
-        stale.push(key);
-      } else if (key.startsWith(prefix) && key !== prefix + own) {
+      if (key.startsWith(prefix) && key !== prefix + own) {
         let record = null;
         try { record = JSON.parse(localStorage.getItem(key) || 'null'); } catch { /* corrupt */ }
         if (!record || typeof record.at !== 'number' || now - record.at > FOREIGN_TTL_MS) {

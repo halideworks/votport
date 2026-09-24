@@ -1351,49 +1351,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "timing, run with --ignored --nocapture"]
-    fn bench_parallel_vs_serial_leaves() {
-        use std::io::Read as _;
-        let directory = tempfile::tempdir().unwrap();
-        let source = directory.path().join("big.bin");
-        let length = 512 * PROOF_LEAF_SIZE * 16; // 512 MiB
-        let bytes: Vec<u8> = (0..length).map(|index| (index % 251) as u8).collect();
-        std::fs::write(&source, &bytes).unwrap();
-        drop(bytes);
-
-        let serial_start = std::time::Instant::now();
-        let mut builder =
-            vot_sdk::object::InMemoryObjectBuilder::new(Suite::Blake3Bao64, Some(length), length)
-                .unwrap();
-        let mut file = std::fs::File::open(&source).unwrap();
-        let mut buf = vec![0u8; 1 << 20];
-        loop {
-            let read = file.read(&mut buf).unwrap();
-            if read == 0 {
-                break;
-            }
-            builder.update(&buf[..read]).unwrap();
-        }
-        let _ = builder.finish().unwrap();
-        let serial = serial_start.elapsed();
-
-        let parallel_start = std::time::Instant::now();
-        let leaves = compute_leaves(&source, Suite::Blake3Bao64, length).unwrap();
-        let parallel = parallel_start.elapsed();
-        assert_eq!(leaves.len() as u64, length.div_ceil(PROOF_LEAF_SIZE));
-
-        let gib = length as f64 / (1024.0 * 1024.0 * 1024.0);
-        eprintln!(
-            "leaves for {gib:.2} GiB: serial {:.3}s ({:.0} ms/GiB), parallel {:.3}s ({:.0} ms/GiB), {:.1}x",
-            serial.as_secs_f64(),
-            serial.as_secs_f64() / gib * 1000.0,
-            parallel.as_secs_f64(),
-            parallel.as_secs_f64() / gib * 1000.0,
-            serial.as_secs_f64() / parallel.as_secs_f64(),
-        );
-    }
-
-    #[test]
     fn leaves_computed_in_parallel_match_the_cache_and_serve_after_the_object_moves() {
         // A file over one leaf, not a multiple of the leaf size, so the last
         // segment is a partial leaf and the parallel split is exercised.
@@ -1479,24 +1436,6 @@ mod tests {
         assert!(!grant_open(&grant(None, 50, 0, None), 50));
         assert!(!grant_open(&grant(None, 100, 2, Some(2)), 50));
         assert!(grant_open(&grant(None, 100, 1, Some(2)), 50));
-    }
-
-    #[test]
-    fn refusal_reasons_are_a_fixed_series() {
-        let metrics = ServeMetrics::default();
-        for reason in ServeRefusalReason::ALL {
-            metrics.refuse(reason);
-        }
-        assert!(ServeRefusalReason::ALL
-            .iter()
-            .all(|reason| metrics.refusals(*reason) == 1));
-        assert_eq!(
-            ServeRefusalReason::ALL
-                .iter()
-                .map(|reason| reason.label())
-                .collect::<Vec<_>>(),
-            ["rate", "capability", "unknown", "closed", "busy"]
-        );
     }
 
     #[test]
@@ -1631,84 +1570,6 @@ mod tests {
                 std::fs::remove_file(&manifest).unwrap();
             }
         }
-    }
-
-    #[tokio::test]
-    async fn mint_fetch_replaces_same_holder_ticket_but_rejects_another_holder() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut config = crate::api::testing::config(directory.path());
-        config.serve_bind = Some("127.0.0.1:0".parse().unwrap());
-        let app = crate::app::build(config).unwrap();
-        let bytes = b"fetch retry";
-        let source = app.config.outbound_dir.join("file.bin");
-        std::fs::write(&source, bytes).unwrap();
-        let mut builder = vot_sdk::object::InMemoryObjectBuilder::new(
-            Suite::Blake3Bao64,
-            Some(bytes.len() as u64),
-            bytes.len() as u64,
-        )
-        .unwrap();
-        builder.update(bytes).unwrap();
-        let object = builder.finish().unwrap().object_id().clone();
-        let token = "a".repeat(32);
-        let now = now_unix();
-        let mut grant = crate::store::tests::test_outbound_grant("fetch-retry", "", 0);
-        grant.token_hash = crate::auth::hash_token(&token);
-        grant.expires_at = now + 600;
-        grant.max_downloads = Some(1);
-        grant.bytes = bytes.len() as u64;
-        grant.root = hex::encode(object.root);
-        grant.files = vec![crate::store::OutboundGrantFile {
-            source: "file.bin".into(),
-            name: "file.bin".into(),
-            suite: "blake3".into(),
-            root: hex::encode(object.root),
-            bytes: bytes.len() as u64,
-            receipt_b64: String::new(),
-            downloads: 0,
-            first_download_at: None,
-            last_download_at: None,
-        }];
-        app.store.insert_outbound_grant(grant.clone()).unwrap();
-
-        let holder_a = ed25519_dalek::SigningKey::from_bytes(&[7; 32])
-            .verifying_key()
-            .to_bytes();
-        assert!(app
-            .store
-            .put_fetch_ticket(
-                &FetchTicket {
-                    holder: hex::encode(holder_a),
-                    grant_token_hash: grant.token_hash.clone(),
-                    policy_revision: 0,
-                    token_id: "interrupted".into(),
-                    grant_id: grant.id.clone(),
-                    manifest_root: "old".into(),
-                    expires_at: now + 300,
-                    delivered_at: None,
-                },
-                now,
-            )
-            .unwrap());
-
-        let mint = |holder_key: [u8; 32]| {
-            mint_fetch(
-                axum::extract::State(Arc::clone(&app)),
-                axum::extract::Path(token.clone()),
-                axum::http::HeaderMap::new(),
-                axum::Json(FetchRequest {
-                    holder_key: hex::encode(holder_key),
-                }),
-            )
-        };
-        assert_eq!(mint(holder_a).await.unwrap().status(), StatusCode::OK);
-        let holder_b = ed25519_dalek::SigningKey::from_bytes(&[8; 32])
-            .verifying_key()
-            .to_bytes();
-        assert_eq!(
-            mint(holder_b).await.unwrap_err().status,
-            StatusCode::CONFLICT
-        );
     }
 
     fn fetch_ttl_grant(

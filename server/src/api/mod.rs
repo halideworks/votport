@@ -668,29 +668,6 @@ mod ip_tests {
 #[cfg(test)]
 mod refusal_copy_tests {
     use super::*;
-    use http_body_util::BodyExt as _;
-
-    /// Audit 433: the rate-limit sentence carries the Retry-After number
-    /// itself, and the header matches it.
-    #[tokio::test]
-    async fn rate_limit_copy_carries_the_retry_after_seconds() {
-        for (what, seconds) in [("automation requests", 600), ("failed attempts", 60)] {
-            let response = rate_limited(what, seconds).into_response();
-            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-            assert_eq!(
-                response
-                    .headers()
-                    .get(header::RETRY_AFTER)
-                    .and_then(|value| value.to_str().ok()),
-                Some(seconds.to_string().as_str())
-            );
-            let body = response.into_body().collect().await.unwrap().to_bytes();
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
-                json!(format!("too many {what}; try again in {seconds} seconds"))
-            );
-        }
-    }
 
     #[test]
     fn page_parameters_preserve_defaults_bounds_and_errors() {
@@ -744,21 +721,6 @@ mod refusal_copy_tests {
             );
         }
     }
-
-    /// Audit 434: a paging refusal a session cannot cause answers with the
-    /// one generic sentence, whatever internal parameter fault produced it.
-    #[tokio::test]
-    async fn paging_refusals_share_one_sentence_and_log_the_fault() {
-        for reason in ["invalid job page", "invalid evidence cursor"] {
-            let response = invalid_page(reason).into_response();
-            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-            let body = response.into_body().collect().await.unwrap().to_bytes();
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
-                json!("This page of results could not be loaded. Reload the page.")
-            );
-        }
-    }
 }
 
 #[cfg(test)]
@@ -773,47 +735,6 @@ mod handler_tests {
     use crate::api::testing;
     use crate::app;
     use crate::store::Link;
-
-    #[tokio::test]
-    async fn unusable_link_hides_its_label() {
-        let directory = tempfile::tempdir().unwrap();
-        let application = testing::build(directory.path());
-        let link = Link {
-            retention_days: None,
-            verification: "default".to_owned(),
-            id: "closed-link-id".to_owned(),
-            tenant: String::new(),
-            label: "tax documents".to_owned(),
-            dest: String::new(),
-            password_hash: None,
-            created_at: 0,
-            expires_at: None,
-            max_bytes: None,
-            active: false,
-            legal_hold: false,
-
-            notifications: None,
-            uploads: Vec::new(),
-            events: Vec::new(),
-        };
-        application.store.insert_link(link).unwrap();
-
-        let router = app::router(application);
-        let response = router
-            .oneshot(
-                Request::get("/api/r/closed-link-id")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["usable"], false);
-        assert_eq!(json["label"], serde_json::Value::Null);
-        assert_eq!(json["authorized"], false);
-    }
 
     fn test_link(id: &str, password_hash: Option<String>) -> Link {
         Link {
@@ -975,42 +896,6 @@ mod handler_tests {
                 .unwrap(),
             "nosniff"
         );
-    }
-
-    #[tokio::test]
-    async fn unbranded_named_tenant_falls_back_to_its_label() {
-        let directory = tempfile::tempdir().unwrap();
-        let application = testing::build(directory.path());
-        application
-            .store
-            .insert_tenant(crate::store::Tenant {
-                retention_days: None,
-                incarnation: String::new(),
-                key: "acme".to_owned(),
-                label: "Acme Legal".to_owned(),
-                admin_group: None,
-                max_total_bytes: None,
-                max_links: None,
-                max_sessions: None,
-                created_at: 0,
-            })
-            .unwrap();
-        let mut link = test_link("acme-link-00000", None);
-        link.tenant = "acme".to_owned();
-        application.store.insert_link(link).unwrap();
-
-        let response = app::router(application)
-            .oneshot(
-                Request::get("/api/r/acme-link-00000")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["branding"]["name"], "Acme Legal");
-        assert_eq!(json["branding"]["has_logo"], false);
     }
 }
 

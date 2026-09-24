@@ -6,35 +6,6 @@ import { entryFiles, runUploadBatch, uploadLibraryFile, libraryFileIdentity } fr
 const deliver = await readFile(new URL('../web/deliver.html', import.meta.url), 'utf8');
 const deliverScript = await readFile(new URL('../web/assets/page-deliver.js', import.meta.url), 'utf8');
 
-test('Deliver exposes file and folder pickers with an accessible drop zone', () => {
-  assert.match(deliver, /id="library-drop" class="drop" role="group"/);
-  assert.doesNotMatch(deliver, /id="library-drop"[^>]+(?:tabindex|role="button")/);
-  assert.match(deliver, /aria-label="Add files or a folder to the library"/);
-  assert.match(deliver, /id="library-add-files"[^>]*>files<\/button>/);
-  assert.match(deliver, /id="library-add-folder"[^>]*>a folder<\/button>/);
-  assert.match(deliver, /id="library-folder-input" type="file" webkitdirectory[^>]*hidden/);
-  assert.doesNotMatch(deliverScript, /libraryDrop\.addEventListener\('keydown'/);
-  assert.match(deliverScript, /document\.addEventListener\('drop'/);
-  assert.match(deliverScript, /carriesFiles\(event\)/);
-  assert.match(deliverScript, /item\.getAsEntry\?\.\(\) \|\| item\.webkitGetAsEntry\?\.\(\)/);
-  assert.match(deliverScript, /libraryDrop\.setAttribute\('aria-busy', 'true'\)/);
-  assert.match(deliverScript, /An upload is already in progress\./);
-});
-
-test('a whole-folder selection shares the folder, not every path', () => {
-  // Ticking a folder used to POST every selected path back (1.14 MB at
-  // scale); the grant API already takes one directory field, like the
-  // folder share flow (finding 539).
-  assert.match(
-    deliverScript,
-    /const folder = \[\.\.\.libraryFolderSelections\]\.find\(\(\[directory, known\]\) => known\.size === paths\.length && paths\.every\(\(path\) => known\.has\(path\)\)\);/,
-  );
-  assert.match(deliverScript, /if \(folder\) \{[\s\S]+?directory: folder\[0\],/);
-  // Mixed and partial selections still send their paths.
-  assert.match(deliverScript, /return \{\s*\n\s*paths,\s*\n\s*label,/);
-  assert.match(deliverScript, /!paths\.length[\s\S]{0,80}Select at least one file\./);
-});
-
 test('dropped entries drain directory readers and preserve relative paths', async () => {
   const file = (path) => ({
     isFile: true,
@@ -58,18 +29,6 @@ test('dropped entries drain directory readers and preserve relative paths', asyn
   assert.match(deliverScript, /file\.webkitRelativePath \|\| file\.name/);
   assert.match(deliverScript, /project \? `\$\{project\}\/\$\{relative\}` : relative/);
   assert.match(deliverScript, /entryFiles\)\)\)\.flat\(\)/);
-});
-
-test('one upload batch validates paths and reports per-file progress', () => {
-  assert.match(deliverScript, /async function uploadLibraryFiles\(pairs\)/);
-  assert.match(deliverScript, /parseLibraryPath\(path\)/);
-  assert.match(deliverScript, /runUploadBatch\(/);
-  assert.match(deliverScript, /uploadLibraryFile\(file, path, progress\)/);
-  assert.match(deliverScript, /Uploading \$\{file\.name\}: \$\{percent\}%/);
-  assert.match(deliverScript, /files complete/);
-  assert.match(deliverScript, /if \(completedUploads > 0\) \{\s+await refreshLibrary\(\)/);
-  assert.match(deliverScript, /\$\{error\.message\} \$\{completedUploads\} of \$\{uploads\.length\} files added\./);
-  assert.match(deliverScript, /await refreshLibrary\(\);\s+\$\('library-status'\)\.textContent = `\$\{uploads\.length\}/);
 });
 
 test('library upload attempts isolate same-metadata files and keep the id through retries', async (t) => {

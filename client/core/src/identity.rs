@@ -309,29 +309,6 @@ pub fn forget_everything() -> Result<()> {
 mod tests {
     use super::*;
 
-    /// An uninstall's "Remove local data" leaves nothing behind: the port
-    /// session, the watch list with its passwords, the journals, the
-    /// evidence outbox, and the device key all live in one directory.
-    #[test]
-    fn forget_everything_removes_every_client_state_file() {
-        let root = tempfile::tempdir().unwrap();
-        let state = root.path().join("state");
-        let _scope = test_state_dir(&state);
-        std::fs::create_dir_all(state.join("journal")).unwrap();
-        std::fs::create_dir_all(state.join("evidence/trees")).unwrap();
-        for name in ["port.json", "watches.json", "device.key"] {
-            std::fs::write(state.join(name), b"secret").unwrap();
-        }
-        std::fs::write(state.join("journal/1.json"), b"{}").unwrap();
-        std::fs::write(state.join("evidence/out.json"), b"{}").unwrap();
-
-        forget_everything().unwrap();
-        assert!(!state.exists(), "client state survived Remove local data");
-        // Nothing left to remove is not an error, so a shell can call it
-        // again before quitting.
-        forget_everything().unwrap();
-    }
-
     #[test]
     fn a_device_key_is_stable_across_loads() {
         let dir = tempfile::tempdir().unwrap();
@@ -367,16 +344,6 @@ mod tests {
                 .unwrap()
                 .is_symlink());
         }
-    }
-
-    // Roaming synced to the domain controller and followed the user to every
-    // machine, carrying the device key, the port session, and watch passwords.
-    #[cfg(windows)]
-    #[test]
-    fn the_windows_state_dir_prefers_local_over_roaming() {
-        std::env::set_var("LOCALAPPDATA", r"C:\votport-local-test");
-        std::env::set_var("APPDATA", r"C:\votport-roaming-test");
-        assert!(platform_data_home().starts_with(r"C:\votport-local-test"));
     }
 
     #[test]

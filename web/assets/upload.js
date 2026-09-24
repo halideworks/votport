@@ -1153,7 +1153,7 @@ async function runUpload() {
           try {
             entries = expandBeginEntries(await postWithRetry(`/api/session/${sessionId}/begin`, {
               headers: { 'X-Votport-Begin': 'compact' },
-            }), items.length);
+            }));
           } catch (error) {
             if (sessionUnknown(error)) {
               // The server restarted between the last page and begin and
@@ -1219,7 +1219,7 @@ async function runUpload() {
           }
           entries = expandBeginEntries(await postWithRetry(`/api/session/${sessionId}/begin`, {
             headers: { 'X-Votport-Begin': 'compact' },
-          }), items.length);
+          }));
         }
 
         rangePostSeen ||= entries.some((entry) => !entry.complete);
