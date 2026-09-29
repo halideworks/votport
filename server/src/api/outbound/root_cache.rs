@@ -2,14 +2,9 @@
 //!
 //! Sharing a library file costs a full BLAKE3-Bao read of every selected
 //! byte. Most re-shares hand back the same files, so this sidecar remembers
-//! `(tenant, source path, size, mtime) -> root` after a successful hash and
-//! lets [`super::hash_library_file`] skip the re-read when all three key
-//! parts still match, the same invalidation rule build systems use. A
-//! content change that keeps size and mtime is not caught here - realistic
-//! on NAS exports with coarse mtime granularity, where two writes can land
-//! in one timestamp tick; the per-download integrity checks stay the last
-//! word and fail closed, which is exactly the pre-cache behavior for a file
-//! mutated after grant creation.
+//! `(tenant, source path, size, mtime, file identity, change time) -> root`.
+//! Unix change time catches rewrites that preserve size and mtime. Other
+//! platforms retain the size/mtime heuristic; downloads still verify bytes.
 //!
 //! Storage follows the `outbound.proofs` precedent: a small file under
 //! `data_dir`, never the main schema. Eviction is by age
@@ -35,7 +30,7 @@ pub(crate) const ROOT_CACHE_MAX_ENTRIES: usize = 8192;
 /// Entries older than thirty days are dropped on load; files re-shared that
 /// rarely are worth one fresh read to keep the sidecar small.
 const ROOT_CACHE_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
-const ROOT_CACHE_VERSION: u32 = 1;
+const ROOT_CACHE_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 struct RootCacheEntry {
@@ -43,6 +38,7 @@ struct RootCacheEntry {
     path: String,
     size: u64,
     mtime_nanos: u64,
+    change: Option<(u64, u64, i64, i64)>,
     root: String,
     cached_at: u64,
 }
@@ -59,11 +55,26 @@ pub(crate) struct RootCache {
     state: Mutex<RootCacheState>,
 }
 
-fn cache_key(tenant: &str, path: &Path, size: u64, mtime_nanos: u64) -> String {
-    format!(
-        "{tenant}\u{0}{}\u{0}{size}\u{0}{mtime_nanos}",
-        path.display()
-    )
+fn cache_key(tenant: &str, path: &Path) -> String {
+    format!("{tenant}\u{0}{}", path.display())
+}
+
+pub(crate) fn change_stamp(metadata: &std::fs::Metadata) -> Option<(u64, u64, i64, i64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Some((
+            metadata.dev(),
+            metadata.ino(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
 }
 
 /// mtime as nanos since the Unix epoch, saturating to 0 when unavailable or
@@ -73,7 +84,7 @@ pub(crate) fn mtime_nanos(metadata: &std::fs::Metadata) -> u64 {
         .modified()
         .ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos() as u64)
+        .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
         .unwrap_or(0)
 }
 
@@ -93,17 +104,32 @@ impl RootCache {
         path: &Path,
         size: u64,
         mtime: u64,
+        change: Option<(u64, u64, i64, i64)>,
     ) -> Option<String> {
-        let key = cache_key(tenant, path, size, mtime);
+        let key = cache_key(tenant, path);
         let mut state = self.state.lock().expect("root cache poisoned");
         self.ensure_loaded(&mut state);
-        state.entries.get(&key).map(|entry| entry.root.clone())
+        state
+            .entries
+            .get(&key)
+            .filter(|entry| {
+                entry.size == size && entry.mtime_nanos == mtime && entry.change == change
+            })
+            .map(|entry| entry.root.clone())
     }
 
     /// Records a freshly hashed root. Age- and count-bounded; see the module
     /// comment for the eviction contract.
-    pub(crate) fn insert(&self, tenant: &str, path: &Path, size: u64, mtime: u64, root: String) {
-        let key = cache_key(tenant, path, size, mtime);
+    pub(crate) fn insert(
+        &self,
+        tenant: &str,
+        path: &Path,
+        size: u64,
+        mtime: u64,
+        change: Option<(u64, u64, i64, i64)>,
+        root: String,
+    ) {
+        let key = cache_key(tenant, path);
         let mut state = self.state.lock().expect("root cache poisoned");
         self.ensure_loaded(&mut state);
         state.entries.insert(
@@ -113,6 +139,7 @@ impl RootCache {
                 path: path.display().to_string(),
                 size,
                 mtime_nanos: mtime,
+                change,
                 root,
                 cached_at: now_unix(),
             },
@@ -152,16 +179,16 @@ impl RootCache {
             "version": ROOT_CACHE_VERSION,
             "entries": state.entries.values().collect::<Vec<_>>(),
         });
+        let mut stage = self.path.clone();
+        stage.set_extension("json.stage");
+        stage
+            .as_mut_os_string()
+            .push(format!("-{}", crate::auth::random_token()));
         let result = (|| {
             let body = serde_json::to_vec(&document).ok()?;
             if let Some(parent) = self.path.parent() {
                 std::fs::create_dir_all(parent).ok()?;
             }
-            let mut stage = self.path.clone();
-            stage.set_extension("json.stage");
-            stage
-                .as_mut_os_string()
-                .push(format!("-{}", crate::auth::random_token()));
             {
                 let mut options = std::fs::OpenOptions::new();
                 options.write(true).create_new(true);
@@ -178,6 +205,8 @@ impl RootCache {
         })();
         if result.is_some() {
             state.dirty = false;
+        } else {
+            let _ = std::fs::remove_file(&stage);
         }
     }
 
@@ -186,6 +215,9 @@ impl RootCache {
             return;
         }
         state.loaded = true;
+        if std::fs::metadata(&self.path).is_ok_and(|metadata| metadata.len() > 16 * 1024 * 1024) {
+            return;
+        }
         let Ok(bytes) = std::fs::read(&self.path) else {
             return;
         };
@@ -201,22 +233,16 @@ impl RootCache {
             return;
         };
         let cutoff = now_unix().saturating_sub(ROOT_CACHE_MAX_AGE_SECS);
-        for entry in entries {
+        for entry in entries.iter().take(ROOT_CACHE_MAX_ENTRIES) {
             let Ok(entry) = serde_json::from_value::<RootCacheEntry>(entry.clone()) else {
                 continue;
             };
             if entry.cached_at < cutoff {
                 continue;
             }
-            state.entries.insert(
-                cache_key(
-                    &entry.tenant,
-                    Path::new(&entry.path),
-                    entry.size,
-                    entry.mtime_nanos,
-                ),
-                entry,
-            );
+            state
+                .entries
+                .insert(cache_key(&entry.tenant, Path::new(&entry.path)), entry);
         }
     }
 }
@@ -231,6 +257,7 @@ mod tests {
             path: "/library/project/a.bin".to_owned(),
             size: 4,
             mtime_nanos: 100,
+            change: None,
             root: root.to_owned(),
             cached_at,
         }
@@ -241,8 +268,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let cache = RootCache::new(directory.path());
         let path = Path::new("/library/project/a.bin");
-        assert_eq!(cache.lookup("acme", path, 4, 100), None);
-        cache.insert("acme", path, 4, 100, "ab".repeat(32));
+        assert_eq!(cache.lookup("acme", path, 4, 100, None), None);
+        cache.insert("acme", path, 4, 100, None, "ab".repeat(32));
         cache.persist();
         assert!(directory.path().join("outbound-roots.json").is_file());
         #[cfg(unix)]
@@ -258,21 +285,21 @@ mod tests {
         // A fresh instance over the same data dir replays the entry.
         let reloaded = RootCache::new(directory.path());
         assert_eq!(
-            reloaded.lookup("acme", path, 4, 100).as_deref(),
+            reloaded.lookup("acme", path, 4, 100, None).as_deref(),
             Some(&"ab".repeat(32)[..])
         );
         assert_eq!(
-            reloaded.lookup("acme", path, 5, 100),
+            reloaded.lookup("acme", path, 5, 100, None),
             None,
             "size is part of the key"
         );
         assert_eq!(
-            reloaded.lookup("acme", path, 4, 101),
+            reloaded.lookup("acme", path, 4, 101, None),
             None,
             "mtime is part of the key"
         );
         assert_eq!(
-            reloaded.lookup("other", path, 4, 100),
+            reloaded.lookup("other", path, 4, 100, None),
             None,
             "tenant is part of the key"
         );
@@ -280,7 +307,7 @@ mod tests {
         // Entries past the age bound are dropped on load.
         let stale = directory.path().join("outbound-roots.json");
         let document = serde_json::json!({
-            "version": 1,
+            "version": ROOT_CACHE_VERSION,
             "entries": [
                 serde_json::to_value(entry(&"ab".repeat(32), now_unix())).unwrap(),
                 serde_json::to_value(entry(&"cd".repeat(32), now_unix() - ROOT_CACHE_MAX_AGE_SECS - 1)).unwrap(),
@@ -289,19 +316,19 @@ mod tests {
         std::fs::write(&stale, serde_json::to_vec(&document).unwrap()).unwrap();
         let aged = RootCache::new(directory.path());
         assert_eq!(
-            aged.lookup("acme", path, 4, 100).as_deref(),
+            aged.lookup("acme", path, 4, 100, None).as_deref(),
             Some(&"ab".repeat(32)[..])
         );
 
         // A corrupt sidecar is discarded, not fatal.
         std::fs::write(&stale, b"{not json").unwrap();
         let corrupt = RootCache::new(directory.path());
-        assert_eq!(corrupt.lookup("acme", path, 4, 100), None);
-        corrupt.insert("acme", path, 4, 100, "ef".repeat(32));
+        assert_eq!(corrupt.lookup("acme", path, 4, 100, None), None);
+        corrupt.insert("acme", path, 4, 100, None, "ef".repeat(32));
         corrupt.persist();
         let rebuilt = RootCache::new(directory.path());
         assert_eq!(
-            rebuilt.lookup("acme", path, 4, 100).as_deref(),
+            rebuilt.lookup("acme", path, 4, 100, None).as_deref(),
             Some(&"ef".repeat(32)[..])
         );
     }
@@ -313,18 +340,65 @@ mod tests {
     fn bulk_same_second_eviction_keeps_the_fresh_majority() {
         let directory = tempfile::tempdir().unwrap();
         let cache = RootCache::new(directory.path());
-        let path = Path::new("/library/project/a.bin");
         for index in 0..=(ROOT_CACHE_MAX_ENTRIES as u64) {
-            cache.insert("acme", path, index, index, "ab".repeat(32));
+            cache.insert(
+                "acme",
+                &PathBuf::from(format!("/library/{index}")),
+                index,
+                index,
+                None,
+                "ab".repeat(32),
+            );
         }
         let state = cache.state.lock().unwrap();
         let crossings = ROOT_CACHE_MAX_ENTRIES + 1;
         assert_eq!(state.entries.len(), crossings - crossings / 8);
         assert!(state.entries.contains_key(&cache_key(
             "acme",
-            path,
-            ROOT_CACHE_MAX_ENTRIES as u64,
-            ROOT_CACHE_MAX_ENTRIES as u64
+            &PathBuf::from(format!("/library/{ROOT_CACHE_MAX_ENTRIES}"))
         )));
+    }
+
+    #[test]
+    fn replacements_match_file_identity_without_accumulating_versions() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = RootCache::new(directory.path());
+        let path = Path::new("/library/a.bin");
+        let first = Some((1, 2, 3, 4));
+        let second = Some((1, 9, 3, 4));
+        cache.insert("acme", path, 4, 100, first, "ab".repeat(32));
+        assert!(cache.lookup("acme", path, 4, 100, second).is_none());
+        cache.insert("acme", path, 4, 100, second, "cd".repeat(32));
+        assert_eq!(cache.state.lock().unwrap().entries.len(), 1);
+        cache.persist();
+        let reloaded = RootCache::new(directory.path());
+        assert!(reloaded.lookup("acme", path, 4, 100, first).is_none());
+        assert_eq!(
+            reloaded.lookup("acme", path, 4, 100, second),
+            Some("cd".repeat(32))
+        );
+    }
+
+    #[test]
+    fn refuses_legacy_and_oversized_sidecars_and_cleans_failed_stages() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = RootCache::new(directory.path());
+        let path = Path::new("/library/project/a.bin");
+        let document = serde_json::json!({"version": 1, "entries": [entry("ab", now_unix())]});
+        std::fs::write(&cache.path, serde_json::to_vec(&document).unwrap()).unwrap();
+        assert!(cache.lookup("acme", path, 4, 100, None).is_none());
+        std::fs::File::create(&cache.path)
+            .unwrap()
+            .set_len(16 * 1024 * 1024 + 1)
+            .unwrap();
+        assert!(RootCache::new(directory.path())
+            .lookup("acme", path, 4, 100, None)
+            .is_none());
+        std::fs::remove_file(&cache.path).unwrap();
+        std::fs::create_dir(&cache.path).unwrap();
+        cache.insert("acme", path, 4, 100, None, "ab".repeat(32));
+        cache.persist();
+        assert!(cache.state.lock().unwrap().dirty);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }

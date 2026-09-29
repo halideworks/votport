@@ -181,6 +181,15 @@ try {
   await page.locator('#library-files input[type=checkbox][value="notification-clip.txt"]').check();
   await page.locator('#deliver-label').fill(downloadLabel);
   await choose(page.locator('#deliver-notifications'), 'Incoming', 'First file requested');
+  for (const width of [390, 1440]) {
+    await page.setViewportSize({ width, height: 1000 });
+    const editor = page.locator('#deliver-notifications .notification-editor');
+    assert.ok(await editor.locator(':scope > p.field-help').evaluate((node) => parseFloat(getComputedStyle(node).marginTop)) >= 16, 'Notification status has space above it');
+    const manage = await editor.getByRole('link', { name: 'Add or manage destinations ↗', exact: true }).boundingBox();
+    const refresh = await editor.getByRole('button', { name: 'Refresh destinations', exact: true }).boundingBox();
+    assert.ok(refresh.y >= manage.y + manage.height + 8 || refresh.x >= manage.x + manage.width + 8, 'Notification management controls are separated');
+  }
+
   let preparationPolls = 0;
   await page.route('**/api/admin/outbound-grants/preparations/*', (route) => {
     if (preparationPolls++ === 0) return route.fulfill({ json: { status: 'preparing', files_done: 0, files_total: 1, bytes_done: 0, bytes_total: 30 } });
@@ -190,6 +199,10 @@ try {
   await page.locator('#deliver-progress-bar:not([hidden])').waitFor();
   await page.getByRole('heading', { name: downloadLabel, exact: true }).waitFor().catch(async (error) => { console.error(await page.locator('body').innerText()); throw error; });
   await page.unroute('**/api/admin/outbound-grants/preparations/*');
+
+  const copy = await page.locator('#outbound-copy').boundingBox();
+  const note = await page.locator('#outbound-note').boundingBox();
+  assert.ok(note.y >= copy.y + copy.height + 16, 'Delivery link note is separated from the copy button');
   const grants = await api('admin/outbound-grants'); const grant = grants.grants.find((grant) => grant.label === downloadLabel);
   assert.deepEqual(grant.notifications.rules, [{ destination_id: incoming.id, events: ['outbound_download_started'] }]);
   // The first file request notifies Incoming, and the notification's link
@@ -274,6 +287,10 @@ try {
   const silent = (await api('workflows/jobs', { operation_id: `${id}-off`, project_id: `${id}-off`, label: 'Silent workflow', expires_days: 1 })).job;
   await page.goto(`${base}/workflows#job-${silent.id}`);
   const silentCard = page.locator(`#job-${silent.id}`);
+  await openAncestors(silentCard.locator('.notification-details'));
+  await silentCard.locator('.notification-details .notification-mode').selectOption('default');
+  await silentCard.getByRole('button', { name: 'Save notifications', exact: true }).click();
+  await silentCard.locator('.notification-details > summary').getByText('Notifications use tenant defaults · configure', { exact: true }).waitFor();
   await choose(silentCard.locator('.notification-details'), 'Incoming', 'Every file requested');
   await silentCard.getByRole('button', { name: 'Save notifications', exact: true }).click();
   await silentCard.getByText('Notification settings saved.', { exact: true }).waitFor();

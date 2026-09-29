@@ -73,9 +73,10 @@ pub fn try_push(
     // The advertised address is often a hostname, so it is resolved. A name
     // that will not resolve, or resolves to addresses none of which answer,
     // means the carrier cannot be reached: a fall-back to HTTP, not an error.
-    let Ok(addresses) = parse_rendezvous(&identity.address) else {
+    let Ok(mut addresses) = parse_rendezvous(&identity.address) else {
         return Ok(Outcome::Unreachable);
     };
+    client.filter_rendezvous(&mut addresses);
     let reachable = match probe_any(&addresses, probe_digest) {
         Probe::Reachable(address) => address,
         Probe::Unreachable => return Ok(Outcome::Unreachable),

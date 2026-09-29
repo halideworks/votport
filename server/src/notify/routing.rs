@@ -117,6 +117,42 @@ async fn send_destination(
     event: &str,
     transfer_id: Option<&str>,
 ) -> Result<(), &'static str> {
+    let send = deliver_destination(
+        app,
+        tenant,
+        destination,
+        title,
+        body,
+        payload,
+        event,
+        transfer_id,
+    );
+    match tokio::time::timeout(Duration::from_secs(30), send).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(
+                channel = destination.channel,
+                event,
+                transfer_id = transfer_id.unwrap_or("none"),
+                outcome = "failed",
+                "notification deadline exceeded"
+            );
+            Err("Notification delivery timed out. Check the destination and try again.")
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn deliver_destination(
+    app: &App,
+    tenant: &str,
+    destination: &NotificationDestination,
+    title: &str,
+    body: &str,
+    payload: &serde_json::Value,
+    event: &str,
+    transfer_id: Option<&str>,
+) -> Result<(), &'static str> {
     let unavailable = |reason| {
         tracing::warn!(
             channel = destination.channel,
@@ -404,6 +440,46 @@ mod tests {
             assert_eq!(fields["transfer_id"], "fixture-transfer");
             assert_eq!(fields["outcome"], "failed");
         }
+    }
+
+    #[tokio::test]
+    async fn smtp_notification_has_a_whole_send_deadline() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (read, mut write) = socket.into_split();
+            let mut reader = BufReader::new(read);
+            // Every reply arrives within the SMTP per-command 15 second timeout.
+            tokio::time::sleep(Duration::from_secs(11)).await;
+            write.write_all(b"220 fixture\r\n").await.unwrap();
+            let mut line = String::new();
+            while reader.read_line(&mut line).await.unwrap() != 0 {
+                tokio::time::sleep(Duration::from_secs(11)).await;
+                write.write_all(b"250 OK\r\n").await.unwrap();
+                line.clear();
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = testing::config(directory.path());
+        config.smtp_host = Some("127.0.0.1".into());
+        config.smtp_port = port;
+        config.smtp_from = Some("sender@example.test".into());
+        config.smtp_starttls = false;
+        let app = crate::app::build(config).unwrap();
+        let mut destination = push_destination("email");
+        destination.recipients = vec!["receiver@example.test".into()];
+        let result = tokio::time::timeout(
+            Duration::from_secs(32),
+            test_destination(&app, "", &destination),
+        )
+        .await;
+        server.abort();
+        assert_eq!(
+            result.unwrap().unwrap_err(),
+            "Notification delivery timed out. Check the destination and try again."
+        );
     }
 
     #[test]

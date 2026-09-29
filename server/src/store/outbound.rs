@@ -233,15 +233,19 @@ impl Store {
     /// Whether the grant keyed by this token hash still admits downloads:
     /// present, unrevoked and unexpired. Reads two columns, not the file list.
     pub fn outbound_grant_admits(&self, token_hash: &str, now: u64) -> Result<bool, String> {
+        self.outbound_grant_deadline(token_hash)
+            .map(|deadline| deadline.is_some_and(|deadline| deadline > now))
+    }
+
+    pub(crate) fn outbound_grant_deadline(&self, token_hash: &str) -> Result<Option<u64>, String> {
         self.with(|connection| {
             connection
                 .query_row(
-                    "SELECT revoked_at IS NULL AND expires_at > ?2 FROM outbound_grants WHERE token_hash = ?1",
-                    rusqlite::params![token_hash, now as i64],
-                    |row| row.get::<_, bool>(0),
+                    "SELECT expires_at FROM outbound_grants WHERE token_hash = ?1 AND revoked_at IS NULL",
+                    [token_hash],
+                    |row| row.get::<_, i64>(0).map(|deadline| deadline.max(0) as u64),
                 )
                 .optional()
-                .map(|admits| admits.unwrap_or(false))
         })
     }
 
@@ -1034,18 +1038,13 @@ impl Store {
         .map_err(|error| error.to_string())
     }
 
-    /// [`Self::has_active_library_grant`] plus, for a non-ASCII path, the
+    /// [`Self::has_active_library_grant`] plus the
     /// Unicode case fold and normalization library volumes apply, which
     /// NOCASE lacks. Delete asks this once; it scans the tenant's live grant
     /// files, so the per-chunk upload check does not.
-    // ponytail: a non-ASCII source that folds to ASCII (U+212A) is still
-    // missed by an ASCII request.
     pub fn serves_library_file(&self, tenant: &str, source: &str) -> Result<bool, String> {
         if self.has_active_library_grant(tenant, source)? {
             return Ok(true);
-        }
-        if source.is_ascii() {
-            return Ok(false);
         }
         let wanted = crate::paths::fold_name(source);
         self.with(|connection| {

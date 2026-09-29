@@ -8,6 +8,158 @@ use std::time::Duration;
 use tower::ServiceExt as _;
 use vot_sdk_file::PublishObservation;
 
+#[test]
+fn live_stream_refreshes_an_extended_deadline_and_still_stops_on_revoke() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = crate::api::testing::build(directory.path());
+    let now = now_unix();
+    let mut grant = crate::store::tests::test_outbound_grant("extended", "", 0);
+    grant.expires_at = now + 600;
+    app.store.insert_outbound_grant(grant.clone()).unwrap();
+    grant.expires_at = now;
+    let gate = StreamGate::for_grant(&app, &grant);
+    let cloned = gate.clone();
+    assert!(!gate.stopped());
+    assert_eq!(cloned.expires_at.load(Ordering::Relaxed), now + 600);
+    app.store
+        .with(|connection| {
+            connection.execute(
+                "UPDATE outbound_grants SET expires_at = ?1 WHERE id = ?2",
+                rusqlite::params![now as i64, grant.id],
+            )
+        })
+        .unwrap();
+    cloned.expires_at.store(now, Ordering::Relaxed);
+    assert!(gate.stopped());
+    app.store
+        .with(|connection| {
+            connection.execute(
+                "UPDATE outbound_grants SET expires_at = ?1 WHERE id = ?2",
+                rusqlite::params![(now + 600) as i64, grant.id],
+            )
+        })
+        .unwrap();
+    assert!(!gate.stopped());
+    let rotated = StreamGate::for_grant(&app, &grant);
+    app.store
+        .with(|connection| {
+            connection.execute(
+                "UPDATE outbound_grants SET token_hash = 'rotated' WHERE id = ?1",
+                [&grant.id],
+            )
+        })
+        .unwrap();
+    assert!(rotated.stopped());
+    cancel_grant_streams(&app, &grant.token_hash);
+    assert!(gate.stopped());
+    assert!(cloned.stopped());
+    let missing = StreamGate::for_grant(&app, &grant);
+    app.store
+        .with(|connection| connection.execute_batch("DROP TABLE outbound_grants"))
+        .unwrap();
+    assert!(missing.stopped());
+}
+
+#[test]
+fn received_sha256_preparation_verifies_once_and_keeps_its_original_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("received.bin");
+    let bytes = vec![7; 128 * 1024 + 17];
+    std::fs::write(&path, &bytes).unwrap();
+    let mut builder = InMemoryObjectBuilder::new(
+        Suite::Sha256Bep52,
+        Some(bytes.len() as u64),
+        bytes.len() as u64,
+    )
+    .unwrap();
+    builder.update(&bytes).unwrap();
+    let prepared = builder.finish().unwrap();
+    let expected = prepared.object_id();
+    let cache = RootCache::new(directory.path());
+    let stat = std::fs::metadata(&path).unwrap();
+    cache.insert(
+        "",
+        &path,
+        stat.len(),
+        mtime_nanos(&stat),
+        change_stamp(&stat),
+        "ab".repeat(32),
+    );
+    let proofs = directory.path().join("proofs");
+    let file = hash_library_file(
+        directory.path(),
+        "received.bin",
+        &path,
+        &proofs,
+        bytes.len() as u64,
+        "",
+        &cache,
+        Some(expected),
+    )
+    .unwrap();
+    assert_eq!(file.suite, "sha256");
+    assert_eq!(file.root, hex::encode(expected.root));
+    assert!(proof::validate_catalog(
+        &std::fs::read(catalog_path(&proofs, expected)).unwrap(),
+        expected
+    )
+    .is_ok());
+    std::fs::write(&path, vec![8; bytes.len()]).unwrap();
+    assert!(
+        hash_library_file(
+            directory.path(),
+            "received.bin",
+            &path,
+            &proofs,
+            bytes.len() as u64,
+            "",
+            &cache,
+            Some(expected)
+        )
+        .is_err(),
+        "an existing catalog cannot authorize changed source bytes"
+    );
+}
+
+#[test]
+fn refreshed_stream_deadline_is_checked_after_waiting_for_the_store() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = crate::api::testing::build(directory.path());
+    let now = now_unix();
+    let mut grant = crate::store::tests::test_outbound_grant("delayed-expiry", "", 0);
+    grant.expires_at = now + 2;
+    app.store.insert_outbound_grant(grant.clone()).unwrap();
+    grant.expires_at = now;
+    let gate = StreamGate::for_grant(&app, &grant);
+    let (locked, ready) = std::sync::mpsc::channel();
+    let (release, unlocked) = std::sync::mpsc::channel();
+    let store_app = Arc::clone(&app);
+    let holder = std::thread::spawn(move || {
+        store_app
+            .store
+            .with(|_| {
+                locked.send(()).unwrap();
+                unlocked.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(())
+            })
+            .unwrap();
+    });
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (sent, result) = std::sync::mpsc::channel();
+    let check = std::thread::spawn(move || sent.send(gate.stopped()).unwrap());
+    assert!(result.recv_timeout(Duration::from_millis(100)).is_err());
+    for _ in 0..40 {
+        if now_unix() >= now + 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    release.send(()).unwrap();
+    assert!(result.recv_timeout(Duration::from_secs(5)).unwrap());
+    holder.join().unwrap();
+    check.join().unwrap();
+}
+
 /// Audit finding 225: a download whose store write fails keeps its 500
 /// response but now warns with the grant id and store error instead of
 /// vanishing into the generic message.
@@ -6898,8 +7050,13 @@ async fn hashed_library_roots_come_from_the_cache_until_the_source_changes() {
     };
     let cached = || {
         let stat = std::fs::symlink_metadata(&file).unwrap();
-        app.root_cache
-            .lookup("acme", &file, stat.len(), mtime_nanos(&stat))
+        app.root_cache.lookup(
+            "acme",
+            &file,
+            stat.len(),
+            mtime_nanos(&stat),
+            change_stamp(&stat),
+        )
     };
 
     assert!(cached().is_none(), "nothing hashed yet");
@@ -6915,9 +7072,13 @@ async fn hashed_library_roots_come_from_the_cache_until_the_source_changes() {
         "the first hash populates the cache"
     );
 
-    // Same size, same mtime: the accepted heuristic hits the cache even
-    // though the bytes changed underneath (rsync-style ceiling), so the
-    // rewrite restores the original mtime before re-sharing.
+    let unchanged = settled_grant_response(app.clone(), &cookie, create_request()).await;
+    assert_eq!(
+        body(unchanged).await["grant"]["files"][0]["root"],
+        first_root
+    );
+
+    // A rewrite that preserves size and mtime still changes Unix ctime.
     let before = std::fs::symlink_metadata(&file).unwrap();
     std::fs::write(&file, vec![2u8; 64]).unwrap();
     std::fs::File::options()
@@ -6930,8 +7091,14 @@ async fn hashed_library_roots_come_from_the_cache_until_the_source_changes() {
     assert_eq!(second.status(), StatusCode::OK);
     let second_body = body(second).await;
     let second_root = second_body["grant"]["files"][0]["root"].as_str().unwrap();
-    assert_eq!(second_root, first_root, "unchanged stat reuses the root");
-    assert_eq!(cached().unwrap(), first_root);
+    #[cfg(unix)]
+    assert_ne!(
+        second_root, first_root,
+        "ctime invalidates a rewrite with restored mtime"
+    );
+    #[cfg(not(unix))]
+    assert_eq!(second_root, first_root);
+    assert_eq!(cached().unwrap(), second_root);
 
     // A content rewrite that also moves mtime must miss and re-hash.
     std::fs::write(&file, vec![3u8; 64]).unwrap();

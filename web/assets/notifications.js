@@ -155,15 +155,15 @@ export function notificationEditor({ policy = null, events = Object.keys(notific
 }
 
 export function notificationDetails({ policy, events, save, readOnly = false, inherit, inheritLabel }) {
-  const enabled = ['default', 'custom'].includes((policy || inherit)?.mode);
-  const details = node('details', '', 'notification-details'), summary = node('summary', enabled ? 'Notifications enabled · configure' : 'Notifications off · configure');
+  const caption = (policy) => (policy || inherit)?.mode === 'default' ? 'Notifications use tenant defaults · configure' : (policy || inherit)?.mode === 'custom' ? 'Notifications enabled · configure' : 'Notifications off · configure';
+  const details = node('details', '', 'notification-details'), summary = node('summary', caption(policy));
   details.setAttribute('data-unsaved', '');
   const editor = notificationEditor({ policy, events, readOnly, inherit, inheritLabel }), status = node('p', '', 'field-help'); status.setAttribute('role', 'status');
   const apply = button('Save notifications', 'ghost', async () => {
     let policy;
     try { policy = editor.read(); } catch (error) { status.textContent = error.message; return; }
     apply.disabled = true; editor.element.disabled = true; status.textContent = 'Saving…';
-    try { await save(policy); markFormSaved(details); delete details.dataset.dirty; status.textContent = 'Notification settings saved.'; summary.textContent = ['default', 'custom'].includes((policy || inherit)?.mode) ? 'Notifications enabled · configure' : 'Notifications off · configure'; }
+    try { await save(policy); markFormSaved(details); delete details.dataset.dirty; status.textContent = 'Notification settings saved.'; summary.textContent = caption(policy); }
     catch (error) { status.textContent = error.message; }
     finally { apply.disabled = false; editor.element.disabled = false; }
   });
