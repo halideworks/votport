@@ -295,13 +295,14 @@ jobs:
           }
           trap cleanup EXIT
 
+          docker build -t votport-minio:ci - < scripts/Dockerfile.minio-fixture
           docker run -d --name votport-s3-minio \
             --user "$(id -u):$(id -g)" \
             -e MINIO_ROOT_USER="$S3_TEST_ACCESS_KEY" \
             -e MINIO_ROOT_PASSWORD="$S3_TEST_SECRET_KEY" \
             --mount "type=bind,src=$s3_data,dst=/data" \
             -p 127.0.0.1:19000:9000 \
-            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z-cpuv1@sha256:13582eff79c6605a2d315bdd0e70164142ea7e98fc8411e9e10d089502a6d883 \
+            votport-minio:ci \
             server /data
           for attempt in $(seq 1 60); do
             if curl --fail --silent --max-time 1 http://127.0.0.1:19000/minio/health/ready >/dev/null; then
