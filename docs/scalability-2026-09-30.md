@@ -76,7 +76,10 @@ background hashing and validated cache reuse address delivery creation delay.
 Local validation passed 975 server checks, 188 native workspace checks
 (including 139 core tests), and 84 JavaScript checks with zero skips. Format,
 deny-warning lints, release validation, and dependency advisory/license/source
-checks passed. Core checks exercise active locks, open waiters, erased state,
+checks passed. CI rejected the existing transitive `yoke-derive 0.8.3` as
+yanked; the client lockfile now selects compatible patch `0.8.4` and the native
+workspace was revalidated. Direct dependencies are unchanged. Core checks
+exercise active locks, open waiters, erased state,
 abandoned sign-in expiry, and stale completion.
 
 Native shell checks run on their respective CI platforms: macOS XCTest and the
