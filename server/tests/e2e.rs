@@ -5913,6 +5913,8 @@ async fn status_reports_receiving_sessions_and_the_days_uploads() {
         .await
         .unwrap();
     assert_eq!(fetched.status().as_u16(), 200);
+    assert_eq!(fetched.bytes().await.unwrap().as_ref(), &[1u8; 256]);
+    wait_for_grant_downloads(&client, &base, grant["grant"]["id"].as_str().unwrap(), 1).await;
     let status: Value = client
         .get(format!("{base}/api/admin/status?since=4"))
         .send()
