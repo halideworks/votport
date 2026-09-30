@@ -57,3 +57,20 @@ targets:
         CODE_SIGN_STYLE: Manual
         DEVELOPMENT_TEAM: ""
         ENABLE_HARDENED_RUNTIME: false
+  VotportTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources: [VotportTests]
+    dependencies:
+      - target: Votport
+      - package: VotportCore
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  Votport:
+    build:
+      targets:
+        Votport: all
+    test:
+      targets: [VotportTests]

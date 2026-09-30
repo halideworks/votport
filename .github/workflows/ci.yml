@@ -131,6 +131,12 @@ jobs:
           xcodebuild -project Votport.xcodeproj -scheme Votport -configuration Release \
             -derivedDataPath build ARCHS=arm64 CODE_SIGN_IDENTITY=- build
 
+      - name: Test account callback ownership
+        working-directory: client/macos
+        run: |
+          xcodebuild -project Votport.xcodeproj -scheme Votport -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath build CODE_SIGN_IDENTITY=- -only-testing:VotportTests test
+
   client-windows:
     # The client carries a QUIC push carrier, so it builds BoringSSL through
     # bindgen and nasm. This job proves it compiles and its tests build on

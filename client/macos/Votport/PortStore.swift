@@ -43,6 +43,11 @@ final class PortStore: ObservableObject {
     /// Which form a failure belongs under.
     enum Scope { case port, watch, links, deliver, agents }
 
+    enum CallError: Error {
+        case failed(PortError)
+        case stale
+    }
+
     /// The headline to show under a form, when the failure was its own.
     func problem(for scope: Scope) -> String? {
         problemScope == scope ? problem : nil
@@ -262,7 +267,7 @@ final class PortStore: ObservableObject {
             switch result {
             case .success(let listing): done(listing)
             case .failure(let error):
-                if case let .Failed(_, _, signedOut) = error, signedOut || isCurrent() {
+                if case let .failed(.Failed(_, _, signedOut)) = error, signedOut || isCurrent() {
                     self?.take(error, .deliver)
                 }
                 done(nil)
@@ -307,7 +312,7 @@ final class PortStore: ObservableObject {
         libraryUploadView = view
     }
 
-    private func finishLibraryUpload(id: UUID, result: Result<[LibraryFile], PortError>) {
+    private func finishLibraryUpload(id: UUID, result: Result<[LibraryFile], CallError>) {
         guard libraryUploadWorkerID == id else { return }
         libraryUploadWorkerID = nil
         libraryUploadActive = false
@@ -315,12 +320,8 @@ final class PortStore: ObservableObject {
         Power.libraryUpload(false)
         guard libraryUploadID == id else { return }
         if case .failure(let error) = result {
-            let outcome: String
-            if case let .Failed(headline, _, _) = error {
-                outcome = headline
-            } else {
-                outcome = String(describing: error)
-            }
+            guard case let .failed(.Failed(headline, _, _)) = error else { return }
+            let outcome = headline
             take(error, .deliver)
             guard libraryUploadID == id else { return }
             libraryUploadOutcome = outcome
@@ -418,8 +419,8 @@ final class PortStore: ObservableObject {
     /// A session the server ended clears the port so the screens fold. The
     /// scope is stamped here, at the failure, so a slow call that lands
     /// after a later one still reports under its own form.
-    private func take(_ error: PortError, _ scope: Scope) {
-        guard case let .Failed(headline, detail, signedOut) = error else { return }
+    func take(_ error: CallError, _ scope: Scope) {
+        guard case let .failed(.Failed(headline, detail, signedOut)) = error else { return }
         problem = headline
         problemScope = scope
         if signedOut { sessionEnded() }
@@ -440,10 +441,10 @@ final class PortStore: ObservableObject {
     /// Runs `work` on its own thread (a core call blocks for its round trips
     /// and through the retry budget) and hands the result to `then` on the
     /// main actor, in order.
-    private func run<T>(
+    func run<T>(
         _ scope: Scope,
         _ work: @escaping @Sendable () throws -> T,
-        then: @escaping @MainActor (Result<T, PortError>) -> Void
+        then: @escaping @MainActor (Result<T, CallError>) -> Void
     ) where T: Sendable {
         let expectedSession = sessionGeneration
         inFlight += 1
@@ -452,13 +453,13 @@ final class PortStore: ObservableObject {
         problem = nil
         problemScope = scope
         let thread = Thread {
-            let result: Result<T, PortError>
+            let result: Result<T, CallError>
             do {
                 result = .success(try work())
             } catch let error as PortError {
-                result = .failure(error)
+                result = .failure(.failed(error))
             } catch {
-                result = .failure(.Failed(headline: String(describing: error), detail: String(describing: error), signedOut: false))
+                result = .failure(.failed(.Failed(headline: String(describing: error), detail: String(describing: error), signedOut: false)))
             }
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
@@ -467,7 +468,7 @@ final class PortStore: ObservableObject {
                     store.busy = store.inFlight > 0
                     guard scope == .watch || store.sessionGeneration == expectedSession else {
                         if scope != .port {
-                            then(.failure(.Failed(headline: "The signed-in account changed; try again", detail: "The signed-in account changed", signedOut: false)))
+                            then(.failure(.stale))
                         }
                         return
                     }

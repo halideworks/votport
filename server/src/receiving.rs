@@ -363,6 +363,10 @@ impl Destinations {
         }
     }
 
+    pub(crate) fn root(&self) -> &Directory {
+        &self.root
+    }
+
     pub fn identity(&self) -> Result<StorageIdentity, String> {
         identity_of(&self.path, self.root.file())
     }

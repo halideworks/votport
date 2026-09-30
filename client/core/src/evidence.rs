@@ -499,16 +499,20 @@ pub fn retry_evidence() -> OutboxStatus {
         return OutboxStatus::default();
     };
     static RETRY: Mutex<()> = Mutex::new(());
+    retry_pass(&outbox(), &RETRY)
+}
+
+fn retry_pass(directory: &Path, pass: &Mutex<()>) -> OutboxStatus {
     // One pass holds this lock across its network round trips, seconds per
     // report. A second caller never queues behind it: it reports the outbox
     // as it stands instead, so a slow retry path cannot stall the FFI.
-    match RETRY.try_lock() {
-        Ok(_pass) => retry_in(&outbox()),
+    match pass.try_lock() {
+        Ok(_pass) => retry_in(directory),
         Err(std::sync::TryLockError::Poisoned(pass)) => {
             let _pass = pass.into_inner();
-            retry_in(&outbox())
+            retry_in(directory)
         }
-        Err(std::sync::TryLockError::WouldBlock) => outbox_status(&outbox()),
+        Err(std::sync::TryLockError::WouldBlock) => outbox_status(directory),
     }
 }
 
@@ -782,14 +786,14 @@ mod tests {
     fn a_retry_pass_in_flight_does_not_stall_the_next_call() {
         use std::io::BufRead;
         let home = tempfile::tempdir().unwrap();
-        let _state = crate::identity::test_state_dir(home.path());
+        let pass = std::sync::Arc::new(Mutex::new(()));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         enqueue(
             &base,
             report(&base, "stall", u64::MAX, EvidenceKind::Verified),
             None,
-            &outbox(),
+            home.path(),
         )
         .unwrap();
         let (accepted, in_flight) = std::sync::mpsc::channel();
@@ -811,12 +815,14 @@ mod tests {
             }
             std::thread::sleep(Duration::from_secs(8));
         });
-        let passes = std::thread::spawn(retry_evidence);
+        let directory = home.path().to_owned();
+        let worker_pass = std::sync::Arc::clone(&pass);
+        let passes = std::thread::spawn(move || retry_pass(&directory, &worker_pass));
         in_flight
             .recv_timeout(Duration::from_secs(5))
             .expect("the stalled pass never reached the server");
         let start = std::time::Instant::now();
-        let status = retry_evidence();
+        let status = retry_pass(home.path(), &pass);
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "a pass in flight stalled this caller"

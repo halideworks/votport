@@ -1575,6 +1575,21 @@ const SURVEY_DEPTH_LIMIT: usize = 128;
 /// (audit finding 373) and reports both gaps in one audit row so holdings
 /// and disk can be reconciled deliberately instead of silently disagreeing.
 pub(crate) fn survey_restored_payloads(store: &crate::store::Store, receive_dir: &Path) {
+    let destinations = crate::receiving::Destinations::configured(receive_dir, store).ok();
+    let qualified = destinations
+        .as_ref()
+        .is_some_and(|root| root.check_current().is_ok())
+        && crate::receiving::saved_qualification(store).is_ok_and(|saved| saved.is_some());
+    survey_restored_payloads_after_scan(store, receive_dir, destinations, qualified, || {});
+}
+
+fn survey_restored_payloads_after_scan(
+    store: &crate::store::Store,
+    receive_dir: &Path,
+    destinations: Option<crate::receiving::Destinations>,
+    qualified: bool,
+    after_scan: impl FnOnce(),
+) {
     if !receive_dir.try_exists().unwrap_or(false) {
         return;
     }
@@ -1607,21 +1622,24 @@ pub(crate) fn survey_restored_payloads(store: &crate::store::Store, receive_dir:
         .iter()
         .map(|(tenant, stored_as)| crate::paths::stored_components(tenant, stored_as).join("/"))
         .collect();
+    // Scan the held root so a replacement mount cannot supply a different tree.
+    let root = destinations
+        .as_ref()
+        .map(|destinations| destinations.root().clone())
+        .or_else(|| vot_platform_fs::Directory::open(receive_dir).ok());
     let mut on_disk = HashSet::new();
     let mut unreadable = Vec::new();
     let mut remaining = SURVEY_ENTRY_LIMIT;
-    let walked = collect_payload_files(
-        receive_dir,
-        "",
-        &mut on_disk,
-        &mut unreadable,
-        &mut remaining,
-        0,
-    )
-    .map_err(
-        |error| tracing::warn!(%error, "restored payload survey could not read the receive tree"),
-    )
-    .is_ok();
+    let walked = root
+        .as_ref()
+        .ok_or_else(|| io::Error::other("receive root is unavailable"))
+        .and_then(|root| {
+            collect_payload_files(root, "", &mut on_disk, &mut unreadable, &mut remaining, 0)
+        })
+        .map_err(|error| {
+            tracing::warn!(%error, "restored payload survey could not read the receive tree")
+        })
+        .is_ok();
     // A folder the service may not list (lost+found, System Volume
     // Information) says nothing about the records under it.
     let missing: Vec<&String> = referenced
@@ -1637,9 +1655,12 @@ pub(crate) fn survey_restored_payloads(store: &crate::store::Store, receive_dir:
     // live records exist, is a volume that is not there yet (unmounted, not
     // restored), not proof every payload is gone; tombstoning then would
     // erase the index permanently. Report only.
+    after_scan();
     let trusted = walked
-        && crate::receiving::saved_qualification(store).is_ok_and(|saved| saved.is_some())
-        && crate::receiving::Destinations::configured(receive_dir, store).is_ok()
+        && qualified
+        && destinations
+            .as_ref()
+            .is_some_and(|root| root.check_current().is_ok())
         && !(on_disk.is_empty() && !records.is_empty());
     // Audit finding 373: a restored record whose payload is gone would stay
     // listed, charged against quota and targeted by retention on a path that
@@ -1700,7 +1721,7 @@ pub(crate) fn survey_restored_payloads(store: &crate::store::Store, receive_dir:
 /// paths. Upload staging and the instance lease are machinery, not payloads;
 /// a receipt sidecar rides with its payload, so only the payload is named.
 fn collect_payload_files(
-    directory: &Path,
+    directory: &vot_platform_fs::Directory,
     prefix: &str,
     out: &mut HashSet<String>,
     unreadable: &mut Vec<String>,
@@ -1710,7 +1731,8 @@ fn collect_payload_files(
     if depth > SURVEY_DEPTH_LIMIT {
         return Err(std::io::Error::other("restore survey depth limit exceeded"));
     }
-    let entries = match fs::read_dir(directory) {
+    use std::os::unix::ffi::OsStrExt as _;
+    let entries = match rustix::fs::Dir::read_from(directory.file()).map_err(io::Error::from) {
         Ok(entries) => entries,
         // Below the root, a folder the service may not list is noted and
         // skipped; any other failure, or an unreadable root, stops the walk.
@@ -1723,37 +1745,48 @@ fn collect_payload_files(
         Err(error) => return Err(error),
     };
     for entry in entries {
+        let entry = entry?;
+        let leaf = std::ffi::OsStr::from_bytes(entry.file_name().to_bytes());
+        if leaf == "." || leaf == ".." {
+            continue;
+        }
         *remaining = remaining
             .checked_sub(1)
             .ok_or_else(|| std::io::Error::other("restore survey entry limit exceeded"))?;
-        let entry = entry?;
-        let metadata = fs::symlink_metadata(entry.path())?;
-        let Ok(name) = entry.file_name().into_string() else {
+        let stat = rustix::fs::statat(
+            directory.file(),
+            leaf,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )?;
+        let Some(name) = leaf.to_str() else {
             continue;
         };
-        let directory = metadata.is_dir();
-        let file = metadata.is_file();
-        if directory && (name == ".vot-stage" || crate::protocol_paths::is_push_staging_name(&name))
+        let kind = rustix::fs::FileType::from_raw_mode(stat.st_mode);
+        let is_directory = kind == rustix::fs::FileType::Directory;
+        let file = kind == rustix::fs::FileType::RegularFile;
+        if is_directory
+            && (name == ".vot-stage" || crate::protocol_paths::is_push_staging_name(name))
         {
             continue;
         }
-        if file && crate::protocol_paths::is_receipt_name(&name) {
+        if file && crate::protocol_paths::is_receipt_name(name) {
             continue;
         }
         let relative = if prefix.is_empty() {
-            name.clone()
+            name.to_owned()
         } else {
             format!("{prefix}/{name}")
         };
-        if directory {
-            collect_payload_files(
-                &entry.path(),
-                &relative,
-                out,
-                unreadable,
-                remaining,
-                depth + 1,
-            )?;
+        if is_directory {
+            let child = match directory.open_child(leaf) {
+                Ok(child) => child,
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    unreadable.push(relative);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            collect_payload_files(&child, &relative, out, unreadable, remaining, depth + 1)?;
         } else if file {
             out.insert(relative);
         }
@@ -2816,23 +2849,90 @@ mod tests {
     }
 
     #[test]
+    fn restored_survey_keeps_records_when_the_admitted_root_changes() {
+        let (root, store) = initialized_root();
+        let receive = root.path().join("received");
+        fs::create_dir(&receive).unwrap();
+        fs::write(receive.join("stray.bin"), b"first tree").unwrap();
+        store.with(|connection| connection.execute_batch(
+            "INSERT INTO files(link_id,tenant,upload_id,file_index,bytes_hi,bytes_lo,deleted,stored_as,path,suite,root,receipt)
+             VALUES ('link','','upload',0,0,1,0,'missing.bin','missing.bin','blake3','root',0)"
+        )).unwrap();
+        // Local handles exercise a pre-admitted root without requiring a NAS mount.
+        let destinations =
+            crate::receiving::Destinations::open(&receive, vot_sdk_file::NasContract::Unqualified)
+                .unwrap();
+        survey_restored_payloads_after_scan(&store, &receive, Some(destinations), true, || {
+            fs::rename(&receive, root.path().join("previous-tree")).unwrap();
+            fs::create_dir(&receive).unwrap();
+            fs::write(receive.join("missing.bin"), b"replacement tree").unwrap();
+        });
+        let live: i64 = store
+            .with(|connection| {
+                connection.query_row("SELECT COUNT(*) FROM files WHERE deleted=0", [], |row| {
+                    row.get(0)
+                })
+            })
+            .unwrap();
+        assert_eq!(live, 1, "a changed root must retain its missing record");
+        let detail = store
+            .audit_export(None, 0, 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.event == "restore_payload_mismatch")
+            .unwrap()
+            .detail;
+        assert_eq!(detail["tombstoned"], 0);
+        assert_eq!(detail["receive_tree_trusted"], false);
+        assert_eq!(detail["unreferenced"][0], "stray.bin");
+
+        let destinations =
+            crate::receiving::Destinations::open(&receive, vot_sdk_file::NasContract::Unqualified)
+                .unwrap();
+        fs::remove_file(receive.join("missing.bin")).unwrap();
+        fs::write(receive.join("stray.bin"), b"stable tree").unwrap();
+        survey_restored_payloads_after_scan(&store, &receive, Some(destinations), true, || {});
+        let live: i64 = store
+            .with(|connection| {
+                connection.query_row("SELECT COUNT(*) FROM files WHERE deleted=0", [], |row| {
+                    row.get(0)
+                })
+            })
+            .unwrap();
+        assert_eq!(
+            live, 0,
+            "a complete stable admitted tree can reconcile a miss"
+        );
+    }
+
+    #[test]
+    fn restored_survey_walk_retains_its_original_root() {
+        let parent = tempfile::tempdir().unwrap();
+        let receive = parent.path().join("received");
+        fs::create_dir(&receive).unwrap();
+        fs::write(receive.join("original.bin"), b"original").unwrap();
+        let held = vot_platform_fs::Directory::open(&receive).unwrap();
+        fs::rename(&receive, parent.path().join("previous-tree")).unwrap();
+        fs::create_dir(&receive).unwrap();
+        fs::write(receive.join("replacement.bin"), b"replacement").unwrap();
+        let mut files = HashSet::new();
+        collect_payload_files(&held, "", &mut files, &mut Vec::new(), &mut 10, 0).unwrap();
+        assert_eq!(files, HashSet::from(["original.bin".to_owned()]));
+    }
+
+    #[test]
     fn restored_payload_walk_stops_at_entry_and_depth_limits() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("payload.bin"), b"bytes").unwrap();
+        let directory = vot_platform_fs::Directory::open(directory.path()).unwrap();
         let mut files = HashSet::new();
         let mut unreadable = Vec::new();
-        assert!(collect_payload_files(
-            directory.path(),
-            "",
-            &mut files,
-            &mut unreadable,
-            &mut 0,
-            0
-        )
-        .is_err());
+        assert!(
+            collect_payload_files(&directory, "", &mut files, &mut unreadable, &mut 0, 0).is_err()
+        );
         assert!(files.is_empty());
         assert!(collect_payload_files(
-            directory.path(),
+            &directory,
             "",
             &mut files,
             &mut unreadable,
@@ -2842,7 +2942,7 @@ mod tests {
         .is_err());
         assert!(files.is_empty());
         collect_payload_files(
-            directory.path(),
+            &directory,
             "",
             &mut files,
             &mut unreadable,

@@ -114,8 +114,8 @@ jobs:
               --notes "Image: ${IMAGE}@${{ steps.image.outputs.digest }}"
           fi
 
-  # The shells build only on their own platforms. macOS minutes bill at ten
-  # times Linux and Windows at two, so both run on tags alone. Both artifacts
+  # Installer packaging runs on release tags after ordinary CI compiles the shells.
+  # macOS minutes bill at ten times Linux and Windows at two. Both artifacts
   # are unsigned until the Developer ID and the code-signing certificate
   # land: the steps that would sign are the ones marked below. Both need
   # the release job, which creates the release they upload to, so a failed
