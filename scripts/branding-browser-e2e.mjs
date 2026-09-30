@@ -7,9 +7,12 @@ const base = process.env.BASE_URL, root = process.env.WORKFLOW_TEST_ROOT;
 if (!base || !root || !process.env.ADMIN_PASSWORD) throw new Error('Use an isolated instance with BASE_URL, WORKFLOW_TEST_ROOT and ADMIN_PASSWORD.');
 const browser = await chromium.launch();
 const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, reducedMotion: 'reduce' });
-let page = await context.newPage(), errors = [];
-page.on('dialog', (dialog) => dialog.accept());
-page.on('pageerror', (error) => errors.push(error.message));
+const errors = [];
+context.on('page', (candidate) => {
+  candidate.on('dialog', (dialog) => dialog.accept());
+  candidate.on('pageerror', (error) => errors.push(error.message));
+});
+let page = await context.newPage();
 const api = apiClient(context, base);
 try {
   await api('admin/login', { password: process.env.ADMIN_PASSWORD });

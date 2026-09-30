@@ -76,11 +76,13 @@ if (browserEngine === "webkit") {
 // Starved CI runners can exceed the 30 second default for load events; the
 // suite's semantics only need the page loaded, not loaded fast.
 context.setDefaultNavigationTimeout(60000);
-let page = await context.newPage();
-page.on("dialog", (dialog) => dialog.accept());
 const errors = [];
-page.on("pageerror", (error) => errors.push(`pageerror: ${error.message}`));
-await page.addInitScript(() => {
+context.on("page", (candidate) => {
+  candidate.on("dialog", (dialog) => dialog.accept());
+  candidate.on("pageerror", (error) => errors.push(`pageerror: ${error.message}`));
+});
+let page = await context.newPage();
+await context.addInitScript(() => {
   Object.defineProperty(window, "__clipboardFailure", { value: false, writable: true });
   Object.defineProperty(window, "__clipboardHold", { value: false, writable: true });
   Object.defineProperty(window, "__releaseClipboard", { value: null, writable: true });
@@ -121,8 +123,12 @@ async function collectDownloads(action, count) {
 
 // Headless Chromium does not provide a deterministic folder chooser. Force
 // the supported anchor-download fallback so this path is exercised in CI.
-await page.addInitScript(() => {
-  Object.defineProperty(window, "showDirectoryPicker", { value: undefined, configurable: true, writable: true });
+await context.addInitScript(() => {
+  const folder = /^https?:$/.test(window.location.protocol) ? sessionStorage.getItem("votport-e2e-saved-feedback") : null;
+  Object.defineProperty(window, "showDirectoryPicker", {
+    value: folder ? async () => (await navigator.storage.getDirectory()).getDirectoryHandle(folder) : undefined,
+    configurable: true, writable: true,
+  });
 });
 
 const genericSsoError = "SSO sign-in failed. Try again or contact your administrator.";
@@ -172,8 +178,11 @@ if (await page.locator(".notification-editor > p.field-help").evaluateAll((nodes
   throw new Error("embedded notification guidance must stay quiet while editors rerender");
 }
 const armCatalogUnavailable = (candidate) => candidate.route("**/api/notifications*", (route) => route.fulfill({ status: 503, json: { error: "Notification catalog unavailable." } }), { times: 1 });
-// A retried fresh page sits at about:blank, so retry via goto instead of reload.
-page = await reloadWithInterceptRetry(page, armCatalogUnavailable, (candidate) => candidate.url() === "about:blank" ? candidate.goto(base) : candidate.reload());
+const discardedPage = page;
+page = await reloadWithInterceptRetry(page, armCatalogUnavailable, async (candidate) => {
+  if (candidate === discardedPage) throw Object.assign(new Error("Exercise replacement-page setup"), { name: "TimeoutError" });
+  await candidate.goto(base);
+});
 await page.locator("#create-notification-options").evaluate((node) => { node.open = true; });
 const notificationStatus = page.locator("#create-notifications .notification-editor > p.field-help");
 await notificationStatus.waitFor();
@@ -234,21 +243,9 @@ if (await page.getAttribute("#new-link-url", "role") !== "status"
 if (!receiveListFailed || await page.locator("#create-error").isVisible()) {
   throw new Error("a list refresh failure must not hide or fail a successfully created request link");
 }
-// The copy click runs while a one-shot links route interception is armed;
-// the Chromium Fetch-domain race can freeze the clipboard stub. One bounded
-// re-click absorbs the stall without weakening the assertion.
-// 60s: observed three runner-side stalls past 30s on loaded CI hosts where
-// the same tree passes locally and on rerun; the re-click below already
-// absorbs Chromium Fetch races, this budget absorbs host contention.
-const copySettled = async () => page.waitForFunction((url) => window.__copiedText === url
-  && document.getElementById("links-action-status").textContent === "Request link copied.", linkUrl, { timeout: 60000, polling: 50 });
 await page.click("#new-link-copy");
-try {
-  await copySettled();
-} catch {
-  await page.click("#new-link-copy");
-  await copySettled();
-}
+await page.waitForFunction((url) => window.__copiedText === url
+  && document.getElementById("links-action-status").textContent === "Request link copied.", linkUrl, { timeout: 60000, polling: 50 });
 await page.evaluate(() => { window.__clipboardFailure = true; window.__clipboardHold = true; window.__releaseClipboard = null; });
 await page.click("#new-link-copy");
 await page.waitForFunction(() => typeof window.__releaseClipboard === "function", null, { polling: 50 });
@@ -1783,9 +1780,9 @@ if (await selectedFolder.isChecked() ||
 await page.unroute("**/api/admin/outbound-files?selection=*");
 await selectedFolder.click();
 await page.waitForFunction(
-  () => document.getElementById("library-selection-status").textContent.startsWith("12 files selected") &&
-    document.querySelector('#library-files input[aria-label^="Select folder "]').checked,
-  undefined,
+  (project) => document.getElementById("library-selection-status").textContent.startsWith("12 files selected") &&
+    document.querySelector(`#library-files input[aria-label="Select folder ${CSS.escape(project)}"]`).checked,
+  PROJECT,
   { timeout: 15000 },
 );
 console.log("oversized library selection refusal keeps existing files and remains retryable: ok");
@@ -2064,9 +2061,11 @@ if (await page.evaluate(() => typeof navigator.storage?.getDirectory === "functi
   await page.evaluate(async (folder) => {
     const root = await navigator.storage.getDirectory();
     await root.getDirectoryHandle(folder, { create: true });
+    sessionStorage.setItem("votport-e2e-saved-feedback", folder);
   }, savedFeedbackFolder);
-  await page.addInitScript((folder) => {
-    window.showDirectoryPicker = async () => (await navigator.storage.getDirectory()).getDirectoryHandle(folder);
+  await page.reload();
+  await page.waitForSelector("#download-content:not([hidden])");
+  await page.evaluate(() => {
     window.__savedFeedbackStatusWrites = 0;
     window.__savedFeedbackFrameRequests = 0;
     const writablePrototype = window.FileSystemWritableFileStream?.prototype;
@@ -2124,9 +2123,7 @@ if (await page.evaluate(() => typeof navigator.storage?.getDirectory === "functi
       window.requestAnimationFrame = originalRequestFrame;
       window.cancelAnimationFrame = originalCancelFrame;
     };
-  }, savedFeedbackFolder);
-  await page.reload();
-  await page.waitForSelector("#download-content:not([hidden])");
+  });
   await page.evaluate(() => {
     window.__savedFeedbackStatusWrites = 0;
     window.__savedFeedbackFrameRequests = 0;
@@ -2199,24 +2196,17 @@ if (await page.evaluate(() => typeof navigator.storage?.getDirectory === "functi
   await page.evaluate(async (folder) => {
     const root = await navigator.storage.getDirectory();
     await root.removeEntry(folder, { recursive: true });
+    sessionStorage.removeItem("votport-e2e-saved-feedback");
   }, savedFeedbackFolder);
   console.log("saved file feedback and terminal status: ok");
 } else {
   console.log("saved file feedback: origin-private file system unavailable in this browser");
 }
-await page.addInitScript(() => window.__restoreSavedFeedbackInstrumentation?.());
-await page.addInitScript(() => {
-  Object.defineProperty(window, "showDirectoryPicker", { value: undefined, configurable: true, writable: true });
-});
 await page.reload();
 await page.waitForSelector("#download-content:not([hidden])");
 
 // Each page has its own browser automatic-download allowance.
 const stopPage = await page.context().newPage();
-stopPage.on("pageerror", (error) => errors.push(`pageerror: ${error.message}`));
-await stopPage.addInitScript(() => {
-  Object.defineProperty(window, "showDirectoryPicker", { value: undefined });
-});
 await stopPage.goto(outboundUrl, { waitUntil: 'domcontentloaded' });
 await stopPage.waitForSelector("#download-content:not([hidden])");
 let cancelledPreflightRequests = 0;
