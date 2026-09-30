@@ -1,17 +1,13 @@
-# ADR-0001: Principal identity and local state ownership
+# Principal identity and local state ownership
 
-Status: Accepted
-
-Date: 2026-09-30
-
-## Context
+## Background
 
 SQLite principal lookups fold subject strings to lowercase. OIDC `sub` must
 retain its exact provider identity; folding distinct subjects can merge their
 permissions. Desktop app and CLI processes also share private files, so
 in-process guards do not serialize journal ownership or account changes.
 
-## Decision
+## Behavior
 
 For the configured `sub` claim, derive a lowercase ASCII storage key from the
 issuer's SHA-256 and the exact UTF-8 subject's hexadecimal encoding. SCIM uses
@@ -59,7 +55,7 @@ directory. Lock failures refuse transfer admission. This prerelease requires
 clients using the current state-ownership protocol; older native clients must
 be closed and upgraded before sharing local state.
 
-## Consequences and verification
+## Limits and verification
 
 Upgrade requires signing in again. Installations using `sub` must re-provision
 SCIM users when provisioning is required, restore SCIM roles where used, and

@@ -1,10 +1,6 @@
-# ADR-0002: Concurrent Store reads and catalog publication
+# Store reads and catalog publication
 
-Status: Accepted
-
-Date: 2026-09-30
-
-## Context
+## Background
 
 The Store uses SQLite WAL with durable commits, but its single application
 mutex serialized administrative reads, timeline exports and serving checks
@@ -12,7 +8,7 @@ with mutations. Stored-file claim checks also scanned a tenant's live rows.
 Independent catalog publications and cache lookups could wait for unrelated
 catalog writes or a cache-sidecar fsync.
 
-## Decision
+## Behavior
 
 Keep the existing serialized writer and its transaction boundaries. Add four
 reusable read-only SQLite connections. A short pool mutex and condition
@@ -40,7 +36,7 @@ serializes snapshots under a separate persistence mutex, releases the lookup
 mutex before disk I/O, and clears dirty state only if the saved generation
 still owns the current entries.
 
-## Consequences and verification
+## Limits and verification
 
 SQLite still permits one writer at a time. The application removes its extra
 read/write serialization without changing atomic mutation or authorization
@@ -54,7 +50,7 @@ after errors and panics, indexed query plans, concurrent catalog publication,
 and changes arriving during cache persistence. The isolated benchmark compares
 the same 100,000-file database with and without the claim index and compares
 the old writer mutex with the read pool under eight reader threads and durable
-writes. Measurements are recorded in the [follow-up report](../scalability-2026-09-30.md).
+writes. Measurements are recorded in the [follow-up report](scalability-2026-09-30.md).
 
 SQLite's [WAL documentation](https://sqlite.org/wal.html) and
 [isolation documentation](https://sqlite.org/isolation.html) describe the

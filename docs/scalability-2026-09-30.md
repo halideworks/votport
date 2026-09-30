@@ -31,10 +31,9 @@ machinery is added for clients predating the shared state lease.
   session after cancellation, including completion committed before its UI
   callback. Stale failures cannot clear a replacement session or its problem.
 
-The Store and catalog decisions are recorded in
-[ADR-0002](adr/0002-concurrent-store-reads-and-catalog-publication.md).
-Local-state ownership is recorded in
-[ADR-0001](adr/0001-principal-identity-and-local-state.md).
+[Store concurrency](store-concurrency.md) documents read snapshots and catalog
+publication. [Identity and local state](identity-and-local-state.md) documents
+principal keys and cross-process ownership. ADRs are maintained only in VOT.
 
 ## Measurements
 
