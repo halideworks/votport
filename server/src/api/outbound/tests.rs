@@ -7537,3 +7537,26 @@ async fn library_preparation_status_is_authenticated_bounded_and_tenant_scoped()
         "unavailable"
     );
 }
+
+#[tokio::test]
+async fn unauthenticated_library_preparation_status_never_reads_the_body() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = crate::api::testing::build(directory.path());
+    let read = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = Arc::clone(&read);
+    let stream = futures_util::stream::once(async move {
+        observed.store(true, Ordering::SeqCst);
+        Err::<Bytes, _>(io::Error::other("anonymous body was read"))
+    });
+    let response = router(app)
+        .oneshot(
+            Request::post("/api/admin/outbound-files/preparation-status")
+                .header("content-type", "application/json")
+                .body(Body::from_stream(stream))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(!read.load(Ordering::SeqCst));
+}

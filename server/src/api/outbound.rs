@@ -694,16 +694,19 @@ pub struct OutboundPathQuery {
 }
 
 #[derive(Deserialize)]
-pub struct LibraryPreparationQuery {
+struct LibraryPreparationQuery {
     paths: Vec<String>,
 }
 
 pub async fn library_preparation_status(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
-    Json(query): Json<LibraryPreparationQuery>,
+    request: Request,
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = admin::require_operator(&app, &headers)?;
+    let Json(query) = Json::<LibraryPreparationQuery>::from_request(request, &app)
+        .await
+        .map_err(|error| ApiError::new(error.status(), error.body_text()))?;
     let operation = begin_outbound_operation_owned(&app, &identity.tenant)?;
     if query.paths.len() > MAX_LIBRARY_DIRECTORY_ENTRIES
         || query
