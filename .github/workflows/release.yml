@@ -10,7 +10,28 @@ permissions:
   packages: write
 
 jobs:
+  verify-ci:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: Require the exact main commit and green CI
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          python3 scripts/check_release_ci.py
+
   release:
+    needs: verify-ci
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:

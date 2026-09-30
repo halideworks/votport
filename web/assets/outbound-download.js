@@ -41,6 +41,12 @@ export function batchDownloadEligible(files) {
     (files.length > 1 && files.some((file) => file.bytes >= BATCH_LARGE_FILE_BYTES));
 }
 
+function writeChunk(writable, bytes) {
+  // WebKit writable streams can consume the whole buffer behind a typed view.
+  return writable.write(bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
+    ? bytes : bytes.slice());
+}
+
 export async function saveBatchFiles(response, directory, files, names, onComplete) {
   if (!response?.body) throw new BatchDownloadUnsupportedError('batch streaming unavailable');
   const contentType = response.headers?.get?.('content-type')?.split(';', 1)[0].trim().toLowerCase();
@@ -72,7 +78,7 @@ export async function saveBatchFiles(response, directory, files, names, onComple
           const chunk = await nextBytes();
           if (!chunk) throw new Error('batch response truncated');
           const length = Math.min(chunk.length, remaining);
-          await writable.write(chunk.subarray(0, length));
+          await writeChunk(writable, chunk.subarray(0, length));
           pendingOffset += length;
           remaining -= length;
         }
@@ -162,7 +168,7 @@ export async function streamToWritable(fetchFn, writable, file, options = {}) {
           if (value.byteLength > file.bytes - written) {
             throw new Error('download response exceeds the file size');
           }
-          await writable.write(value);
+          await writeChunk(writable, value);
           written += value.byteLength;
         }
         if (written !== file.bytes) {

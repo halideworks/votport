@@ -1037,12 +1037,26 @@ fn quota_trigger_sql() -> String {
     )
 }
 
+pub(crate) const MAX_AUTOMATION_TOKENS_PER_TENANT: u64 = 100;
+
 /// Audit rows the store failed to persist since boot; exported on /metrics.
 pub static AUDIT_INSERT_FAILURES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+type AllocationLock = Arc<(Mutex<bool>, std::sync::Condvar)>;
+
+pub(crate) struct UploadAllocation(AllocationLock);
+
+impl Drop for UploadAllocation {
+    fn drop(&mut self) {
+        let (held, available) = self.0.as_ref();
+        *held.lock().expect("upload allocation poisoned") = false;
+        available.notify_one();
+    }
+}
+
 pub struct Store {
-    pub(crate) upload_allocation: Mutex<()>,
+    upload_allocations: Mutex<HashMap<String, AllocationLock>>,
     connection: Mutex<Connection>,
     pub(crate) event_signer: std::sync::Arc<crate::receipt::ReceiptSigner>,
     path: PathBuf,
@@ -1167,7 +1181,7 @@ impl Store {
             .and_then(|directory| directory.sync_all())
             .map_err(|error| format!("sync {}: {error}", data_dir.display()))?;
         let store = Self {
-            upload_allocation: Mutex::new(()),
+            upload_allocations: Mutex::new(HashMap::new()),
             connection: Mutex::new(connection),
             event_signer: std::sync::Arc::new(crate::receipt::ReceiptSigner::load_or_create(
                 data_dir,
@@ -1224,14 +1238,16 @@ impl Store {
         })
     }
 
-    pub fn insert_automation_token(&self, token: AutomationToken) -> Result<(), String> {
+    pub fn insert_automation_token(&self, token: AutomationToken) -> Result<bool, String> {
         self.with(|connection| {
             connection
                 .execute(
                     "INSERT INTO automation_tokens
                          (id, token_hash, tenant, label, created_at, expires_at, revoked_at,
                           last_used_at, directory, permissions, created_by)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
+                     WHERE ?7 IS NOT NULL OR ?6 <= ?12 OR
+                       (SELECT count(*) FROM automation_tokens WHERE tenant=?3 AND revoked_at IS NULL AND expires_at>?12) < ?13",
                     rusqlite::params![
                         token.id,
                         token.token_hash,
@@ -1248,9 +1264,11 @@ impl Store {
                         token.directory,
                         serde_json::to_string(&token.permissions).unwrap(),
                         token.created_by,
+                        now_unix() as i64,
+                        MAX_AUTOMATION_TOKENS_PER_TENANT as i64,
                     ],
                 )
-                .map(|_| ())
+                .map(|changed| changed > 0)
         })
     }
 
@@ -1790,6 +1808,26 @@ impl Store {
         self.with(|connection| read_upload(connection, tenant, link_id, upload_id))
     }
 
+    pub(crate) fn upload_allocation(&self, tenant: &str) -> UploadAllocation {
+        let lock = {
+            let mut locks = self
+                .upload_allocations
+                .lock()
+                .expect("upload allocations poisoned");
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+            Arc::clone(locks.entry(tenant.to_owned()).or_default())
+        };
+        let (held, available) = lock.as_ref();
+        let mut held = available
+            .wait_while(held.lock().expect("upload allocation poisoned"), |held| {
+                *held
+            })
+            .expect("upload allocation poisoned");
+        *held = true;
+        drop(held);
+        UploadAllocation(lock)
+    }
+
     /// Stored names among `candidates` that a live record still claims under
     /// a different object identity (audit finding 373). After a restore a
     /// resurrected record can hold a name whose bytes a later upload
@@ -1805,36 +1843,38 @@ impl Store {
         if candidates.is_empty() {
             return Ok(Default::default());
         }
-        let names: Vec<String> = candidates.iter().map(|(name, _, _)| name.clone()).collect();
-        let names = serde_json::to_string(&names).map_err(|e| e.to_string())?;
-        let claimed: Vec<String> = self.with(|connection| {
-            connection
-                .prepare(
-                    "SELECT DISTINCT stored_as FROM files
-                     WHERE tenant=?1 AND deleted=0
-                       AND stored_as IN (SELECT value FROM json_each(?2))",
-                )?
-                .query_map(rusqlite::params![tenant, names], |row| row.get(0))?
-                .collect()
-        })?;
-        let mut conflicts = std::collections::HashSet::new();
+        let mut identities: std::collections::HashMap<
+            &str,
+            std::collections::HashSet<(&str, &str)>,
+        > = Default::default();
         for (name, suite, root) in candidates {
-            if !claimed.contains(name) {
-                continue;
-            }
-            let foreign: bool = self.with(|connection| {
-                connection.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM files WHERE tenant=?1 AND stored_as=?2
-                     AND deleted=0 AND NOT (suite=?3 AND root=?4))",
-                    rusqlite::params![tenant, name, suite, root],
-                    |row| row.get(0),
-                )
-            })?;
-            if foreign {
-                conflicts.insert(name.clone());
-            }
+            identities.entry(name).or_default().insert((suite, root));
         }
-        Ok(conflicts)
+        let names = serde_json::to_string(&identities.keys().collect::<Vec<_>>())
+            .map_err(|error| error.to_string())?;
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT stored_as, suite, root FROM files WHERE tenant=?1 AND deleted=0
+                 AND stored_as IN (SELECT value FROM json_each(?2))",
+            )?;
+            let rows = statement.query_map(rusqlite::params![tenant, names], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut conflicts = std::collections::HashSet::new();
+            for row in rows {
+                let (name, suite, root) = row?;
+                if identities.get(name.as_str()).is_some_and(|expected| {
+                    expected.len() > 1 || !expected.contains(&(suite.as_str(), root.as_str()))
+                }) {
+                    conflicts.insert(name);
+                }
+            }
+            Ok(conflicts)
+        })
     }
 
     pub(crate) fn delivered_candidates(
@@ -3379,6 +3419,33 @@ impl Store {
         }
     }
 
+    pub(crate) fn migrate_oidc_subjects(&self, issuer: &str) -> Result<(), String> {
+        use sha2::{Digest as _, Sha256};
+        let issuer_hash = hex::encode(Sha256::digest(issuer.as_bytes()));
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let changed = transaction
+            .execute(
+                "INSERT INTO meta(key,value) VALUES ('oidc-sub-v2-current-issuer',?1)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE value<>excluded.value",
+                [&issuer_hash],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed > 0 {
+            transaction.execute(
+                "UPDATE automation_tokens SET revoked_at=?1 WHERE revoked_at IS NULL AND lower(created_by) IN (SELECT lower(subject) FROM principals WHERE subject <> 'local')",
+                [now_unix() as i64],
+            ).map_err(|error| error.to_string())?;
+            transaction.execute(
+                "UPDATE principals SET blocked=1,credential_version=credential_version+1,external_id=NULL WHERE subject <> 'local'",
+                [],
+            ).map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
     pub fn revoke_principal(&self, subject: &str) -> Result<bool, String> {
         let at = i64::try_from(now_unix()).unwrap_or(i64::MAX);
         let mut connection = self.connection.lock().expect("store poisoned");
@@ -3452,12 +3519,15 @@ impl Store {
                 [subject],
             )
             .map_err(|error| error.to_string())?;
-        transaction
-            .execute(
-                "DELETE FROM scim_group_members WHERE lower(subject) = lower(?1)",
-                [subject],
-            )
-            .map_err(|error| error.to_string())?;
+        if changed > 0 {
+            transaction
+                .execute(
+                    "DELETE FROM scim_group_members WHERE lower(subject) = lower(?1)",
+                    [subject],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(changed > 0)
     }

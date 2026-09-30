@@ -6088,7 +6088,10 @@ mod principals_api_tests {
     fn payload_cv(set_cookie: &str) -> u64 {
         let token = cookie_token(set_cookie);
         let payload_hex = token.split('.').nth(1).unwrap();
-        let payload = hex::decode(payload_hex).unwrap();
+        use base64::Engine as _;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload_hex)
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&payload).unwrap();
         json["cv"].as_u64().unwrap()
     }

@@ -436,6 +436,13 @@ Disabled storage and notification destinations retain their saved credentials.
 Restore still loads the archived users, roles and administrator password;
 review access and reconcile the file volumes before enabling links or retention.
 
+The boot survey automatically tombstones missing payload records only when the
+restored database contains a NAS qualification matching the mounted storage.
+Unqualified local directories report mismatches and retain records for operator
+reconciliation. Surveys stop after 100,000 live records or filesystem entries,
+or 128 directory levels; incomplete surveys retain every record and report the
+limit or incomplete walk in the audit log.
+
 Restore creates a fresh cookie-signing key and signs out existing sessions.
 Plan to sign in again after restart. Archives use format version 2; older
 archives containing a cookie-signing secret are refused. Create a new backup
@@ -550,7 +557,35 @@ using SCIM group display names in Votport's group settings.
 
 votport serves SCIM 2.0 Users and Groups at `/scim/v2` (RFC 7643 and RFC 7644): `ServiceProviderConfig`, `Schemas`, `ResourceTypes`, `GET`, `POST` `/Groups` with the filters `displayName eq "value"` and `externalId eq "value"`, `GET`, `PUT`, `PATCH`, `DELETE /Groups/{id}` (members by user id; PATCH takes the Okta and Entra shapes: add or replace with a member list, remove by `members[value eq "id"]` or by list, and a pathless replace with a value object), `GET /Users` with the filters `userName eq "value"` and `externalId eq "value"` and `startIndex`/`count` paging, `POST /Users`, and `GET`, `PUT`, `PATCH`, `DELETE /Users/{id}`. The bearer token is `VOTPORT_SCIM_TOKEN` or the value saved under System > Sign-in (the stored value wins; clear it to disable the endpoint). Every route answers 401 until a token is set. A saved token is stored as a SHA-256 digest, never in clear; the env value is compared as given. Saving a new token moves the old digest to a previous slot that stays accepted, while a current token exists, until **Clear previous token** is pressed, so the provider can be switched over without a gap; clearing the current token turns the endpoint off whatever the previous slot holds; a request with the previous token is logged as `scim_previous_token_used`. Failed bearers count against the client address the way failed admin passwords do and lock that address out for a minute after a burst; every SCIM mutation is audited with the client address (`ip` in the detail, honoring `VOTPORT_TRUSTED_PROXIES`).
 
-A user's `userName` is the principal subject, so it must equal the claim the OIDC sign-in uses as the subject: that is the row the sign-in path looks up and the row SCIM deactivates. Subjects are matched and stored case-insensitively: `userName` and the sign-in subject are folded to lowercase, so the provider may send any case, and the stored (displayed) form is lowercase because no separate display column is kept. Rows stored with mixed case by earlier versions still resolve by any case and converge to the folded form the next time that row is written; until then two rows differing only by case can coexist, and a delete by either spelling revokes both. `VOTPORT_OIDC_SUBJECT_CLAIM` chooses that claim: `sub` (the default), `email`, or `preferred_username`, read from the id token and then from userinfo. The userinfo `sub` is still checked against the verified id token whichever claim is chosen. `email` trusts the provider's email attribute: an id token or userinfo document that says `email_verified: false` is refused, one that omits the flag (Entra) is accepted, so where users can edit their own email at the provider, choose `preferred_username` or `sub`. Okta and Entra both send the user's login as SCIM `userName` and as `preferred_username` (Entra: the UPN) or `email`, so set the claim to match the provisioning app's `userName` mapping. Authentik emits `preferred_username` and `email` as well. `externalId` is stored and searchable (`filter=externalId eq "..."`) so a provider can reconcile by its own id.
+A user's `userName` must equal the claim selected for OIDC sign-in. With the
+default `sub` claim, the exact bytes and the configured issuer identify the
+principal: case and whitespace are significant. Internal user IDs use the
+`oidc-sub-v2:` namespace; SCIM shows the original subject as `userName` for the
+current issuer. Project membership and SCIM group members use the returned user
+ID, not a reconstructed username. Email and preferred username retain their
+trimmed, lowercase identity convention.
+
+Upgrading an installation configured with `sub` quarantines its legacy nonlocal
+principals on the initial cutover and every issuer change. Their credential
+versions advance, automation tokens are revoked, and external IDs are cleared
+so SCIM can provision the exact new identities. Re-provision users when SCIM
+provisioning is required, and restore SCIM group memberships where they supply
+roles. Otherwise the next OIDC login creates the new principal and OIDC group
+claims can supply roles. Update explicit project member IDs. Pending and
+retrying jobs belonging to legacy credential versions cannot progress and
+require review and replacement. Previously released delivery links remain
+usable under their existing grant and project policy; revoke them explicitly if
+the identity cutover requires withdrawing earlier deliveries. Changing issuer
+also quarantines prior issuer identities. All previous admin cookies expire at
+this upgrade, including the local admin's; sign in again. Use the local
+password to perform migration administration. With email or preferred username,
+this principal migration does not run.
+
+Browser session cookies use compact base64url payloads. Accounts whose full
+cookie exceeds 4096 bytes receive an explicit sign-in error; reduce the account's
+tenant group memberships before retrying.
+
+`VOTPORT_OIDC_SUBJECT_CLAIM` chooses that claim: `sub` (the default), `email`, or `preferred_username`, read from the id token and then from userinfo. The userinfo `sub` is still checked against the verified id token whichever claim is chosen. `email` trusts the provider's email attribute: an id token or userinfo document that says `email_verified: false` is refused, one that omits the flag (Entra) is accepted, so where users can edit their own email at the provider, choose `preferred_username` or `sub`. Okta and Entra both send the user's login as SCIM `userName` and as `preferred_username` (Entra: the UPN) or `email`, so set the claim to match the provisioning app's `userName` mapping. Authentik emits `preferred_username` and `email` as well. `externalId` is stored and searchable (`filter=externalId eq "..."`) so a provider can reconcile by its own id.
 
 `VOTPORT_SCIM_REQUIRE_PROVISIONING=1`, or the **Require SCIM provisioning** toggle under System > Sign-in, refuses SSO sign-in for a subject with no principal row, which makes the provisioning system the source of truth for who may enter. Rows created by earlier sign-ins count as provisioned. The local password is unaffected.
 

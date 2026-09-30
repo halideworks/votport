@@ -290,10 +290,15 @@ pub(crate) fn issue_admin_cookie(
     let ttl = expires.saturating_sub(now);
     let token =
         auth::issue_admin_token_until(&app.secret, identity, &admin_token_phc(app)?, expires);
-    Ok(format!(
+    let cookie = format!(
         "{ADMIN_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ttl}{}",
         cookie_attributes(app)
-    ))
+    );
+    if cookie.len() > 4096 {
+        return Err(ApiError::new(StatusCode::UNPROCESSABLE_ENTITY,
+            "This account has too many tenant grants for a browser session. Reduce its tenant group memberships."));
+    }
+    Ok(cookie)
 }
 
 /// Cookie attributes for non-admin cookies too (Secure behind https).
@@ -4218,6 +4223,9 @@ pub async fn update_link(
         .map_err(ApiError::internal)?;
     if !found {
         return Err(ApiError::not_found());
+    }
+    if !active {
+        app.sessions.cancel_pushes_for_link(&id);
     }
     tracing::info!(target: "audit", event = "link_active_changed", id = %id, active, "request link toggled");
     app.store.audit(

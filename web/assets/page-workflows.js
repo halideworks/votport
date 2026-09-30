@@ -17,6 +17,28 @@ const loaded = new Set();
 const session = await requireSession();
 const admin = session.role === 'admin';
 const draftKey = `votport-workflow-draft:${JSON.stringify([session.subject, session.tenant])}`;
+let pendingRequest;
+function readRequestDraft() {
+  if (pendingRequest !== undefined) return pendingRequest;
+  let saved = null;
+  try { saved = JSON.parse(sessionStorage.getItem(draftKey) || 'null'); } catch { /* Storage can be blocked or contain a damaged draft. */ }
+  const validTime = (value) => (value === null || value === undefined) || (Number.isFinite(value) && Math.abs(value) <= 8640000000000);
+  pendingRequest = saved && typeof saved.operation_id === 'string' && saved.operation_id.length > 0
+    && typeof saved.project_id === 'string' && typeof saved.label === 'string'
+    && Number.isFinite(saved.expires_days) && saved.metadata && typeof saved.metadata === 'object' && !Array.isArray(saved.metadata)
+    && Object.values(saved.metadata).every((value) => typeof value === 'string')
+    && Array.isArray(saved.recipients) && saved.recipients.every((value) => typeof value === 'string')
+    && validTime(saved.not_before) && validTime(saved.deadline) ? saved : null;
+  if (!pendingRequest) writeRequestDraft(null);
+  return pendingRequest;
+}
+function writeRequestDraft(request) {
+  pendingRequest = request;
+  try {
+    if (request) sessionStorage.setItem(draftKey, JSON.stringify(request));
+    else sessionStorage.removeItem(draftKey);
+  } catch { /* Keep the operation ID in memory when storage is unavailable. */ }
+}
 const initialFilters = new URLSearchParams(window.location.search);
 let jobsLoading = false, committedFilters = '';
 let jobFilter = { q: initialFilters.get('q') || '', project: initialFilters.get('project') || '', state: initialFilters.get('state') || '' };
@@ -116,7 +138,7 @@ async function newDelivery(id) {
   $('workflow-create').hidden = false;
   if (id) $('workflow-project').value = id;
   else if (projects.length === 1) $('workflow-project').value = projects[0].id;
-  const saved = JSON.parse(sessionStorage.getItem(draftKey) || 'null');
+  const saved = readRequestDraft();
   if (saved) {
     $('workflow-project').value = saved.project_id; $('workflow-label').value = saved.label; $('workflow-days').value = saved.expires_days;
     for (const [field, timestamp] of [['start', saved.not_before], ['deadline', saved.deadline]]) {
@@ -158,7 +180,7 @@ function renderProjects() {
 }
 
 const fields = {
-  members: [{ key: 'subject', label: 'Email or agent ID', list: 'wp-agent-subjects', max: 500 }, { key: 'role', label: 'Role', options: ['sender', 'approver', 'viewer'] }],
+  members: [{ key: 'subject', label: 'Principal or agent ID', list: 'wp-agent-subjects', max: 600 }, { key: 'role', label: 'Role', options: ['sender', 'approver', 'viewer'] }],
   recipients: [{ key: 'email', label: 'Email', type: 'email', max: 254 }, { key: 'holder', label: 'Device public key', pattern: '[0-9a-fA-F]{64}', max: 64 }],
   metadata: [{ key: 'key', label: 'Field name', max: 100 }],
 };
@@ -361,18 +383,18 @@ form('workflow-create', async () => {
   const request = { ...(notifications ? { notifications } : {}), project_id: value('workflow-project'), label: value('workflow-label'), expires_days: Number(value('workflow-days')),
     metadata: Object.fromEntries([...$('workflow-metadata').querySelectorAll('input')].map((input) => [input.dataset.key, input.value])), recipients,
     not_before: localTime('workflow-start'), deadline: localTime('workflow-deadline'), import: value('workflow-import') ? { storage_id: value('workflow-import'), prefix: value('workflow-prefix') } : null };
-  const saved = JSON.parse(sessionStorage.getItem(draftKey) || 'null'); request.operation_id = saved?.operation_id || crypto.randomUUID();
+  const saved = readRequestDraft(); request.operation_id = saved?.operation_id || crypto.randomUUID();
   if (saved && JSON.stringify(request) !== JSON.stringify(saved)) { $('workflow-new-operation').hidden = false; throw new Error('A previous request is still pending. Retry its original fields, or discard the pending draft before changing this delivery.'); }
-  sessionStorage.setItem(draftKey, JSON.stringify(request));
+  writeRequestDraft(request);
   $('workflow-result').textContent = 'Creating delivery…';
   let issued;
   try { issued = await api('/api/workflows/jobs', { method: 'POST', body: JSON.stringify(request) }); }
   catch (error) {
-    if (!saved && error.status >= 400 && error.status < 500) sessionStorage.removeItem(draftKey);
-    $('workflow-new-operation').hidden = !sessionStorage.getItem(draftKey); $('workflow-result').textContent = '';
+    if (!saved && error.status >= 400 && error.status < 500) writeRequestDraft(null);
+    $('workflow-new-operation').hidden = !readRequestDraft(); $('workflow-result').textContent = '';
     throw error;
   }
-  markFormSaved($('workflow-create')); sessionStorage.removeItem(draftKey); $('workflow-create').hidden = true; $('workflow-create').reset(); $('workflow-result').textContent = '';
+  markFormSaved($('workflow-create')); writeRequestDraft(null); $('workflow-create').hidden = true; $('workflow-create').reset(); $('workflow-result').textContent = '';
   notice(`“${issued.job.request.label}” was created. Follow its progress below.`); await refreshJobs();
 });
 form('workflow-save-project', async () => {
@@ -472,7 +494,7 @@ $('workflow-close-project').onclick = () => { if (!discardForm($('workflow-save-
 $('workflow-new-project').onclick = () => editProject(); $('workflow-new-project').hidden = !admin;
 $('workflow-project').onchange = projectFields;
 $('workflow-import').onchange = () => { $('workflow-prefix-field').hidden = !value('workflow-import'); };
-$('workflow-new-operation').onclick = () => { sessionStorage.removeItem(draftKey); $('workflow-new-operation').hidden = true; $('workflow-result').textContent = 'Ready to create a new delivery.'; };
+$('workflow-new-operation').onclick = () => { writeRequestDraft(null); $('workflow-new-operation').hidden = true; $('workflow-result').textContent = 'Ready to create a new delivery.'; };
 $('workflow-refresh').onclick = () => guard(async () => { await refreshProjects(); await refreshJobs(); }); $('workflow-more').onclick = () => guard(() => refreshJobs(true));
 $('wp-label').oninput = () => { if (!editingProject && autoProjectId) $('wp-id').value = value('wp-label').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 100); };
 $('wp-id').oninput = () => { autoProjectId = false; };

@@ -25,6 +25,7 @@ public sealed partial class WorkflowsPage : Page
     private string operation = Guid.NewGuid().ToString();
     private string? cursor;
     private bool busy;
+    private long sessionGeneration = -1;
 
     public WorkflowsPage()
     {
@@ -50,6 +51,14 @@ public sealed partial class WorkflowsPage : Page
 
     private void RebuildForSession()
     {
+        var currentSession = PortStore.Shared.SessionGeneration;
+        if (currentSession != sessionGeneration)
+        {
+            sessionGeneration = currentSession;
+            projects = Array.Empty<WorkflowProject>(); cursor = null;
+            project.Items.Clear(); jobs.Children.Clear(); metadata.Children.Clear(); recipients.Children.Clear(); evidence.Children.Clear();
+            label.Text = ""; days.Text = "7"; problem.Text = ""; operation = Guid.NewGuid().ToString();
+        }
         var signedInNow = PortStore.Shared.SignedIn;
         signedIn.Visibility = signedInNow ? Visibility.Visible : Visibility.Collapsed;
         if (!signedInNow || signedInBuilt) return;
@@ -78,15 +87,17 @@ public sealed partial class WorkflowsPage : Page
     private async Task Run(Func<Task> action)
     {
         if (busy) return;
+        var expectedSession = PortStore.Shared.SessionGeneration;
         busy = true; problem.Text = "";
         try { await action(); }
         catch (PortException.Failed error)
         {
+            if (PortStore.Shared.SessionGeneration != expectedSession) return;
             problem.Text = error.headline;
             // The call ran outside the store, so its signed-out fold is ours.
             if (error.signedOut) PortStore.Shared.SessionEnded();
         }
-        catch (Exception error) { problem.Text = error.Message; }
+        catch (Exception error) { if (PortStore.Shared.SessionGeneration == expectedSession) problem.Text = error.Message; }
         finally { busy = false; }
     }
     private static void Copy(string value)
@@ -95,10 +106,13 @@ public sealed partial class WorkflowsPage : Page
     }
     private async Task Refresh()
     {
+        var expectedSession = PortStore.Shared.SessionGeneration;
         await LoadEvidence();
-        if (!PortStore.Shared.SignedIn) return;
+        if (PortStore.Shared.SessionGeneration != expectedSession || !PortStore.Shared.SignedIn) return;
         var selected = (project.SelectedItem as ComboBoxItem)?.Tag as string;
-        projects = await Task.Run(VotportClientCoreMethods.WorkflowProjects);
+        var loadedProjects = await Task.Run(VotportClientCoreMethods.WorkflowProjects);
+        if (PortStore.Shared.SessionGeneration != expectedSession) return;
+        projects = loadedProjects;
         project.Items.Clear();
         foreach (var item in projects) project.Items.Add(new ComboBoxItem { Content = item.Label, Tag = item.Id });
         project.SelectedIndex = Math.Max(0, projects.ToList().FindIndex(item => item.Id == selected));
@@ -115,6 +129,7 @@ public sealed partial class WorkflowsPage : Page
     }
     private async Task Create()
     {
+        var expectedSession = PortStore.Shared.SessionGeneration;
         var id = (project.SelectedItem as ComboBoxItem)?.Tag as string;
         if (id is null || string.IsNullOrWhiteSpace(label.Text) || !ulong.TryParse(days.Text, out var expiry) || expiry is < 1 or > 365) throw new InvalidOperationException("Choose a project, label and expiry from 1 to 365 days.");
         var fields = metadata.Children.OfType<TextBox>().ToDictionary(item => (string)item.Tag, item => item.Text);
@@ -122,14 +137,17 @@ public sealed partial class WorkflowsPage : Page
         var selected = recipients.Children.OfType<CheckBox>().Where(item => item.IsChecked == true).Select(item => (string)item.Tag).ToArray();
         var spec = new WorkflowJobSpec(operation, id, label.Text.Trim(), fields, selected, expiry, null, null);
         var issued = await Task.Run(() => VotportClientCoreMethods.CreateWorkflowJob(spec));
+        if (PortStore.Shared.SessionGeneration != expectedSession) return;
         operation = Guid.NewGuid().ToString();
         problem.Text = $"Job {issued.Id}: {issued.State.Replace('_', ' ')}. Refresh to follow its progress.";
         await LoadJobs(false);
     }
     private async Task LoadJobs(bool more)
     {
+        var expectedSession = PortStore.Shared.SessionGeneration;
         if (more && cursor is null) return;
         var page = await Task.Run(() => VotportClientCoreMethods.WorkflowJobs(more ? cursor : null));
+        if (PortStore.Shared.SessionGeneration != expectedSession) return;
         cursor = page.Next;
         if (!more) jobs.Children.Clear();
         foreach (var job in page.Jobs)
@@ -156,17 +174,22 @@ public sealed partial class WorkflowsPage : Page
     }
     private async Task Change(WorkflowJob job, string action)
     {
+        var expectedSession = PortStore.Shared.SessionGeneration;
         if (action != "retry")
         {
             var dialog = new ContentDialog { XamlRoot = XamlRoot, Title = action == "approve" ? "Approve delivery" : "Cancel delivery", Content = action == "approve" ? $"Release {job.Label} with manifest {job.Manifest}?" : "Stop downloads here and request revocation at connected ports? Independent copies remain.", PrimaryButtonText = action == "approve" ? "Approve" : "Cancel job", CloseButtonText = "Back" };
             if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
         }
+        if (PortStore.Shared.SessionGeneration != expectedSession) return;
         await Task.Run(() => VotportClientCoreMethods.ChangeWorkflowJob(job.Id, action, job.Manifest));
+        if (PortStore.Shared.SessionGeneration != expectedSession) return;
         await LoadJobs(false);
     }
     private async Task LoadEvidence()
     {
+        var expectedSession = PortStore.Shared.SessionGeneration;
         var records = await Task.Run(VotportClientCoreMethods.DeliveryVerifications);
+        if (PortStore.Shared.SessionGeneration != expectedSession) return;
         evidence.Children.Clear();
         if (!records.Any()) evidence.Children.Add(Text("Verified deliveries received on this device will appear here."));
         foreach (var record in records)
@@ -180,6 +203,7 @@ public sealed partial class WorkflowsPage : Page
             {
                 var dialog = new ContentDialog { XamlRoot = XamlRoot, Title = "Accept verified delivery", Content = $"Confirm you reviewed and accept manifest {record.Manifest}?", PrimaryButtonText = "Accept", CloseButtonText = "Back" };
                 if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
+                if (PortStore.Shared.SessionGeneration != expectedSession) return;
                 await Task.Run(() => VotportClientCoreMethods.AcceptDelivery(record.Id)); await LoadEvidence();
             }));
             evidence.Children.Add(row);

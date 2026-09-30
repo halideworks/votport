@@ -9,16 +9,16 @@
 #   FENCE_CMD='ssh -o ConnectTimeout=5 live "cd /srv/votport && docker compose stop votport"' \
 #   UNFENCE_CMD='ssh -o ConnectTimeout=5 live "cd /srv/votport && docker compose start votport"' \
 #   PROMOTE_CMD='ssh standby "cd /srv/votport && docker compose --profile standby stop && docker compose --profile live up -d"' \
+#   PROMOTION_STOP_CMD='ssh standby "cd /srv/votport && docker compose --profile live stop votport"' \
 #   REPOINT_CMD='ssh proxy "sed -i s/10.0.0.5/10.0.0.6/ /etc/caddy/Caddyfile && caddy reload --config /etc/caddy/Caddyfile"' \
 #   ops/failover/watch.sh
 #
 # The watcher arms only after one successful probe, so a wrong URL cannot
-# fence a healthy instance. A fence that fails (the host is dead) is logged
-# and promotion proceeds, but a holder of the shared receive-root kernel
-# lock prevents the new instance from booting. Heartbeat age cannot release
-# that lock. Run one watcher, and not on the live host.
+# fence a healthy instance. A failed fence stops promotion: replica roots
+# do not share a kernel lease. Run one watcher, and not on the live host.
 #
-# A promote that fails after the fence is rolled back: UNFENCE_CMD (the
+# A failed promote is rolled back only after PROMOTION_STOP_CMD succeeds.
+# UNFENCE_CMD (the
 # inverse of FENCE_CMD) restarts the previously-live instance, the rollback
 # is logged loudly, and the script exits non-zero. The proxy is never
 # repointed before the promoted instance holds the lease, so a failed
@@ -43,6 +43,7 @@ command -v python3 >/dev/null 2>&1 || {
 : "${FENCE_CMD:?FENCE_CMD is required}"
 : "${UNFENCE_CMD:?UNFENCE_CMD is required: the inverse of FENCE_CMD, run to restart the old live when a promote fails}"
 : "${PROMOTE_CMD:?PROMOTE_CMD is required}"
+PROMOTION_STOP_CMD="${PROMOTION_STOP_CMD:-}"
 REPOINT_CMD="${REPOINT_CMD:-}"
 INTERVAL="${INTERVAL:-10}"
 FAILURES="${FAILURES:-10}"
@@ -81,7 +82,7 @@ if [ "$DRY_RUN" = 1 ]; then
   run "$PROMOTE_CMD"
   log "dry run: would wait up to ${READY_TIMEOUT}s for $NEW_LIVE_HOST_URL/readyz to report lease.mine true"
   run "$REPOINT_CMD"
-  log "dry run: a failed promote would run UNFENCE_CMD to restart the old live, then exit non-zero"
+  log "dry run: a failed promote would stop the new live with PROMOTION_STOP_CMD, then run UNFENCE_CMD to restart the old live, then exit non-zero"
   log "dry run complete; nothing was changed"
   exit 0
 fi
@@ -105,9 +106,16 @@ while :; do
 done
 
 log "live instance unreachable; fencing"
-run "$FENCE_CMD" || log "fence exited non-zero (host dead or unreachable); the lease is the fence of last resort, continuing"
+if ! run "$FENCE_CMD"; then
+  log "fence failed; the old instance may still be live; promotion refused"
+  exit 1
+fi
 log "promoting the standby"
 if ! run "$PROMOTE_CMD"; then
+  if [ -z "$PROMOTION_STOP_CMD" ] || ! run "$PROMOTION_STOP_CMD"; then
+    log "promotion may have started the new live; stop it before restarting the old live; automatic rollback refused"
+    exit 1
+  fi
   log "PROMOTE FAILED; rolling back: restarting the fenced live instance with UNFENCE_CMD"
   if ! run "$UNFENCE_CMD"; then
     log "the rollback restart failed as well; the site is down: run the inverse of FENCE_CMD by hand, then inspect $NEW_LIVE_HOST_URL/readyz and the receive root's .votport-lease before promoting again"

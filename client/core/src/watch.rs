@@ -112,6 +112,9 @@ pub fn watches() -> Vec<Watch> {
 /// A `dir` that is not a folder ([`Error::Read`]) or a link that is not a
 /// request link.
 pub fn add_watch(dir: &str, link: &str, password: Option<String>) -> Result<Watch> {
+    let _state = crate::identity::state_lease()?;
+    let lock = crate::identity::private_lock(&state_dir().join("watch.lock"))?;
+    fs4::FileExt::lock(&lock)?;
     let dir = std::fs::canonicalize(dir).map_err(|source| Error::Read {
         path: PathBuf::from(dir),
         source,
@@ -154,6 +157,9 @@ pub fn add_watch(dir: &str, link: &str, password: Option<String>) -> Result<Watc
 /// # Errors
 /// A write failure.
 pub fn remove_watch(id: &str) -> Result<()> {
+    let _state = crate::identity::state_lease()?;
+    let lock = crate::identity::private_lock(&state_dir().join("watch.lock"))?;
+    fs4::FileExt::lock(&lock)?;
     let mut list = load();
     list.retain(|stored| stored.id != id);
     let result = store(&list);
@@ -267,11 +273,15 @@ pub fn watch_with(
                 }
                 let now = Instant::now();
                 let wall = SystemTime::now();
+                let Ok(state) = crate::identity::state_lease() else {
+                    return;
+                };
                 let list = load();
                 seen.retain(|(id, _), _| list.iter().any(|w| &w.id == id));
                 for watch in &list {
                     scan(watch, settle, now, wall, &mut seen, listener.as_ref());
                 }
+                drop(state);
                 std::thread::sleep(poll);
             }
         })
@@ -430,6 +440,7 @@ pub(crate) struct Flight {
     path: String,
     watched: bool,
     _lock: Option<std::fs::File>,
+    _state: std::fs::File,
 }
 
 /// The outcome of claiming a path across processes.
@@ -484,6 +495,12 @@ fn claim_across_processes(path: &str) -> Claim {
 /// Whether another process is shipping `path` right now; a path this
 /// process holds is not "elsewhere".
 pub(crate) fn shipping_elsewhere(path: &str) -> bool {
+    let Ok(_state) = crate::identity::state_lease() else {
+        return false;
+    };
+    if !state_dir().exists() {
+        return false;
+    }
     // Held across the probe, so a claim this process makes meanwhile is
     // neither refused by the probe nor read as another process's.
     let guard = IN_FLIGHT
@@ -516,6 +533,7 @@ impl Drop for Flight {
 /// [`Error::AlreadyShipping`] when the path is already shipping; the
 /// journal drops the refused send's entry, since nothing of it moved.
 pub(crate) fn single_flight(path: &str) -> Result<Flight> {
+    let state = crate::identity::state_lease()?;
     let mut guard = IN_FLIGHT
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -527,6 +545,7 @@ pub(crate) fn single_flight(path: &str) -> Result<Flight> {
     }
     match claim_across_processes(path) {
         Claim::Free(lock) => Ok(Flight {
+            _state: state,
             path: path.to_owned(),
             watched: false,
             _lock: lock,
@@ -541,6 +560,7 @@ pub(crate) fn single_flight(path: &str) -> Result<Flight> {
 }
 
 fn try_admit(watch_id: &str, path: &str) -> Option<Arc<WatchAdmission>> {
+    let state = crate::identity::state_lease().ok()?;
     let admission = {
         let mut guard = IN_FLIGHT
             .lock()
@@ -556,6 +576,7 @@ fn try_admit(watch_id: &str, path: &str) -> Option<Arc<WatchAdmission>> {
         };
         let admission = Arc::new(WatchAdmission {
             flight: Mutex::new(Some(Flight {
+                _state: state,
                 path: path.to_owned(),
                 watched: true,
                 _lock: lock,

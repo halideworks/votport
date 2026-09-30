@@ -291,6 +291,32 @@ fn watch_ship_replacement_aborts_the_old_http_session() {
     )
     .unwrap();
 
+    let journal_dir = votport_client_core::identity::state_dir().join("journal");
+    let locks = journal_dir.join("locks");
+    let saved_locks = journal_dir.join("saved-locks");
+    std::fs::rename(&locks, &saved_locks).unwrap();
+    std::fs::write(&locks, b"new claims cannot open this directory").unwrap();
+    let failed_shipper = Arc::new(ShipOnWatch(Mutex::new(None)));
+    let failed_watcher = watch::watch_with(
+        Duration::ZERO,
+        Duration::from_millis(10),
+        failed_shipper.clone(),
+    );
+    let mut failed = None;
+    for _ in 0..1000 {
+        failed = failed_shipper.0.lock().unwrap().take();
+        if failed.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    failed_watcher.stop();
+    assert!(failed.expect("failed claim must settle").is_err());
+    assert!(journal::get(&paused.journal_id).is_ok());
+    assert!(client.begin(&old_session).is_ok());
+    std::fs::remove_file(&locks).unwrap();
+    std::fs::rename(&saved_locks, &locks).unwrap();
+
     let shipper = Arc::new(ShipOnWatch(Mutex::new(None)));
     let watcher = watch::watch_with(Duration::ZERO, Duration::from_millis(10), shipper.clone());
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -356,16 +382,21 @@ fn a_concurrent_resume_cannot_take_ownership_from_the_first_run() {
     assert!(journal::get(&duplicate_handle.journal_id().unwrap()).is_err());
 
     let refused_handle = Transfer::new();
+    let refused_views = Arc::new(Recorder::default());
     let refused = ffi::resume(
         paused.journal_id.clone(),
         None,
         None,
         refused_handle.clone(),
-        Arc::new(Recorder::default()),
+        refused_views.clone(),
     );
     assert!(matches!(refused, Err(Error::AlreadyShipping { .. })));
-    assert_eq!(refused_handle.journal_id(), None);
-    assert!(!refused_handle.journal_kept());
+    assert_eq!(
+        refused_views.0.lock().unwrap().last().unwrap().phase,
+        Phase::Failed
+    );
+    assert_eq!(refused_handle.journal_id(), Some(paused.journal_id.clone()));
+    assert!(refused_handle.journal_kept());
     assert_eq!(
         journal::get(&paused.journal_id).unwrap().http,
         Some(paused.http.clone())

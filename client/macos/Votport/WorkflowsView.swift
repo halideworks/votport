@@ -106,6 +106,11 @@ struct WorkflowsView: View {
             }.padding(24).frame(maxWidth: .infinity, alignment: .leading)
         }
         .onAppear { refresh() }
+        .onChange(of: port.sessionGeneration) { _, _ in
+            projects = []; jobs = []; records = []; cursor = nil; projectID = ""; label = ""
+            metadata = [:]; recipients = []; operation = UUID().uuidString
+            confirmation = nil; problem = nil
+        }
         .onChange(of: projectID) { _, _ in metadata = [:]; recipients = [] }
         .alert("Confirm delivery action", isPresented: Binding(get: { confirmation != nil }, set: { if !$0 { confirmation = nil } }), presenting: confirmation) { action in
             Button(action.action == "cancel" ? "Cancel job" : action.action == "accept" ? "Accept" : "Approve") {
@@ -124,11 +129,13 @@ struct WorkflowsView: View {
     private func copy(_ value: String) { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(value, forType: .string) }
     private func run<T: Sendable>(_ work: @escaping @Sendable () throws -> T, then: @escaping @MainActor (T) -> Void) {
         guard !busy else { return }
+        let expectedSession = port.sessionGeneration
         busy = true; problem = nil
         Thread {
             let result = Result { try work() }
             DispatchQueue.main.async {
                 busy = false
+                guard port.sessionGeneration == expectedSession else { return }
                 switch result {
                 case .success(let value): then(value)
                 case .failure(let error):

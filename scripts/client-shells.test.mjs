@@ -2,9 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 
-// The shells cannot be built on the CI runner, so this checks that the core,
-// the XcodeGen project, the Windows manifests and both build scripts carry
-// one version.
+// Check source versions alongside the platform shell builds in CI.
 
 const read = (path) => readFile(new URL(`../${path}`, import.meta.url), 'utf8');
 

@@ -1,6 +1,228 @@
 use super::*;
 
 #[test]
+fn purging_an_active_principal_does_not_remove_group_memberships() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    store.provision_principal("alice", None).unwrap();
+    let group = store
+        .create_scim_group("editors", None, &["alice".into()])
+        .unwrap()
+        .unwrap();
+    assert!(!store.purge_principal("alice").unwrap());
+    assert_eq!(
+        store.scim_group(&group.id).unwrap().unwrap().members,
+        ["alice"]
+    );
+    store.revoke_principal("alice").unwrap();
+    assert!(store.purge_principal("alice").unwrap());
+    assert!(store
+        .scim_group(&group.id)
+        .unwrap()
+        .unwrap()
+        .members
+        .is_empty());
+}
+
+#[test]
+fn stored_claim_conflicts_match_live_tenant_names_and_exact_identities() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    store.with(|connection| connection.execute_batch(
+        "INSERT INTO files(link_id,tenant,upload_id,file_index,bytes_hi,bytes_lo,deleted,stored_as,path,suite,root,receipt)
+         VALUES ('link','acme','upload',0,0,1,0,'same','same','blake3','root',0),
+                ('link','acme','upload',1,0,1,0,'different','different','sha256','foreign',0),
+                ('link','acme','upload',2,0,1,1,'deleted','deleted','blake3','foreign',0),
+                ('other-link','beta','other-upload',0,0,1,0,'other-tenant','other-tenant','blake3','foreign',0)"
+    )).unwrap();
+    let candidate = |name: &str| (name.into(), "blake3".into(), "root".into());
+    let mut candidates = vec![
+        candidate("same"),
+        candidate("different"),
+        candidate("deleted"),
+        candidate("other-tenant"),
+        candidate("new"),
+    ];
+    candidates.extend([
+        candidate("same"),
+        ("same".into(), "blake3".into(), "another".into()),
+    ]);
+    assert_eq!(
+        store
+            .conflicting_stored_claims("acme", &candidates)
+            .unwrap(),
+        std::collections::HashSet::from(["different".into(), "same".into()])
+    );
+    assert!(store
+        .conflicting_stored_claims("acme", &[])
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn oidc_cutover_blocks_legacy_rows_and_revokes_tokens_on_every_issuer_change() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    let legacy = store
+        .upsert_sso_principal("Alice", &[], &serde_json::json!([]))
+        .unwrap();
+    store
+        .with(|connection| {
+            connection.execute(
+                "UPDATE principals SET external_id='old-scim' WHERE subject=?1",
+                [&legacy.subject],
+            )
+        })
+        .unwrap();
+    let mut token = test_automation_token("legacy-token", "acme");
+    token.expires_at = now_unix() + 600;
+    token.created_by = "Alice".into();
+    store.insert_automation_token(token).unwrap();
+    store
+        .upsert_sso_principal("local", &[], &serde_json::json!([]))
+        .unwrap();
+    store
+        .migrate_oidc_subjects("https://issuer.example")
+        .unwrap();
+    let migrated = store.principal("Alice").unwrap().unwrap();
+    assert!(migrated.blocked);
+    assert!(migrated.external_id.is_none());
+    assert_eq!(migrated.credential_version, legacy.credential_version + 1);
+    assert!(!store.principal_allows("Alice", legacy.credential_version));
+    assert!(!store.principal("local").unwrap().unwrap().blocked);
+    assert_eq!(store.automation_token_count("acme").unwrap(), 0);
+    let key = format!("oidc-sub-v2:{}:416c696365", "a".repeat(64));
+    store
+        .upsert_sso_principal(&key, &[], &serde_json::json!([]))
+        .unwrap();
+    store
+        .migrate_oidc_subjects("https://issuer.example")
+        .unwrap();
+    assert!(!store.principal(&key).unwrap().unwrap().blocked);
+    assert_eq!(
+        store
+            .principal("Alice")
+            .unwrap()
+            .unwrap()
+            .credential_version,
+        migrated.credential_version
+    );
+    store
+        .migrate_oidc_subjects("https://other.example")
+        .unwrap();
+    assert!(store.principal(&key).unwrap().unwrap().blocked);
+    let other_key = format!("oidc-sub-v2:{}:426f62", "b".repeat(64));
+    let other = store
+        .upsert_sso_principal(&other_key, &[], &serde_json::json!([]))
+        .unwrap();
+    let mut token = test_automation_token("other-issuer-token", "acme");
+    token.created_by = other_key.clone();
+    token.expires_at = now_unix() + 600;
+    let token_hash = token.token_hash.clone();
+    store.insert_automation_token(token).unwrap();
+    assert!(store
+        .authenticate_automation_token(&token_hash, now_unix())
+        .unwrap()
+        .is_some());
+    store
+        .migrate_oidc_subjects("https://issuer.example")
+        .unwrap();
+    assert!(store.principal(&other_key).unwrap().unwrap().blocked);
+    assert!(!store.principal_allows(&other_key, other.credential_version));
+    assert!(store
+        .authenticate_automation_token(&token_hash, now_unix())
+        .unwrap()
+        .is_none());
+    assert!(!store.principal("local").unwrap().unwrap().blocked);
+}
+
+#[test]
+fn concurrent_automation_mints_obey_the_per_tenant_live_cap() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(directory.path()).unwrap());
+    let live = |id: &str, tenant: &str| AutomationToken {
+        expires_at: now_unix() + 600,
+        ..test_automation_token(id, tenant)
+    };
+    for index in 0..99 {
+        assert!(store
+            .insert_automation_token(live(&format!("seed-{index}"), "acme"))
+            .unwrap());
+    }
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let threads: Vec<_> = (0..2)
+        .map(|index| {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let token = live(&format!("racing-{index}"), "acme");
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.insert_automation_token(token).unwrap()
+            })
+        })
+        .collect();
+    barrier.wait();
+    assert_eq!(
+        threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .filter(|inserted| *inserted)
+            .count(),
+        1
+    );
+    assert_eq!(store.automation_token_count("acme").unwrap(), 100);
+    assert!(!store
+        .insert_automation_token(live("over-cap", "acme"))
+        .unwrap());
+    assert!(store
+        .insert_automation_token(live("other-tenant", "beta"))
+        .unwrap());
+    assert!(store
+        .insert_automation_token(test_automation_token("expired", "acme"))
+        .unwrap());
+    let mut revoked = live("revoked", "acme");
+    revoked.revoked_at = Some(now_unix());
+    assert!(store.insert_automation_token(revoked).unwrap());
+    store
+        .revoke_automation_token("acme", "seed-0", now_unix())
+        .unwrap();
+    assert!(store
+        .insert_automation_token(live("replacement", "acme"))
+        .unwrap());
+}
+
+#[test]
+fn upload_allocation_serializes_one_tenant_without_blocking_another() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(directory.path()).unwrap());
+    let first = store.upload_allocation("acme");
+    let (started, ready) = std::sync::mpsc::channel();
+    let other = Arc::clone(&store);
+    let thread = std::thread::spawn(move || {
+        let _guard = other.upload_allocation("beta");
+        started.send(()).unwrap();
+    });
+    ready
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    thread.join().unwrap();
+    let (started, ready) = std::sync::mpsc::channel();
+    let other = Arc::clone(&store);
+    let thread = std::thread::spawn(move || {
+        let _guard = other.upload_allocation("acme");
+        started.send(()).unwrap();
+    });
+    assert!(ready
+        .recv_timeout(std::time::Duration::from_millis(30))
+        .is_err());
+    drop(first);
+    ready
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    thread.join().unwrap();
+}
+
+#[test]
 fn a_broken_table_is_an_error_not_a_panic() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path()).unwrap();

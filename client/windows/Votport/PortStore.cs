@@ -31,6 +31,7 @@ public sealed class PortStore
     internal string? LibraryUploadStatus => LibraryUploadOutcome ?? LibraryUploadView?.Status;
     private Guid? libraryUploadWorkerId;
     private long sessionGeneration;
+    internal long SessionGeneration => sessionGeneration;
     /// The last failure's headline, for the line under the form that made
     /// the call, named by ProblemScope.
     public string? Problem { get; private set; }
@@ -70,6 +71,7 @@ public sealed class PortStore
 
     public void SignIn(string @base, string password)
     {
+        sessionGeneration++;
         var previous = ClearSso();
         Run(Scope.Port, () => { previous?.Cancel(); return VotportClientCoreMethods.SignIn(@base, password); }, port =>
         {
@@ -146,6 +148,7 @@ public sealed class PortStore
 
     public void SignOut()
     {
+        sessionGeneration++;
         var previous = ClearSso();
         Run(Scope.Port, () => { previous?.Cancel(); VotportClientCoreMethods.SignOut(); return true; }, _ =>
         {
@@ -164,6 +167,7 @@ public sealed class PortStore
     /// device key), so an uninstall leaves nothing behind.
     public void RemoveLocalData()
     {
+        sessionGeneration++;
         var previous = ClearSso();
         Run(Scope.Port, () => { previous?.Cancel(); VotportClientCoreMethods.ForgetEverything(); return true; }, _ =>
         {
@@ -380,6 +384,12 @@ public sealed class PortStore
             {
                 inFlight--;
                 Busy = inFlight > 0;
+                if (scope != Scope.Watch && sessionGeneration != expectedSession)
+                {
+                    failed?.Invoke();
+                    Changed?.Invoke();
+                    return;
+                }
                 if (problem is null) done(result!);
                 else
                 {

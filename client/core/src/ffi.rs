@@ -274,6 +274,9 @@ pub fn pending() -> Vec<journal::Entry> {
 /// person removed rather than resumed.
 #[uniffi::export]
 pub fn forget(id: String) {
+    let Ok(_claim) = journal::claim(&id) else {
+        return;
+    };
     let entry = journal::get(&id).ok();
     journal::forget(&id);
     if let Some(entry) = entry {
@@ -326,6 +329,17 @@ pub enum ResumeReport {
     Received(ReceiveReport),
 }
 
+fn report_early_error<T>(
+    result: crate::Result<T>,
+    kind: journal::Kind,
+    transfer: &Arc<Transfer>,
+    listener: &Arc<dyn TransferListener>,
+) -> crate::Result<T> {
+    result.inspect_err(|error| {
+        Forward::new(kind, Arc::clone(transfer), Arc::clone(listener)).finish(Some(error));
+    })
+}
+
 /// Runs a journalled transfer again under the same id: the same link and
 /// paths, with `password` supplied afresh. A receive's `dest` overrides the
 /// journalled folder for this run and is journalled as its folder, so a
@@ -345,18 +359,30 @@ pub fn resume(
     transfer: Arc<Transfer>,
     listener: Arc<dyn TransferListener>,
 ) -> std::result::Result<ResumeReport, Error> {
-    let entry = match journal::get(&id) {
-        Ok(entry) => entry,
-        Err(error) => {
-            // The handle still names the id, and the journal does not hold
-            // it, so a shell stops offering the resume.
-            transfer.set_journal_id(&id);
-            transfer.journal_kept.store(false, Ordering::Release);
-            let mut forward = Forward::new(journal::Kind::Send, transfer, listener);
-            forward.finish(Some(&error));
-            return Err(error);
-        }
-    };
+    let (entry, journal_claim) =
+        match journal::claim(&id).and_then(|claim| journal::get(&id).map(|entry| (entry, claim))) {
+            Ok(entry) => entry,
+            Err(error @ Error::AlreadyShipping { .. }) => {
+                transfer.set_journal_id(&id);
+                transfer.journal_kept.store(true, Ordering::Release);
+                let kind = journal::get(&id).map_or(journal::Kind::Send, |entry| {
+                    transfer
+                        .journal_needs_password
+                        .store(entry.needs_password, Ordering::Release);
+                    entry.kind
+                });
+                return report_early_error(Err(error), kind, &transfer, &listener);
+            }
+            Err(error) => {
+                // The handle still names the id, and the journal does not hold
+                // it, so a shell stops offering the resume.
+                transfer.set_journal_id(&id);
+                transfer.journal_kept.store(false, Ordering::Release);
+                let mut forward = Forward::new(journal::Kind::Send, transfer, listener);
+                forward.finish(Some(&error));
+                return Err(error);
+            }
+        };
     match entry.kind {
         journal::Kind::Send => {
             // A watch ship moves its drop into the folder's `shipped`
@@ -372,7 +398,15 @@ pub fn resume(
                 .as_deref()
                 .and_then(|path| watch::fingerprint(Path::new(path)));
             let listener = LastView::wrap(listener);
-            let sent = run_send(entry, password, transfer, listener.clone(), false, None);
+            let sent = run_send(
+                entry,
+                password,
+                transfer,
+                listener.clone(),
+                journal_claim,
+                false,
+                None,
+            );
             if sent.is_ok() {
                 if let Some(path) = drop {
                     if watch::is_watched_drop(Path::new(&path)) {
@@ -386,7 +420,16 @@ pub fn resume(
         }
         journal::Kind::Receive => {
             let dest = dest.map(|dest| journal::absolute(&dest));
-            run_receive(entry, password, transfer, listener, true, dest).map(ResumeReport::Received)
+            run_receive(
+                entry,
+                password,
+                transfer,
+                listener,
+                journal_claim,
+                true,
+                dest,
+            )
+            .map(ResumeReport::Received)
         }
     }
 }
@@ -528,7 +571,9 @@ fn preview(link: &str, expect: Option<LinkKind>) -> std::result::Result<LinkPrev
             needs_password: !known,
             usable: true,
             quic: known.then_some(metadata.fetch.is_some()),
-            total_bytes: known.then(|| files.iter().map(|file| file.bytes).sum()),
+            total_bytes: known
+                .then(|| crate::receive::delivery_bytes(files.iter().map(|file| file.bytes)))
+                .transpose()?,
             files,
             ..LinkPreview::default()
         })
@@ -764,16 +809,31 @@ pub fn ship(
     transfer: Arc<Transfer>,
     listener: Arc<dyn TransferListener>,
 ) -> std::result::Result<ShipReport, Error> {
-    let flight = admission.take(&watch_id, &path)?;
-    let (link, password) = watch::credentials(&watch_id)?;
-    journal::forget_send_of(&path, abort_saved_http);
-    let entry = journal::record(
+    let flight = report_early_error(
+        admission.take(&watch_id, &path),
         journal::Kind::Send,
-        &link,
-        vec![path.clone()],
-        None,
-        password.is_some(),
-    );
+        &transfer,
+        &listener,
+    )?;
+    let (link, password) = report_early_error(
+        watch::credentials(&watch_id),
+        journal::Kind::Send,
+        &transfer,
+        &listener,
+    )?;
+    let (entry, journal_claim) = report_early_error(
+        journal::record_claimed(
+            journal::Kind::Send,
+            &link,
+            vec![path.clone()],
+            None,
+            password.is_some(),
+        ),
+        journal::Kind::Send,
+        &transfer,
+        &listener,
+    )?;
+    journal::forget_send_of(&path, abort_saved_http);
     let sent = watch::fingerprint(Path::new(&path));
     let listener = LastView::wrap(listener);
     let (report, _flight) = run_send(
@@ -781,6 +841,7 @@ pub fn ship(
         password,
         transfer,
         listener.clone(),
+        journal_claim,
         true,
         Some(flight),
     )?;
@@ -815,8 +876,22 @@ pub fn send(
     transfer: Arc<Transfer>,
     listener: Arc<dyn TransferListener>,
 ) -> std::result::Result<SendReport, Error> {
-    let entry = journal::record(journal::Kind::Send, &link, paths, None, password.is_some());
-    run_send(entry, password, transfer, listener, true, None).map(|(report, _)| report)
+    let (entry, journal_claim) = report_early_error(
+        journal::record_claimed(journal::Kind::Send, &link, paths, None, password.is_some()),
+        journal::Kind::Send,
+        &transfer,
+        &listener,
+    )?;
+    run_send(
+        entry,
+        password,
+        transfer,
+        listener,
+        journal_claim,
+        true,
+        None,
+    )
+    .map(|(report, _)| report)
 }
 
 /// Runs a journalled send. The entry is dropped from the journal when the
@@ -827,6 +902,7 @@ fn run_send(
     password: Option<String>,
     transfer: Arc<Transfer>,
     listener: Arc<dyn TransferListener>,
+    _journal: journal::Claim,
     new_journal: bool,
     claimed_flight: Option<watch::Flight>,
 ) -> std::result::Result<(SendReport, Option<watch::Flight>), Error> {
@@ -969,14 +1045,27 @@ pub fn receive(
     transfer: Arc<Transfer>,
     listener: Arc<dyn TransferListener>,
 ) -> std::result::Result<ReceiveReport, Error> {
-    let entry = journal::record(
+    let (entry, journal_claim) = report_early_error(
+        journal::record_claimed(
+            journal::Kind::Receive,
+            &link,
+            Vec::new(),
+            Some(dest),
+            password.is_some(),
+        ),
         journal::Kind::Receive,
-        &link,
-        Vec::new(),
-        Some(dest),
-        password.is_some(),
-    );
-    run_receive(entry, password, transfer, listener, false, None)
+        &transfer,
+        &listener,
+    )?;
+    run_receive(
+        entry,
+        password,
+        transfer,
+        listener,
+        journal_claim,
+        false,
+        None,
+    )
 }
 
 /// Runs a journalled receive; the entry's fate is as for [`run_send`].
@@ -988,6 +1077,7 @@ fn run_receive(
     password: Option<String>,
     transfer: Arc<Transfer>,
     listener: Arc<dyn TransferListener>,
+    _journal: journal::Claim,
     resume: bool,
     dest_override: Option<String>,
 ) -> std::result::Result<ReceiveReport, Error> {
@@ -1964,6 +2054,39 @@ mod tests {
     impl TransferListener for Count {
         fn update(&self, view: TransferView) {
             self.0.lock().unwrap().push(view);
+        }
+    }
+
+    #[test]
+    fn journal_ownership_failures_publish_a_failed_native_view() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocked = directory.path().join("blocked");
+        std::fs::write(&blocked, b"not a state directory").unwrap();
+        let _state = crate::identity::test_state_dir(&blocked);
+        for receiving in [false, true] {
+            let listener = Arc::new(Count(std::sync::Mutex::new(Vec::new())));
+            let result = if receiving {
+                receive(
+                    "https://fixture/s/token".into(),
+                    None,
+                    directory.path().display().to_string(),
+                    Transfer::new(),
+                    listener.clone(),
+                )
+                .map(|_| ())
+            } else {
+                send(
+                    "https://fixture/r/token".into(),
+                    None,
+                    vec![],
+                    Transfer::new(),
+                    listener.clone(),
+                )
+                .map(|_| ())
+            };
+            assert!(result.is_err());
+            let views = listener.0.lock().unwrap();
+            assert_eq!(views.last().unwrap().phase, Phase::Failed);
         }
     }
 

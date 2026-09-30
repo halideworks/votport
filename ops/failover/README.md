@@ -16,8 +16,7 @@ lease as its own on `/readyz` before repointing the proxy. If the old
 instance still holds the shared receive root's kernel lock, the promoted one
 refuses to boot, the proxy stays on the old live, and the script reports
 that refusal. Heartbeat age never grants ownership. A
-fence command that fails because the host is dead is logged and the
-promotion proceeds. Every supplied command runs under `CMD_TIMEOUT` so a
+failed fence stops promotion because the old writer may still be running. Every supplied command runs under `CMD_TIMEOUT` so a
 wedged docker daemon cannot stall the failover; `planned.sh` defaults it to
 600 s because it must exceed the container's `stop_grace_period` (a clean
 stop waits for in-flight downloads), `watch.sh` to 120 s. The drain wait
@@ -34,8 +33,8 @@ on loopback. `LIVE_URL` and `NEW_LIVE_URL` are the proxied https addresses
 the admin API is used through; the admin cookie is `Secure`, so those must
 be https.
 
-A failed promote after the stop or fence does not leave the site down: both
-scripts restart the previously-live instance (`LIVE_RESTART_CMD` in
+A failed promote first requires a successful `PROMOTION_STOP_CMD` to stop any
+partially started new instance. Only then do both scripts restart the previously-live instance (`LIVE_RESTART_CMD` in
 `planned.sh`, which also clears the drain that instance boots with;
 `UNFENCE_CMD` in `watch.sh`), log the rollback loudly, and exit non-zero.
 See [Rolling back a failed promote](#rolling-back-a-failed-promote).
@@ -92,6 +91,7 @@ A missing required value must be corrected first.
 ## Planned failover
 
 ```sh
+TOPOLOGY=replica \
 LIVE_URL=https://drop.example.com \
 NEW_LIVE_URL=https://drop.example.com \
 LIVE_HOST_URL=http://10.0.0.5:8103 \
@@ -100,11 +100,14 @@ VOTPORT_ADMIN_PASSWORD=... \
 LIVE_STOP_CMD='ssh live "cd /srv/votport && docker compose stop votport"' \
 LIVE_RESTART_CMD='ssh live "cd /srv/votport && docker compose start votport"' \
 PROMOTE_CMD='ssh standby "cd /srv/votport && docker compose --profile standby stop && docker compose --profile live up -d"' \
+PROMOTION_STOP_CMD='ssh standby "cd /srv/votport && docker compose --profile live stop votport"' \
 REPOINT_CMD='ssh proxy "sed -i s/10.0.0.5/10.0.0.6/ /etc/caddy/Caddyfile && caddy reload --config /etc/caddy/Caddyfile"' \
 ops/failover/planned.sh
 ```
 
-Replica topology: `REPOINT_CMD` is required, because a replica-mode standby
+Set `TOPOLOGY=replica` for replicated storage or `TOPOLOGY=shared` for shared
+volumes. An unreachable standby or missing archive never skips the replica
+freshness check. Replica topology: `REPOINT_CMD` is required, because a replica-mode standby
 is not in the proxy pool until promoted, and the final drain clear goes
 through `NEW_LIVE_URL`. Once sessions reach 0 the script also waits, within
 `DRAIN_TIMEOUT`, until the standby's `/readyz` reports an `archive_created_at`
@@ -125,6 +128,7 @@ NEW_LIVE_HOST_URL=http://10.0.0.6:8103 \
 FENCE_CMD='ssh -o ConnectTimeout=5 live "cd /srv/votport && docker compose stop votport"' \
 UNFENCE_CMD='ssh -o ConnectTimeout=5 live "cd /srv/votport && docker compose start votport"' \
 PROMOTE_CMD='ssh standby "cd /srv/votport && docker compose --profile standby stop && docker compose --profile live up -d"' \
+PROMOTION_STOP_CMD='ssh standby "cd /srv/votport && docker compose --profile live stop votport"' \
 REPOINT_CMD='ssh proxy "sed -i s/10.0.0.5/10.0.0.6/ /etc/caddy/Caddyfile && caddy reload --config /etc/caddy/Caddyfile"' \
 INTERVAL=10 FAILURES=10 \
 ops/failover/watch.sh
@@ -142,8 +146,11 @@ against the new pair.
 
 ## Rolling back a failed promote
 
-If the promote fails after the stop or fence, the scripts put the old live
-back themselves: they run the inverse of the stop or fence command
+If promotion fails after the stop or fence, the scripts run `PROMOTION_STOP_CMD`
+first. Its success must mean the new writer has stopped, including a writer
+started by a partial or timed-out promotion. If that command is absent or fails,
+automatic rollback stops and the operator must establish that the new writer is
+down. Only after a successful stop do they run the inverse of the stop or fence command
 (`LIVE_RESTART_CMD`, `UNFENCE_CMD`), `planned.sh` also clears the drain the
 restarted instance boots with, the rollback is logged loudly, and the script
 exits non-zero. The proxy was not repointed yet at that stage, so service

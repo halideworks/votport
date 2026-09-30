@@ -476,12 +476,9 @@ impl Client {
         let http = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("votport-client/", env!("CARGO_PKG_VERSION")))
-            // Transfers can legitimately run long. Authentication and the
-            // short interactive preview use total-request timeouts; the
-            // transfer client leaves the total unbounded and bounds each
-            // phase instead: metadata and chunks by whole-request deadlines,
-            // a streaming download by the connect bound alone.
-            .timeout(timeout)
+            // The blocking client's timeout bounds each read, not the whole
+            // stream. Request timeouts separately bound metadata and uploads.
+            .timeout(timeout.or(Some(chunk_timeout)))
             .connect_timeout(std::time::Duration::from_secs(20))
             .build()
             .map_err(|source| Error::Http {
@@ -874,10 +871,13 @@ impl Client {
                 let base: reqwest::Url = url
                     .parse()
                     .map_err(|_| Error::Other("invalid download url".into()))?;
-                url = base
+                let redirected = base
                     .join(&location)
-                    .map_err(|_| Error::Other("invalid redirect location".into()))?
-                    .to_string();
+                    .map_err(|_| Error::Other("invalid redirect location".into()))?;
+                if redirected.origin() != base.origin() {
+                    return Err(Error::Other("download redirect changed origin".into()));
+                }
+                url = redirected.to_string();
             };
             let status = response.status();
             if !status.is_success() {
@@ -1026,8 +1026,9 @@ impl Client {
         body: Option<&serde_json::Value>,
     ) -> Result<T> {
         let url = self.url(path);
-        let mut request =
-            with_cookie(self.http.request(method, &url), Some(cookie)).header("X-Votport", "1");
+        let mut request = with_cookie(self.http.request(method, &url), Some(cookie))
+            .header("X-Votport", "1")
+            .timeout(self.metadata_timeout);
         if let Some(body) = body {
             request = request.json(body);
         }
@@ -1433,6 +1434,67 @@ pub fn split_link_as(link: &str, kind: LinkKind) -> Result<Link> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn download_redirects_do_not_forward_cookies_to_another_origin() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        for status in [307, 308] {
+            let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+            let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+            destination.set_nonblocking(true).unwrap();
+            let base = format!("http://{}", origin.local_addr().unwrap());
+            let location = format!("http://{}/stolen", destination.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                origin.set_nonblocking(true).unwrap();
+                let mut stream = (0..400)
+                    .find_map(|_| {
+                        origin.accept().ok().map(|(stream, _)| stream).or_else(|| {
+                            std::thread::sleep(Duration::from_millis(5));
+                            None
+                        })
+                    })
+                    .expect("download reached origin");
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut headers = String::new();
+                for _ in 0..64 {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    headers.push_str(&line);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                assert!(headers
+                    .to_ascii_lowercase()
+                    .contains("cookie: delivery=secret"));
+                stream.write_all(format!("HTTP/1.1 {status} Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
+            });
+            let result = super::Client::new(base).unwrap().download(
+                "/file",
+                Some("delivery=secret"),
+                &mut None,
+                0,
+                1,
+            );
+            server.join().unwrap();
+            assert!(
+                matches!(result, Err(crate::error::Error::Other(ref message)) if message == "download redirect changed origin")
+            );
+            assert!(
+                matches!(destination.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+            );
+        }
+    }
+
     use super::{split_link, LinkKind};
     use crate::error::Error;
 
@@ -2035,6 +2097,75 @@ mod tests {
     /// request: a server that accepts and then never answers is lost, not
     /// slow, and the send fails into the retry budget instead of wedging the
     /// transfer past its own cancellation.
+    #[test]
+    fn stalled_admin_mutations_and_download_body_reads_have_phase_deadlines() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::time::Duration;
+        for download in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let mut stream = (0..400)
+                    .find_map(|_| match listener.accept() {
+                        Ok((stream, _)) => Some(stream),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                            None
+                        }
+                        Err(error) => panic!("fixture accept failed: {error}"),
+                    })
+                    .expect("request reached fixture");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(&stream);
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                if download {
+                    stream.write_all(b"HTTP/1.1 200 Test\r\nContent-Length: 8\r\nConnection: close\r\n\r\n123").unwrap();
+                }
+                std::thread::sleep(Duration::from_millis(1500));
+            });
+            let client = super::Client::with_bounds(
+                base,
+                None,
+                Duration::from_millis(100),
+                Duration::from_millis(100),
+            )
+            .unwrap();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    let failed = if download {
+                        let (mut response, _) =
+                            client.download("/file", None, &mut None, 0, 8).unwrap();
+                        response.read_to_end(&mut Vec::new()).is_err()
+                    } else {
+                        client
+                            .admin_send::<serde_json::Value>(
+                                reqwest::Method::POST,
+                                "/api/admin/action",
+                                "session",
+                                None,
+                            )
+                            .is_err()
+                    };
+                    sender.send(failed).unwrap();
+                });
+                assert!(receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("stalled phase must fail before the fixture closes"));
+            });
+            server.join().unwrap();
+        }
+    }
+
     #[test]
     fn a_transfer_client_bounds_a_stalled_metadata_request() {
         use std::io::{BufRead, BufReader};

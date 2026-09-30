@@ -82,7 +82,7 @@ impl SignedPortMessage {
     pub fn verify(&self, purpose: &str, audience: &str, now: u64) -> bool {
         self.document.purpose == purpose
             && self.document.audience == audience
-            && self.document.expires_at + PORT_MESSAGE_SKEW > now
+            && self.document.expires_at.saturating_add(PORT_MESSAGE_SKEW) > now
             && id(&self.document.nonce)
             && digest(&self.document.issuer)
             && verify(
@@ -106,8 +106,11 @@ impl SignedPortMessage {
                 &self.signature,
                 &message(b"votport-port-message-v1\0", &self.document),
             )
-            && (self.document.expires_at + PORT_MESSAGE_SKEW <= now
-                || self.document.expires_at > now + PORT_MESSAGE_LIFETIME + PORT_MESSAGE_SKEW)
+            && (self.document.expires_at.saturating_add(PORT_MESSAGE_SKEW) <= now
+                || self.document.expires_at
+                    > now
+                        .saturating_add(PORT_MESSAGE_LIFETIME)
+                        .saturating_add(PORT_MESSAGE_SKEW))
     }
 }
 
@@ -459,6 +462,10 @@ mod tests {
                 &key,
             )
         };
+        assert!(mint(u64::MAX).verify("status", &audience, u64::MAX - 1));
+        assert!(!mint(u64::MAX).verify("status", &audience, u64::MAX));
+        assert!(mint(u64::MAX).window_failed("status", &audience, u64::MAX));
+        assert!(mint(u64::MAX).window_failed("status", &audience, 1));
         let now = 1_800_000_000;
         // A message minted one lifetime ago verifies now, and a peer clock
         // up to one skew window behind still pairs; beyond that it refuses.

@@ -48,12 +48,17 @@ function requestQuery(cursor = null) {
   if (cursor) { query.set('before_created_at', cursor.created_at); query.set('before_id', cursor.id); }
   return query;
 }
-function showRequests(requests, preferred = '') {
+function showRequests(requests, preferred = '', older = false) {
   const select = $('trade-request'), retained = select.selectedOptions[0];
   const chosen = retained?.value || preferred;
-  select.replaceChildren();
-  const placeholder = node('option', 'Choose a request'); placeholder.value = ''; select.append(placeholder);
+  if (!older) {
+    select.replaceChildren();
+    const placeholder = node('option', 'Choose a request'); placeholder.value = ''; select.append(placeholder);
+  }
+  const shown = new Set([...select.options].map((option) => option.value));
   for (const request of requests.links) {
+    if (shown.has(request.id)) continue;
+    shown.add(request.id);
     const option = node('option', request.label + ' · ' + (request.dest || 'Receive root'));
     option.value = request.id; option.dataset.label = request.label; select.append(option);
   }
@@ -61,7 +66,7 @@ function showRequests(requests, preferred = '') {
   select.value = chosen || '';
   requestCursor = requests.next_cursor;
   $('trade-request-more').hidden = !requestCursor;
-  $('trade-request-help').textContent = requests.links.length
+  $('trade-request-help').textContent = [...select.options].some((option) => option.value)
     ? 'Only active requests with no password or previous uploads can be used. Search by name or folder to find another request.'
     : 'No eligible requests match. Try another search or create a request below.';
   requestSelected();
@@ -73,7 +78,7 @@ async function loadRequests(older = false) {
   search.disabled = more.disabled = true;
   try {
     const requests = await api('/api/admin/links?' + requestQuery(older ? requestCursor : null));
-    if (ticket === requestTicket) showRequests(requests);
+    if (ticket === requestTicket) showRequests(requests, '', older);
   } catch (error) {
     if (ticket === requestTicket) $('trade-request-help').textContent = error.message;
   } finally {

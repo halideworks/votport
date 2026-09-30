@@ -59,10 +59,20 @@ for (let at = 0; at < held.length; at += pattern.length) pattern.copy(held, at, 
 fs.writeFileSync(path.join(folder, "nested", "held.bin"), held);
 
 // A UTF-8 locale is required for all engines to accept non-ASCII file names.
-const browser = await browserType.launch({
-  env: { ...process.env, LANG: "C.UTF-8", LC_ALL: "C.UTF-8" },
-});
-const context = await browser.newContext();
+const launchOptions = { env: { ...process.env, LANG: "C.UTF-8", LC_ALL: "C.UTF-8" } };
+const browser = browserEngine === "webkit" ? null : await browserType.launch(launchOptions);
+// WebKit's ephemeral contexts refuse OPFS even though the API is exposed.
+const context = browser ? await browser.newContext()
+  : await browserType.launchPersistentContext(path.join(dir, "webkit-profile"), launchOptions);
+if (browserEngine === "webkit") {
+  // WebKit omits Blob bodies from intercepted requests; expose the same bytes
+  // so route.fetch can replay the binary upload during fault injection.
+  await context.addInitScript(() => {
+    const original = window.fetch;
+    window.fetch = async (resource, options) => original(resource, options?.body instanceof Blob
+      ? { ...options, body: await options.body.arrayBuffer() } : options);
+  });
+}
 // Starved CI runners can exceed the 30 second default for load events; the
 // suite's semantics only need the page loaded, not loaded fast.
 context.setDefaultNavigationTimeout(60000);
@@ -144,6 +154,18 @@ await page.fill("#login-password", adminPassword);
 await page.click("#login-form button[type=submit]");
 // Signed-in users land on /receive; the create form is the first element.
 await page.waitForSelector("#create-form:not([hidden])", { timeout: 15000 });
+await page.evaluate(async () => {
+  const { confirmModal, alertModal } = await import('/assets/object-card.js');
+  window.modalAnswers = [];
+  confirmModal('First action', 'First details', 'Proceed').then((answer) => window.modalAnswers.push(answer));
+  alertModal('Second details').then((answer) => window.modalAnswers.push(answer));
+});
+await page.getByRole('dialog', { name: 'First action', exact: true }).getByRole('button', { name: 'Proceed', exact: true }).click();
+await page.getByRole('dialog', { name: 'Something went wrong', exact: true }).getByRole('button', { name: 'OK', exact: true }).click();
+await page.waitForFunction(() => window.modalAnswers.length === 2);
+if (!(await page.evaluate(() => window.modalAnswers[0] === true && window.modalAnswers[1] === false))) {
+  throw new Error('overlapping modal actions must retain separate answers');
+}
 await page.locator("#create-notification-options").evaluate((node) => { node.open = true; });
 await page.locator(".notification-editor > p.field-help").first().waitFor();
 if (await page.locator(".notification-editor > p.field-help").evaluateAll((nodes) => nodes.some((node) => node.getAttribute("role") === "status"))) {
@@ -1856,6 +1878,16 @@ await page.route("**/api/admin/outbound-grants/preparations", async (route) => {
 try {
   await page.click("#deliver-submit");
   await page.locator("#deliver-progress").waitFor({ state: "visible" });
+  const fill = await page.locator('#deliver-progress-fill').evaluate((element) => {
+    element.parentElement.hidden = false;
+    const style = getComputedStyle(element);
+    const geometry = { height: element.getBoundingClientRect().height, background: style.backgroundColor };
+    element.parentElement.hidden = true;
+    return geometry;
+  });
+  if (fill.height <= 0 || fill.background === 'rgba(0, 0, 0, 0)') {
+    throw new Error('delivery preparation progress must have a visible fill');
+  }
   if (!(await page.textContent("#deliver-progress")).includes("Verifying selected files") ||
       await page.textContent("#deliver-submit") !== "Preparing link…" ||
       !(await page.locator("#deliver-label").isDisabled()) ||
@@ -2185,7 +2217,7 @@ stopPage.on("pageerror", (error) => errors.push(`pageerror: ${error.message}`));
 await stopPage.addInitScript(() => {
   Object.defineProperty(window, "showDirectoryPicker", { value: undefined });
 });
-await stopPage.goto(outboundUrl);
+await stopPage.goto(outboundUrl, { waitUntil: 'domcontentloaded' });
 await stopPage.waitForSelector("#download-content:not([hidden])");
 let cancelledPreflightRequests = 0;
 const countCancelledPreflight = async (route) => {
@@ -2347,7 +2379,8 @@ for (const download of separateDownloads) {
   }
 }
 console.log("separate fallback downloads: ok");
-await browser.close();
+await context.close();
+await browser?.close();
 
 if (
   fs.readFileSync(path.join(stored, "Résumé Draft.pdf"), "utf8") !==

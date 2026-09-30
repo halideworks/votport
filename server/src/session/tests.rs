@@ -115,6 +115,30 @@ mod pin_tests {
     }
 
     #[test]
+    fn active_transfer_ids_distinguish_same_second_replacements_without_exposing_credentials() {
+        let sessions = Sessions::new();
+        let status = |id: &str| {
+            sessions
+                .insert(id.into(), "link".into(), "acme".into(), dummy_sender())
+                .unwrap();
+            sessions.seed_resumed(id, 42, 0);
+            let transfers = sessions.active_transfers("acme");
+            assert!(sessions.active_transfers("other").is_empty());
+            let transfer = serde_json::to_value(&transfers[0]).unwrap();
+            assert_ne!(transfer["id"], id);
+            assert_eq!(transfer["id"], crate::auth::hash_token(id));
+            sessions.remove(id).unwrap();
+            transfer
+        };
+        let first = status("first-session-secret");
+        let second = status("second-session-secret");
+        assert_ne!(first["id"], second["id"]);
+        for field in ["link_id", "transport", "started_at", "total"] {
+            assert_eq!(first[field], second[field]);
+        }
+    }
+
+    #[test]
     fn resumed_sessions_measure_their_own_active_time() {
         let sessions = Sessions::new();
         sessions
@@ -490,6 +514,77 @@ mod push_tests {
     use super::*;
     use vot_sdk::object::{InMemoryObjectBuilder, Suite};
     use vot_sdk::package::{PackageBuilder, PackageEntry};
+
+    #[tokio::test]
+    async fn native_push_rechecks_closed_and_expired_links_before_publication() {
+        for force_publication in [false, true] {
+            for expired in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let app = crate::api::testing::build(directory.path());
+                app.store
+                    .insert_link(crate::store::tests::test_link("link"))
+                    .unwrap();
+                let (package, _, _, records) = empty_manifest(1);
+                let setup = setup_with_app(directory.path(), package.clone(), &app);
+                let (seams, handle) = push_seams(
+                    Arc::clone(&app),
+                    setup,
+                    PushControl::default(),
+                    tokio::runtime::Handle::current(),
+                );
+                let receive = handle.0.upgrade().unwrap();
+                receive
+                    .prepare_manifest(
+                        vot_cli::PackageSummary {
+                            root: package.root,
+                            logical_length: package.length,
+                            entries: 1,
+                        },
+                        &records,
+                    )
+                    .unwrap();
+                let now = now_unix();
+                receive.request_checked_at.store(now, Ordering::Release);
+                receive
+                    .request_expires_at
+                    .store(u64::MAX, Ordering::Release);
+                app.store
+                    .update_link("", "link", |link| {
+                        if expired {
+                            link.expires_at = Some(now)
+                        } else {
+                            link.active = false
+                        }
+                    })
+                    .unwrap();
+                if expired {
+                    receive.request_expires_at.store(now, Ordering::Release);
+                }
+                if force_publication {
+                    let object = object(Suite::Blake3Bao64, b"");
+                    assert!(receive
+                        .finish_object(PushObjectKey {
+                            suite: object.suite,
+                            root: object.root,
+                            length: object.length,
+                        })
+                        .is_err());
+                } else {
+                    receive.request_checked_at.store(0, Ordering::Release);
+                    let sink = PushFileSink {
+                        files: Arc::new(std::sync::RwLock::new(Vec::new())),
+                        receive: Arc::clone(&receive),
+                        stopped: AtomicBool::new(false),
+                    };
+                    assert!(sink.check_writable().is_err());
+                }
+                assert!(receive.control.is_cancelled());
+                assert!(!directory.path().join("receive/empty-0000").exists());
+                drop(receive);
+                drop(seams);
+            }
+        }
+    }
 
     fn open_destination_for(
         setup: &WorkerSetup,

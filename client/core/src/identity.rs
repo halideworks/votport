@@ -103,6 +103,7 @@ impl Device {
     /// # Errors
     /// A read or write failure.
     pub fn load_or_create() -> Result<Self> {
+        let _state = state_lease()?;
         Self::load_or_create_in(&state_dir())
     }
 
@@ -289,6 +290,29 @@ fn restrict_to_user(path: &std::path::Path) -> Result<()> {
     }
 }
 
+pub(crate) fn private_lock(path: &std::path::Path) -> Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    #[cfg(windows)]
+    restrict_to_user(path)?;
+    Ok(file)
+}
+
+pub(crate) fn state_lease() -> Result<std::fs::File> {
+    let file = private_lock(&state_dir().with_extension("lock"))?;
+    fs4::FileExt::lock_shared(&file)?;
+    Ok(file)
+}
+
 /// Removes the whole per-user state directory: the stored port session,
 /// the watch list with its saved passwords, the transfer journal, the
 /// evidence outbox, and the device key. A shell offers this as "Remove
@@ -297,8 +321,14 @@ fn restrict_to_user(path: &std::path::Path) -> Result<()> {
 /// now gone.
 ///
 /// # Errors
-/// A state directory that cannot be removed.
+/// Active transfers or sign-ins, or a state directory that cannot be removed.
 pub fn forget_everything() -> Result<()> {
+    let lock = private_lock(&state_dir().with_extension("lock"))?;
+    fs4::FileExt::try_lock(&lock).map_err(|_| {
+        crate::Error::Other(
+            "Pause active transfers and finish or cancel sign-ins and wait for background reports before removing local data".into(),
+        )
+    })?;
     match std::fs::remove_dir_all(state_dir()) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         other => other.map_err(crate::Error::from),

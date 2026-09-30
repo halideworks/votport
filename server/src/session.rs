@@ -1916,11 +1916,11 @@ pub(crate) fn check_upload_directory(
     check_pending_parent(&key, &pending)
 }
 
-fn prepare_files<'a>(
-    setup: &'a WorkerSetup,
+fn prepare_files(
+    setup: &WorkerSetup,
     entries: &[(Vec<String>, ObjectId)],
     active: impl Fn() -> bool + Sync,
-) -> Result<(Vec<FileState>, std::sync::MutexGuard<'a, ()>), SessionError> {
+) -> Result<(Vec<FileState>, crate::store::UploadAllocation), SessionError> {
     check_session_entry_cap(entries.len())?;
     for (components, _) in entries {
         crate::protocol_paths::check_payload_name_length(
@@ -1961,12 +1961,7 @@ fn prepare_files<'a>(
         .store
         .conflicting_stored_claims(&setup.tenant, &fresh)
         .map_err(SessionError::internal)?;
-    // ponytail: large NAS manifests serialize metadata allocation; temporary claims can narrow it.
-    let allocation = setup
-        .store
-        .upload_allocation
-        .lock()
-        .map_err(|_| SessionError::internal("upload allocation poisoned"))?;
+    let allocation = setup.store.upload_allocation(&setup.tenant);
     let pending = pending_upload_claims(&setup.store, &setup.tenant)?;
     let mut parents = HashSet::new();
     for ((components, _), existing) in entries.iter().zip(&existing) {
@@ -2865,6 +2860,8 @@ struct PushReceive {
     received: AtomicU64,
     activity_origin: Instant,
     last_active: AtomicU64,
+    request_checked_at: AtomicU64,
+    request_expires_at: AtomicU64,
     checkpoint: Mutex<PersistTracker>,
     /// Serializes whole checkpoints without holding `inner` across the store
     /// commit, so receive-path calls only wait for the snapshot phases.
@@ -2875,6 +2872,11 @@ struct PushReceive {
 
 impl PushReceive {
     fn check_active(&self) -> Result<(), SessionError> {
+        self.check_live()?;
+        self.check_request(true)
+    }
+
+    fn check_live(&self) -> Result<(), SessionError> {
         self.mark_active();
         if self.control.is_cancelled() {
             return Err(SessionError::conflict("native push was cancelled"));
@@ -2883,6 +2885,30 @@ impl PushReceive {
             .destinations
             .check_live()
             .map_err(SessionError::internal)
+    }
+
+    fn check_request(&self, force: bool) -> Result<(), SessionError> {
+        let now = now_unix();
+        if !force
+            && self.request_checked_at.load(Ordering::Acquire) == now
+            && self.request_expires_at.load(Ordering::Acquire) > now
+        {
+            return Ok(());
+        }
+        let link = self
+            .setup
+            .store
+            .upload_link(&self.setup.link_id)
+            .map_err(SessionError::internal)?;
+        if let Some(link) = link.filter(|link| link.usable_now()) {
+            self.request_expires_at
+                .store(link.expires_at.unwrap_or(u64::MAX), Ordering::Release);
+            self.request_checked_at.store(now, Ordering::Release);
+            Ok(())
+        } else {
+            self.control.cancel();
+            Err(SessionError::conflict("request link is closed or expired"))
+        }
     }
 
     fn cli_error(&self, error: SessionError) -> vot_cli::Error {
@@ -2928,8 +2954,9 @@ impl PushReceive {
             .app
             .sessions
             .push_lease(&hex::encode(self.setup.session_id));
-        self.check_active()?;
+        self.check_live()?;
         let validated = validate_push_manifest(&self.setup, summary, records)?;
+        self.check_active()?;
         self.setup
             .store
             .link_metadata(&self.setup.tenant, &self.setup.link_id)
@@ -2958,9 +2985,11 @@ impl PushReceive {
                 ));
             }
             Some(
-                restore_files(&self.setup, saved, || self.check_active().is_ok())
-                    .map_err(SessionError::internal)?
-                    .0,
+                restore_files(&self.setup, saved, || {
+                    self.check_live().is_ok() && self.check_request(false).is_ok()
+                })
+                .map_err(SessionError::internal)?
+                .0,
             )
         } else {
             None
@@ -2968,17 +2997,19 @@ impl PushReceive {
         let (files, allocation) = match restored {
             Some(files) => (files, None),
             None => {
-                let (files, allocation) =
-                    prepare_files(&self.setup, &validated, || self.check_active().is_ok())?;
+                let (files, allocation) = prepare_files(&self.setup, &validated, || {
+                    self.check_live().is_ok() && self.check_request(false).is_ok()
+                })?;
                 (files, Some(allocation))
             }
         };
+        self.check_active()?;
         let mut inner = self.inner.lock().expect("push receive poisoned");
         if inner.manifest_ready {
             return Err(SessionError::conflict("push manifest was already prepared"));
         }
         for file in files {
-            self.check_active()?;
+            self.check_live()?;
             let key = PushObjectKey {
                 suite: file.object.suite,
                 root: file.object.root,
@@ -3033,7 +3064,7 @@ impl PushReceive {
             .app
             .sessions
             .push_lease(&hex::encode(self.setup.session_id));
-        self.check_active()?;
+        self.check_live()?;
         let key = PushObjectKey::from(object);
         let mut inner = self.inner.lock().expect("push receive poisoned");
         let planned = inner
@@ -3540,7 +3571,7 @@ impl PushFileSink {
         {
             return Err(SessionError::conflict("native push stopped"));
         }
-        Ok(())
+        self.receive.check_request(false)
     }
 
     fn place(&self, verified: &vot_sdk::verify::VerifiedSlice<'_>) -> Result<(), SessionError> {
@@ -3773,6 +3804,8 @@ pub(crate) fn push_seams(
         received: AtomicU64::new(0),
         activity_origin: Instant::now(),
         last_active: AtomicU64::new(0),
+        request_checked_at: AtomicU64::new(0),
+        request_expires_at: AtomicU64::new(u64::MAX),
         checkpoint: Mutex::new(PersistTracker::new()),
         checkpointing: Mutex::new(()),
         dirty: Mutex::new(HashSet::new()),
@@ -4412,6 +4445,7 @@ struct SessionActivity {
 /// One session in progress, as the admin pages show it.
 #[derive(Clone, Debug, Serialize)]
 pub struct ActiveTransfer {
+    pub id: String,
     pub link_id: String,
     pub transport: &'static str,
     pub received: u64,
@@ -5031,6 +5065,23 @@ impl Sessions {
     }
 
     /// Cancels a connected push after releasing the session registry lock.
+    pub(crate) fn cancel_pushes_for_link(&self, link: &str) {
+        let controls: Vec<_> = self
+            .inner
+            .lock()
+            .expect("sessions poisoned")
+            .map
+            .values()
+            .filter_map(|handle| match &handle.kind {
+                SessionKind::Push(control) if handle.link_id == link => Some(control.clone()),
+                _ => None,
+            })
+            .collect();
+        for control in controls {
+            control.cancel();
+        }
+    }
+
     pub fn abort_push(&self, id: &str) -> bool {
         let control = self
             .inner
@@ -5196,9 +5247,10 @@ impl Sessions {
         let inner = self.inner.lock().expect("sessions poisoned");
         let mut transfers: Vec<ActiveTransfer> = inner
             .map
-            .values()
-            .filter(|handle| handle.tenant == tenant)
-            .map(|handle| ActiveTransfer {
+            .iter()
+            .filter(|(_, handle)| handle.tenant == tenant)
+            .map(|(id, handle)| ActiveTransfer {
+                id: crate::auth::hash_token(id),
                 link_id: handle.link_id.clone(),
                 transport: match &handle.kind {
                     SessionKind::Push(_) => "push",

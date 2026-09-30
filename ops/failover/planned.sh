@@ -7,6 +7,7 @@
 # commands you supply, so the same script drives docker compose over ssh, a
 # local process, or an orchestrator:
 #
+#   TOPOLOGY=replica \
 #   LIVE_URL=https://drop.example.com \
 #   NEW_LIVE_URL=https://drop.example.com \
 #   LIVE_HOST_URL=http://10.0.0.5:8103 \
@@ -15,6 +16,7 @@
 #   LIVE_STOP_CMD='ssh live "cd /srv/votport && docker compose stop votport"' \
 #   LIVE_RESTART_CMD='ssh live "cd /srv/votport && docker compose start votport"' \
 #   PROMOTE_CMD='ssh standby "cd /srv/votport && docker compose --profile standby stop && docker compose --profile live up -d"' \
+#   PROMOTION_STOP_CMD='ssh standby "cd /srv/votport && docker compose --profile live stop votport"' \
 #   REPOINT_CMD='ssh proxy "sed -i s/10.0.0.5/10.0.0.6/ /etc/caddy/Caddyfile && caddy reload --config /etc/caddy/Caddyfile"' \
 #   ops/failover/planned.sh
 #
@@ -40,7 +42,8 @@
 # If the script aborts with the drain on, the EXIT trap clears it on the old
 # live while that instance is still running; after the stop, a failed clear
 # on the new live is reported and left for the operator. A failed promote
-# after the stop is rolled back: LIVE_RESTART_CMD (the inverse of
+# after the stop is rolled back only after PROMOTION_STOP_CMD stops the new live.
+# LIVE_RESTART_CMD (the inverse of
 # LIVE_STOP_CMD) restarts the old live, the drain it boots with is cleared,
 # and the script exits non-zero. See README.md for the reverse repoint.
 set -euo pipefail
@@ -56,6 +59,9 @@ command -v python3 >/dev/null 2>&1 || {
 : "${LIVE_STOP_CMD:?LIVE_STOP_CMD is required}"
 : "${LIVE_RESTART_CMD:?LIVE_RESTART_CMD is required: the inverse of LIVE_STOP_CMD, run to restart the old live when a promote fails}"
 : "${PROMOTE_CMD:?PROMOTE_CMD is required}"
+PROMOTION_STOP_CMD="${PROMOTION_STOP_CMD:-}"
+: "${TOPOLOGY:?TOPOLOGY must be shared or replica}"
+case "$TOPOLOGY" in shared|replica) ;; *) echo "TOPOLOGY must be shared or replica" >&2; exit 1 ;; esac
 REPOINT_CMD="${REPOINT_CMD:-}"
 # The drain must outlast the largest in-flight upload, not just a fast
 # transfer: a 500 GiB upload over a 1 Gbit/s link takes about 1.5 hours, and
@@ -90,7 +96,7 @@ if [ "$DRY_RUN" = 1 ]; then
   log "dry run: would poll $LIVE_HOST_URL/readyz until sessions_active is 0 (up to ${DRAIN_TIMEOUT}s)"
   run "$LIVE_STOP_CMD"
   run "$PROMOTE_CMD"
-  log "dry run: a failed promote would run LIVE_RESTART_CMD to restart the old live, clear its drain, and exit non-zero"
+  log "dry run: a failed promote would stop the new live with PROMOTION_STOP_CMD, then run LIVE_RESTART_CMD to restart the old live, clear its drain, and exit non-zero"
   log "dry run: would wait for $NEW_LIVE_HOST_URL/readyz to report lease.mine true (up to ${READY_TIMEOUT}s)"
   run "$REPOINT_CMD"
   log "dry run: would sign in to $NEW_LIVE_URL and clear draining"
@@ -181,7 +187,7 @@ done
 # that finished during the drain. Wait for a copy the live instance built
 # after the drain settled; a shared-volume standby reports no archive.
 drained_at=$(date +%s)
-if [[ "$(readyz_field "$NEW_LIVE_HOST_URL" archive_created_at)" =~ ^[0-9]+$ ]]; then
+if [ "$TOPOLOGY" = replica ]; then
   log "waiting up to ${DRAIN_TIMEOUT}s for the standby to pull a copy built after the drain"
   deadline=$((SECONDS + DRAIN_TIMEOUT))
   while :; do
@@ -204,6 +210,10 @@ run "$LIVE_STOP_CMD"
 drained=0
 log "promoting the standby"
 if ! run "$PROMOTE_CMD"; then
+  if [ -z "$PROMOTION_STOP_CMD" ] || ! run "$PROMOTION_STOP_CMD"; then
+    log "promotion may have started the new live; stop it before restarting the old live; automatic rollback refused"
+    exit 1
+  fi
   log "PROMOTE FAILED; rolling back: restarting the stopped live instance with LIVE_RESTART_CMD"
   if ! run "$LIVE_RESTART_CMD"; then
     log "the rollback restart failed as well; the site is down: run the inverse of LIVE_STOP_CMD by hand, then inspect $LIVE_HOST_URL/readyz and the receive root's .votport-lease"

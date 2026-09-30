@@ -67,7 +67,6 @@ public sealed partial class TransfersPage : Page
         var box = ((sender as FrameworkElement)?.Parent as Panel)?.Children.OfType<PasswordBox>().FirstOrDefault();
         var password = box is null || box.Password.Length == 0 ? null : box.Password;
         if (item.NeedsPassword && password is null) return;
-        if (box is not null) box.Password = "";
         // The one thing a journalled receive can be asked again: where it
         // lands. The tray's resume takes no answer and keeps the journalled
         // folder.
@@ -81,6 +80,7 @@ public sealed partial class TransfersPage : Page
             if (picked is null) return;
             destination = picked.Path;
         }
+        if (box is not null) box.Password = "";
         TransferStore.Shared.Resume(item, password, destination);
     }
 

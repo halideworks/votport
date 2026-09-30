@@ -31,6 +31,7 @@ self.onmessage = async ({ data: message }) => {
       let pending = file.size > 0 ? readAt(0) : null;
       while (pending) {
         const bytes = new Uint8Array(await pending);
+        if (bytes.length !== Math.min(HASH_READ_BYTES, file.size - offset)) throw new Error('File changed or could not be read completely. Select it again.');
         offset += bytes.length;
         pending = offset < file.size ? readAt(offset) : null;
         builder.update(bytes);
@@ -49,6 +50,7 @@ self.onmessage = async ({ data: message }) => {
       let pending = readSlice(file, offset, end);
       while (pending) {
         const bytes = new Uint8Array(await pending);
+        if (bytes.length !== Math.min(HASH_READ_BYTES, end - offset)) throw new Error('File changed or could not be read completely. Select it again.');
         const next = offset + bytes.length;
         pending = next < end ? readSlice(file, next, end) : null;
         parts.push(proofLeavesAt(Suite.Blake3Bao64, BigInt(offset), bytes, BigInt(file.size)));

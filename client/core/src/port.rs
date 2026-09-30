@@ -80,7 +80,7 @@ pub struct Port {
     pub role: String,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 struct Stored {
     base: String,
     cookie: String,
@@ -104,8 +104,26 @@ fn store(stored: &Stored) -> Result<()> {
     write_private(&path(), &bytes)
 }
 
-fn drop_stored() {
-    let _ = std::fs::remove_file(path());
+fn replace_stored(expected: Option<&Stored>, replacement: Option<&Stored>) -> Result<bool> {
+    let _state = crate::identity::state_lease()?;
+    if expected.is_some() && !path().is_file() {
+        return Ok(false);
+    }
+    let lock = crate::identity::private_lock(&state_dir().join("port.lock"))?;
+    fs4::FileExt::lock(&lock)?;
+    let current = load();
+    if current.as_ref() != expected {
+        return Ok(false);
+    }
+    if let Some(stored) = replacement {
+        store(stored)?;
+    } else {
+        match std::fs::remove_file(path()) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
+    }
+    Ok(true)
 }
 
 /// The origin `base` names, trimmed of a trailing slash, when it is an
@@ -145,10 +163,14 @@ pub struct SsoLogin {
     authorization_url: String,
     started: std::time::Instant,
     active: std::sync::Mutex<bool>,
+    previous: Option<Stored>,
+    state_lease: std::sync::Mutex<Option<std::fs::File>>,
 }
 
 pub fn begin_sso(base: &str) -> Result<std::sync::Arc<SsoLogin>> {
     use sha2::Digest as _;
+    let state_lease = crate::identity::state_lease()?;
+    let previous = load();
     let base = origin(base)?;
     let client = Client::authentication(&base)?;
     let available: serde_json::Value = client.admin_get("/api/admin/sso", "")?;
@@ -169,6 +191,8 @@ pub fn begin_sso(base: &str) -> Result<std::sync::Arc<SsoLogin>> {
         authorization_url,
         started: std::time::Instant::now(),
         active: std::sync::Mutex::new(true),
+        previous,
+        state_lease: std::sync::Mutex::new(Some(state_lease)),
     }))
 }
 
@@ -197,6 +221,7 @@ impl SsoLogin {
     }
 
     fn complete_inner(&self, callback: &str) -> Result<Port> {
+        let _state = crate::identity::state_lease()?;
         let code = self.code(callback)?;
         if self.started.elapsed() >= std::time::Duration::from_secs(DESKTOP_SSO_TIMEOUT_SECS)
             || !*self.active.lock().expect("SSO state poisoned")
@@ -227,13 +252,21 @@ impl SsoLogin {
                 "Sign-in expired or was cancelled; start again".to_owned(),
             ));
         }
-        store(&Stored {
-            base: self.base.clone(),
-            cookie: exchange.cookie,
-            tenant: session.tenant.clone(),
-            role: session.role.clone(),
-        })?;
+        if !replace_stored(
+            self.previous.as_ref(),
+            Some(&Stored {
+                base: self.base.clone(),
+                cookie: exchange.cookie,
+                tenant: session.tenant.clone(),
+                role: session.role.clone(),
+            }),
+        )? {
+            return Err(Error::Other(
+                "The signed-in account changed; start again".into(),
+            ));
+        }
         *active = false;
+        self.state_lease.lock().expect("SSO state poisoned").take();
         Ok(Port {
             base: self.base.clone(),
             tenant: session.tenant,
@@ -250,6 +283,7 @@ impl SsoLogin {
 
     pub fn cancel(&self) {
         *self.active.lock().expect("SSO state poisoned") = false;
+        self.state_lease.lock().expect("SSO state poisoned").take();
     }
 
     pub fn complete(&self, callback: String) -> std::result::Result<Port, PortError> {
@@ -265,6 +299,8 @@ impl SsoLogin {
 /// [`Error::WrongPassword`], a 429 after too many refusals, or a network
 /// failure.
 pub fn sign_in(base: &str, password: &str) -> Result<Port> {
+    let _state = crate::identity::state_lease()?;
+    let previous = load();
     let base = origin(base)?;
     let client = Client::new(&base)?;
     let cookie = client.admin_login(password)?;
@@ -277,11 +313,20 @@ pub fn sign_in(base: &str, password: &str) -> Result<Port> {
         tenant: String::new(),
         role: String::new(),
     };
-    store(&stored)?;
+    if !replace_stored(previous.as_ref(), Some(&stored))? {
+        return Err(Error::Other(
+            "The signed-in account changed; start again".into(),
+        ));
+    }
     let session: SessionInfo = client.admin_get("/api/admin/session", &stored.cookie)?;
+    let expected = stored.clone();
     stored.tenant = session.tenant.clone();
     stored.role = session.role.clone();
-    store(&stored)?;
+    if !replace_stored(Some(&expected), Some(&stored))? {
+        return Err(Error::Other(
+            "The signed-in account changed; start again".into(),
+        ));
+    }
     Ok(Port {
         base,
         tenant: session.tenant,
@@ -313,12 +358,15 @@ pub fn check() -> Result<Option<Port>> {
     let client = Client::new(&stored.base)?;
     match client.admin_get::<SessionInfo>("/api/admin/session", &stored.cookie) {
         Ok(session) => {
-            if session.tenant != stored.tenant || session.role != stored.role {
-                let _ = store(&Stored {
+            if !replace_stored(
+                Some(&stored),
+                Some(&Stored {
                     tenant: session.tenant.clone(),
                     role: session.role.clone(),
                     ..stored.clone()
-                });
+                }),
+            )? {
+                return Ok(current());
             }
             Ok(Some(Port {
                 base: stored.base,
@@ -327,8 +375,8 @@ pub fn check() -> Result<Option<Port>> {
             }))
         }
         Err(Error::NotSignedIn) => {
-            drop_stored();
-            Ok(None)
+            replace_stored(Some(&stored), None)?;
+            Ok(current())
         }
         Err(error) => Err(error),
     }
@@ -337,6 +385,7 @@ pub fn check() -> Result<Option<Port>> {
 /// Ends the session on the server (best effort) and forgets it here.
 pub fn sign_out() {
     if let Some(stored) = load() {
+        let _ = replace_stored(Some(&stored), None);
         if let Ok(client) = Client::new(&stored.base) {
             let _ = client.admin_send::<serde_json::Value>(
                 reqwest::Method::POST,
@@ -346,7 +395,6 @@ pub fn sign_out() {
             );
         }
     }
-    drop_stored();
 }
 
 /// The client and cookie of the signed-in port.
@@ -362,8 +410,11 @@ pub(crate) fn run<T>(call: impl FnOnce(&Client, &str) -> Result<T>) -> Result<T>
     let (client, stored) = signed()?;
     match call(&client, &stored.cookie) {
         Err(Error::NotSignedIn) => {
-            drop_stored();
-            Err(Error::NotSignedIn)
+            if replace_stored(Some(&stored), None)? {
+                Err(Error::NotSignedIn)
+            } else {
+                Err(Error::Other("The previous account's session ended".into()))
+            }
         }
         other => other,
     }
@@ -1029,6 +1080,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stale_metadata_cannot_regress_the_same_sessions_updated_role() {
+        let directory = tempfile::tempdir().unwrap();
+        let _state = crate::identity::test_state_dir(directory.path());
+        let earlier = Stored {
+            base: "http://127.0.0.1:1".into(),
+            cookie: "same".into(),
+            tenant: "acme".into(),
+            role: "admin".into(),
+        };
+        let later = Stored {
+            role: "viewer".into(),
+            ..earlier.clone()
+        };
+        assert!(replace_stored(None, Some(&earlier)).unwrap());
+        assert!(replace_stored(Some(&earlier), Some(&later)).unwrap());
+        assert!(!replace_stored(Some(&earlier), Some(&earlier)).unwrap());
+        assert_eq!(load().unwrap().role, "viewer");
+    }
+
+    #[test]
+    fn previous_session_results_cannot_replace_or_remove_a_new_login() {
+        let directory = tempfile::tempdir().unwrap();
+        let _state = crate::identity::test_state_dir(directory.path());
+        let previous = Stored {
+            base: "http://127.0.0.1:1".into(),
+            cookie: "old".into(),
+            tenant: "first".into(),
+            role: "admin".into(),
+        };
+        let next = Stored {
+            cookie: "new".into(),
+            tenant: "second".into(),
+            ..previous.clone()
+        };
+        assert!(replace_stored(None, Some(&previous)).unwrap());
+        let result = run::<()>(|_, _| {
+            assert!(replace_stored(Some(&previous), Some(&next)).unwrap());
+            Err(Error::NotSignedIn)
+        });
+        assert!(!matches!(result, Err(Error::NotSignedIn)));
+        assert!(!replace_stored(Some(&previous), None).unwrap());
+        assert!(!replace_stored(Some(&previous), Some(&previous)).unwrap());
+        assert!(load() == Some(next.clone()));
+        assert!(replace_stored(Some(&next), None).unwrap());
+        assert!(load().is_none());
+    }
+
+    #[test]
     fn resume_offsets_validate_progress_and_bound_backtracking() {
         let cases = [
             (0, 16, 0, 0, None, 0),
@@ -1202,6 +1301,8 @@ mod tests {
         let state = "ab".repeat(16);
         let code = "cd".repeat(16);
         let login = SsoLogin {
+            state_lease: std::sync::Mutex::new(None),
+            previous: None,
             base: "https://original.example".into(),
             verifier: "ef".repeat(32),
             state: state.clone(),

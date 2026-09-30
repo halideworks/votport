@@ -222,13 +222,19 @@ function showModal(title, detail, action) {
   return dialog;
 }
 
+let pendingModal = Promise.resolve();
+
 export function confirmModal(title, detail, action) {
-  const dialog = showModal(title, detail, action);
-  return new Promise((resolve) => {
-    dialog.addEventListener('close', () => resolve(dialog.returnValue === 'ok'), { once: true });
+  const result = pendingModal.then(() => {
+    const dialog = showModal(title, detail, action);
+    return new Promise((resolve) => {
+      dialog.addEventListener('close', () => resolve(dialog.returnValue === 'ok'), { once: true });
+    });
   });
+  pendingModal = result.catch(() => {});
+  return result;
 }
 
 export function alertModal(message) {
-  showModal('Something went wrong', message);
+  return confirmModal('Something went wrong', message);
 }

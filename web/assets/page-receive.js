@@ -528,7 +528,7 @@ function renderStatus(status) {
   // A transfer starting or finishing changes what the list should show. The
   // first poll only records the set; a refresh in flight defers the change
   // to the next tick, and a list the operator paged through is left alone.
-  const key = [...byLink.keys()].sort().join(',');
+  const key = status.receiving.map(({ id }) => id).sort().join(',');
   if (linksRefreshPending || (receivingKey !== null && key !== receivingKey)) {
     if (linksBusy || receptionEditing()) return;
     if (!linksExpanded) refreshLinksSafe({ fromPoll: true });

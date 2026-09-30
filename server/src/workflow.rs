@@ -348,7 +348,7 @@ impl Project {
         if self.members.len() > 500
             || self.members.iter().any(|(subject, role)| {
                 subject.is_empty()
-                    || subject.len() > 500
+                    || subject.len() > 600
                     || !["sender", "approver", "viewer"].contains(&role.as_str())
             })
         {

@@ -359,7 +359,8 @@ pub(crate) fn validate_endpoint(value: &str) -> Result<(), String> {
     if !matches!(url.scheme(), "https" | "http") || url.host_str().is_none() {
         return Err("invalid S3 endpoint".into());
     }
-    if url.scheme() == "http" && !matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"))
+    if url.scheme() == "http"
+        && !matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
     {
         return Err("S3 endpoint must use HTTPS except loopback".into());
     }
@@ -1563,6 +1564,9 @@ pub(crate) fn record_applied_restore(store: &crate::store::Store, applied: &Appl
     );
 }
 
+const SURVEY_ENTRY_LIMIT: usize = 100_000;
+const SURVEY_DEPTH_LIMIT: usize = 128;
+
 /// Reconciles the restored records against the receive tree (audit finding
 /// 498): a restore rolls the database back, so payloads and receipts
 /// published after the backup stay on disk with no record, while live
@@ -1576,8 +1580,8 @@ pub(crate) fn survey_restored_payloads(store: &crate::store::Store, receive_dir:
     }
     let records: Vec<(String, String)> = match store.with(|connection| {
         connection
-            .prepare("SELECT tenant, stored_as FROM files WHERE deleted = 0 AND stored_as <> ''")?
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .prepare("SELECT tenant, stored_as FROM files WHERE deleted = 0 AND stored_as <> '' LIMIT ?1")?
+            .query_map([(SURVEY_ENTRY_LIMIT + 1) as i64], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()
     }) {
         Ok(rows) => rows,
@@ -1586,15 +1590,38 @@ pub(crate) fn survey_restored_payloads(store: &crate::store::Store, receive_dir:
             return;
         }
     };
+    if records.len() > SURVEY_ENTRY_LIMIT {
+        tracing::warn!("restored payload survey exceeded its record limit; records retained");
+        store.audit(
+            "",
+            "",
+            "restore_payload_mismatch",
+            "",
+            &serde_json::json!({
+                "survey_complete": false, "record_limit": SURVEY_ENTRY_LIMIT, "tombstoned": 0,
+            }),
+        );
+        return;
+    }
     let referenced: HashSet<String> = records
         .iter()
         .map(|(tenant, stored_as)| crate::paths::stored_components(tenant, stored_as).join("/"))
         .collect();
     let mut on_disk = HashSet::new();
     let mut unreadable = Vec::new();
-    let walked = collect_payload_files(receive_dir, "", &mut on_disk, &mut unreadable)
-        .map_err(|error| tracing::warn!(%error, "restored payload survey could not read the receive tree"))
-        .is_ok();
+    let mut remaining = SURVEY_ENTRY_LIMIT;
+    let walked = collect_payload_files(
+        receive_dir,
+        "",
+        &mut on_disk,
+        &mut unreadable,
+        &mut remaining,
+        0,
+    )
+    .map_err(
+        |error| tracing::warn!(%error, "restored payload survey could not read the receive tree"),
+    )
+    .is_ok();
     // A folder the service may not list (lost+found, System Volume
     // Information) says nothing about the records under it.
     let missing: Vec<&String> = referenced
@@ -1610,7 +1637,10 @@ pub(crate) fn survey_restored_payloads(store: &crate::store::Store, receive_dir:
     // live records exist, is a volume that is not there yet (unmounted, not
     // restored), not proof every payload is gone; tombstoning then would
     // erase the index permanently. Report only.
-    let trusted = walked && !(on_disk.is_empty() && !records.is_empty());
+    let trusted = walked
+        && crate::receiving::saved_qualification(store).is_ok_and(|saved| saved.is_some())
+        && crate::receiving::Destinations::configured(receive_dir, store).is_ok()
+        && !(on_disk.is_empty() && !records.is_empty());
     // Audit finding 373: a restored record whose payload is gone would stay
     // listed, charged against quota and targeted by retention on a path that
     // no longer holds its bytes. Tombstone the stat-misses now, while the
@@ -1642,7 +1672,7 @@ pub(crate) fn survey_restored_payloads(store: &crate::store::Store, receive_dir:
             }
         };
     }
-    if missing.is_empty() && unreferenced.is_empty() {
+    if walked && missing.is_empty() && unreferenced.is_empty() {
         return;
     }
     let detail = serde_json::json!({
@@ -1652,6 +1682,7 @@ pub(crate) fn survey_restored_payloads(store: &crate::store::Store, receive_dir:
         "unreferenced": sample_names(&unreferenced),
         "tombstoned": tombstoned,
         "receive_tree_trusted": trusted,
+        "survey_complete": walked,
         "unreadable": unreadable.iter().take(8).collect::<Vec<_>>(),
     });
     tracing::warn!(
@@ -1673,7 +1704,12 @@ fn collect_payload_files(
     prefix: &str,
     out: &mut HashSet<String>,
     unreadable: &mut Vec<String>,
+    remaining: &mut usize,
+    depth: usize,
 ) -> std::io::Result<()> {
+    if depth > SURVEY_DEPTH_LIMIT {
+        return Err(std::io::Error::other("restore survey depth limit exceeded"));
+    }
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         // Below the root, a folder the service may not list is noted and
@@ -1687,6 +1723,9 @@ fn collect_payload_files(
         Err(error) => return Err(error),
     };
     for entry in entries {
+        *remaining = remaining
+            .checked_sub(1)
+            .ok_or_else(|| std::io::Error::other("restore survey entry limit exceeded"))?;
         let entry = entry?;
         let metadata = fs::symlink_metadata(entry.path())?;
         let Ok(name) = entry.file_name().into_string() else {
@@ -1707,7 +1746,14 @@ fn collect_payload_files(
             format!("{prefix}/{name}")
         };
         if directory {
-            collect_payload_files(&entry.path(), &relative, out, unreadable)?;
+            collect_payload_files(
+                &entry.path(),
+                &relative,
+                out,
+                unreadable,
+                remaining,
+                depth + 1,
+            )?;
         } else if file {
             out.insert(relative);
         }
@@ -2694,6 +2740,147 @@ mod tests {
         );
     }
 
+    #[test]
+    fn s3_endpoint_accepts_ipv6_loopback_but_requires_remote_tls() {
+        for endpoint in [
+            "http://[::1]:9000",
+            "http://127.0.0.1:9000",
+            "https://[2001:db8::1]",
+        ] {
+            assert!(validate_endpoint(endpoint).is_ok(), "{endpoint}");
+        }
+        for endpoint in [
+            "http://[2001:db8::1]",
+            "http://[::2]",
+            "http://[::1]/bucket",
+        ] {
+            assert!(validate_endpoint(endpoint).is_err(), "{endpoint}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restored_survey_does_not_tombstone_an_unqualified_backing_directory() {
+        let (root, store) = initialized_root();
+        let receive = root.path().join("received");
+        fs::create_dir(&receive).unwrap();
+        crate::paths::tighten_private_dir(&receive).unwrap();
+        fs::write(receive.join("stray.bin"), b"local backing directory").unwrap();
+        store.with(|connection| connection.execute_batch(
+            "INSERT INTO files(link_id,tenant,upload_id,file_index,bytes_hi,bytes_lo,deleted,stored_as,path,suite,root,receipt)
+             VALUES ('link','','upload',0,0,1,0,'missing.bin','missing.bin','blake3','root',0)"
+        )).unwrap();
+        survey_restored_payloads(&store, &receive);
+        assert_eq!(
+            store
+                .with(|connection| connection.query_row(
+                    "SELECT COUNT(*) FROM files WHERE deleted=0",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                ))
+                .unwrap(),
+            1
+        );
+        let qualification = crate::receiving::Qualification {
+            storage: crate::receiving::storage_identity(&receive).unwrap(),
+            qualified_at: 1,
+            qualified_by: "fixture".into(),
+        };
+        store
+            .put_settings(
+                "fixture",
+                &[(
+                    crate::receiving::SETTING_KEY.into(),
+                    crate::store::SettingWrite::Set(serde_json::to_string(&qualification).unwrap()),
+                )],
+            )
+            .unwrap();
+        survey_restored_payloads(&store, &receive);
+        let live = store
+            .with(|connection| {
+                connection.query_row("SELECT COUNT(*) FROM files WHERE deleted=0", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+            })
+            .unwrap();
+        assert_eq!(live, 1);
+        let detail = store
+            .audit_export(None, 0, 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.event == "restore_payload_mismatch")
+            .unwrap()
+            .detail;
+        assert_eq!(detail["receive_tree_trusted"], false);
+        assert_eq!(detail["tombstoned"], 0);
+    }
+
+    #[test]
+    fn restored_payload_walk_stops_at_entry_and_depth_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("payload.bin"), b"bytes").unwrap();
+        let mut files = HashSet::new();
+        let mut unreadable = Vec::new();
+        assert!(collect_payload_files(
+            directory.path(),
+            "",
+            &mut files,
+            &mut unreadable,
+            &mut 0,
+            0
+        )
+        .is_err());
+        assert!(files.is_empty());
+        assert!(collect_payload_files(
+            directory.path(),
+            "",
+            &mut files,
+            &mut unreadable,
+            &mut 1,
+            SURVEY_DEPTH_LIMIT + 1
+        )
+        .is_err());
+        assert!(files.is_empty());
+        collect_payload_files(
+            directory.path(),
+            "",
+            &mut files,
+            &mut unreadable,
+            &mut 1,
+            SURVEY_DEPTH_LIMIT,
+        )
+        .unwrap();
+        assert!(files.contains("payload.bin"));
+    }
+
+    #[test]
+    fn restored_payload_survey_reports_an_oversized_catalog_without_walking() {
+        let (root, store) = initialized_root();
+        let receive = root.path().join("received");
+        fs::create_dir(&receive).unwrap();
+        store
+            .with(|connection| {
+                connection.execute_batch(&format!(
+                    "CREATE TEMP VIEW files AS WITH RECURSIVE catalog(n) AS
+             (SELECT 1 UNION ALL SELECT n+1 FROM catalog WHERE n<{})
+             SELECT '' AS tenant, 'missing.bin' AS stored_as, 0 AS deleted FROM catalog;",
+                    SURVEY_ENTRY_LIMIT + 1
+                ))
+            })
+            .unwrap();
+        survey_restored_payloads(&store, &receive);
+        let detail = store
+            .audit_export(None, 0, 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.event == "restore_payload_mismatch")
+            .unwrap()
+            .detail;
+        assert_eq!(detail["survey_complete"], false);
+        assert_eq!(detail["record_limit"], SURVEY_ENTRY_LIMIT);
+        assert_eq!(detail["tombstoned"], 0);
+    }
+
     fn initialized_root() -> (tempfile::TempDir, crate::store::Store) {
         let root = tempfile::tempdir().unwrap();
         crate::paths::tighten_private_dir(root.path()).unwrap();
@@ -2841,23 +3028,17 @@ mod tests {
             // Running with privileges that ignore the mode; nothing to prove.
             return;
         }
-        assert_eq!(
-            live(&store),
-            1,
-            "gone.bin is tombstoned, sub/kept.bin is kept"
-        );
+        assert_eq!(live(&store), 2, "an unqualified tree retains both records");
         let detail = latest(&store);
-        assert_eq!(detail["tombstoned"], 1);
-        assert_eq!(detail["receive_tree_trusted"], true);
+        assert_eq!(detail["tombstoned"], 0);
+        assert_eq!(detail["receive_tree_trusted"], false);
         assert_eq!(detail["unreadable"][0], "sub");
     }
 
-    /// Audit finding 373: the survey must tombstone the live records whose
-    /// payload did not survive the restore, so nothing lists, charges or
-    /// retires against a path that no longer holds the record's bytes,
-    /// while a record whose payload stats stays live.
+    /// Without a saved storage identity, missing bytes need operator review.
+    /// A local backing directory can be present before the NAS is mounted.
     #[test]
-    fn restored_payload_survey_tombstones_records_missing_from_disk() {
+    fn restored_payload_survey_retains_missing_records_without_storage_identity() {
         let (root, store) = initialized_root();
         let receive = root.path().join("received");
         store
@@ -2892,8 +3073,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             (deleted, path.as_str()),
-            (1, ""),
-            "the miss must be tombstoned"
+            (0, "gone.bin"),
+            "the unqualified miss must retain its record"
         );
         let kept: i64 = store
             .with(|connection| {
@@ -2911,17 +3092,17 @@ mod tests {
             .find(|row| row.event == "restore_payload_mismatch")
             .expect("one mismatch row");
         assert_eq!(row.detail["missing"][0], "gone.bin", "{}", row.detail);
-        assert_eq!(row.detail["tombstoned"], 1, "{}", row.detail);
+        assert_eq!(row.detail["tombstoned"], 0, "{}", row.detail);
 
-        // The reconciled tree agrees on a further survey.
+        // A missing record stays visible for operator reconciliation.
         survey_restored_payloads(&store, &receive);
         let rows = store.audit_export(None, 0, 0, 100).unwrap();
         assert_eq!(
             rows.iter()
                 .filter(|row| row.event == "restore_payload_mismatch")
                 .count(),
-            1,
-            "a tombstoned record stops being reported"
+            2,
+            "an unqualified missing record is still reported"
         );
     }
 

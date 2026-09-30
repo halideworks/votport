@@ -12,6 +12,7 @@ private let log = Logger(subsystem: "com.halideworks.votport", category: "port")
 final class PortStore: ObservableObject {
     static let shared = PortStore()
 
+    @Published private(set) var sessionGeneration = 0
     @Published private(set) var port: VotportCore.Port?
     @Published private(set) var requests: [RequestLink] = []
     @Published private(set) var deliveries: [Delivery] = []
@@ -69,6 +70,7 @@ final class PortStore: ObservableObject {
     }
 
     func signIn(base: String, password: String) {
+        sessionGeneration += 1
         let previous = clearSso()
         run(.port) {
             previous?.cancel()
@@ -88,6 +90,7 @@ final class PortStore: ObservableObject {
     }
 
     func beginSso(base: String) {
+        sessionGeneration += 1
         let previous = clearSso()
         let attempt = UUID()
         ssoAttempt = attempt
@@ -154,6 +157,7 @@ final class PortStore: ObservableObject {
     }
 
     func signOut() {
+        sessionGeneration += 1
         let previous = clearSso()
         run(.port) {
             previous?.cancel()
@@ -326,6 +330,7 @@ final class PortStore: ObservableObject {
     /// Drops upload state when the signed-in account changes. A running core
     /// worker remains the active guard until its completion callback settles.
     private func resetLibraryUploadForSession() {
+        sessionGeneration += 1
         if libraryUploadActive {
             libraryUploadTransfer?.cancel()
             Power.libraryUpload(false)
@@ -392,6 +397,7 @@ final class PortStore: ObservableObject {
     /// passwords, the journals, the pending verification evidence, and the
     /// device key), so an uninstall leaves nothing behind.
     func removeLocalData() {
+        sessionGeneration += 1
         let previous = clearSso()
         run(.port) {
             previous?.cancel()
@@ -439,6 +445,7 @@ final class PortStore: ObservableObject {
         _ work: @escaping @Sendable () throws -> T,
         then: @escaping @MainActor (Result<T, PortError>) -> Void
     ) where T: Sendable {
+        let expectedSession = sessionGeneration
         inFlight += 1
         busy = true
         // A problem belongs to the call that failed; the next call clears it.
@@ -458,6 +465,12 @@ final class PortStore: ObservableObject {
                     let store = PortStore.shared
                     store.inFlight -= 1
                     store.busy = store.inFlight > 0
+                    guard scope == .watch || store.sessionGeneration == expectedSession else {
+                        if scope != .port {
+                            then(.failure(.Failed(headline: "The signed-in account changed; try again", detail: "The signed-in account changed", signedOut: false)))
+                        }
+                        return
+                    }
                     then(result)
                 }
             }

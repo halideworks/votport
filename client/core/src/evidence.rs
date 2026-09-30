@@ -304,6 +304,7 @@ pub fn delivery_verifications() -> Vec<VerificationRecord> {
 
 #[uniffi::export]
 pub fn accept_delivery(verification_id: String) -> Result<String> {
+    let _state = crate::identity::state_lease()?;
     accept_in(&outbox(), &verification_id, &Device::load_or_create()?)
 }
 
@@ -494,6 +495,9 @@ fn outbox_status(directory: &Path) -> OutboxStatus {
 
 #[uniffi::export]
 pub fn retry_evidence() -> OutboxStatus {
+    let Ok(_state) = crate::identity::state_lease() else {
+        return OutboxStatus::default();
+    };
     static RETRY: Mutex<()> = Mutex::new(());
     // One pass holds this lock across its network round trips, seconds per
     // report. A second caller never queues behind it: it reports the outbox

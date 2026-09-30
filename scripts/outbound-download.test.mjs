@@ -163,7 +163,7 @@ function responseInChunks(chunks, status = 200, contentType = 'application/vnd.v
   };
 }
 
-function fakeDirectory({ failWrite = false, initialFiles = [], directories = [] } = {}) {
+function fakeDirectory({ failWrite = false, initialFiles = [], directories = [], ignoreViewBounds = false } = {}) {
   const files = new Map(initialFiles);
   const aborted = [];
   return {
@@ -182,7 +182,7 @@ function fakeDirectory({ failWrite = false, initialFiles = [], directories = [] 
           return {
             async write(chunk) {
               if (failWrite) throw new Error('write failed');
-              chunks.push(new Uint8Array(chunk));
+              chunks.push(new Uint8Array(ignoreViewBounds ? chunk.buffer : chunk));
             },
             async close() { files.set(name, new TextDecoder().decode(join(...chunks))); },
             async abort() { aborted.push(name); },
@@ -268,6 +268,21 @@ test('streams concatenated batch payloads by trusted metadata lengths', async ()
     (completed, total, name) => progress.push([completed, total, name]));
   assert.deepEqual([...directory.files], [['first.bin', 'first'], ['second.bin', 'second']]);
   assert.deepEqual(progress, [[1, 2, 'first.bin'], [2, 2, 'second.bin']]);
+});
+
+test('sliced download chunks keep exact bytes when a writer consumes backing buffers', async () => {
+  const directory = fakeDirectory({ ignoreViewBounds: true });
+  await saveBatchFiles(responseInChunks([new TextEncoder().encode('firstsecond')]), directory,
+    [{ bytes: 5 }, { bytes: 6 }], ['first', 'second']);
+  assert.deepEqual([...directory.files], [['first', 'first'], ['second', 'second']]);
+  const writes = [];
+  const source = new TextEncoder().encode('beforewantedafter').subarray(6, 12);
+  const response = responseInChunks([source]);
+  response.ok = true;
+  assert.equal(await streamToWritable(async () => response, {
+    async write(bytes) { writes.push(new TextDecoder().decode(bytes.buffer)); },
+  }, { bytes: 6, download_url: 'fixture' }), 6);
+  assert.deepEqual(writes, ['wanted']);
 });
 
 test('rejects truncation and trailing bytes without direct fallback', async () => {

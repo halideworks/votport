@@ -192,8 +192,7 @@ fn merge_scim_groups(
 /// value counts as absent. An email the provider marks unverified is
 /// refused outright: a self-asserted address must not select a principal.
 /// Providers that omit email_verified (Entra) are accepted as is.
-/// The subject folds to lowercase so a sign-in lands on the same principal
-/// row a SCIM client provisioned, whatever case each source used.
+/// Opaque subjects preserve exact case; configured email and username claims fold.
 fn select_subject(
     claim: crate::config::SubjectClaim,
     sub: &str,
@@ -211,9 +210,14 @@ fn select_subject(
         SubjectClaim::PreferredUsername => preferred_username,
     };
     Ok(chosen
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_lowercase))
+        .map(|value| {
+            if claim == SubjectClaim::Sub {
+                value.to_owned()
+            } else {
+                value.trim().to_lowercase()
+            }
+        })
+        .filter(|value| !value.is_empty()))
 }
 
 fn finish_sso_login(
@@ -885,6 +889,10 @@ pub async fn sso_callback(
         );
         return home("identity could not be verified");
     };
+    let subject = match sso_config.0.subject_key(&subject) {
+        Ok(subject) => subject,
+        Err(_) => return home("identity could not be verified"),
+    };
     let require_provisioning = match app.store.resolved_settings(&app.config) {
         Ok(settings) => settings.require_provisioning,
         Err(error) => {
@@ -930,6 +938,9 @@ pub async fn sso_callback(
     }
     let admin_cookie = match super::admin::issue_admin_cookie(&app, &identity, None) {
         Ok(cookie) => cookie,
+        Err(error) if error.status == StatusCode::UNPROCESSABLE_ENTITY => {
+            return home(&error.message)
+        }
         Err(_) => return home("could not complete sign-in"),
     };
     browser_login_response(&app, admin_cookie)
@@ -1467,7 +1478,11 @@ mod tests {
             if case == "scim-only" {
                 for group in ["platform-admins", "tenant-admins"] {
                     app.store
-                        .create_scim_group(group, None, &[case.to_owned()])
+                        .create_scim_group(
+                            group,
+                            None,
+                            &[app.config.oidc.as_ref().unwrap().subject_key(case).unwrap()],
+                        )
                         .unwrap()
                         .unwrap();
                 }
@@ -1609,7 +1624,10 @@ mod tests {
                     let mut headers = HeaderMap::new();
                     headers.insert(header::COOKIE, cookie.clone());
                     let identity = super::super::admin::test_require_admin(&app, &headers).unwrap();
-                    assert_eq!(identity.subject, case);
+                    assert_eq!(
+                        identity.subject,
+                        app.config.oidc.as_ref().unwrap().subject_key(case).unwrap()
+                    );
                     assert_eq!(identity.role, role, "{case}");
                     assert_eq!(
                         identity
@@ -1619,7 +1637,12 @@ mod tests {
                         case != "absent",
                         "{case}"
                     );
-                    let groups = app.store.principal(case).unwrap().unwrap().last_groups;
+                    let groups = app
+                        .store
+                        .principal(&identity.subject)
+                        .unwrap()
+                        .unwrap()
+                        .last_groups;
                     let unique: std::collections::HashSet<_> =
                         groups.iter().map(String::as_str).collect();
                     assert_eq!(groups.len(), unique.len(), "{case}");
@@ -1644,7 +1667,7 @@ mod tests {
                         assert!(app.store.audit_export(None, 0, 0, 100).unwrap().iter().any(
                             |row| {
                                 row.event == "sso_login"
-                                    && row.subject == case
+                                    && row.subject == identity.subject
                                     && row.detail["role"] == "admin"
                             }
                         ));
@@ -1835,7 +1858,15 @@ mod tests {
                     let mut headers = HeaderMap::new();
                     headers.insert(header::COOKIE, cookie.clone());
                     let identity = super::super::admin::test_require_admin(&app, &headers).unwrap();
-                    assert_eq!(identity.subject, "clock-test");
+                    assert_eq!(
+                        identity.subject,
+                        app.config
+                            .oidc
+                            .as_ref()
+                            .unwrap()
+                            .subject_key("clock-test")
+                            .unwrap()
+                    );
                     assert_eq!(identity.role, "admin");
                 }
                 Some(code) => {
@@ -2313,7 +2344,11 @@ mod tests {
             ..identity.clone()
         };
         let token_b = auth::issue_admin_token(&secret, &other, "version-1");
-        let swapped = token.replace(&hex::encode("user@example.com"), &hex::encode("other"));
+        let mut parts: Vec<_> = token.split('.').map(str::to_owned).collect();
+        use base64::Engine as _;
+        parts[1] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&other).unwrap());
+        let swapped = parts.join(".");
         assert!(auth::verify_admin_token(&secret, "version-1", &swapped).is_none());
         drop(token_b);
     }
@@ -2905,7 +2940,18 @@ mod tests {
         stage_token(&rolled, &nonce);
         let response = complete(&router, peer, &cookie, &state).await;
         assert_eq!(response.headers()[axum::http::header::LOCATION], "/");
-        assert!(app.store.principal("walker").unwrap().is_some());
+        assert!(app
+            .store
+            .principal(
+                &app.config
+                    .oidc
+                    .as_ref()
+                    .unwrap()
+                    .subject_key("walker")
+                    .unwrap()
+            )
+            .unwrap()
+            .is_some());
         assert!(app.sso_client.health_peek());
         tasks.shutdown().await;
     }
