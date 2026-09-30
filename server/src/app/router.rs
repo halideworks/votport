@@ -300,6 +300,11 @@ pub fn router(app: Arc<App>) -> Router {
                 .post(api::upload_outbound_file)
                 .delete(api::delete_outbound_file),
         )
+        .route(
+            "/api/admin/outbound-files/preparation-status",
+            post(api::outbound::library_preparation_status)
+                .layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
         .route("/api/admin/password", post(api::admin_change_password))
         .route(
             "/api/admin/links",

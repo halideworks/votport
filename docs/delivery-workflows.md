@@ -6,6 +6,28 @@ and storage integration to the existing verified transfer paths. Open
 Agents use the scoped HTTP API, client CLI, or MCP tools described
 in [Agent access](agents.md).
 
+## Library preparation status
+
+The Deliver Library lists each file's preparation status before you create a
+link. Status refreshes every five seconds while the tab is visible, preserving
+file selections and keyboard focus.
+
+- **Ready**: the unchanged file can reuse its prepared content hash. Large files
+  also have the required proof catalog. Link creation rechecks the source.
+- **Preparing**: an existing background or delivery preparation owns the file.
+- **Waiting for idle**: automatic preparation is paused for active transfers or
+  server draining. You can still request a link.
+- **Not prepared**: no reusable preparation exists. The background scan considers
+  recent stable files while idle; creating a link prepares selected files too.
+- **On demand**: automatic preparation is disabled or the file has a temporary
+  extension excluded from background preparation.
+- **Unavailable**: the file is missing, unsafe, or exceeds the configured size
+  limit. Refresh the Library before sharing it.
+
+Status failures display **Unknown** and do not prevent link creation. These
+checks read metadata and small catalog headers, never hash file contents or
+create delivery grants. Readiness is advisory; source changes invalidate it.
+
 ## What each client can do
 
 | Capability | Browser | Windows/macOS | CLI/MCP |

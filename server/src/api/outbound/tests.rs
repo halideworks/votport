@@ -7331,3 +7331,209 @@ async fn a_protected_directory_refuses_a_plain_link_as_a_conflict() {
         "this directory requires a delivery workflow"
     );
 }
+
+#[tokio::test]
+async fn library_preparation_status_checks_cached_catalog_source_and_ownership() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = crate::api::testing::build(directory.path());
+    Arc::get_mut(&mut app).unwrap().config.max_upload_bytes = BATCH_STAGE_BYTES + 1;
+    let root = &app.config.outbound_dir;
+    let path = root.join("clip.mov");
+    std::fs::write(&path, b"original clip").unwrap();
+    let check = |background, idle| prehash::status(&app, "", "clip.mov", background, idle);
+    assert_eq!(check(true, true), "not_prepared");
+    assert_eq!(check(true, false), "waiting_for_idle");
+    assert_eq!(check(false, true), "on_demand");
+    let lock = library_hash_lock(&app, &path);
+    let held = lock.lock().await;
+    assert_eq!(check(false, false), "preparing");
+    drop(held);
+    let proofs = app.config.data_dir.join("outbound.proofs");
+    hash_library_file(
+        root,
+        "clip.mov",
+        &path,
+        &proofs,
+        app.config.max_upload_bytes,
+        "",
+        &app.root_cache,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(check(false, false), "ready");
+    assert!(std::fs::read_dir(&proofs).is_err());
+    let hashed = hash_library_file(
+        root,
+        "clip.mov",
+        &path,
+        &proofs,
+        app.config.max_upload_bytes,
+        "",
+        &app.root_cache,
+        None,
+        Some(&app),
+    )
+    .unwrap();
+    assert_eq!(check(false, false), "ready");
+    let object = ObjectId {
+        suite: 1,
+        root: hex::decode(&hashed.root).unwrap().try_into().unwrap(),
+        length: hashed.bytes,
+    };
+    let catalog = catalog_path(&proofs, &object);
+    let bytes = std::fs::read(&catalog).unwrap();
+    std::fs::remove_file(&catalog).unwrap();
+    assert_eq!(check(true, true), "ready");
+    std::fs::write(&catalog, &bytes[..bytes.len() - 1]).unwrap();
+    assert_eq!(check(true, true), "ready");
+    std::fs::write(&catalog, bytes).unwrap();
+    assert_eq!(check(true, true), "ready");
+    std::fs::write(&path, b"modified clip").unwrap();
+    assert_eq!(check(true, true), "not_prepared");
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(check(true, true), "unavailable");
+    for name in ["../outside", ".votport-workflows/private", "missing.mov"] {
+        assert_eq!(prehash::status(&app, "", name, true, true), "unavailable");
+    }
+    std::fs::write(root.join("unfinished.PART"), b"clip").unwrap();
+    assert_eq!(
+        prehash::status(&app, "", "unfinished.PART", true, true),
+        "on_demand"
+    );
+    let large = root.join("large.mov");
+    std::fs::File::create(&large)
+        .unwrap()
+        .set_len(BATCH_STAGE_BYTES)
+        .unwrap();
+    let meta = std::fs::symlink_metadata(&large).unwrap();
+    app.root_cache.insert(
+        "",
+        &large,
+        meta.len(),
+        mtime_nanos(&meta),
+        change_stamp(&meta),
+        "ab".repeat(32),
+    );
+    assert_eq!(
+        prehash::status(&app, "", "large.mov", true, true),
+        "not_prepared"
+    );
+    let outside_directory = directory.path().join("outside");
+    std::fs::create_dir_all(&outside_directory).unwrap();
+    std::fs::write(outside_directory.join("clip.mov"), b"clip").unwrap();
+    std::os::unix::fs::symlink(&outside_directory, root.join("linked")).unwrap();
+    assert_eq!(
+        prehash::status(&app, "", "linked/clip.mov", true, true),
+        "unavailable"
+    );
+    let outside = directory.path().join("outside.mov");
+    std::fs::write(&outside, b"clip").unwrap();
+    std::os::unix::fs::symlink(&outside, &path).unwrap();
+    assert_eq!(check(true, true), "unavailable");
+}
+
+#[tokio::test]
+async fn library_preparation_status_is_authenticated_bounded_and_tenant_scoped() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = crate::api::testing::build(directory.path());
+    app.store
+        .insert_tenant(crate::store::tests::test_tenant("acme"))
+        .unwrap();
+    let root = library_root(&app, "acme");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("clip.mov"), b"tenant clip").unwrap();
+    let request = |cookie: Option<String>, paths: serde_json::Value| {
+        let mut request = Request::post("/api/admin/outbound-files/preparation-status")
+            .header("content-type", "application/json");
+        if let Some(cookie) = cookie {
+            request = request.header("cookie", cookie);
+        }
+        request
+            .body(Body::from(json!({"paths": paths}).to_string()))
+            .unwrap()
+    };
+    for (role, expected) in [
+        ("viewer", StatusCode::OK),
+        ("auditor", StatusCode::FORBIDDEN),
+    ] {
+        let identity = auth::AdminIdentity {
+            subject: format!("sso:readiness-{role}"),
+            tenant: String::new(),
+            role: role.into(),
+            grants: vec![auth::TenantGrant {
+                incarnation: None,
+                tenant: String::new(),
+                role: role.into(),
+            }],
+            credential_version: 1,
+        };
+        let cookie = super::super::admin::issue_admin_cookie(&app, &identity, None).unwrap();
+        let response = router(app.clone())
+            .oneshot(request(Some(cookie), json!(["clip.mov"])))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{role}");
+    }
+    let response = router(app.clone())
+        .oneshot(request(None, json!(["clip.mov"])))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let response = router(app.clone())
+        .oneshot(request(
+            Some(admin_cookie(&app)),
+            json!([
+                "clip.mov",
+                format!("{}/acme/clip.mov", crate::paths::TENANT_STORAGE_DIR)
+            ]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let files = body(response).await;
+    assert_eq!(files["files"][0]["preparation"], "unavailable");
+    assert_eq!(files["files"][1]["preparation"], "unavailable");
+    let response = router(app.clone())
+        .oneshot(request(
+            Some(named_admin_cookie(&app, "acme")),
+            json!(["clip.mov", "../clip.mov"]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let files = body(response).await;
+    assert_eq!(files["files"][0]["preparation"], "on_demand");
+    assert_eq!(files["files"][1]["preparation"], "unavailable");
+    for paths in [
+        json!(vec!["clip.mov"; MAX_LIBRARY_DIRECTORY_ENTRIES + 1]),
+        json!(["x".repeat(MAX_LIBRARY_CURSOR_BYTES + 1)]),
+    ] {
+        let response = router(app.clone())
+            .oneshot(request(Some(admin_cookie(&app)), paths))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    // A full visible page may exceed the default 64 KiB body limit.
+    let response = router(app.clone())
+        .oneshot(request(
+            Some(admin_cookie(&app)),
+            json!(vec!["x".repeat(100); MAX_LIBRARY_DIRECTORY_ENTRIES]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(app.library_hash_locks.lock().unwrap().is_empty());
+    let tenant_storage = app
+        .config
+        .outbound_dir
+        .join(crate::paths::TENANT_STORAGE_DIR);
+    let moved = directory.path().join("external-tenants");
+    std::fs::rename(&tenant_storage, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &tenant_storage).unwrap();
+    assert_eq!(
+        prehash::status(&app, "acme", "clip.mov", true, true),
+        "unavailable"
+    );
+}

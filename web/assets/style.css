@@ -1517,6 +1517,16 @@ textarea { resize: vertical; }
  text-transform: none;
  color: var(--muted);
 }
+.library-file-details {
+ display: flex;
+ flex-direction: column;
+ align-items: flex-end;
+ gap: 0.2rem;
+ text-align: right;
+}
+.library-preparation[data-state="ready"] {
+ color: var(--ok);
+}
 .library-file input {
  margin: 0;
  width: auto;

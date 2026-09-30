@@ -38,6 +38,77 @@ pub(super) fn idle(app: &App) -> bool {
             .is_empty()
 }
 
+fn eligible(path: &Path, size: u64, max: u64) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    !["tmp", "part", "stage", "journal", "crdownload", "download"]
+        .iter()
+        .any(|value| extension.eq_ignore_ascii_case(value))
+        && valid_preparation_length(size, None, max)
+}
+
+fn cached_object(app: &App, tenant: &str, path: &Path, stamp: Stamp) -> Option<ObjectId> {
+    let (size, mtime, change) = stamp;
+    app.root_cache
+        .lookup(tenant, path, size, mtime, change)
+        .and_then(|root| hex::decode(root).ok())
+        .and_then(|root| root.try_into().ok())
+        .map(|root| ObjectId {
+            suite: 1,
+            root,
+            length: size,
+        })
+}
+
+pub(super) fn status(
+    app: &App,
+    tenant: &str,
+    name: &str,
+    background: bool,
+    idle: bool,
+) -> &'static str {
+    let Ok(path) = safe_library_path(app, tenant, name) else {
+        return "unavailable";
+    };
+    let root = library_root(app, tenant);
+    if !library_components_safe(&app.config.outbound_dir, &root)
+        || !library_components_safe(&root, &path)
+    {
+        return "unavailable";
+    }
+    let Ok(meta) = std::fs::symlink_metadata(&path) else {
+        return "unavailable";
+    };
+    if !meta.is_file() || !valid_preparation_length(meta.len(), None, app.config.max_upload_bytes) {
+        return "unavailable";
+    }
+    if cached_object(app, tenant, &path, stamp(&meta)).is_some_and(|object| {
+        object.length < BATCH_STAGE_BYTES
+            || cached_catalog_usable(&app.config.data_dir.join("outbound.proofs"), &object)
+    }) {
+        return "ready";
+    }
+    // Inspect existing ownership without adding entries to the hash-lock registry.
+    let lock = app
+        .library_hash_locks
+        .lock()
+        .expect("library hash locks poisoned")
+        .get(&path)
+        .cloned();
+    if lock.is_some_and(|lock| lock.try_lock().is_err()) {
+        return "preparing";
+    }
+    if !background || !eligible(&path, meta.len(), app.config.max_upload_bytes) {
+        return "on_demand";
+    }
+    if !idle {
+        return "waiting_for_idle";
+    }
+    "not_prepared"
+}
+
 fn scan(app: &App) -> io::Result<Vec<Source>> {
     let mut tenants = vec![String::new()];
     tenants.extend(
@@ -76,15 +147,7 @@ fn scan(app: &App) -> io::Result<Vec<Source>> {
                 else {
                     return true;
                 };
-                let extension = path
-                    .extension()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                if matches!(
-                    extension.as_str(),
-                    "tmp" | "part" | "stage" | "journal" | "crdownload" | "download"
-                ) || !valid_preparation_length(meta.len(), None, app.config.max_upload_bytes)
+                if !eligible(path, meta.len(), app.config.max_upload_bytes)
                     || safe_library_path(app, &tenant, name).is_err()
                 {
                     return true;
@@ -133,20 +196,10 @@ fn ready(
             .map_or(now, |(_, since)| since);
         next.insert(key, (source.stamp, since));
         let path = library_root(app, &source.tenant).join(&source.name);
-        let (size, mtime, change) = source.stamp;
-        let cached = app
-            .root_cache
-            .lookup(&source.tenant, &path, size, mtime, change)
-            .and_then(|root| hex::decode(root).ok())
-            .and_then(|root| root.try_into().ok())
-            .map(|root| ObjectId {
-                suite: 1,
-                root,
-                length: size,
+        let complete =
+            cached_object(app, &source.tenant, &path, source.stamp).is_some_and(|object| {
+                cached_catalog_usable(&app.config.data_dir.join("outbound.proofs"), &object)
             });
-        let complete = cached.is_some_and(|object| {
-            cached_catalog_usable(&app.config.data_dir.join("outbound.proofs"), &object)
-        });
         if now.saturating_duration_since(since) >= POLL && !complete {
             ready.push(source);
         }

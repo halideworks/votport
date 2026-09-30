@@ -694,6 +694,54 @@ pub struct OutboundPathQuery {
 }
 
 #[derive(Deserialize)]
+pub struct LibraryPreparationQuery {
+    paths: Vec<String>,
+}
+
+pub async fn library_preparation_status(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(query): Json<LibraryPreparationQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = admin::require_operator(&app, &headers)?;
+    let operation = begin_outbound_operation_owned(&app, &identity.tenant)?;
+    if query.paths.len() > MAX_LIBRARY_DIRECTORY_ENTRIES
+        || query
+            .paths
+            .iter()
+            .any(|path| path.len() > MAX_LIBRARY_CURSOR_BYTES)
+    {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "too many or oversized library paths",
+        ));
+    }
+    let background = app.config.library_prehash;
+    let files = tokio::task::spawn_blocking(move || {
+        let _operation = operation;
+        let idle = prehash::idle(&app)
+            && !app
+                .store
+                .resolved_settings(&app.config)
+                .map_err(ApiError::internal)?
+                .draining;
+        Ok::<_, ApiError>(
+            query
+                .paths
+                .into_iter()
+                .map(|path| {
+                    let status = prehash::status(&app, &identity.tenant, &path, background, idle);
+                    json!({ "path": path, "preparation": status })
+                })
+                .collect::<Vec<_>>(),
+        )
+    })
+    .await
+    .map_err(|_| ApiError::internal("library preparation status failed"))??;
+    Ok(Json(json!({ "files": files })))
+}
+
+#[derive(Deserialize)]
 pub struct OutboundListQuery {
     directory: Option<String>,
     q: Option<String>,

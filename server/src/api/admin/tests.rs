@@ -1242,6 +1242,13 @@ mod handler_tests {
             ("POST", "/api/admin/sso/exchange"),
         ];
         registered.retain(|pair| !exempt.contains(&(pair.0.as_str(), pair.1.as_str())));
+        // This POST only reads bounded file status; viewer sessions may query it.
+        registered.retain(|pair| {
+            pair != &(
+                "POST".into(),
+                "/api/admin/outbound-files/preparation-status".into(),
+            )
+        });
         let mut expected: Vec<(String, String)> = covered
             .iter()
             .map(|(method, template, _, _)| (method.to_string(), template.to_string()))

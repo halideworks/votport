@@ -1,6 +1,6 @@
 # Scalability and native-state follow-up, 2026-09-30
 
-This follows the completed [application audit](audit-2026-09-30.md).
+This follows the completed application audit. The superseded audit report has been removed.
 Native signing remains deferred. The application is prerelease software;
 clients sharing local state must be updated together. No compatibility
 machinery is added for clients predating the shared state lease.
