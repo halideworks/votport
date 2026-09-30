@@ -164,7 +164,7 @@ impl Store {
     }
 
     pub fn outbound_grants(&self, tenant: &str) -> Result<Vec<OutboundGrant>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let mut statement = connection.prepare(
                 "SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
                         name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
@@ -189,7 +189,7 @@ impl Store {
         offset: usize,
         file_preview_limit: usize,
     ) -> Result<(Vec<(OutboundGrant, usize)>, u64), String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let grants = outbound_grant_previews(
                 connection,
                 tenant,
@@ -215,7 +215,7 @@ impl Store {
         id: &str,
         file_preview_limit: usize,
     ) -> Result<Option<(OutboundGrant, usize)>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             Ok(
                 outbound_grant_previews(connection, tenant, Some(id), 1, 0, file_preview_limit)?
                     .pop(),
@@ -239,7 +239,7 @@ impl Store {
         if !admitted {
             return Ok(false);
         }
-        let id: Option<String> = self.with(|connection| {
+        let id: Option<String> = self.read(|connection| {
             connection
                 .query_row(
                     "SELECT id FROM outbound_grants WHERE token_hash=?1",
@@ -252,7 +252,7 @@ impl Store {
     }
 
     pub(crate) fn outbound_grant_deadline(&self, token_hash: &str) -> Result<Option<u64>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .query_row(
                     "SELECT expires_at FROM outbound_grants WHERE token_hash = ?1 AND revoked_at IS NULL",
@@ -265,7 +265,7 @@ impl Store {
 
     /// The manifest root recorded for a grant's VOT package, if one was built.
     pub fn outbound_grant_manifest_root(&self, grant_id: &str) -> Result<Option<String>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .query_row(
                     "SELECT manifest_root FROM outbound_grant_manifests WHERE grant_id = ?1",
@@ -277,7 +277,7 @@ impl Store {
     }
 
     pub(crate) fn outbound_grant_is_non_revoked(&self, grant_id: &str) -> Result<bool, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM outbound_grants WHERE id = ?1 AND revoked_at IS NULL)",
                 [grant_id],
@@ -311,7 +311,7 @@ impl Store {
     }
 
     fn outbound_grant(&self, column: &str, value: &str) -> Result<Option<OutboundGrant>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .prepare_cached(
                     &format!("SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
@@ -394,7 +394,7 @@ impl Store {
     }
 
     pub fn fetch_ticket(&self, token_id: &str) -> Result<Option<FetchTicket>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .query_row(
                     "SELECT token_id, grant_id, manifest_root, expires_at, delivered_at, holder, grant_token_hash, policy_revision
@@ -410,7 +410,7 @@ impl Store {
     /// its whole window, so a restart warms servers for these and the
     /// registry keeps their state.
     pub fn unexpired_fetch_tickets(&self, now: u64) -> Result<Vec<FetchTicket>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .prepare_cached(
                     "SELECT token_id, grant_id, manifest_root, expires_at, delivered_at, holder, grant_token_hash, policy_revision
@@ -424,7 +424,7 @@ impl Store {
     /// Grants with a built manifest that may still be fetched: what the serve
     /// registry keeps a server for.
     pub fn servable_grant_ids(&self, now: u64) -> Result<Vec<String>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .prepare_cached(
                     "SELECT m.grant_id FROM outbound_grant_manifests m
@@ -454,7 +454,7 @@ impl Store {
         token_hash: &str,
         index: usize,
     ) -> Result<Option<(OutboundGrant, Option<OutboundGrantFile>)>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let parent = outbound_grant_parent(connection, token_hash)?;
             let Some((grant, file_count)) = parent else {
                 return Ok(None);
@@ -508,7 +508,7 @@ impl Store {
         let offset =
             i64::try_from(offset).map_err(|_| "outbound file offset overflow".to_owned())?;
         let limit = i64::try_from(limit).map_err(|_| "outbound file limit overflow".to_owned())?;
-        self.with(|connection| {
+        self.read(|connection| {
             let parent = outbound_grant_parent(connection, token_hash)?;
             let Some((grant, file_count)) = parent else {
                 return Ok(None);
@@ -603,7 +603,7 @@ impl Store {
         tenant: &str,
         id: &str,
     ) -> Result<Option<String>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection.query_row(
                 "SELECT CASE WHEN j.id IS NULL THEN g.share_token ELSE j.token END, g.token_hash
                  FROM outbound_grants AS g
@@ -702,7 +702,7 @@ impl Store {
     /// DELETE handler answer an already-revoked repeat with 200 and only an
     /// unknown id with 404.
     pub fn outbound_grant_exists(&self, tenant: &str, id: &str) -> Result<bool, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .query_row(
                     "SELECT 1 FROM outbound_grants WHERE tenant = ?1 AND id = ?2",
@@ -1016,7 +1016,7 @@ impl Store {
         file_index: usize,
         now: u64,
     ) -> Result<bool, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection.query_row(
                 "SELECT EXISTS (
                      SELECT 1 FROM outbound_grants
@@ -1044,7 +1044,7 @@ impl Store {
     /// Every upload chunk asks, so it reads the source index rather than
     /// parsing every live grant's file list under the store lock.
     pub fn has_active_library_grant(&self, tenant: &str, source: &str) -> Result<bool, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .prepare_cached(ACTIVE_LIBRARY_GRANT)?
                 .query_row(rusqlite::params![tenant, source], |row| row.get(0))
@@ -1061,7 +1061,7 @@ impl Store {
             return Ok(true);
         }
         let wanted = crate::paths::fold_name(source);
-        self.with(|connection| {
+        self.read(|connection| {
             let mut statement = connection.prepare_cached(
                 "SELECT f.source FROM outbound_grant_files f JOIN outbound_grants g ON g.id = f.grant_id
                  WHERE g.tenant = ?1 AND g.revoked_at IS NULL",
@@ -1083,7 +1083,7 @@ impl Store {
         link_id: &str,
         now: u64,
     ) -> Result<Vec<(String, usize)>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let mut statement = connection.prepare(
                 "SELECT upload_id, file_index
                  FROM outbound_grants
@@ -1119,7 +1119,7 @@ impl Store {
         &self,
         now: u64,
     ) -> Result<Vec<(String, String, String, u64)>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let mut statement = connection.prepare(
                 "SELECT grants.id, grants.suite, grants.root, grants.bytes_hi, grants.bytes_lo
                  FROM outbound_grants AS grants
@@ -1149,7 +1149,7 @@ impl Store {
         link_id: &str,
         now: u64,
     ) -> Result<bool, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection.query_row(
                 "SELECT EXISTS (
                      SELECT 1 FROM outbound_grants

@@ -217,7 +217,7 @@ fn received_sha256_preparation_verifies_once_and_keeps_its_original_identity() {
 }
 
 #[test]
-fn refreshed_stream_deadline_is_checked_after_waiting_for_the_store() {
+fn refreshed_stream_deadline_is_checked_after_waiting_for_a_reader() {
     let directory = tempfile::tempdir().unwrap();
     let app = crate::api::testing::build(directory.path());
     let now = now_unix();
@@ -232,7 +232,7 @@ fn refreshed_stream_deadline_is_checked_after_waiting_for_the_store() {
     let holder = std::thread::spawn(move || {
         store_app
             .store
-            .with(|_| {
+            .with_all_readers(|_| {
                 locked.send(()).unwrap();
                 unlocked.recv_timeout(Duration::from_secs(5)).unwrap();
                 Ok(())
@@ -1410,6 +1410,32 @@ fn proof_catalog_round_trip_rejects_tampered_header() {
 }
 
 #[test]
+fn unrelated_library_publications_progress_while_another_publisher_is_active() {
+    let directory = tempfile::tempdir().unwrap();
+    let publication = std::sync::RwLock::new(());
+    let bytes = b"independent library source";
+    let mut builder =
+        InMemoryObjectBuilder::new(Suite::Blake3Bao64, Some(bytes.len() as u64), 1024).unwrap();
+    builder.update(bytes).unwrap();
+    let prepared = builder.finish().unwrap();
+    let publisher = publication.read().unwrap();
+    std::thread::scope(|scope| {
+        let (done, result) = std::sync::mpsc::channel();
+        let publication = &publication;
+        let root = directory.path();
+        scope.spawn(move || {
+            done.send(with_catalog_publication(publication, || {
+                ensure_catalog_from_prepared(root, &prepared)
+            }))
+            .unwrap()
+        });
+        let progress = result.recv_timeout(std::time::Duration::from_secs(5));
+        drop(publisher);
+        assert!(progress.unwrap().is_ok());
+    });
+}
+
+#[test]
 fn concurrent_cold_catalog_requests_share_one_build() {
     let directory = tempfile::tempdir().unwrap();
     let bytes = vec![9u8; 64 * 1024];
@@ -1428,10 +1454,9 @@ fn concurrent_cold_catalog_requests_share_one_build() {
         }
     });
     // Other tests share the static map; only this object's entry matters.
-    assert!(!CATALOG_BUILDS
-        .lock()
-        .unwrap()
-        .contains_key(&catalog_path(&root, &expected)));
+    let mut builds = CATALOG_BUILDS.lock().unwrap();
+    builds.retain(|_, lock| Arc::strong_count(lock) > 1);
+    assert!(!builds.contains_key(&catalog_path(&root, &expected)));
 }
 
 /// Opens a batch download of an eight-part grant, reads its first frame,

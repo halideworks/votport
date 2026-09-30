@@ -84,6 +84,7 @@ public sealed class PortStore
 
     public void BeginSso(string origin)
     {
+        sessionGeneration++;
         var previous = ClearSso();
         var attempt = Guid.NewGuid();
         ssoAttempt = attempt;
@@ -114,8 +115,19 @@ public sealed class PortStore
 
     public void CancelSso()
     {
+        sessionGeneration++;
+        var wasCompleting = ssoCompleting;
         var login = ClearSso();
-        Run(Scope.Port, () => { login?.Cancel(); return true; }, _ => { });
+        Run(Scope.Port, () => { login?.Cancel(); return VotportClientCoreMethods.Port(); }, current =>
+        {
+            if (!wasCompleting && Port?.Base == current?.Base && Port?.Tenant == current?.Tenant && Port?.Role == current?.Role) return;
+            ResetLibraryUploadForSession();
+            Port = current;
+            Requests.Clear();
+            Deliveries.Clear();
+            AutomationTokens = Array.Empty<AutomationToken>();
+            if (current is not null) Refresh();
+        });
     }
 
     public void CompleteSso(Uri url)

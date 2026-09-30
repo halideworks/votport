@@ -413,7 +413,7 @@ impl Store {
     }
 
     pub fn delivery_evidence_recorded(&self, id: &str) -> Result<bool, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM delivery_evidence WHERE id=?1)",
                 [id],
@@ -471,7 +471,7 @@ impl Store {
         after: u64,
         limit: usize,
     ) -> Result<Vec<serde_json::Value>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let mut query = connection.prepare("SELECT rowid,received_at,document FROM delivery_evidence WHERE grant_id=?1 AND rowid>?2 ORDER BY rowid LIMIT ?3")?;
             let rows = query.query_map(params![grant_id, after as i64, limit.min(100) as i64], |row| {
                 let document: String = row.get(2)?;
@@ -487,7 +487,7 @@ impl Store {
         after: u64,
         limit: usize,
     ) -> Result<Vec<DeliveryEvent>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             if after > i64::MAX as u64 {
                 return Err(invalid_chain());
             }
@@ -511,7 +511,7 @@ impl Store {
         terminal: Option<EventCheckpoint>,
         limit: usize,
     ) -> Result<EventExport, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let issuer = &self.event_signer.public_hex;
             if !(1..=100).contains(&limit) {
                 return Err(invalid_chain());

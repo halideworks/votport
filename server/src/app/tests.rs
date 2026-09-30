@@ -397,7 +397,7 @@ mod health_tests {
                     pause();
                 } else {
                     app.store
-                        .with(|_| {
+                        .with_all_readers(|_| {
                             pause();
                             Ok(())
                         })

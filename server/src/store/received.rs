@@ -81,7 +81,7 @@ impl Store {
         links: &[String],
     ) -> Result<HashMap<String, (u64, u64)>, String> {
         let ids = serde_json::to_string(links).map_err(|error| error.to_string())?;
-        self.with(|connection| {
+        self.read(|connection| {
             let mut statement = connection.prepare_cached(
                 "SELECT link_id, document -> '$.total_bytes' FROM link_uploads
                  WHERE tenant=?1 AND link_id IN (SELECT value FROM json_each(?2))",
@@ -111,7 +111,7 @@ impl Store {
         before: Option<i64>,
         limit: usize,
     ) -> Result<Option<UploadPage>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let exists: bool = connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM links WHERE tenant=?1 AND id=?2)",
                 [tenant, link],
@@ -155,7 +155,7 @@ impl Store {
         link: &str,
         upload: &str,
     ) -> Result<Option<UploadHeader>, String> {
-        self.with(|connection| read_header(connection, tenant, link, upload))
+        self.read(|connection| read_header(connection, tenant, link, upload))
     }
 
     pub fn upload_files_page(
@@ -166,7 +166,7 @@ impl Store {
         offset: usize,
         limit: usize,
     ) -> Result<Option<UploadFilesPage>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let Some(header) = read_header(connection, tenant, link, upload)? else {
                 return Ok(None);
             };
@@ -205,81 +205,82 @@ impl Store {
         upload: &str,
         output: impl Write,
     ) -> Result<bool, String> {
-        let connection = self.connection.lock().expect("store poisoned");
-        let Some(link_record) = read_link_metadata(&connection, tenant, link)? else {
-            return Ok(false);
-        };
-        let Some(header) =
-            read_header(&connection, tenant, link, upload).map_err(|e| e.to_string())?
-        else {
-            return Ok(false);
-        };
-        let record = &header.upload;
-        let duration = (record.started_at > 0 && record.completed_at > record.started_at)
-            .then(|| record.completed_at - record.started_at);
-        let average = duration.map(|seconds| (record.total_bytes as f64 / seconds as f64).round());
-        let mut peak: Option<f64> = None;
-        let (mut pauses, mut restarts) = (0_u64, 0_u64);
-        for event in &record.log {
-            if event.kind == "published" {
-                if let (Some(bytes), Some(seconds)) = (
-                    event.bytes.filter(|bytes| *bytes > 0),
-                    event.secs.filter(|seconds| *seconds > 0),
-                ) {
-                    let rate = bytes as f64 / seconds as f64;
-                    peak = Some(peak.map_or(rate, |previous| previous.max(rate)));
+        self.read(|connection| {
+            let link_record = read_link_metadata(connection, tenant, link)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?;
+            let Some(link_record) = link_record else {
+                return Ok(false);
+            };
+            let Some(header) = read_header(connection, tenant, link, upload)? else {
+                return Ok(false);
+            };
+            let record = &header.upload;
+            let duration = (record.started_at > 0 && record.completed_at > record.started_at)
+                .then(|| record.completed_at - record.started_at);
+            let average = duration.map(|seconds| (record.total_bytes as f64 / seconds as f64).round());
+            let mut peak: Option<f64> = None;
+            let (mut pauses, mut restarts) = (0_u64, 0_u64);
+            for event in &record.log {
+                if event.kind == "published" {
+                    if let (Some(bytes), Some(seconds)) = (
+                        event.bytes.filter(|bytes| *bytes > 0),
+                        event.secs.filter(|seconds| *seconds > 0),
+                    ) {
+                        let rate = bytes as f64 / seconds as f64;
+                        peak = Some(peak.map_or(rate, |previous| previous.max(rate)));
+                    }
+                }
+                if event.kind == "quiet" {
+                    pauses = pauses.saturating_add(event.secs.unwrap_or(0));
+                }
+                if event.kind == "reattached" {
+                    restarts = restarts.saturating_add(1);
                 }
             }
-            if event.kind == "quiet" {
-                pauses = pauses.saturating_add(event.secs.unwrap_or(0));
-            }
-            if event.kind == "reattached" {
-                restarts = restarts.saturating_add(1);
-            }
-        }
-        let outcome = record
-            .log
-            .iter()
-            .map(|event| event.kind.as_str())
-            .find(|kind| matches!(*kind, "finished" | "cancelled" | "interrupted" | "dropped"))
-            .unwrap_or(if record.partial {
-                "partial"
-            } else {
-                "finished"
+            let outcome = record
+                .log
+                .iter()
+                .map(|event| event.kind.as_str())
+                .find(|kind| matches!(*kind, "finished" | "cancelled" | "interrupted" | "dropped"))
+                .unwrap_or(if record.partial {
+                    "partial"
+                } else {
+                    "finished"
+                });
+            let transport = record.transport.as_deref().unwrap_or("http");
+            let summary = serde_json::json!({
+                "files": header.file_count, "bytes": record.total_bytes, "duration": duration,
+                "average": average, "peak": peak.map(f64::round), "pauses": pauses,
+                "restarts": restarts, "resent": record.replayed_chunks, "rejected": record.rejected_chunks,
+                "outcome": outcome, "transport": transport,
             });
-        let transport = record.transport.as_deref().unwrap_or("http");
-        let summary = serde_json::json!({
-            "files": header.file_count, "bytes": record.total_bytes, "duration": duration,
-            "average": average, "peak": peak.map(f64::round), "pauses": pauses,
-            "restarts": restarts, "resent": record.replayed_chunks, "rejected": record.rejected_chunks,
-            "outcome": outcome, "transport": transport,
-        });
-        let document = Timeline {
-            request: serde_json::json!({"id":link_record.id,"label":link_record.label,"dest":link_record.dest}),
-            upload: TimelineUpload {
-                id: &record.id,
-                started_at: record.started_at,
-                completed_at: record.completed_at,
-                transport,
-                package_root: &record.package_root,
-                total_bytes: record.total_bytes,
-                partial: record.partial,
-                replayed_chunks: record.replayed_chunks,
-                rejected_chunks: record.rejected_chunks,
-                files: TimelineFiles {
-                    connection: &connection,
-                    tenant,
-                    link,
-                    upload,
-                    count: header.file_count,
+            let document = Timeline {
+                request: serde_json::json!({"id":link_record.id,"label":link_record.label,"dest":link_record.dest}),
+                upload: TimelineUpload {
+                    id: &record.id,
+                    started_at: record.started_at,
+                    completed_at: record.completed_at,
+                    transport,
+                    package_root: &record.package_root,
+                    total_bytes: record.total_bytes,
+                    partial: record.partial,
+                    replayed_chunks: record.replayed_chunks,
+                    rejected_chunks: record.rejected_chunks,
+                    files: TimelineFiles {
+                        connection,
+                        tenant,
+                        link,
+                        upload,
+                        count: header.file_count,
+                    },
                 },
-            },
-            summary,
-            events: &record.log,
-        };
-        // ponytail: one export holds the Store lock while spooling metadata; a dedicated read snapshot is the upgrade for very large histories.
-        serde_json::to_writer(output, &document).map_err(|error| error.to_string())?;
-        Ok(true)
+                summary,
+                events: &record.log,
+            };
+            serde_json::to_writer(output, &document)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            Ok(true)
+        })
     }
 }
 
@@ -470,8 +471,12 @@ mod tests {
             "UPDATE files SET root=x'01' WHERE file_index=2",
             "UPDATE link_uploads SET document=json_set(document,'$.files',json('[{}]'))",
         ] {
+            let case_directory = tempfile::tempdir().unwrap();
+            let store = Store::open(case_directory.path()).unwrap();
+            let mut link = test_link("request");
+            link.uploads.push(upload("upload", 3));
+            store.insert_link(link).unwrap();
             let connection = store.connection.lock().unwrap();
-            connection.execute_batch("SAVEPOINT corruption").unwrap();
             connection.execute_batch(sql).unwrap();
             drop(connection);
             if !sql.contains("$.files") {
@@ -493,12 +498,6 @@ mod tests {
                 "{sql}"
             );
             assert!(serde_json::from_slice::<serde_json::Value>(&incomplete).is_err());
-            store
-                .connection
-                .lock()
-                .unwrap()
-                .execute_batch("ROLLBACK TO corruption; RELEASE corruption")
-                .unwrap();
         }
         let mut complete = Vec::new();
         assert!(store

@@ -124,7 +124,7 @@ impl Store {
     /// Routes a peer has marked unreachable in its own state document.
     /// Drives the votport_trade_routes_unreachable gauge.
     pub fn unreachable_trade_routes(&self) -> Result<u64, String> {
-        self.with(|c| {
+        self.read(|c| {
             c.query_row(
                 "SELECT COUNT(*) FROM trade_routes WHERE json_extract(document,'$.state')='unreachable'",
                 [],
@@ -134,14 +134,14 @@ impl Store {
     }
 
     pub fn trade_endpoints(&self, tenant: &str) -> Result<Vec<TradeEndpoint>, String> {
-        self.with(|c| {
+        self.read(|c| {
             c.prepare("SELECT document FROM trade_endpoints WHERE tenant=?1 ORDER BY id")?
                 .query_map([tenant], decode)?
                 .collect()
         })
     }
     pub fn is_trade_endpoint(&self, id: &str) -> Result<bool, String> {
-        self.with(|c| {
+        self.read(|c| {
             c.query_row(
                 "SELECT EXISTS(SELECT 1 FROM trade_endpoints WHERE id=?1)",
                 [id],
@@ -306,7 +306,7 @@ impl Store {
         Ok((route, true))
     }
     pub fn trade_routes(&self, tenant: Option<&str>) -> Result<Vec<TradeRoute>, String> {
-        self.with(|c| {
+        self.read(|c| {
             c.prepare(
                 "SELECT document FROM trade_routes WHERE (?1 IS NULL OR tenant=?1) ORDER BY id",
             )?
@@ -315,7 +315,7 @@ impl Store {
         })
     }
     pub fn trade_routes_to_monitor(&self) -> Result<Vec<TradeRoute>, String> {
-        self.with(|c| {
+        self.read(|c| {
             c.prepare(
                 "SELECT document FROM trade_routes WHERE direction='outgoing'
                  AND json_extract(document,'$.state')!='revoked'
@@ -338,7 +338,7 @@ impl Store {
         Ok(route.filter(|route: &TradeRoute| route.tenant == tenant))
     }
     pub fn trade_credential(&self, tenant: &str, id: &str) -> Result<String, String> {
-        self.with(|c|c.query_row("SELECT credential FROM trade_routes WHERE tenant=?1 AND id=?2 AND direction='outgoing'",params![tenant,id],|r|r.get(0)))
+        self.read(|c|c.query_row("SELECT credential FROM trade_routes WHERE tenant=?1 AND id=?2 AND direction='outgoing'",params![tenant,id],|r|r.get(0)))
     }
     pub fn authenticate_trade(
         &self,
@@ -439,7 +439,7 @@ impl Store {
         tenant: &str,
         id: &str,
     ) -> Result<Option<SignedPortMessage>, String> {
-        self.with(|c| {
+        self.read(|c| {
             c.query_row(
                 "SELECT enrollment FROM trade_routes WHERE tenant=?1 AND id=?2",
                 params![tenant, id],
@@ -704,7 +704,7 @@ const INCOMING_DELIVERIES: &str = "SELECT r.id,r.receipt,r.revoked_at,j.state,js
 
 impl Store {
     pub fn trade_deliveries(&self, route: &TradeRoute) -> Result<serde_json::Value, String> {
-        self.with(|c| {
+        self.read(|c| {
             if route.direction=="incoming" {
                 c.prepare(INCOMING_DELIVERIES)?.query_map([&route.id],|r|{
                     let receipt:Option<String>=r.get(1)?;let state:Option<String>=r.get(3)?;let released:Option<i64>=r.get(4)?;
@@ -817,7 +817,7 @@ impl Store {
     }
     /// The next credential of a rotation that has not been confirmed, if any.
     pub fn trade_rotation_in_flight(&self, id: &str) -> Result<Option<String>, String> {
-        self.with(|c| {
+        self.read(|c| {
             c.query_row(
                 "SELECT credential FROM trade_rotations WHERE route_id=?1",
                 [id],
@@ -836,13 +836,13 @@ impl Store {
         .map(|_| ())
     }
     pub fn trade_sessions(&self, id: &str) -> Result<Vec<String>, String> {
-        self.with(|c|c.prepare("SELECT session_id FROM inbound_routes WHERE json_extract(source,'$.document.permission.grant')=?1 AND receipt IS NULL AND session_id IS NOT NULL")?.query_map([id],|r|r.get(0))?.collect())
+        self.read(|c|c.prepare("SELECT session_id FROM inbound_routes WHERE json_extract(source,'$.document.permission.grant')=?1 AND receipt IS NULL AND session_id IS NOT NULL")?.query_map([id],|r|r.get(0))?.collect())
     }
 }
 
 impl Store {
     pub fn is_trade_route(&self, id: &str) -> Result<bool, String> {
-        self.with(|c| {
+        self.read(|c| {
             c.query_row(
                 "SELECT EXISTS(SELECT 1 FROM trade_routes WHERE id=?1)",
                 [id],
@@ -890,7 +890,7 @@ impl Store {
 
 impl Store {
     pub fn trade_delivery_policy(&self, id: &str) -> Result<Option<NotificationPolicy>, String> {
-        self.with(|c| {
+        self.read(|c| {
             c.query_row(
                 "SELECT document FROM trade_delivery_policies WHERE route_id=?1",
                 [id],

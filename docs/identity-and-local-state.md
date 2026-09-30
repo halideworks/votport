@@ -1,17 +1,13 @@
-# ADR-0001: Principal identity and local state ownership
+# Principal identity and local state ownership
 
-Status: Accepted
-
-Date: 2026-09-30
-
-## Context
+## Background
 
 SQLite principal lookups fold subject strings to lowercase. OIDC `sub` must
 retain its exact provider identity; folding distinct subjects can merge their
 permissions. Desktop app and CLI processes also share private files, so
 in-process guards do not serialize journal ownership or account changes.
 
-## Decision
+## Behavior
 
 For the configured `sub` claim, derive a lowercase ASCII storage key from the
 issuer's SHA-256 and the exact UTF-8 subject's hexadecimal encoding. SCIM uses
@@ -38,8 +34,10 @@ Client state operations acquire a shared OS file lock outside the removable
 state directory. Removal requires an exclusive lock. Transfers keep their
 shared lease through journal updates and settlement; evidence retries keep it
 through network calls and final writes. Browser sign-in keeps a cancellable
-lease while pending. Removal asks the user to finish or cancel work that still
-owns state.
+lease while pending and releases it automatically at the ten-minute deadline.
+The expiry worker retains only a weak reference and ends on cancellation,
+completion or object destruction. Removal asks the user to finish or cancel
+work that still owns state.
 
 Serialize stored-account replacements using a stable account lock and compare
 the complete prior record before writing. Serialize watch-list updates with
@@ -48,13 +46,23 @@ stable registry lock serializes per-entry lock opening with orphan removal, so
 retained sidecars can be cleaned without splitting ownership. Close in-state
 lock handles before releasing the outer lease.
 
-## Consequences and verification
+Watch probes do not create lock sidecars. Completed transfers release their
+handles and shared state lease before attempting cleanup. Removing a flight
+sidecar requires nonblocking exclusive state ownership, which excludes both
+active holders and open-descriptor waiters. Startup and minute-based cleanup
+remove at most 1024 sidecars per pass, and skip an erased or absent state
+directory. Lock failures refuse transfer admission. This prerelease requires
+clients using the current state-ownership protocol; older native clients must
+be closed and upgraded before sharing local state.
+
+## Limits and verification
 
 Upgrade requires signing in again. Installations using `sub` must re-provision
 SCIM users when provisioning is required, restore SCIM roles where used, and
 update explicit project member IDs. Changing issuer also quarantines previous
-identities. An abandoned SSO attempt in another process must be cancelled or
-that process closed before local removal. A network evidence retry can briefly
+identities. An abandoned SSO attempt releases its retained lease at expiry;
+an already-running exchange keeps its own lease until its bounded request and
+final account comparison end. A network evidence retry can briefly
 refuse removal until its bounded attempt ends. Files remain ordinary private
 JSON files; there is no new database or dependency.
 

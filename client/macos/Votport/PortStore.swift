@@ -132,8 +132,22 @@ final class PortStore: ObservableObject {
     }
 
     func cancelSso() {
+        sessionGeneration += 1
+        let wasCompleting = ssoCompleting
         let login = clearSso()
-        run(.port) { login?.cancel() } then: { _ in }
+        run(.port) {
+            login?.cancel()
+            return VotportCore.port()
+        } then: { [weak self] result in
+            guard let self, case .success(let current) = result,
+                  wasCompleting || self.port != current else { return }
+            self.resetLibraryUploadForSession()
+            self.port = current
+            self.requests = []
+            self.deliveries = []
+            self.automationTokens = []
+            if current != nil { self.refresh() }
+        }
     }
 
     func completeSso(_ url: URL) {

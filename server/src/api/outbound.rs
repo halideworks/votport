@@ -127,7 +127,7 @@ fn library_mutation_lock(app: &App, tenant: &str) -> Arc<Mutex<u64>> {
 
 static LIBRARY_HASH_PERMITS: Semaphore = Semaphore::const_new(LIBRARY_HASH_CONCURRENCY);
 // Cached catalogs enter the prune keep set in the same publication critical section.
-pub(crate) static CATALOG_CACHE_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) static CATALOG_CACHE_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 fn library_hash_lock(app: &App, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
     let mut locks = app
@@ -3336,16 +3336,23 @@ fn hash_library_file(
             "source changed while hashing",
         ));
     }
-    let _publication = CATALOG_CACHE_LOCK
-        .lock()
-        .expect("catalog cache lock poisoned");
-    if bytes >= BATCH_STAGE_BYTES || expected.is_some() || idle.is_some() {
-        ensure_catalog_from_prepared(proof_root, &prepared)?;
-    }
-    if bytes == size && expected.is_none() {
-        cache.insert(tenant, path, size, mtime, change, hex::encode(object.root));
-    }
-    grant_file(&object)
+    with_catalog_publication(&CATALOG_CACHE_LOCK, || {
+        if bytes >= BATCH_STAGE_BYTES || expected.is_some() || idle.is_some() {
+            ensure_catalog_from_prepared(proof_root, &prepared)?;
+        }
+        if bytes == size && expected.is_none() {
+            cache.insert(tenant, path, size, mtime, change, hex::encode(object.root));
+        }
+        grant_file(&object)
+    })
+}
+
+fn with_catalog_publication<T>(
+    lock: &std::sync::RwLock<()>,
+    publish: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    let _publication = lock.read().expect("catalog cache lock poisoned");
+    publish()
 }
 
 fn catalog_path(root: &Path, object: &ObjectId) -> PathBuf {
@@ -3450,33 +3457,21 @@ fn ensure_catalog(root: &Path, source: &Path, expected: &ObjectId) -> io::Result
             return Ok(path);
         }
     }
-    let build_lock = Arc::clone(
-        CATALOG_BUILDS
-            .lock()
-            .expect("catalog builds poisoned")
-            .entry(path.clone())
-            .or_default(),
-    );
+    let build_lock = {
+        let mut builds = CATALOG_BUILDS.lock().expect("catalog builds poisoned");
+        builds.retain(|_, lock| Arc::strong_count(lock) > 1);
+        Arc::clone(builds.entry(path.clone()).or_default())
+    };
     let _building = build_lock.lock().expect("catalog build poisoned");
     // A racer may have finished the build while this thread waited.
     if let Ok(mut file) = std::fs::File::open(&path) {
         if catalog_header(&mut file, expected).is_ok() {
             drop(_building);
-            CATALOG_BUILDS
-                .lock()
-                .expect("catalog builds poisoned")
-                .remove(&path);
             return Ok(path);
         }
     }
     let result = build_catalog(root, source, expected);
     drop(_building);
-    // Waiters still hold their Arc; a later request re-creates the entry
-    // and finds the finished catalog on the recheck above.
-    CATALOG_BUILDS
-        .lock()
-        .expect("catalog builds poisoned")
-        .remove(&path);
     result
 }
 

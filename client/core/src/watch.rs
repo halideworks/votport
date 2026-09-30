@@ -265,7 +265,9 @@ pub fn watch_with(
     std::thread::Builder::new()
         .name("votport watch".to_owned())
         .spawn(move || {
+            prune_flights();
             let mut seen: HashMap<(String, PathBuf), Seen> = HashMap::new();
+            let mut last_cleanup = Instant::now();
             loop {
                 match handle.upgrade() {
                     Some(watcher) if !watcher.stopped.load(Ordering::Acquire) => {}
@@ -282,6 +284,10 @@ pub fn watch_with(
                     scan(watch, settle, now, wall, &mut seen, listener.as_ref());
                 }
                 drop(state);
+                if last_cleanup.elapsed() >= Duration::from_secs(60) {
+                    prune_flights();
+                    last_cleanup = Instant::now();
+                }
                 std::thread::sleep(poll);
             }
         })
@@ -440,22 +446,20 @@ pub(crate) struct Flight {
     path: String,
     watched: bool,
     _lock: Option<std::fs::File>,
-    _state: std::fs::File,
+    _state: Option<std::fs::File>,
 }
 
 /// The outcome of claiming a path across processes.
 enum Claim {
-    /// Ours; the lock is held until the file closes. `None` when the state
-    /// folder could not hold a lock, which leaves the in-process guard.
+    /// Ours; the lock is held until the file closes.
     Free(Option<std::fs::File>),
     /// Another process is shipping it.
     Held,
+    Failed(Error),
 }
 
 fn flight_lock_path(path: &str) -> PathBuf {
     use sha2::Digest as _;
-    // ponytail: one small lock file per shipped path is never removed, since
-    // unlinking a lock another process may be opening splits the lock.
     state_dir().join("flights").join(format!(
         "{}.lock",
         hex::encode(sha2::Sha256::digest(path.as_bytes()))
@@ -463,33 +467,66 @@ fn flight_lock_path(path: &str) -> PathBuf {
 }
 
 fn claim_across_processes(path: &str) -> Claim {
-    let lock = flight_lock_path(path);
-    let opened = lock
-        .parent()
-        .map_or(Ok(()), std::fs::create_dir_all)
-        .and_then(|()| {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(&lock)
-        });
-    let Ok(file) = opened else {
-        return Claim::Free(None);
-    };
-    // Another process's `shipping_elsewhere` probe holds the lock for an
-    // instant; a few short retries tell that apart from a real ship.
-    for attempt in 0..3 {
-        match fs4::FileExt::try_lock(&file) {
-            Ok(()) => return Claim::Free(Some(file)),
-            Err(fs4::TryLockError::WouldBlock) if attempt < 2 => {
-                std::thread::sleep(Duration::from_millis(5));
+    let result = (|| -> Result<Claim> {
+        let file = crate::identity::private_lock(&flight_lock_path(path))?;
+        for attempt in 0..3 {
+            match fs4::FileExt::try_lock(&file) {
+                Ok(()) => return Ok(Claim::Free(Some(file))),
+                Err(fs4::TryLockError::WouldBlock) if attempt < 2 => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(fs4::TryLockError::WouldBlock) => return Ok(Claim::Held),
+                Err(fs4::TryLockError::Error(error)) => return Err(error.into()),
             }
-            Err(fs4::TryLockError::WouldBlock) => return Claim::Held,
-            Err(fs4::TryLockError::Error(_)) => return Claim::Free(None),
         }
+        Ok(Claim::Held)
+    })();
+    result.unwrap_or_else(Claim::Failed)
+}
+
+fn prune_flights() {
+    prune_flight_files(None);
+}
+
+fn prune_flight_files(path: Option<&str>) {
+    let Ok(state) = crate::identity::private_lock(&state_dir().with_extension("lock")) else {
+        return;
+    };
+    if fs4::FileExt::try_lock(&state).is_err() || !state_dir().is_dir() {
+        return;
     }
-    Claim::Held
+    // Every opener owns a shared state lease; exclusive ownership excludes
+    // both active holders and waiters with an already-open descriptor.
+    let remove = |path: PathBuf| {
+        let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) else {
+            return;
+        };
+        if fs4::FileExt::try_lock(&file).is_ok() {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+        }
+    };
+    if let Some(path) = path {
+        remove(flight_lock_path(path));
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(state_dir().join("flights")) else {
+        return;
+    };
+    for entry in entries.flatten().take(1024) {
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "lock")
+            || path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .is_none_or(|name| {
+                    name.len() != 64 || !name.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        {
+            continue;
+        }
+        remove(path);
+    }
 }
 
 /// Whether another process is shipping `path` right now; a path this
@@ -509,21 +546,33 @@ pub(crate) fn shipping_elsewhere(path: &str) -> bool {
     if guard.as_ref().is_some_and(|set| set.contains(path)) {
         return false;
     }
-    matches!(claim_across_processes(path), Claim::Held)
+    let lock = flight_lock_path(path);
+    let file = match std::fs::OpenOptions::new().write(true).open(&lock) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    if fs4::FileExt::try_lock(&file).is_err() {
+        return true;
+    }
+    false
 }
 
 impl Drop for Flight {
     fn drop(&mut self) {
-        if let Some(set) = IN_FLIGHT
+        let mut guard = IN_FLIGHT
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_mut()
-        {
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self._lock.take();
+        if let Some(set) = guard.as_mut() {
             set.remove(&self.path);
         }
         if self.watched {
             WATCH_IN_FLIGHT.fetch_sub(1, Ordering::Release);
         }
+        self._state.take();
+        drop(guard);
+        prune_flight_files(Some(&self.path));
     }
 }
 
@@ -545,7 +594,7 @@ pub(crate) fn single_flight(path: &str) -> Result<Flight> {
     }
     match claim_across_processes(path) {
         Claim::Free(lock) => Ok(Flight {
-            _state: state,
+            _state: Some(state),
             path: path.to_owned(),
             watched: false,
             _lock: lock,
@@ -555,6 +604,10 @@ pub(crate) fn single_flight(path: &str) -> Result<Flight> {
             Err(Error::AlreadyShipping {
                 path: path.to_owned(),
             })
+        }
+        Claim::Failed(error) => {
+            set.remove(path);
+            Err(error)
         }
     }
 }
@@ -576,7 +629,7 @@ fn try_admit(watch_id: &str, path: &str) -> Option<Arc<WatchAdmission>> {
         };
         let admission = Arc::new(WatchAdmission {
             flight: Mutex::new(Some(Flight {
-                _state: state,
+                _state: Some(state),
                 path: path.to_owned(),
                 watched: true,
                 _lock: lock,
@@ -814,6 +867,77 @@ mod tests {
         // Held by this process: in flight here, not elsewhere.
         assert!(!shipping_elsewhere(path));
         drop(flight);
+    }
+
+    #[test]
+    fn failed_cross_process_claims_refuse_transfer_and_can_retry() {
+        let _test_lock = TEST_LOCK.lock().unwrap();
+        let (state, _state_scope) = test_state();
+        let watch = watch_in(state.path());
+        store(std::slice::from_ref(&watch)).unwrap();
+        let flights = state_dir().join("flights");
+        std::fs::write(&flights, b"blocked directory").unwrap();
+        let before = WATCH_IN_FLIGHT.load(Ordering::Acquire);
+        assert!(single_flight("blocked").is_err());
+        assert!(try_admit(&watch.id, "blocked").is_none());
+        assert_eq!(WATCH_IN_FLIGHT.load(Ordering::Acquire), before);
+        std::fs::remove_file(flights).unwrap();
+        drop(single_flight("blocked").unwrap());
+        let admitted = try_admit(&watch.id, "blocked").unwrap();
+        admitted.release();
+        assert_eq!(WATCH_IN_FLIGHT.load(Ordering::Acquire), before);
+    }
+
+    #[test]
+    fn flight_cleanup_preserves_active_locks_and_probes_do_not_create_files() {
+        let _test_lock = TEST_LOCK.lock().unwrap();
+        let (_state, _state_scope) = test_state();
+        let active = single_flight("active").unwrap();
+        let held_path = flight_lock_path("active");
+        assert!(held_path.exists());
+        let stale_path = flight_lock_path("stale");
+        std::fs::write(&stale_path, []).unwrap();
+        prune_flights();
+        assert!(held_path.exists());
+        assert!(
+            stale_path.exists(),
+            "GC must skip while an active transfer owns state"
+        );
+        assert!(!shipping_elsewhere("never-shipped"));
+        assert!(!flight_lock_path("never-shipped").exists());
+        drop(active);
+        assert!(!held_path.exists());
+        prune_flights();
+        assert!(!stale_path.exists());
+        let next = single_flight("active").unwrap();
+        assert!(held_path.exists());
+        drop(next);
+        assert!(!held_path.exists());
+    }
+
+    #[test]
+    fn flight_gc_excludes_open_waiters_and_does_not_recreate_erased_state() {
+        let _test_lock = TEST_LOCK.lock().unwrap();
+        let (_state, _state_scope) = test_state();
+        let flight = single_flight("waiting").unwrap();
+        let path = flight_lock_path("waiting");
+        let waiting_state = crate::identity::state_lease().unwrap();
+        let waiting_descriptor = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        drop(flight);
+        prune_flights();
+        assert!(path.exists());
+        fs4::FileExt::try_lock(&waiting_descriptor).unwrap();
+        assert!(matches!(
+            single_flight("waiting"),
+            Err(Error::AlreadyShipping { .. })
+        ));
+        drop(waiting_descriptor);
+        drop(waiting_state);
+        prune_flights();
+        assert!(!path.exists());
+        std::fs::remove_dir_all(state_dir()).unwrap();
+        prune_flights();
+        assert!(!state_dir().exists());
     }
 
     /// Content written into a drop while it sends stays in the watched

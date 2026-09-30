@@ -165,6 +165,7 @@ pub struct SsoLogin {
     active: std::sync::Mutex<bool>,
     previous: Option<Stored>,
     state_lease: std::sync::Mutex<Option<std::fs::File>>,
+    expiry: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 pub fn begin_sso(base: &str) -> Result<std::sync::Arc<SsoLogin>> {
@@ -184,7 +185,7 @@ pub fn begin_sso(base: &str) -> Result<std::sync::Arc<SsoLogin>> {
     let challenge = hex::encode(sha2::Sha256::digest(verifier.as_bytes()));
     let authorization_url =
         format!("{base}/api/admin/sso/start?desktop_challenge={challenge}&desktop_state={state}");
-    Ok(std::sync::Arc::new(SsoLogin {
+    let login = std::sync::Arc::new(SsoLogin {
         base,
         verifier,
         state,
@@ -193,10 +194,34 @@ pub fn begin_sso(base: &str) -> Result<std::sync::Arc<SsoLogin>> {
         active: std::sync::Mutex::new(true),
         previous,
         state_lease: std::sync::Mutex::new(Some(state_lease)),
-    }))
+        expiry: std::sync::Mutex::new(None),
+    });
+    login.expire_after(std::time::Duration::from_secs(DESKTOP_SSO_TIMEOUT_SECS))?;
+    Ok(login)
 }
 
 impl SsoLogin {
+    fn expire_after(
+        self: &std::sync::Arc<Self>,
+        timeout: std::time::Duration,
+    ) -> Result<std::thread::JoinHandle<()>> {
+        let (cancel, expiry) = std::sync::mpsc::channel();
+        *self.expiry.lock().expect("SSO expiry poisoned") = Some(cancel);
+        let login = std::sync::Arc::downgrade(self);
+        Ok(std::thread::Builder::new()
+            .name("votport sign-in expiry".into())
+            .spawn(move || {
+                if matches!(
+                    expiry.recv_timeout(timeout),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    if let Some(login) = login.upgrade() {
+                        login.cancel();
+                    }
+                }
+            })?)
+    }
+
     fn code(&self, callback: &str) -> Result<String> {
         let invalid =
             || Error::Other("This sign-in was not started by this app; start again".to_owned());
@@ -267,6 +292,7 @@ impl SsoLogin {
         }
         *active = false;
         self.state_lease.lock().expect("SSO state poisoned").take();
+        self.expiry.lock().expect("SSO expiry poisoned").take();
         Ok(Port {
             base: self.base.clone(),
             tenant: session.tenant,
@@ -284,6 +310,7 @@ impl SsoLogin {
     pub fn cancel(&self) {
         *self.active.lock().expect("SSO state poisoned") = false;
         self.state_lease.lock().expect("SSO state poisoned").take();
+        self.expiry.lock().expect("SSO expiry poisoned").take();
     }
 
     pub fn complete(&self, callback: String) -> std::result::Result<Port, PortError> {
@@ -1302,6 +1329,7 @@ mod tests {
         let code = "cd".repeat(16);
         let login = SsoLogin {
             state_lease: std::sync::Mutex::new(None),
+            expiry: std::sync::Mutex::new(None),
             previous: None,
             base: "https://original.example".into(),
             verifier: "ef".repeat(32),
@@ -1336,6 +1364,37 @@ mod tests {
             ..login
         };
         assert!(expired.complete_inner(&callback).is_err());
+    }
+
+    #[test]
+    fn abandoned_browser_sign_in_releases_its_state_lease_at_expiry() {
+        let directory = tempfile::tempdir().unwrap();
+        let _state = crate::identity::test_state_dir(directory.path());
+        let login = std::sync::Arc::new(SsoLogin {
+            base: "https://original.example".into(),
+            verifier: String::new(),
+            state: "ab".repeat(16),
+            authorization_url: String::new(),
+            started: std::time::Instant::now(),
+            active: std::sync::Mutex::new(true),
+            previous: None,
+            state_lease: std::sync::Mutex::new(Some(crate::identity::state_lease().unwrap())),
+            expiry: std::sync::Mutex::new(None),
+        });
+        let exclusive =
+            crate::identity::private_lock(&directory.path().with_extension("lock")).unwrap();
+        assert!(fs4::FileExt::try_lock(&exclusive).is_err());
+        login
+            .expire_after(std::time::Duration::from_millis(10))
+            .unwrap()
+            .join()
+            .unwrap();
+        fs4::FileExt::try_lock(&exclusive).unwrap();
+        assert!(!*login.active.lock().unwrap());
+        assert!(login.state_lease.lock().unwrap().is_none());
+        drop(exclusive);
+        let callback = format!("votport://signin/{}?state={}", "cd".repeat(16), login.state);
+        assert!(login.complete_inner(&callback).is_err());
     }
 
     #[test]

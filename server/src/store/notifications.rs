@@ -136,7 +136,7 @@ impl Store {
         &self,
         tenant: &str,
     ) -> Result<Vec<NotificationDestination>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let mut query = connection.prepare("SELECT document FROM notification_destinations WHERE tenant=?1 ORDER BY id LIMIT 100")?;
             let rows = query.query_map([tenant], |row| parse_json(&row.get::<_, String>(0)?, 0))?;
             rows.collect()
@@ -148,7 +148,7 @@ impl Store {
         tenant: &str,
         id: &str,
     ) -> Result<Option<NotificationDestination>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .query_row(
                     "SELECT document FROM notification_destinations WHERE tenant=?1 AND id=?2",
@@ -207,7 +207,7 @@ impl Store {
     }
 
     pub fn notification_defaults(&self, tenant: &str) -> Result<NotificationPolicy, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .query_row(
                     "SELECT document FROM notification_defaults WHERE tenant=?1",
@@ -247,7 +247,7 @@ impl Store {
                 row.get::<_, i64>(0).map(|count| count.max(0) as u64)
             })
         };
-        self.with(|connection| {
+        self.read(|connection| {
             Ok(rules_in(connection, "SELECT COUNT(*) FROM links, json_each(json_extract(links.notifications_json,'$.rules')) WHERE links.tenant=?1 AND json_extract(json_each.value,'$.destination_id')=?2")?
                 + rules_in(connection, "SELECT COUNT(*) FROM outbound_grants, json_each(json_extract(outbound_grants.notifications_json,'$.rules')) WHERE outbound_grants.tenant=?1 AND json_extract(json_each.value,'$.destination_id')=?2")?
                 + rules_in(connection, "SELECT COUNT(*) FROM notification_job_overrides n JOIN delivery_jobs j ON j.id=n.job_id, json_each(json_extract(n.document,'$.rules')) WHERE j.tenant=?1 AND json_extract(json_each.value,'$.destination_id')=?2")?
@@ -256,7 +256,7 @@ impl Store {
     }
 
     pub fn notification_outcomes(&self, tenant: &str) -> Result<serde_json::Value, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let mut query = connection.prepare("SELECT id,last_at,last_delivered,json_extract(document,'$.last_reason') FROM notification_destinations WHERE tenant=?1 AND last_at IS NOT NULL")?;
             let pairs = query.query_map([tenant], |row| Ok((row.get::<_, String>(0)?,serde_json::json!({"at":row.get::<_, i64>(1)?,"delivered":row.get::<_, bool>(2)?,"reason":row.get::<_, Option<String>>(3)?}))))?.collect::<rusqlite::Result<serde_json::Map<String,serde_json::Value>>>()?;
             Ok(serde_json::Value::Object(pairs))
@@ -266,7 +266,7 @@ impl Store {
     /// Destinations whose last delivery attempt failed. Drives the
     /// votport_notification_destinations_failing gauge.
     pub fn failing_notification_destinations(&self) -> Result<u64, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection.query_row(
                 "SELECT COUNT(*) FROM notification_destinations WHERE last_delivered=0 AND last_at IS NOT NULL AND json_extract(document,'$.enabled')=1",
                 [],
@@ -309,7 +309,7 @@ impl Store {
         tenant: &str,
         id: &str,
     ) -> Result<Option<NotificationPolicy>, String> {
-        self.with(|connection| notification_job_override_in(connection, tenant, id))
+        self.read(|connection| notification_job_override_in(connection, tenant, id))
     }
 
     pub fn set_job_notifications(
@@ -362,7 +362,7 @@ impl Store {
         actor: &str,
         operation_id: &str,
     ) -> Result<bool, String> {
-        self.with(|connection| connection.query_row("SELECT EXISTS(SELECT 1 FROM delivery_jobs WHERE tenant=?1 AND actor=?2 AND operation_id=?3)",params![tenant,actor,operation_id],|row|row.get(0)))
+        self.read(|connection| connection.query_row("SELECT EXISTS(SELECT 1 FROM delivery_jobs WHERE tenant=?1 AND actor=?2 AND operation_id=?3)",params![tenant,actor,operation_id],|row|row.get(0)))
     }
 }
 
