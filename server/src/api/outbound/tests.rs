@@ -95,6 +95,7 @@ fn received_sha256_preparation_verifies_once_and_keeps_its_original_identity() {
         "",
         &cache,
         Some(expected),
+        None,
     )
     .unwrap();
     assert_eq!(file.suite, "sha256");
@@ -114,7 +115,8 @@ fn received_sha256_preparation_verifies_once_and_keeps_its_original_identity() {
             bytes.len() as u64,
             "",
             &cache,
-            Some(expected)
+            Some(expected),
+            None,
         )
         .is_err(),
         "an existing catalog cannot authorize changed source bytes"
@@ -1264,25 +1266,28 @@ fn library_preparation_preserves_identity_and_enforces_source_bounds() {
         let bytes = vec![7; length];
         std::fs::write(&path, &bytes).unwrap();
         let prepared =
-            prepare_library_file(&path, Suite::Blake3Bao64, None, length as u64).unwrap();
+            prepare_library_file(&path, Suite::Blake3Bao64, None, length as u64, None).unwrap();
         assert_eq!(prepared.object_id(), &object_id(&bytes));
         assert!(prepare_library_file(
             &path,
             Suite::Blake3Bao64,
             None,
-            vot_sdk::object::MAX_OBJECT_LENGTH + 1
+            vot_sdk::object::MAX_OBJECT_LENGTH + 1,
+            None,
         )
         .is_err());
         assert!(prepare_library_file(
             &path,
             Suite::Blake3Bao64,
             Some(length as u64 + 1),
-            length as u64 + 1
+            length as u64 + 1,
+            None,
         )
         .is_err());
         if length != 0 {
             assert!(
-                prepare_library_file(&path, Suite::Blake3Bao64, None, length as u64 - 1).is_err()
+                prepare_library_file(&path, Suite::Blake3Bao64, None, length as u64 - 1, None)
+                    .is_err()
             );
         }
     }
@@ -6070,17 +6075,15 @@ fn library_search_stops_at_depth_budget() {
 #[test]
 fn library_search_reports_missing_directory_as_truncated() {
     let directory = tempfile::tempdir().unwrap();
-    let mut matches = BinaryHeap::new();
     let mut visited = 0;
-
-    assert!(search_library_dir(
+    assert!(visit_library_files(
         directory.path(),
         &directory.path().join("missing"),
-        "match",
-        &mut matches,
         &mut visited,
         1,
         0,
+        &|_| true,
+        &mut |_, _| true,
     ));
 }
 

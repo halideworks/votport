@@ -18,6 +18,7 @@ use futures_util::{Stream, StreamExt as _};
 use serde::Deserialize;
 
 pub mod automation;
+pub mod prehash;
 pub mod root_cache;
 pub mod workflows;
 use crate::receipt::verify_receipt_with_key;
@@ -129,6 +130,21 @@ static LIBRARY_MUTATION_LOCK: Mutex<()> = Mutex::new(());
 static LIBRARY_MUTATION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 static LIBRARY_HASH_PERMITS: Semaphore = Semaphore::const_new(LIBRARY_HASH_CONCURRENCY);
+// Cached catalogs enter the prune keep set in the same publication critical section.
+pub(crate) static CATALOG_CACHE_LOCK: Mutex<()> = Mutex::new(());
+
+fn library_hash_lock(app: &App, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = app
+        .library_hash_locks
+        .lock()
+        .expect("library hash locks poisoned");
+    locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    Arc::clone(
+        locks
+            .entry(path.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+    )
+}
 
 // The deliver page's create-share used to block the POST on hashing every
 // selected file, so a multi-gigabyte folder froze the page with no feedback.
@@ -1760,14 +1776,14 @@ fn list_library_directory(
     direct_library_entries_page(root, directory, after, limit).map_err(|_| ())
 }
 
-fn search_library_dir(
+fn visit_library_files(
     root: &Path,
     directory: &Path,
-    query: &str,
-    matches: &mut BinaryHeap<(String, String, u64)>,
     visited: &mut usize,
     max_nodes: usize,
     depth: usize,
+    include: &impl Fn(&std::ffi::OsStr) -> bool,
+    visit: &mut impl FnMut(&Path, &std::fs::Metadata) -> bool,
 ) -> bool {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return true;
@@ -1781,7 +1797,7 @@ fn search_library_dir(
             continue;
         };
         let name = entry.file_name();
-        if is_private_library_name(&name) {
+        if is_private_library_name(&name) || !include(&name) {
             continue;
         }
         let path = entry.path();
@@ -1800,23 +1816,12 @@ fn search_library_dir(
         }
         if meta.file_type().is_dir() {
             if depth >= MAX_LIBRARY_SEARCH_DEPTH
-                || search_library_dir(root, &path, query, matches, visited, max_nodes, depth + 1)
+                || visit_library_files(root, &path, visited, max_nodes, depth + 1, include, visit)
             {
                 return true;
             }
-        } else if meta.file_type().is_file() {
-            let Some(relative) = path.strip_prefix(root).ok() else {
-                continue;
-            };
-            let relative = relative.to_string_lossy().replace('\\', "/");
-            let lowercase = relative.to_lowercase();
-            if !lowercase.contains(query) {
-                continue;
-            }
-            matches.push((lowercase, relative, meta.len()));
-            if matches.len() > RETAINED_LIBRARY_SEARCH_RESULTS {
-                matches.pop();
-            }
+        } else if meta.file_type().is_file() && !visit(&path, &meta) {
+            return true;
         }
     }
     false
@@ -1836,8 +1841,28 @@ fn list_library_search_with_budget(
     }
     let mut matches = BinaryHeap::new();
     let mut visited = 0;
-    let budget_exhausted =
-        search_library_dir(root, root, query, &mut matches, &mut visited, max_nodes, 0);
+    let budget_exhausted = visit_library_files(
+        root,
+        root,
+        &mut visited,
+        max_nodes,
+        0,
+        &|_| true,
+        &mut |path, meta| {
+            let Some(relative) = path.strip_prefix(root).ok() else {
+                return true;
+            };
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            let lowercase = relative.to_lowercase();
+            if lowercase.contains(query) {
+                matches.push((lowercase, relative, meta.len()));
+                if matches.len() > RETAINED_LIBRARY_SEARCH_RESULTS {
+                    matches.pop();
+                }
+            }
+            true
+        },
+    );
     let truncated = budget_exhausted || matches.len() > MAX_LIBRARY_SEARCH_RESULTS;
     let mut matches = matches.into_sorted_vec();
     matches.truncate(MAX_LIBRARY_SEARCH_RESULTS);
@@ -2931,11 +2956,15 @@ async fn create_library_grant(
             async move {
                 let expected = expected?;
                 let verifies_received = expected.is_some();
-                let _permit = LIBRARY_HASH_PERMITS
+                let hash_lock = library_hash_lock(&cache_app, &path);
+                let hash_guard = hash_lock.lock_owned().await;
+                let permit = LIBRARY_HASH_PERMITS
                     .acquire()
                     .await
                     .map_err(|_| ApiError::internal("hash outbound files failed"))?;
                 let hashed = tokio::task::spawn_blocking(move || {
+                    let _hash_guard = hash_guard;
+                    let _permit = permit;
                     hash_library_file(
                         &hash_root,
                         &name,
@@ -2945,6 +2974,7 @@ async fn create_library_grant(
                         &tenant,
                         &cache_app.root_cache,
                         expected.as_ref(),
+                        None,
                     )
                 })
                 .await
@@ -3192,6 +3222,7 @@ fn prepare_library_file(
     suite: Suite,
     expected_length: Option<u64>,
     max: u64,
+    idle: Option<&App>,
 ) -> io::Result<vot_sdk::object::InMemoryPreparedObject> {
     use std::io::Read as _;
     let invalid = || io::Error::new(io::ErrorKind::InvalidData, "source");
@@ -3200,7 +3231,7 @@ fn prepare_library_file(
     if !valid_preparation_length(length, expected_length, max) {
         return Err(invalid());
     }
-    if length > vot_sdk::object::PROOF_LEAF_SIZE {
+    if length > vot_sdk::object::PROOF_LEAF_SIZE && idle.is_none() {
         let leaves =
             vot_cli::file_proof_leaves(&mut input, suite, length).map_err(|error| match error {
                 vot_cli::Error::Io(error) => error,
@@ -3215,6 +3246,12 @@ fn prepare_library_file(
         InMemoryObjectBuilder::new(suite, Some(length), max).map_err(|_| invalid())?;
     let mut buffer = vec![0; (length as usize).clamp(1, CHUNK)];
     loop {
+        if idle.is_some_and(|app| !prehash::idle(app)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "library prehash paused",
+            ));
+        }
         let count = input.read(&mut buffer)?;
         if count == 0 {
             break;
@@ -3234,6 +3271,7 @@ fn hash_library_file(
     tenant: &str,
     cache: &RootCache,
     expected: Option<&ObjectId>,
+    idle: Option<&App>,
 ) -> io::Result<OutboundGrantFile> {
     let grant_file = |object: &ObjectId| -> io::Result<OutboundGrantFile> {
         Ok(OutboundGrantFile {
@@ -3281,21 +3319,28 @@ fn hash_library_file(
                 length: size,
             });
         if let Some(object) = object {
-            let usable =
-                size < BATCH_STAGE_BYTES || ensure_catalog(proof_root, path, &object).is_ok();
+            let usable = if idle.is_some() {
+                cached_catalog_usable(proof_root, &object)
+            } else {
+                size < BATCH_STAGE_BYTES || ensure_catalog(proof_root, path, &object).is_ok()
+            };
             if usable {
                 return grant_file(&object);
             }
         }
     }
     let suite = expected.map_or(Suite::Blake3Bao64, |_| Suite::Sha256Bep52);
-    let prepared = prepare_library_file(path, suite, expected.map(|object| object.length), max)?;
+    let prepared =
+        prepare_library_file(path, suite, expected.map(|object| object.length), max, idle)?;
     let bytes = prepared.object_id().length;
     let object = prepared.object_id().clone();
     if expected.is_some_and(|expected| expected != &object) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "source"));
     }
-    if bytes >= BATCH_STAGE_BYTES || expected.is_some() {
+    let _publication = CATALOG_CACHE_LOCK
+        .lock()
+        .expect("catalog cache lock poisoned");
+    if bytes >= BATCH_STAGE_BYTES || expected.is_some() || idle.is_some() {
         ensure_catalog_from_prepared(proof_root, &prepared)?;
     }
     let after = std::fs::symlink_metadata(path)?;
@@ -3322,6 +3367,12 @@ fn catalog_path(root: &Path, object: &ObjectId) -> PathBuf {
         hex::encode(object.root),
         object.length
     ))
+}
+
+fn cached_catalog_usable(root: &Path, object: &ObjectId) -> bool {
+    std::fs::File::open(catalog_path(root, object))
+        .and_then(|mut file| catalog_header(&mut file, object))
+        .is_ok()
 }
 
 fn catalog_header(file: &mut std::fs::File, expected: &ObjectId) -> io::Result<CatalogHeader> {
@@ -3443,7 +3494,8 @@ fn ensure_catalog(root: &Path, source: &Path, expected: &ObjectId) -> io::Result
 
 fn build_catalog(root: &Path, source: &Path, expected: &ObjectId) -> io::Result<PathBuf> {
     let suite = Suite::try_from(expected.suite).map_err(|_| io::Error::other("suite"))?;
-    let prepared = prepare_library_file(source, suite, Some(expected.length), expected.length)?;
+    let prepared =
+        prepare_library_file(source, suite, Some(expected.length), expected.length, None)?;
     if prepared.object_id() != expected {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "source"));
     }

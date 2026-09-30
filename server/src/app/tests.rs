@@ -152,7 +152,7 @@ mod outbound_stage_tests {
             .with_writer(move || writer.try_clone().unwrap())
             .finish();
         tracing::subscriber::with_default(subscriber, || {
-            clean_outbound_proofs(&app.config.data_dir, &app.store, now);
+            clean_outbound_proofs(&app.config.data_dir, &app.store, &app.root_cache, now);
         });
 
         assert!(

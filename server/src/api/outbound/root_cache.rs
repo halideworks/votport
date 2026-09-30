@@ -15,7 +15,7 @@
 //! restart loses only entries written since the last persist.
 //! VOTPORT PROPRIETARY LICENSE.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -89,6 +89,27 @@ pub(crate) fn mtime_nanos(metadata: &std::fs::Metadata) -> u64 {
 }
 
 impl RootCache {
+    pub(crate) fn catalog_names(&self) -> HashSet<String> {
+        let mut state = self.state.lock().expect("root cache poisoned");
+        self.ensure_loaded(&mut state);
+        state
+            .entries
+            .values()
+            .filter_map(|entry| {
+                let root = hex::decode(&entry.root)
+                    .ok()
+                    .filter(|root| root.len() == 32)?;
+                Some((hex::encode(root), entry.size))
+            })
+            .flat_map(|(root, size)| {
+                [
+                    format!("1-{root}-{size}.vot-catalog"),
+                    format!("1-{root}-{size}.leaves"),
+                ]
+            })
+            .collect()
+    }
+
     pub(crate) fn new(data_dir: &Path) -> Self {
         Self {
             path: data_dir.join("outbound-roots.json"),

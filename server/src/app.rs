@@ -340,6 +340,7 @@ pub struct App {
     /// Reusable verified roots for unchanged outbound library files, backed
     /// by a bounded sidecar under data_dir (outbound.proofs precedent).
     pub(crate) root_cache: crate::api::outbound::RootCache,
+    pub(crate) library_hash_locks: Mutex<HashMap<std::path::PathBuf, Arc<tokio::sync::Mutex<()>>>>,
     /// In-flight async grant preparations (deliver-page progress handles).
     pub(crate) grant_preparations: Mutex<crate::api::outbound::GrantPreparationRegistry>,
     health: HealthCache,
@@ -1099,8 +1100,14 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
     };
     clean_outbound_stage(&config.data_dir);
     clean_outbound_proof_stages(&config.data_dir);
+    let root_cache = crate::api::outbound::RootCache::new(&config.data_dir);
     if boot_retention.allow_age {
-        clean_outbound_proofs(&config.data_dir, &store, boot_retention.effective_at);
+        clean_outbound_proofs(
+            &config.data_dir,
+            &store,
+            &root_cache,
+            boot_retention.effective_at,
+        );
     } else {
         tracing::warn!(
             "automatic retention is held until a platform operator acknowledges the current clock"
@@ -1208,7 +1215,8 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         lease_lost_total: AtomicU64::new(0),
         mount_disqualified: AtomicBool::new(false),
         push_staging_warn: Mutex::new(crate::api::outbound::ErrorDeduper::new("push staging lock")),
-        root_cache: crate::api::outbound::RootCache::new(&config.data_dir),
+        root_cache,
+        library_hash_locks: Mutex::default(),
         grant_preparations: Mutex::default(),
         health: HealthCache::default(),
         config,
@@ -2361,7 +2369,12 @@ fn owned_catalog_stage_name(name: &str) -> bool {
     canonical_proof_name(catalog) && crate::auth::valid_hex(token, 32)
 }
 
-fn clean_outbound_proofs(data_dir: &std::path::Path, store: &Store, now: u64) {
+pub(crate) fn clean_outbound_proofs(
+    data_dir: &std::path::Path,
+    store: &Store,
+    cache: &crate::api::outbound::RootCache,
+    now: u64,
+) {
     let root = data_dir.join("outbound.proofs");
     let Ok(meta) = std::fs::symlink_metadata(&root) else {
         return;
@@ -2369,7 +2382,10 @@ fn clean_outbound_proofs(data_dir: &std::path::Path, store: &Store, now: u64) {
     if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
         return;
     }
-    let (names, unparseable) = match store.active_outbound_object_keys(now) {
+    let _publication = crate::api::outbound::CATALOG_CACHE_LOCK
+        .lock()
+        .expect("catalog cache lock poisoned");
+    let (mut names, unparseable) = match store.active_outbound_object_keys(now) {
         Ok(keys) => active_catalog_names(keys),
         Err(error) => {
             tracing::error!(%error, "outbound catalog references unavailable; skipping prune");
@@ -2400,6 +2416,7 @@ fn clean_outbound_proofs(data_dir: &std::path::Path, store: &Store, now: u64) {
     if !unparseable.is_empty() {
         return;
     }
+    names.extend(cache.catalog_names());
     prune_outbound_proofs(&root, &names);
 }
 
@@ -3822,7 +3839,7 @@ async fn sweep_daily_at(app: &Arc<App>, retention: RetentionObservation) {
         None => return,
     };
     sweep_task(app, "outbound proofs", move |app| {
-        clean_outbound_proofs(&app.config.data_dir, &app.store, now);
+        clean_outbound_proofs(&app.config.data_dir, &app.store, &app.root_cache, now);
     })
     .await;
     sweep_task(app, "revoked deliveries", move |app| {
