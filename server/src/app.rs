@@ -341,6 +341,7 @@ pub struct App {
     /// by a bounded sidecar under data_dir (outbound.proofs precedent).
     pub(crate) root_cache: crate::api::outbound::RootCache,
     pub(crate) library_hash_locks: Mutex<HashMap<std::path::PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    pub(crate) library_mutations: Mutex<HashMap<String, Arc<Mutex<u64>>>>,
     /// In-flight async grant preparations (deliver-page progress handles).
     pub(crate) grant_preparations: Mutex<crate::api::outbound::GrantPreparationRegistry>,
     health: HealthCache,
@@ -1046,6 +1047,11 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
     let applied_restore =
         crate::backup::apply_pending_restore(&config.data_dir, crate::store::SCHEMA_VERSION)?;
     let store = Arc::new(Store::open(&config.data_dir)?);
+    if let Some(oidc) = &config.oidc {
+        if oidc.subject_claim == crate::config::SubjectClaim::Sub {
+            store.migrate_oidc_subjects(&oidc.issuer)?;
+        }
+    }
     crate::backup::retire_standby_status(&config.data_dir)?;
     if let Some(applied) = applied_restore {
         crate::backup::record_applied_restore(&store, &applied);
@@ -1217,6 +1223,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         push_staging_warn: Mutex::new(crate::api::outbound::ErrorDeduper::new("push staging lock")),
         root_cache,
         library_hash_locks: Mutex::default(),
+        library_mutations: Mutex::default(),
         grant_preparations: Mutex::default(),
         health: HealthCache::default(),
         config,
@@ -2606,6 +2613,19 @@ fn admit_push(
         return None;
     }
     let token_id = capability.token_id;
+    let session_id = {
+        let tickets = app.push_tickets.lock().expect("push tickets poisoned");
+        tickets
+            .get(&token_id)
+            .map(|ticket| ticket.session_id.clone())
+    };
+    let link = session_id
+        .as_deref()
+        .and_then(|id| app.sessions.link_id(id))
+        .and_then(|id| app.store.upload_link(&id).ok().flatten());
+    if !link.is_some_and(|link| link.usable_now()) {
+        return refuse_push(app, PushRefusalReason::Spent, presentation.peer);
+    }
     // A connected ticket owns the drain already, so later rails may join it.
     // An idle pre-minted ticket must win this fence before connect consumes it.
     let admission = app.sessions.try_admit();

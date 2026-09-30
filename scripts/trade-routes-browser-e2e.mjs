@@ -108,7 +108,8 @@ try {
   assert.equal(await receiving.locator('#trade-request').inputValue(), selectedRequest, 'Paging keeps the selected request');
   assert.equal(await receiving.locator('#trade-endpoint-name').inputValue(), 'Keep route permission draft');
   assert.ok(await receiving.locator('#trade-request-help').evaluate((node) => node === document.activeElement));
-  assert.ok(await receiving.locator('#trade-request option').count() <= 4);
+  assert.deepEqual(new Set(await receiving.locator('#trade-request option').evaluateAll((options) => options.map((option) => option.value).filter(Boolean))),
+    new Set(eligibleRequests.map((request) => request.id)), 'Paging retains every earlier request and adds the older requests');
   await receiving.fill('#trade-request-query', olderRequest.id); await receiving.click('#trade-request-search');
   await receiving.waitForFunction((id) => [...document.querySelector('#trade-request').options].some((option) => option.value === id), olderRequest.id);
   await receiving.selectOption('#trade-request', olderRequest.id);

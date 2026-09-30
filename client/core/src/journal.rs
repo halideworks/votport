@@ -89,12 +89,8 @@ pub(crate) fn fresh_id(started_unix: u64) -> String {
     format!("{started_unix}-{random:016x}")
 }
 
-/// Records a transfer that is starting and returns its entry. Paths are made
-/// absolute, so a resume from another working directory names the same
-/// files. A journal that cannot be written does not stop the transfer: the
-/// caller gets the entry anyway and only the resume is lost.
 #[must_use]
-pub fn record(
+fn new_entry(
     kind: Kind,
     link: &str,
     paths: Vec<String>,
@@ -105,7 +101,7 @@ pub fn record(
         .duration_since(UNIX_EPOCH)
         .map(|since| since.as_secs())
         .unwrap_or(0);
-    let entry = Entry {
+    Entry {
         id: fresh_id(started_unix),
         kind,
         link: link.to_owned(),
@@ -114,9 +110,72 @@ pub fn record(
         needs_password,
         http: None,
         started_unix,
-    };
-    let _ = write_in(&dir(), &entry);
+    }
+}
+
+pub(crate) struct Claim {
+    _entry: std::fs::File,
+    _state: std::fs::File,
+}
+
+fn claim_in(dir: &std::path::Path, id: &str) -> Result<std::fs::File> {
+    let name = path_of(dir, id)?.file_name().unwrap().to_owned();
+    let registry = crate::identity::private_lock(&dir.join("locks.lock"))?;
+    fs4::FileExt::lock(&registry)?;
+    let lock = crate::identity::private_lock(&dir.join("locks").join(name))?;
+    fs4::FileExt::try_lock(&lock).map_err(|_| Error::AlreadyShipping {
+        path: get_in(dir, id)
+            .ok()
+            .and_then(|entry| entry.paths.into_iter().next().or(entry.dest))
+            .unwrap_or_else(|| id.to_owned()),
+    })?;
+    Ok(lock)
+}
+
+pub(crate) fn claim(id: &str) -> Result<Claim> {
+    let state = crate::identity::state_lease()?;
+    if !path_of(&dir(), id)?.is_file() {
+        return Err(Error::UnknownTransfer { id: id.to_owned() });
+    }
+    claim_with_state(id, state)
+}
+
+fn claim_with_state(id: &str, state: std::fs::File) -> Result<Claim> {
+    Ok(Claim {
+        _entry: claim_in(&dir(), id)?,
+        _state: state,
+    })
+}
+
+/// Records a transfer that is starting and returns its entry. Paths are made
+/// absolute, so a resume from another working directory names the same
+/// files. A journal that cannot be written does not stop the transfer: the
+/// caller gets the entry anyway and only the resume is lost.
+pub fn record(
+    kind: Kind,
+    link: &str,
+    paths: Vec<String>,
+    dest: Option<String>,
+    needs_password: bool,
+) -> Entry {
+    let entry = new_entry(kind, link, paths, dest, needs_password);
+    if let Ok(_state) = crate::identity::state_lease() {
+        let _ = write_in(&dir(), &entry);
+    }
     entry
+}
+
+pub(crate) fn record_claimed(
+    kind: Kind,
+    link: &str,
+    paths: Vec<String>,
+    dest: Option<String>,
+    needs_password: bool,
+) -> Result<(Entry, Claim)> {
+    let entry = new_entry(kind, link, paths, dest, needs_password);
+    let claim = claim_with_state(&entry.id, crate::identity::state_lease()?)?;
+    let _ = write_in(&dir(), &entry);
+    Ok((entry, claim))
 }
 
 /// `path` made absolute against the working directory, without touching the
@@ -201,6 +260,10 @@ pub(crate) fn forget_send_of(path: &str, mut before_forget: impl FnMut(&Entry)) 
     let path = absolute(path);
     for entry in pending() {
         if entry.kind == Kind::Send && entry.paths == [path.clone()] {
+            let Ok(_claim) = claim(&entry.id) else {
+                continue;
+            };
+            let Ok(entry) = get(&entry.id) else { continue };
             before_forget(&entry);
             forget(&entry.id);
         }
@@ -225,6 +288,9 @@ fn forget_in(dir: &std::path::Path, id: &str) {
 /// accumulate forever.
 #[must_use]
 pub fn pending() -> Vec<Entry> {
+    let Ok(_state) = crate::identity::state_lease() else {
+        return Vec::new();
+    };
     pending_in(&dir())
 }
 
@@ -238,7 +304,11 @@ fn pending_in(dir: &std::path::Path) -> Vec<Entry> {
         .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
         .filter_map(|path| {
             let entry: Entry = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
-            (path_of(dir, &entry.id).ok()? == path).then_some(entry)
+            if path_of(dir, &entry.id).ok()? != path {
+                return None;
+            }
+            let _claim = claim_in(dir, &entry.id).ok()?;
+            Some(entry)
         })
         .collect();
     entries.sort_by(|a, b| a.started_unix.cmp(&b.started_unix).then(a.id.cmp(&b.id)));
@@ -250,9 +320,37 @@ fn pending_in(dir: &std::path::Path) -> Vec<Entry> {
         .into_iter()
         .partition(|entry| now.saturating_sub(entry.started_unix) <= RETENTION_SECS);
     for entry in &abandoned {
+        let Ok(_claim) = claim_in(dir, &entry.id) else {
+            continue;
+        };
         forget_in(dir, &entry.id);
     }
+    prune_locks(dir);
     current
+}
+
+fn prune_locks(dir: &std::path::Path) {
+    let Ok(registry) = crate::identity::private_lock(&dir.join("locks.lock")) else {
+        return;
+    };
+    if fs4::FileExt::lock(&registry).is_err() {
+        return;
+    }
+    let Ok(locks) = fs::read_dir(dir.join("locks")) else {
+        return;
+    };
+    for entry in locks.flatten() {
+        let path = entry.path();
+        if dir.join(entry.file_name()).exists() {
+            continue;
+        }
+        let Ok(lock) = crate::identity::private_lock(&path) else {
+            continue;
+        };
+        if fs4::FileExt::try_lock(&lock).is_ok() {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 /// One journalled transfer by id.
@@ -279,6 +377,50 @@ fn get_in(dir: &std::path::Path, id: &str) -> Result<Entry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_claims_hide_entries_protect_retention_and_block_erasure() {
+        let home = tempfile::tempdir().unwrap();
+        let state = home.path().join("state");
+        let _test_state = crate::identity::test_state_dir(&state);
+        let (mut entry, claim) = record_claimed(
+            Kind::Receive,
+            "https://drop.example/s/DEL",
+            Vec::new(),
+            None,
+            false,
+        )
+        .unwrap();
+        entry.started_unix = 0;
+        write_in(&dir(), &entry).unwrap();
+        assert!(self::claim(&entry.id).is_err());
+        assert!(pending().is_empty());
+        assert!(get(&entry.id).is_ok());
+        assert!(crate::identity::forget_everything().is_err());
+        prune_locks(&dir());
+        assert!(dir()
+            .join("locks")
+            .join(format!("{}.json", entry.id))
+            .exists());
+        drop(claim);
+        assert!(pending().is_empty());
+        assert!(get(&entry.id).is_err());
+        assert_eq!(fs::read_dir(dir().join("locks")).unwrap().count(), 0);
+        let (_, claim) = record_claimed(
+            Kind::Send,
+            "https://drop.example/r/REQ",
+            Vec::new(),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(crate::identity::forget_everything().is_err());
+        drop(claim);
+        crate::identity::forget_everything().unwrap();
+        assert!(!state.exists());
+        assert!(self::claim(&entry.id).is_err());
+        assert!(!state.exists());
+    }
 
     #[test]
     fn journal_ids_cannot_escape_the_directory_or_retarget_an_entry() {

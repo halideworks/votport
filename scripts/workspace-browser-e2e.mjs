@@ -15,6 +15,15 @@ const page = await context.newPage(), errors = [];
 page.on('dialog', (dialog) => dialog.accept());
 page.on('pageerror', (error) => errors.push(error.message));
 const api = apiClient(context, base);
+async function waitForFixture(promise, label) {
+  let timeout;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timeout = setTimeout(() => reject(new Error(`${label} did not settle within 30 seconds`)), 30000);
+      timeout.unref();
+    })]);
+  } finally { clearTimeout(timeout); }
+}
 async function layout(name) {
   for (const width of [1440, 900, 640, 390, 320]) {
     await page.setViewportSize({ width, height: 1000 });
@@ -152,7 +161,7 @@ try {
     const heldJob = new Promise((resolve) => releaseJob = resolve), jobPending = new Promise((resolve) => jobStarted = resolve);
     await page.route(`**/api/workflows/jobs/${jobA}`, async (route) => { jobStarted(); await heldJob; await route.fulfill({ json: { ...issued, job: { ...issued.job, id: jobA } } }); });
     await page.route(`**/api/workflows/jobs/${jobB}`, (route) => route.fulfill({ json: { ...issued, job: { ...issued.job, id: jobB } } }));
-    await page.evaluate((id) => { window.location.hash = `job-${id}`; }, jobA); await jobPending;
+    await page.evaluate((id) => { window.location.hash = `job-${id}`; }, jobA); await waitForFixture(jobPending, 'jobPending');
     await page.evaluate((id) => { window.location.hash = `job-${id}`; }, jobB);
     await page.locator(`#job-${jobB}`).waitFor();
     const oldResponse = page.waitForResponse((response) => response.url().endsWith(`/api/workflows/jobs/${jobA}`));
@@ -225,7 +234,7 @@ try {
     if (route.request().method() !== 'PUT') return route.fulfill({ status: 503, json: { error: 'List refresh failed fixture' } });
     const response = await route.fetch(); saveStarted(); await pendingSave; await route.fulfill({ response });
   });
-  const saving = saveStorage(); await savingStarted;
+  const saving = saveStorage(); await waitForFixture(savingStarted, 'savingStarted');
   assert.ok(await page.locator('#workflow-save-storage').evaluate((form) => form.inert), 'Inputs stay locked until the saved revision is available');
   releaseSave(); await saving; await page.unroute('**/api/workflows/storage');
   await page.getByText('List refresh failed fixture', { exact: true }).waitFor();
@@ -239,7 +248,7 @@ try {
     let release, started;
     const pending = new Promise((resolve) => release = resolve), requestStarted = new Promise((resolve) => started = resolve);
     await page.route('**/api/workflows/storage/*/test', async (route) => { started(); await pending; await route.fulfill({ json: { ok: true, message: 'Stale test success' } }); }, { times: 1 });
-    await page.click('#storage-test'); await requestStarted;
+    await page.click('#storage-test'); await waitForFixture(requestStarted, 'requestStarted');
     if (change === 'input') await page.fill('#ws-label', `${id} changed`);
     else await page.click('#storage-new');
     const response = page.waitForResponse((r) => r.url().endsWith('/test')); release(); await response;
@@ -316,7 +325,7 @@ try {
           const pending = new Promise((resolve) => { started = resolve; });
           holdAudit = { started, wait: new Promise((resolve) => { release = resolve; }) };
           await auditAction(async () => {
-            await moreAudit(); await pending;
+            await moreAudit(); await waitForFixture(pending, 'audit page request');
             await page.locator('.audit-row summary').first().focus(); release();
           });
           assert.equal(await page.evaluate(() => document.activeElement.id), 'audit-range', 'Evicting the focused row moves focus to the range');
@@ -638,9 +647,9 @@ try {
     listReads++; const response = await route.fetch(); listStarted(); await heldList;
     await route.fulfill({ response });
   });
-  status.receiving = [{ link_id: incoming.id, received: 1, total: 100, started_at: status.now, transport: 'http' }];
+  status.receiving = [{ id: 'a'.repeat(64), link_id: incoming.id, received: 1, total: 100, started_at: status.now, transport: 'http' }];
   await pollStatus();
-  await listPending;
+  await waitForFixture(listPending, 'listPending');
   await editor.evaluate((node) => { node.open = true; });
   await editor.locator('input[data-metadata]').fill('Unsaved reception draft');
   releaseList(); await page.waitForLoadState('networkidle');
@@ -655,7 +664,7 @@ try {
   const heldPatch = new Promise((resolve) => releasePatch = resolve), patchPending = new Promise((resolve) => patchStarted = resolve);
   await page.route(`**/api/admin/links/${incoming.id}`, async (route) => { patchStarted(); await heldPatch; await route.continue(); });
   await editor.evaluate((node) => { node.open = true; });
-  await editor.getByRole('button', { name: 'Save reception workflow' }).click(); await patchPending;
+  await editor.getByRole('button', { name: 'Save reception workflow' }).click(); await waitForFixture(patchPending, 'patchPending');
   assert.ok(await editor.locator('input[data-metadata]').isDisabled(), 'Inputs cannot create an unsaved revision while PATCH is in flight');
   await editor.evaluate((node) => { node.open = false; });
   await pollStatus();
@@ -688,7 +697,7 @@ try {
   let releaseOld, oldStarted;
   const heldOld = new Promise((resolve) => releaseOld = resolve), oldPending = new Promise((resolve) => oldStarted = resolve);
   await page.route('**/api/admin/links?*', async (route) => { const response = await route.fetch(); oldStarted(); await heldOld; await route.fulfill({ response }); }, { times: 1 });
-  await page.click('#links-refresh'); await oldPending;
+  await page.click('#links-refresh'); await waitForFixture(oldPending, 'oldPending');
   await editor.getByRole('button', { name: 'Save reception workflow' }).click();
   await page.waitForFunction(() => document.querySelector('.reception-workflow > [role=status]').textContent.startsWith('Saved.'));
   releaseOld(); await page.waitForLoadState('networkidle');
@@ -829,7 +838,7 @@ try {
     if (initialReads === 1) { initialStarted(); await heldInitial; }
     await route.fulfill({ response });
   });
-  await page.goto(`${base}/workflows`); await initialPending;
+  await page.goto(`${base}/workflows`); await waitForFixture(initialPending, 'initialPending');
   await page.getByRole('link', { name: 'Projects', exact: true }).click();
   await page.locator('#workflow-project-list article').first().waitFor();
   const initialResponse = page.waitForResponse((response) => response.url().includes('/api/workflows/jobs?'));

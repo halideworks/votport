@@ -97,7 +97,6 @@ struct TransferCard: View {
                         }
                         Button(item.interrupted || item.view?.phase == .paused ? "Resume" : "Retry") {
                             let password = password.isEmpty ? nil : password
-                            self.password = ""
                             if item.kind == .receive {
                                 // The one thing a journalled receive can be
                                 // asked again: where it lands. Opens on the
@@ -111,8 +110,10 @@ struct TransferCard: View {
                                 guard panel.runModal() == .OK, let folder = panel.url else {
                                     return
                                 }
+                                self.password = ""
                                 store.resume(item.id, password: password, destination: folder)
                             } else {
+                                self.password = ""
                                 store.resume(item.id, password: password, destination: nil)
                             }
                         }

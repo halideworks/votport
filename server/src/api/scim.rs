@@ -212,35 +212,40 @@ fn authorize(app: &App, headers: &HeaderMap, ip: &str) -> ScimResult<()> {
     Ok(())
 }
 
-/// A userName usable as a principal subject. Refuses the break-glass
-/// subject, which never comes from an identity provider. The subject folds
-/// to lowercase before storage: this is the row an SSO sign-in (folded the
-/// same way in select_subject) looks up, so both sources must spell it
-/// alike. There is no separate display column, so the folded form is what
-/// SCIM responses and the admin listing show; rows stored with mixed case
-/// by earlier versions still resolve by any case because the store's
-/// subject lookups match case-insensitively.
-fn admit_subject(value: Option<&Value>) -> ScimResult<String> {
-    let subject = value
+/// Maps the provider's username through the same identity key as OIDC sign-in.
+fn admit_subject(app: &App, value: Option<&Value>) -> ScimResult<String> {
+    let exact_sub = app
+        .config
+        .oidc
+        .as_ref()
+        .is_some_and(|oidc| oidc.subject_claim == crate::config::SubjectClaim::Sub);
+    let raw = value
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| ScimError::invalid_value("userName is required"))?
-        .to_lowercase();
-    // Interior whitespace means a display name was mapped, not a subject.
-    if subject.len() > MAX_SUBJECT_BYTES
+        .ok_or_else(|| ScimError::invalid_value("userName is required"))?;
+    let subject = if exact_sub { raw } else { raw.trim() };
+    if subject.is_empty()
+        || subject.len() > MAX_SUBJECT_BYTES
         || subject
             .chars()
-            .any(|ch| ch.is_control() || ch.is_whitespace())
+            .any(|ch| ch.is_control() || (!exact_sub && ch.is_whitespace()))
     {
         return Err(ScimError::invalid_value("userName is not acceptable"));
     }
-    if subject == "local" {
+    if !exact_sub && subject.eq_ignore_ascii_case("local") {
         return Err(ScimError::invalid_value(
             "the local administrator is not provisionable",
         ));
     }
-    Ok(subject)
+    if let Some(oidc) = &app.config.oidc {
+        oidc.subject_key(subject).map_err(ScimError::invalid_value)
+    } else {
+        if subject.to_lowercase().starts_with("oidc-sub-v2:") {
+            return Err(ScimError::invalid_value(
+                "userName uses a reserved identity prefix",
+            ));
+        }
+        Ok(subject.to_lowercase())
+    }
 }
 
 /// SCIM `active` arrives as a bool from most clients and as the strings
@@ -284,7 +289,10 @@ fn resource(app: &App, principal: &Principal) -> Value {
     let mut resource = json!({
         "schemas": [USER_SCHEMA],
         "id": principal.subject,
-        "userName": principal.subject,
+        "userName": app.config.oidc.as_ref().and_then(|oidc| {
+            let raw = crate::config::original_sub(&principal.subject)?;
+            (oidc.subject_key(&raw).ok()?.as_str() == principal.subject).then_some(raw)
+        }).unwrap_or_else(|| principal.subject.clone()),
         "active": !principal.blocked,
         "meta": meta,
     });
@@ -622,7 +630,9 @@ pub async fn list_users(
         Some(filter) => {
             let (key, value) = filter_equality(filter, "userName")?;
             let found = match key {
-                FilterKey::Name => app.store.principal(&value),
+                FilterKey::Name => app
+                    .store
+                    .principal(&admit_subject(&app, Some(&Value::String(value)))?),
                 FilterKey::ExternalId => app.store.principal_by_external_id(&value),
             };
             let rows: Vec<_> = found.map_err(ScimError::store)?.into_iter().collect();
@@ -655,7 +665,7 @@ pub async fn create_user(
 ) -> ScimResult<Response> {
     let ip = client_ip(&app, &headers, &peer);
     authorize(&app, &headers, &ip)?;
-    let subject = admit_subject(body.get("userName"))?;
+    let subject = admit_subject(&app, body.get("userName"))?;
     let external_id = admit_external_id(body.get("externalId"))?;
     let active = body
         .get("active")
@@ -714,7 +724,7 @@ pub async fn replace_user(
     let ip = client_ip(&app, &headers, &peer);
     authorize(&app, &headers, &ip)?;
     load(&app, &id)?;
-    if admit_subject(body.get("userName"))? != id {
+    if admit_subject(&app, body.get("userName"))? != id {
         return Err(ScimError::mutability("userName cannot change"));
     }
     if let Some(active) = body.get("active") {
@@ -859,7 +869,7 @@ fn admit_members(value: Option<&Value>) -> ScimResult<Vec<String>> {
             .filter(|subject| !subject.is_empty())
             .ok_or_else(|| ScimError::invalid_value("each member needs a value"))?
             .to_lowercase();
-        if subject.len() > MAX_SUBJECT_BYTES || subject.chars().any(char::is_control) {
+        if subject.len() > 600 || subject.chars().any(char::is_control) {
             return Err(ScimError::invalid_value("member value is not acceptable"));
         }
         members.push(subject);
@@ -1243,6 +1253,68 @@ mod tests {
         )
         .await;
         (status, json)
+    }
+
+    #[tokio::test]
+    async fn exact_oidc_subs_provision_filter_and_deactivate_independently() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = testing::config(directory.path());
+        config.scim_token = Some(TOKEN.into());
+        config.oidc = Some(crate::config::OidcConfig {
+            issuer: "https://issuer.example".into(),
+            client_id: "client".into(),
+            client_secret: "secret".into(),
+            admin_group: None,
+            auditor_group: None,
+            subject_claim: crate::config::SubjectClaim::Sub,
+        });
+        let application = app::build(config).unwrap();
+        let mut ids = Vec::new();
+        for raw in ["Alice", "alice", "local", " spaced "] {
+            let body = json!({"userName": raw}).to_string();
+            let (status, user) = scim(&application, "POST", "/scim/v2/Users", Some(&body)).await;
+            assert_eq!(status, StatusCode::CREATED, "{user}");
+            assert_eq!(user["userName"], raw);
+            let id = user["id"].as_str().unwrap().to_owned();
+            assert!(id.starts_with("oidc-sub-v2:"));
+            let filter = encode_segment(&format!("userName eq \"{raw}\""));
+            let (status, found) = scim(
+                &application,
+                "GET",
+                &format!("/scim/v2/Users?filter={filter}"),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(found["totalResults"], 1);
+            assert_eq!(found["Resources"][0]["id"], id);
+            ids.push(id);
+        }
+        assert_ne!(ids[0], ids[1]);
+        let body = json!({"displayName":"editors", "members":[{"value":ids[0]},{"value":ids[1]}]})
+            .to_string();
+        let (status, group) = scim(&application, "POST", "/scim/v2/Groups", Some(&body)).await;
+        assert_eq!(status, StatusCode::CREATED, "{group}");
+        assert_eq!(group["members"].as_array().unwrap().len(), 2);
+        let patch = r#"{"Operations":[{"op":"replace","path":"active","value":false}]}"#;
+        let (status, _) = scim(
+            &application,
+            "PATCH",
+            &format!("/scim/v2/Users/{}", ids[0]),
+            Some(patch),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!application.store.principal_allows(&ids[0], 1));
+        assert!(application.store.principal_allows(&ids[1], 1));
+        let prior = application.store.principal(&ids[1]).unwrap().unwrap();
+        let mut other = application.config.oidc.clone().unwrap();
+        other.issuer = "https://previous.example".into();
+        let old = other.subject_key("alice").unwrap();
+        application.store.provision_principal(&old, None).unwrap();
+        let old = application.store.principal(&old).unwrap().unwrap();
+        assert_eq!(resource(&application, &prior)["userName"], "alice");
+        assert_eq!(resource(&application, &old)["userName"], old.subject);
     }
 
     #[tokio::test]

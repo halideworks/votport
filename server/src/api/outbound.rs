@@ -110,24 +110,20 @@ const LIBRARY_SELECTION_BUDGET: LibraryEnumerationBudget = LibraryEnumerationBud
     max_path_bytes: 16 * 1024 * 1024,
 };
 
-// ponytail: one tiny global critical section; use per-tenant locks only if contention is measured.
-static LIBRARY_MUTATION_LOCK: Mutex<()> = Mutex::new(());
-
-// Serialization contract for LIBRARY_MUTATION_LOCK: it must stay impossible
-// for delete_outbound_file to remove a library source that a concurrent grant
-// creation validated and inserted. Grant creation validates its sources by
-// statting every selected file, which on a stalled library mount can block
-// forever, so the walk runs WITHOUT the lock and the lock guards only the
-// grant insert. Closing the validation-to-insert window against deletes is
-// the generation below: delete_outbound_file is the only in-process mutator
-// that removes sources under the lock, and it bumps the count after removing.
-// A creation that saw generation G before validating re-reads it under the
-// lock (the mutex hand-off makes that re-read authoritative over every
-// completed bump) and, when it moved, revalidates before inserting. So a
-// delete and a validated insert are strictly ordered: either the delete
-// completes first and the insert revalidates and fails, or the insert lands
-// first and the delete observes the active grant and refuses.
-static LIBRARY_MUTATION_GENERATION: AtomicU64 = AtomicU64::new(0);
+// A delete advances its tenant's generation under the grant insertion lock.
+// Creations retain the same lock across validation to detect that deletion.
+fn library_mutation_lock(app: &App, tenant: &str) -> Arc<Mutex<u64>> {
+    let mut locks = app
+        .library_mutations
+        .lock()
+        .expect("library mutations poisoned");
+    locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    Arc::clone(
+        locks
+            .entry(tenant.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(0))),
+    )
+}
 
 static LIBRARY_HASH_PERMITS: Semaphore = Semaphore::const_new(LIBRARY_HASH_CONCURRENCY);
 // Cached catalogs enter the prune keep set in the same publication critical section.
@@ -467,13 +463,6 @@ pub async fn outbound_grant_preparation(
         .filter(|preparation| preparation.tenant == identity.tenant)
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, PREPARATION_LOST_MESSAGE))?;
     Ok(Json(preparation.snapshot()))
-}
-
-fn library_mutation_generation() -> u64 {
-    // Relaxed is enough: only the lock-held re-read decides, and the mutex
-    // gives that read happens-after every bump from earlier critical
-    // sections. A stale unlocked read can only cause a redundant recheck.
-    LIBRARY_MUTATION_GENERATION.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -1415,9 +1404,8 @@ pub async fn delete_outbound_file(
     let relative_path_for_worker = relative_path.clone();
     let bytes = tokio::task::spawn_blocking(move || {
         let _operation = operation;
-        let _lock = LIBRARY_MUTATION_LOCK
-            .lock()
-            .expect("library mutation lock poisoned");
+        let mutation = library_mutation_lock(&worker, &tenant);
+        let mut generation = mutation.lock().expect("library mutation lock poisoned");
         let root = library_root(&worker, &tenant);
         #[cfg(test)]
         wait_library_mutation_stall(&root);
@@ -1440,8 +1428,8 @@ pub async fn delete_outbound_file(
         }
         std::fs::remove_file(&path)
             .map_err(|_| ApiError::internal("delete outbound file failed"))?;
-        LIBRARY_MUTATION_GENERATION.fetch_add(1, Ordering::Relaxed);
-        drop(_lock);
+        *generation = generation.wrapping_add(1);
+        drop(generation);
         worker.store.audit(
             &tenant,
             &subject,
@@ -2170,7 +2158,7 @@ const AUTOMATION_TOKEN_PAGE_MAX: usize = 100;
 // Live (unrevoked, unexpired) tokens per tenant, in the style of the
 // workflows project limit: automation minting on a schedule must revoke or
 // let tokens expire before it can mint more.
-const MAX_AUTOMATION_TOKENS_PER_TENANT: u64 = 100;
+const MAX_AUTOMATION_TOKENS_PER_TENANT: u64 = crate::store::MAX_AUTOMATION_TOKENS_PER_TENANT;
 
 pub async fn list_automation_tokens(
     State(app): State<Arc<App>>,
@@ -2274,9 +2262,14 @@ pub async fn create_automation_token(
         revoked_at: None,
         last_used_at: None,
     };
-    app.store
+    if !app
+        .store
         .insert_automation_token(token.clone())
-        .map_err(super::store_unavailable)?;
+        .map_err(super::store_unavailable)?
+    {
+        return Err(ApiError::new(StatusCode::UNPROCESSABLE_ENTITY,
+            format!("this tenant allows at most {MAX_AUTOMATION_TOKENS_PER_TENANT} automation tokens; revoke one first")));
+    }
     app.store.audit(
         &identity.tenant,
         &identity.subject,
@@ -3160,7 +3153,8 @@ async fn create_library_grant(
         // a stalled library mount would otherwise hold the lock forever.
         #[cfg(test)]
         wait_library_mutation_stall(&root);
-        let generation = library_mutation_generation();
+        let mutation = library_mutation_lock(&worker, &tenant);
+        let generation = *mutation.lock().expect("library mutation lock poisoned");
         if !library_sources_match(&root, &revalidation, &grant.files) {
             return Err(ApiError::not_found());
         }
@@ -3169,15 +3163,9 @@ async fn create_library_grant(
         // a delete can be run through the window deterministically.
         #[cfg(test)]
         wait_library_mutation_stall(&root.join(".validated"));
-        let _lock = LIBRARY_MUTATION_LOCK
-            .lock()
-            .expect("library mutation lock poisoned");
-        // The lock covers only the store transaction plus this recheck, so a
-        // stalled mount delays only the request doing the walking. A delete
-        // that completed while we validated moved the generation; redo the
-        // walk under the lock so it cannot win the validation-to-insert
-        // window.
-        if library_mutation_generation() != generation
+        let current_generation = mutation.lock().expect("library mutation lock poisoned");
+        // Recheck a source deleted during validation before inserting its grant.
+        if *current_generation != generation
             && !library_sources_match(&root, &revalidation, &grant.files)
         {
             return Err(ApiError::not_found());
@@ -3191,7 +3179,7 @@ async fn create_library_grant(
                 Some(&token_for_worker),
             )
             .map_err(workflows::workflow_store_error)?;
-        drop(_lock);
+        drop(current_generation);
         worker.store.audit(
             &tenant,
             &subject,
@@ -3337,12 +3325,6 @@ fn hash_library_file(
     if expected.is_some_and(|expected| expected != &object) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "source"));
     }
-    let _publication = CATALOG_CACHE_LOCK
-        .lock()
-        .expect("catalog cache lock poisoned");
-    if bytes >= BATCH_STAGE_BYTES || expected.is_some() || idle.is_some() {
-        ensure_catalog_from_prepared(proof_root, &prepared)?;
-    }
     let after = std::fs::symlink_metadata(path)?;
     if !after.is_file()
         || after.len() != size
@@ -3353,6 +3335,12 @@ fn hash_library_file(
             io::ErrorKind::InvalidData,
             "source changed while hashing",
         ));
+    }
+    let _publication = CATALOG_CACHE_LOCK
+        .lock()
+        .expect("catalog cache lock poisoned");
+    if bytes >= BATCH_STAGE_BYTES || expected.is_some() || idle.is_some() {
+        ensure_catalog_from_prepared(proof_root, &prepared)?;
     }
     if bytes == size && expected.is_none() {
         cache.insert(tenant, path, size, mtime, change, hex::encode(object.root));
@@ -5510,6 +5498,7 @@ fn read_verified_receipt(
 }
 
 struct VerifiedStream {
+    finished: bool,
     first: Option<Result<Bytes, io::Error>>,
     receiver: mpsc::Receiver<Result<Bytes, io::Error>>,
     _operation: Option<OwnedOutboundOperation>,
@@ -5578,11 +5567,24 @@ impl Stream for VerifiedStream {
     type Item = Result<Bytes, io::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.finished {
+            return Poll::Ready(None);
+        }
+        if self.gate.as_ref().is_some_and(StreamGate::stopped) {
+            self.finished = true;
+            self.first = None;
+            self.receiver.close();
+            return Poll::Ready(Some(Err(io::Error::other(
+                "download revoked or expired mid-stream",
+            ))));
+        }
         if let Some(item) = self.first.take() {
             return Poll::Ready(Some(item));
         }
         match self.receiver.poll_recv(cx) {
             Poll::Ready(Some(_)) if self.gate.as_ref().is_some_and(StreamGate::stopped) => {
+                self.finished = true;
+                self.receiver.close();
                 Poll::Ready(Some(Err(io::Error::other(
                     "download revoked or expired mid-stream",
                 ))))
@@ -5617,6 +5619,7 @@ async fn start_verified_stream(
         .await
         .map_err(|_| io::Error::other("verified stream stopped"))??;
     Ok(VerifiedStream {
+        finished: false,
         first: Some(Ok(first)),
         receiver,
         _operation: operation,
@@ -6000,7 +6003,7 @@ pub(crate) struct ActiveDownload {
 /// operator extended it. Admission-only checks would let a stream verified
 /// before the revocation deliver the whole body.
 #[derive(Clone)]
-struct StreamGate {
+pub(crate) struct StreamGate {
     cancel: CancellationToken,
     expires_at: Arc<AtomicU64>,
     app: Arc<App>,
@@ -6008,7 +6011,7 @@ struct StreamGate {
 }
 
 impl StreamGate {
-    fn for_grant(app: &Arc<App>, grant: &OutboundGrant) -> Self {
+    pub(crate) fn for_grant(app: &Arc<App>, grant: &OutboundGrant) -> Self {
         Self {
             cancel: stream_cancel_token(app, &grant.token_hash),
             expires_at: Arc::new(AtomicU64::new(grant.expires_at)),
@@ -6017,7 +6020,7 @@ impl StreamGate {
         }
     }
 
-    fn stopped(&self) -> bool {
+    pub(crate) fn stopped(&self) -> bool {
         if self.cancel.is_cancelled() {
             return true;
         }

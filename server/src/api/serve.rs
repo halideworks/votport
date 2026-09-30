@@ -1136,6 +1136,7 @@ pub(crate) fn admit_fetch(
         registry: Arc::clone(&serve.registry),
         token,
     };
+    let gate = crate::api::outbound::StreamGate::for_grant(app, &grant);
     match app.store.admit_fetch_ticket(&ticket, presentation.now) {
         Ok(true) => {}
         Ok(false) => return refuse_closed_fetch(app, runtime, token, peer),
@@ -1240,6 +1241,7 @@ pub(crate) fn admit_fetch(
     Some(vot_cli::ServeAdmission {
         server,
         scope,
+        access: Some(Box::new(move || !gate.stopped())),
         observer: Some(observer),
     })
 }
@@ -1951,6 +1953,35 @@ mod tests {
             now,
             _directory: directory,
         }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_ticket_admission_reaches_the_returned_guard() {
+        let fixture = fetch_admission_fixture("admission-cancel", 85);
+        let weak = Arc::downgrade(&fixture.app);
+        fixture.app.store.with(|connection| {
+            connection.create_scalar_function("cancel_during_admission", 0,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8, move |_| {
+                    let app = weak.upgrade().unwrap();
+                    crate::api::outbound::cancel_grant_streams(&app, &crate::auth::hash_token("admission-cancel"));
+                    Ok(0)
+                })?;
+            connection.execute_batch("CREATE TRIGGER cancel_admission AFTER UPDATE OF admitted_at ON outbound_fetch_tickets
+                BEGIN SELECT cancel_during_admission(); END;")
+        }).unwrap();
+        let admission = admit_fetch(
+            &fixture.app,
+            vot_cli::ServePresentation {
+                peer: "127.0.0.1:1".parse().unwrap(),
+                challenge: &fixture.challenge,
+                open: &fixture.open,
+                channel_binding: fixture.binding,
+                now: fixture.now,
+            },
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        assert!(!admission.access.as_ref().unwrap()());
     }
 
     #[tokio::test]

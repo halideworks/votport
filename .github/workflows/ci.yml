@@ -1,17 +1,8 @@
 name: ci
 
 on:
-  # A squash merge lands the tree the pull request already ran, so a push to
-  # main only re-runs when it changes what the caches key on.
   push:
     branches: [main]
-    paths:
-      - server/Cargo.toml
-      - server/Cargo.lock
-      - client/Cargo.toml
-      - client/Cargo.lock
-      - package-lock.json
-      - Dockerfile
   pull_request:
   workflow_dispatch:
 
@@ -50,6 +41,10 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Check release CI admission
+        working-directory: .
+        run: python3 -m unittest discover -s scripts -p 'test_check_release_ci.py'
 
       - name: Tests
         run: |
@@ -95,14 +90,52 @@ jobs:
         working-directory: client
         run: VOTPORT_BIN="$GITHUB_WORKSPACE/server/target/debug/votport" cargo test --locked
 
-      # The shells build only on their own machines, so the FFI surface is
-      # checked here: the bindgen reads the built library and fails on a
-      # surface the Swift generator cannot express.
+      # Bindgen reads the Linux library as well as the platform shell builds.
+      # It fails on an FFI surface the Swift generator cannot express.
       - name: Generate the Swift bindings
         working-directory: client
         run: |
           cargo build --locked -p votport-client-core
           cargo run --locked -p uniffi-bindgen -- generate --library target/debug/libvotport_client_core.so --language swift --out-dir target/bindings
+
+  client-macos:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust and Apple targets
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            client/target
+          key: cargo-client-macos-${{ hashFiles('client/Cargo.lock') }}
+
+      - name: Install build tools
+        run: brew install cmake xcodegen
+
+      - name: Build the core and macOS app
+        working-directory: client/macos
+        run: |
+          sh build-core.sh
+          xcodegen generate
+          xcodebuild -project Votport.xcodeproj -scheme Votport -configuration Release \
+            -derivedDataPath build ARCHS=arm64 CODE_SIGN_IDENTITY=- build
+
+      - name: Test account callback ownership
+        working-directory: client/macos
+        run: |
+          xcodebuild -project Votport.xcodeproj -scheme Votport -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath build CODE_SIGN_IDENTITY=- -only-testing:VotportTests test
 
   client-windows:
     # The client carries a QUIC push carrier, so it builds BoringSSL through

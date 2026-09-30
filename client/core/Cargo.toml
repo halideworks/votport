@@ -1,6 +1,6 @@
 [package]
 name = "votport-client-core"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 license-file = "../../LICENSE"
 rust-version = "1.97"
@@ -13,10 +13,10 @@ publish = false
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-vot-cli = { git = "https://github.com/halideworks/VOT", rev = "fff2b842aae2fd40f5fc2fc5e26c82cf8256d448", default-features = false, features = ["wire"] }
-vot-object = { git = "https://github.com/halideworks/VOT", rev = "fff2b842aae2fd40f5fc2fc5e26c82cf8256d448" }
-vot-manifest = { git = "https://github.com/halideworks/VOT", rev = "fff2b842aae2fd40f5fc2fc5e26c82cf8256d448" }
-vot-platform-fs = { git = "https://github.com/halideworks/VOT", rev = "fff2b842aae2fd40f5fc2fc5e26c82cf8256d448" }
+vot-cli = { git = "https://github.com/halideworks/VOT", rev = "f77d7a896b9f2b76d3f36c1af9dc6fa5fc8d3369", default-features = false, features = ["wire"] }
+vot-object = { git = "https://github.com/halideworks/VOT", rev = "f77d7a896b9f2b76d3f36c1af9dc6fa5fc8d3369" }
+vot-manifest = { git = "https://github.com/halideworks/VOT", rev = "f77d7a896b9f2b76d3f36c1af9dc6fa5fc8d3369" }
+vot-platform-fs = { git = "https://github.com/halideworks/VOT", rev = "f77d7a896b9f2b76d3f36c1af9dc6fa5fc8d3369" }
 
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls", "rustls-tls-native-roots"] }
 serde = { version = "1", features = ["derive"] }

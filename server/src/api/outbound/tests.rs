@@ -9,6 +9,99 @@ use tower::ServiceExt as _;
 use vot_sdk_file::PublishObservation;
 
 #[test]
+fn library_mutation_locks_are_shared_within_tenants_and_independent_between_them() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = crate::api::testing::build(directory.path());
+    let first = library_mutation_lock(&app, "acme");
+    let same = library_mutation_lock(&app, "acme");
+    assert!(Arc::ptr_eq(&first, &same));
+    let held = first.lock().unwrap();
+    assert!(same.try_lock().is_err());
+    assert!(library_mutation_lock(&app, "beta").try_lock().is_ok());
+    drop(held);
+    drop(first);
+    assert!(Arc::ptr_eq(&same, &library_mutation_lock(&app, "acme")));
+}
+
+#[test]
+fn admin_cookie_accepts_long_subs_and_reports_excessive_grants() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = crate::api::testing::build(directory.path());
+    let mut identity = auth::AdminIdentity::local_admin();
+    identity.subject = format!("oidc-sub-v2:{}:{}", "a".repeat(64), "61".repeat(256));
+    identity.grants = (0..16)
+        .map(|index| auth::TenantGrant {
+            tenant: format!("tenant{index:02}"),
+            incarnation: Some("a".repeat(32)),
+            role: "admin".into(),
+        })
+        .collect();
+    let cookie = super::super::admin::issue_admin_cookie(&app, &identity, None).unwrap();
+    assert!(cookie.len() <= 4096);
+    let token = auth::cookie_value(cookie.split(';').next().unwrap(), "votport_admin").unwrap();
+    let version = app.config.admin_token_tag.clone();
+    assert_eq!(
+        auth::verify_admin_token(&app.secret, &version, token)
+            .unwrap()
+            .0
+            .subject,
+        identity.subject
+    );
+    identity.grants = (0..100)
+        .map(|index| auth::TenantGrant {
+            tenant: format!("tenant{index:02}"),
+            incarnation: Some("a".repeat(32)),
+            role: "admin".into(),
+        })
+        .collect();
+    let error = super::super::admin::issue_admin_cookie(&app, &identity, None).unwrap_err();
+    assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(error.message.contains("tenant group memberships"));
+}
+
+#[tokio::test]
+async fn cancelled_verified_stream_emits_no_prepared_or_queued_bytes() {
+    use futures_util::StreamExt as _;
+    let directory = tempfile::tempdir().unwrap();
+    let app = crate::api::testing::build(directory.path());
+    let mut grant = crate::store::tests::test_outbound_grant("revoked-first-frame", "", 0);
+    grant.expires_at = now_unix() + 600;
+    app.store.insert_outbound_grant(grant.clone()).unwrap();
+    let gate = StreamGate::for_grant(&app, &grant);
+    let (sender, receiver) = mpsc::channel(1);
+    sender
+        .send(Ok(Bytes::from_static(b"queued")))
+        .await
+        .unwrap();
+    let mut stream = VerifiedStream {
+        finished: false,
+        first: Some(Ok(Bytes::from_static(b"prepared"))),
+        receiver,
+        _operation: None,
+        _active: None,
+        gate: Some(gate),
+    };
+    cancel_grant_streams(&app, &grant.token_hash);
+    assert!(stream.next().await.unwrap().is_err());
+    assert!(stream.next().await.is_none());
+    let (sender, receiver) = mpsc::channel(1);
+    drop(sender);
+    let mut probe = VerifiedStream {
+        finished: false,
+        first: Some(Ok(Bytes::from_static(b"probe"))),
+        receiver,
+        _operation: None,
+        _active: None,
+        gate: None,
+    };
+    assert_eq!(
+        probe.next().await.unwrap().unwrap(),
+        Bytes::from_static(b"probe")
+    );
+    assert!(probe.next().await.is_none());
+}
+
+#[test]
 fn live_stream_refreshes_an_extended_deadline_and_still_stops_on_revoke() {
     let directory = tempfile::tempdir().unwrap();
     let app = crate::api::testing::build(directory.path());

@@ -953,10 +953,7 @@ pub async fn create_push_session(
     let tenant = prepared.link.tenant.clone();
     let destination = prepared.link.dest.clone();
     let destinations = tokio::task::spawn_blocking(move || -> ApiResult<_> {
-        let _allocation = store
-            .upload_allocation
-            .lock()
-            .map_err(|_| ApiError::internal("upload allocation poisoned"))?;
+        let _allocation = store.upload_allocation(&tenant);
         session::check_upload_directory(&store, &tenant, &destination).map_err(ApiError::from)?;
         root.child(&components)
             .map(Arc::new)

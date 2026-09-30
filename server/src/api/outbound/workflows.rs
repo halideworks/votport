@@ -176,6 +176,7 @@ pub async fn put_project(
         .store
         .save_delivery_project(&identity.tenant, &identity.subject, project)
         .map_err(workflow_store_error)?;
+    super::cancel_stale_grant_streams(&app);
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(project)).into_response())
 }
 
@@ -551,6 +552,15 @@ pub async fn change(
         )
     }
     .map_err(workflow_store_error)?;
+    if matches!(action.action.as_str(), "cancel" | "remove_recipient") {
+        if let Some(grant) = app
+            .store
+            .outbound_grant_by_id(&job.id)
+            .map_err(crate::api::store_unavailable)?
+        {
+            super::cancel_grant_streams(&app, &grant.token_hash);
+        }
+    }
     app.workflow_ready.notify_one();
     Ok((
         [(header::CACHE_CONTROL, "no-store")],

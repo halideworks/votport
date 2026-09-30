@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher as _, PasswordVerifier as _};
 use argon2::Argon2;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hmac::{Hmac, Mac as _};
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
@@ -228,7 +229,7 @@ fn identity_payload(id: &AdminIdentity) -> String {
 fn admin_mac(secret: &[u8; 32], payload: &str, version: &str, expires: u64, nonce: &str) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts 32-byte keys");
     for part in [
-        b"votport-admin-v3".as_slice(),
+        b"votport-admin-v4".as_slice(),
         payload.as_bytes(),
         version.as_bytes(),
     ] {
@@ -271,7 +272,7 @@ pub(crate) fn issue_admin_token_until(
     let mac = admin_mac(secret, &payload, version, expires, &nonce);
     format!(
         "{expires}.{}.{}.{}",
-        hex::encode(payload.as_bytes()),
+        URL_SAFE_NO_PAD.encode(payload.as_bytes()),
         nonce,
         mac
     )
@@ -285,7 +286,7 @@ pub fn verify_admin_token(
     token: &str,
 ) -> Option<(AdminIdentity, u64)> {
     let parts: Vec<&str> = token.split('.').collect();
-    let [expires, payload_hex, nonce, mac] = parts.as_slice() else {
+    let [expires, payload_encoded, nonce, mac] = parts.as_slice() else {
         return None;
     };
     let Ok(expires) = expires.parse::<u64>() else {
@@ -294,7 +295,7 @@ pub fn verify_admin_token(
     if now_unix() >= expires {
         return None;
     }
-    let payload = hex::decode(payload_hex).ok()?;
+    let payload = URL_SAFE_NO_PAD.decode(payload_encoded).ok()?;
     let payload = String::from_utf8(payload).ok()?;
     let expected = admin_mac(secret, &payload, version, expires, nonce);
     if !constant_time_eq(expected.as_bytes(), mac.as_bytes()) {
@@ -310,7 +311,7 @@ pub fn issue_admin_token_from_payload(secret: &[u8; 32], payload: &str, version:
     let mac = admin_mac(secret, payload, version, expires, &nonce);
     format!(
         "{expires}.{}.{}.{}",
-        hex::encode(payload.as_bytes()),
+        URL_SAFE_NO_PAD.encode(payload.as_bytes()),
         nonce,
         mac
     )
@@ -588,6 +589,36 @@ pub fn cookie_value<'header>(header: &'header str, name: &str) -> Option<&'heade
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn previous_admin_mac_domain_is_refused_even_if_payload_is_reencoded() {
+        let secret = [7; 32];
+        let identity = AdminIdentity::local_admin();
+        let payload = identity_payload(&identity);
+        let expires = now_unix() + 600;
+        let nonce = random_token();
+        let mut mac = Hmac::<Sha256>::new_from_slice(&secret).unwrap();
+        for part in [
+            b"votport-admin-v3".as_slice(),
+            payload.as_bytes(),
+            b"version".as_slice(),
+        ] {
+            mac.update(part);
+            mac.update(b"\0");
+        }
+        mac.update(&expires.to_le_bytes());
+        mac.update(nonce.as_bytes());
+        let mac = hex::encode(mac.finalize().into_bytes());
+        for encoded in [
+            hex::encode(payload.as_bytes()),
+            URL_SAFE_NO_PAD.encode(payload.as_bytes()),
+        ] {
+            let previous = format!("{expires}.{encoded}.{nonce}.{mac}");
+            assert!(verify_admin_token(&secret, "version", &previous).is_none());
+        }
+        let current = issue_admin_token(&secret, &identity, "version");
+        assert!(verify_admin_token(&secret, "version", &current).is_some());
+    }
 
     /// Stored admin, link and delivery password hashes predate any
     /// argon2 upgrade; this one was made by argon2 0.5.

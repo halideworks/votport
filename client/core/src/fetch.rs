@@ -32,7 +32,8 @@ use crate::identity::Device;
 use crate::package::{package_path_string, read_manifest, StoredEntry};
 use crate::progress::{with_events, Event, Observer, PlannedFile, Transport, PROGRESS_QUANTUM};
 use crate::receive::{
-    local_path_of, require_space, reusable_file, write_verified, Delivery, Received, Resumed,
+    delivery_bytes, local_path_of, require_space, reusable_file, write_verified, Delivery,
+    Received, Resumed,
 };
 use crate::send_push::{base64_decode, decode_digest, direct_rails, probe_any, Probe};
 
@@ -277,7 +278,7 @@ fn try_fetch_with_resume_mode(
         });
     };
 
-    let total: u64 = metadata.files.iter().map(|file| file.bytes).sum();
+    let total = delivery_bytes(metadata.files.iter().map(|file| file.bytes))?;
     let copies = if clone::supported(staging_parent, dest) {
         0
     } else {

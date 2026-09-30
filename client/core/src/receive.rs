@@ -60,6 +60,14 @@ fn receive_buffer(total: u64) -> Vec<u8> {
     vec![0; (total.min(READ_CHUNK as u64) as usize).max(1)]
 }
 
+pub(crate) fn delivery_bytes(mut bytes: impl Iterator<Item = u64>) -> Result<u64> {
+    bytes.try_fold(0u64, |total, bytes| {
+        total
+            .checked_add(bytes)
+            .ok_or_else(|| Error::Other("delivery size exceeds the supported byte limit".into()))
+    })
+}
+
 /// Names the path an io error came from, so a destination permission
 /// failure says where instead of a bare "Permission denied" (audit 482).
 pub(crate) fn io_at(path: &Path, error: std::io::Error) -> Error {
@@ -234,11 +242,12 @@ fn receive_over_http_inner(
             Ok((file, path, object, complete))
         })
         .collect::<Result<Vec<_>>>()?;
-    let needed: u64 = planned
-        .iter()
-        .filter(|(_, _, _, complete)| !complete)
-        .map(|(file, _, _, _)| file.bytes)
-        .sum();
+    let needed = delivery_bytes(
+        planned
+            .iter()
+            .filter(|(_, _, _, complete)| !complete)
+            .map(|(file, _, _, _)| file.bytes),
+    )?;
     require_space(dest, needed)?;
 
     for (index, (_, path, _, complete)) in planned.iter().enumerate() {
@@ -1066,6 +1075,16 @@ fn decode_root(hex_root: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivery_sizes_refuse_overflow() {
+        assert_eq!(delivery_bytes([].into_iter()).unwrap(), 0);
+        assert_eq!(
+            delivery_bytes([u64::MAX - 1, 1].into_iter()).unwrap(),
+            u64::MAX
+        );
+        assert!(delivery_bytes([u64::MAX, 1].into_iter()).is_err());
+    }
 
     #[test]
     fn receive_buffers_bound_memory_and_still_read_past_empty_files() {

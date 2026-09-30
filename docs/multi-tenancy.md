@@ -41,7 +41,7 @@ completion marker commit together. Admission looks up live file candidates by
 request, tenant, suite, root and exact byte length in pages of 128 rows. It skips
 repeated stored paths and verifies the candidate bytes outside the Store lock
 before reusing a copy; saved sessions keep their recorded destinations. The
-current schema is 41; startup and restore refuse earlier schemas without
+current schema is 48; startup and restore refuse earlier schemas without
 conversion.
 
 An empty database receives the complete current schema in one transaction.
@@ -80,7 +80,8 @@ still leave only the tracing event.
   and each tenant's `admin_group`. `viewer` gets read-only admin routes (enforced
   by `require_admin_write`); `auditor` (VOTPORT_OIDC_AUDITOR_GROUP) sees only
   the audit trail, enforced by `require_operator` on every other read route.
-  Finer roles stay deferred until a concrete use case.
+  Workflow projects separately grant sender, approver, and viewer roles to
+  explicit principal IDs.
   SAML is out of scope: OIDC covers every provider named above, and SAML-in-front
   of an OIDC bridge is the standard enterprise answer.
 - Local password auth remains the zero-config default and the break-glass path;

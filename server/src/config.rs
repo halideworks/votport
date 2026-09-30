@@ -341,6 +341,36 @@ pub struct OidcConfig {
     pub subject_claim: SubjectClaim,
 }
 
+impl OidcConfig {
+    pub(crate) fn subject_key(&self, value: &str) -> Result<String, String> {
+        if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+            return Err("the provider subject is invalid".into());
+        }
+        if self.subject_claim == SubjectClaim::Sub {
+            use sha2::{Digest as _, Sha256};
+            Ok(format!(
+                "oidc-sub-v2:{}:{}",
+                hex::encode(Sha256::digest(self.issuer.as_bytes())),
+                hex::encode(value.as_bytes())
+            ))
+        } else {
+            let key = value.trim().to_lowercase();
+            if key.is_empty() || key.starts_with("oidc-sub-v2:") {
+                return Err("the provider subject uses a reserved identity prefix".into());
+            }
+            Ok(key)
+        }
+    }
+}
+
+pub(crate) fn original_sub(key: &str) -> Option<String> {
+    let (issuer, value) = key.strip_prefix("oidc-sub-v2:")?.split_once(':')?;
+    if issuer.len() != 64 || !issuer.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    String::from_utf8(hex::decode(value).ok()?).ok()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubjectClaim {
     Sub,
@@ -1316,6 +1346,41 @@ mod cidr_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn oidc_sub_keys_preserve_case_bytes_and_issuer() {
+        let mut config = super::OidcConfig {
+            issuer: "https://issuer.example".into(),
+            client_id: "client".into(),
+            client_secret: "secret".into(),
+            admin_group: None,
+            auditor_group: None,
+            subject_claim: super::SubjectClaim::Sub,
+        };
+        for raw in ["Alice", "alice", " local ", "local", "é"] {
+            let key = config.subject_key(raw).unwrap();
+            assert_eq!(key, key.to_lowercase());
+            assert_eq!(super::original_sub(&key).as_deref(), Some(raw));
+        }
+        assert_ne!(
+            config.subject_key("Alice").unwrap(),
+            config.subject_key("alice").unwrap()
+        );
+        let first = config.subject_key("Alice").unwrap();
+        config.issuer = "https://other.example".into();
+        assert_ne!(first, config.subject_key("Alice").unwrap());
+        assert!(config.subject_key(&"a".repeat(256)).unwrap().len() <= 600);
+        for bad in ["".to_owned(), "a".repeat(257), "bad\nsub".into()] {
+            assert!(config.subject_key(&bad).is_err());
+        }
+        config.subject_claim = super::SubjectClaim::Email;
+        assert_eq!(
+            config.subject_key(" Alice@Example.com ").unwrap(),
+            "alice@example.com"
+        );
+        assert!(config.subject_key("oidc-sub-v2:spoof").is_err());
+        assert!(config.subject_key(" ").is_err());
+    }
+
     use super::*;
 
     fn test_password_hash(algorithm: argon2::Algorithm, version: argon2::Version) -> String {

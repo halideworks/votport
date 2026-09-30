@@ -231,10 +231,24 @@ impl Store {
     }
 
     /// Whether the grant keyed by this token hash still admits downloads:
-    /// present, unrevoked and unexpired. Reads two columns, not the file list.
+    /// present, unrevoked, unexpired, and allowed by current workflow policy.
     pub fn outbound_grant_admits(&self, token_hash: &str, now: u64) -> Result<bool, String> {
-        self.outbound_grant_deadline(token_hash)
-            .map(|deadline| deadline.is_some_and(|deadline| deadline > now))
+        let admitted = self
+            .outbound_grant_deadline(token_hash)?
+            .is_some_and(|deadline| deadline > now);
+        if !admitted {
+            return Ok(false);
+        }
+        let id: Option<String> = self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT id FROM outbound_grants WHERE token_hash=?1",
+                    [token_hash],
+                    |row| row.get(0),
+                )
+                .optional()
+        })?;
+        Ok(id.is_some_and(|id| self.delivery_access(&id, token_hash).is_ok()))
     }
 
     pub(crate) fn outbound_grant_deadline(&self, token_hash: &str) -> Result<Option<u64>, String> {
