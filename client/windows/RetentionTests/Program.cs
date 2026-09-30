@@ -158,49 +158,104 @@ static void RunPortStoreSessionEpochRegression()
     Check(Generation(store) == generation + 1 && !store.SignedIn,
         "signed-out failure did not invalidate the session");
 
-    Set(store, "Port", new Port("https://replacement", "tenant", "admin"));
-    var workerEntered = new ManualResetEventSlim();
-    var releaseWorker = new ManualResetEventSlim();
-    var workerFinished = new ManualResetEventSlim();
-    var staleFailed = false;
-    try
+    foreach (var fails in new[] { false, true })
     {
-        Run<int>(store,
-            () => {
-                workerEntered.Set();
-                try
-                {
-                    if (!releaseWorker.Wait(TimeSpan.FromSeconds(5)))
-                        throw new InvalidOperationException("worker release timed out");
-                    throw new PortException.Failed("old account", "old account", true);
-                }
-                finally { workerFinished.Set(); }
-            },
-            _ => { },
-            () => staleFailed = true);
-        Check(workerEntered.Wait(TimeSpan.FromSeconds(5)), "controlled old-account worker did not start");
-        var problem = typeof(PortStore).GetProperty("Problem", BindingFlags.Instance | BindingFlags.Public)!;
-        problem.SetValue(store, "replacement problem");
-        var reset = typeof(PortStore).GetMethod("ResetLibraryUploadForSession", BindingFlags.Instance | BindingFlags.NonPublic)!;
-        var beforeReset = Generation(store);
-        reset.Invoke(store, null);
-        releaseWorker.Set();
-        PumpUntil(() => staleFailed && !store.Busy, "stale worker failure callback did not settle");
-        Check(store.Problem == "replacement problem",
-            "stale old-account failure overwrote the replacement problem");
-        Check(store.SignedIn, "stale old-account failure signed out the replacement session");
-        Check(Generation(store) == beforeReset + 1,
-            "stale failure performed a second session reset");
+        Set(store, "Port", new Port("https://replacement", "tenant", "admin"));
+        var workerEntered = new ManualResetEventSlim();
+        var releaseWorker = new ManualResetEventSlim();
+        var workerFinished = new ManualResetEventSlim();
+        var staleFailed = false;
+        var staleSucceeded = false;
+        try
+        {
+            Run<int>(store,
+                () => {
+                    workerEntered.Set();
+                    try
+                    {
+                        if (!releaseWorker.Wait(TimeSpan.FromSeconds(5)))
+                            throw new InvalidOperationException("worker release timed out");
+                        if (fails) throw new PortException.Failed("old account", "old account", true);
+                        return 42;
+                    }
+                    finally { workerFinished.Set(); }
+                },
+                _ => staleSucceeded = true,
+                () => staleFailed = true, scope: PortStore.Scope.Links);
+            Check(workerEntered.Wait(TimeSpan.FromSeconds(5)), "controlled old-account worker did not start");
+            var problem = typeof(PortStore).GetProperty("Problem", BindingFlags.Instance | BindingFlags.Public)!;
+            problem.SetValue(store, "replacement problem");
+            var reset = typeof(PortStore).GetMethod("ResetLibraryUploadForSession", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            var beforeReset = Generation(store);
+            reset.Invoke(store, null);
+            releaseWorker.Set();
+            PumpUntil(() => staleFailed && !store.Busy, "stale worker failure callback did not settle");
+            Check(!staleSucceeded, "old-account success reached the replacement session");
+            Check(store.Problem == "replacement problem",
+                "stale old-account failure overwrote the replacement problem");
+            Check(store.SignedIn, "stale old-account failure signed out the replacement session");
+            Check(Generation(store) == beforeReset + 1,
+                "stale failure performed a second session reset");
+        }
+        finally
+        {
+            releaseWorker.Set();
+            Check(workerFinished.Wait(TimeSpan.FromSeconds(5)), "old-account worker did not exit");
+            if (!staleFailed) PumpUntil(() => !store.Busy, "old-account callback did not drain before cleanup");
+            workerEntered.Dispose();
+            releaseWorker.Dispose();
+            workerFinished.Dispose();
+        }
     }
-    finally
+
+    using (var entered = new ManualResetEventSlim())
+    using (var release = new ManualResetEventSlim())
+    using (var finished = new ManualResetEventSlim())
     {
-        releaseWorker.Set();
-        Check(workerFinished.Wait(TimeSpan.FromSeconds(5)), "old-account worker did not exit");
-        if (!staleFailed) PumpUntil(() => !store.Busy, "old-account callback did not drain before cleanup");
-        workerEntered.Dispose();
-        releaseWorker.Dispose();
-        workerFinished.Dispose();
+        var oldFailed = false;
+        Run<int>(store, () => {
+            entered.Set();
+            try {
+                if (!release.Wait(TimeSpan.FromSeconds(5))) throw new InvalidOperationException("worker release timed out");
+                throw new PortException.Failed("old sign-in failure", "old sign-in failure", true);
+            } finally { finished.Set(); }
+        }, _ => { }, () => oldFailed = true);
+        Check(entered.Wait(TimeSpan.FromSeconds(5)), "old sign-in worker did not start");
+        try {
+            var previous = Generation(store);
+            store.BeginSso("invalid origin");
+            Check(Generation(store) == previous + 1, "browser sign-in did not invalidate older account calls");
+            PumpUntil(() => GetField<Guid?>(store, "ssoAttempt") is null, "new invalid-origin attempt did not settle");
+            var replacementProblem = store.Problem;
+            Check(replacementProblem is not null, "current sign-in failure was not reported");
+            release.Set();
+            PumpUntil(() => oldFailed && !store.Busy, "old sign-in failure did not settle");
+            Check(store.Problem == replacementProblem && store.SignedIn,
+                "older sign-in failure replaced or signed out the newer attempt");
+            store.CancelSso();
+            Check(Generation(store) == previous + 2, "cancellation did not invalidate pending sign-in callbacks");
+            PumpUntil(() => !store.Busy, "sign-in cancellation did not settle");
+            var committed = VotportClientCoreMethods.Port();
+            var displayed = Get<Port?>(store, "Port");
+            Check(displayed?.Base == committed?.Base && displayed?.Tenant == committed?.Tenant
+                && displayed?.Role == committed?.Role,
+                "cancellation retained a session that differs from the committed core session");
+        } finally {
+            release.Set();
+            Check(finished.Wait(TimeSpan.FromSeconds(5)), "old sign-in worker did not exit");
+            PumpUntil(() => !store.Busy, "account workers did not drain");
+        }
     }
+
+    Set(store, "Port", VotportClientCoreMethods.Port());
+    SetField(store, "ssoCompleting", true);
+    Set(store, "LibraryUploadOutcome", "old account result");
+    var beforeCompletionCancel = Generation(store);
+    store.CancelSso();
+    PumpUntil(() => !store.Busy, "completed session cancellation did not settle");
+    Check(Generation(store) == beforeCompletionCancel + 2
+        && Get<string?>(store, "LibraryUploadOutcome") is null,
+        "cancellation retained old account state when the committed port summary was unchanged");
 
     var uploadId = Guid.NewGuid();
     Set(store, "LibraryUploadId", uploadId);
@@ -217,10 +272,10 @@ static void RunPortStoreSessionEpochRegression()
         "old upload worker did not settle after session reset");
 }
 
-static void Run<T>(PortStore store, Func<T> work, Action<T> done, Action? failed, Func<bool>? isCurrent = null) =>
+static void Run<T>(PortStore store, Func<T> work, Action<T> done, Action? failed, Func<bool>? isCurrent = null, PortStore.Scope scope = PortStore.Scope.Port) =>
     typeof(PortStore).GetMethod("Run", BindingFlags.Instance | BindingFlags.NonPublic)!
         .MakeGenericMethod(typeof(T))
-        .Invoke(store, new object?[] { PortStore.Scope.Port, work, done, failed, isCurrent });
+        .Invoke(store, new object?[] { scope, work, done, failed, isCurrent });
 
 static long Generation(PortStore store) => (long)(typeof(PortStore)
     .GetField("sessionGeneration", BindingFlags.Instance | BindingFlags.NonPublic)!

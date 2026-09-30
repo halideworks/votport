@@ -2390,7 +2390,7 @@ pub(crate) fn clean_outbound_proofs(
         return;
     }
     let _publication = crate::api::outbound::CATALOG_CACHE_LOCK
-        .lock()
+        .write()
         .expect("catalog cache lock poisoned");
     let (mut names, unparseable) = match store.active_outbound_object_keys(now) {
         Ok(keys) => active_catalog_names(keys),

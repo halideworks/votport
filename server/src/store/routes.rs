@@ -84,7 +84,7 @@ impl Store {
     }
 
     pub fn inbound_route(&self, id: &str) -> Result<Option<InboundRoute>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .prepare_cached(&format!("SELECT {COLUMNS} FROM inbound_routes WHERE id=?1"))?
                 .query_row([id], row_route)
@@ -196,7 +196,7 @@ impl Store {
         session: &str,
         manifest: impl FnOnce() -> String,
     ) -> Result<(), String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .query_row(
                     "SELECT source,revoked_at FROM inbound_routes WHERE session_id=?1",
@@ -224,7 +224,7 @@ impl Store {
         tenant: &str,
         upload: &str,
     ) -> Result<Option<RouteReceipt>, String> {
-        self.with(|connection| connection.query_row("SELECT receipt FROM inbound_routes WHERE tenant=?1 AND upload_id=?2 AND receipt IS NOT NULL",params![tenant,upload],|row| parse_json(&row.get::<_,String>(0)?,0)).optional())
+        self.read(|connection| connection.query_row("SELECT receipt FROM inbound_routes WHERE tenant=?1 AND upload_id=?2 AND receipt IS NOT NULL",params![tenant,upload],|row| parse_json(&row.get::<_,String>(0)?,0)).optional())
     }
 
     pub fn received_route(
@@ -232,7 +232,7 @@ impl Store {
         tenant: &str,
         upload: &str,
     ) -> Result<Option<InboundRoute>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .query_row(
                     &format!(
@@ -250,7 +250,7 @@ impl Store {
         tenant: &str,
         link: &str,
     ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let mut query = connection.prepare_cached("SELECT upload_id,issuer,revoked_at FROM inbound_routes WHERE tenant=?1 AND link_id=?2 AND receipt IS NOT NULL")?;
             let rows = query.query_map(params![tenant,link],|row| Ok((row.get::<_,String>(0)?,serde_json::json!({"issuer":row.get::<_,String>(1)?,"revoked_at":row.get::<_,Option<i64>>(2)?}))))?;
             rows.collect()

@@ -469,7 +469,7 @@ impl Store {
         tenant: &str,
         link_id: &str,
     ) -> Result<Option<crate::workflow::ReceiveWorkflow>, String> {
-        self.with(|connection| receive_workflow_in(connection, tenant, link_id))
+        self.read(|connection| receive_workflow_in(connection, tenant, link_id))
     }
 
     pub fn set_receive_workflow(
@@ -485,7 +485,7 @@ impl Store {
     }
 
     pub fn receive_workflow_pending(&self, tenant: &str, link_id: &str) -> Result<bool, String> {
-        self.with(|connection| receive_pending(connection, tenant, link_id))
+        self.read(|connection| receive_pending(connection, tenant, link_id))
     }
 
     pub fn reserve_delivery_snapshot(
@@ -567,7 +567,7 @@ impl Store {
     pub fn delivery_storages(
         &self,
     ) -> Result<Vec<crate::api::outbound::workflows::storage::Storage>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let mut query =
                 connection.prepare("SELECT document FROM delivery_storage ORDER BY id")?;
             let rows = query.query_map([], |row| decode(row.get(0)?))?;
@@ -744,7 +744,7 @@ impl Store {
     }
 
     pub fn delivery_storage_has_credentials(&self, id: &str) -> Result<bool, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM delivery_storage_credentials WHERE id=?1)",
                 [id],
@@ -843,7 +843,7 @@ impl Store {
     }
 
     pub fn delivery_projects(&self, tenant: &str) -> Result<Vec<Project>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let mut query = connection
                 .prepare("SELECT document FROM delivery_projects WHERE tenant=?1 ORDER BY id")?;
             let rows = query.query_map([tenant], |row| decode(row.get(0)?))?;
@@ -852,7 +852,7 @@ impl Store {
     }
 
     pub fn delivery_project(&self, tenant: &str, id: &str) -> Result<Option<Project>, String> {
-        self.with(|connection| project_in(connection, tenant, id))
+        self.read(|connection| project_in(connection, tenant, id))
     }
 
     pub fn save_delivery_project(
@@ -1048,7 +1048,7 @@ impl Store {
     }
 
     pub fn delivery_job(&self, id: &str) -> Result<Option<Job>, String> {
-        self.with(|connection| job_in(connection, id))
+        self.read(|connection| job_in(connection, id))
     }
 
     pub fn delivery_jobs(
@@ -1064,7 +1064,7 @@ impl Store {
             .map(serde_json::to_string)
             .transpose()
             .map_err(|e| e.to_string())?;
-        self.with(|connection| {
+        self.read(|connection| {
             // Pages follow creation order; the cursor is the previous page's
             // last job id, resolved to its creation stamp for a keyset seek
             // over delivery_jobs_tenant_created. An unknown cursor restarts
@@ -1617,7 +1617,7 @@ impl Store {
     }
 
     pub(crate) fn delivery_job_token(&self, tenant: &str, id: &str) -> Result<String, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection.query_row(
                 "SELECT token FROM delivery_jobs WHERE tenant=?1 AND id=?2",
                 params![tenant, id],
@@ -1676,7 +1676,7 @@ impl Store {
     }
 
     pub fn delivery_token_active(&self, id: &str, token_hash: &str) -> Result<bool, String> {
-        self.with(|connection| connection.query_row("SELECT EXISTS(SELECT 1 FROM outbound_grants WHERE id=?1 AND token_hash=?2 AND revoked_at IS NULL AND expires_at>?3)", params![id,token_hash,now_unix() as i64], |row| row.get(0)))
+        self.read(|connection| connection.query_row("SELECT EXISTS(SELECT 1 FROM outbound_grants WHERE id=?1 AND token_hash=?2 AND revoked_at IS NULL AND expires_at>?3)", params![id,token_hash,now_unix() as i64], |row| row.get(0)))
     }
 }
 

@@ -22,6 +22,7 @@ pub mod conversion;
 mod evidence;
 mod notifications;
 mod outbound;
+mod readers;
 mod received;
 pub use notifications::*;
 pub use received::{UploadFilesPage, UploadHeader, UploadPage};
@@ -1055,9 +1056,28 @@ impl Drop for UploadAllocation {
     }
 }
 
+fn register_functions(connection: &Connection) -> Result<(), String> {
+    connection
+        .create_scalar_function(
+            "votport_within",
+            2,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |context| {
+                Ok(crate::workflow::within(
+                    &context.get::<String>(0)?,
+                    &context.get::<String>(1)?,
+                ))
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 pub struct Store {
     upload_allocations: Mutex<HashMap<String, AllocationLock>>,
     connection: Mutex<Connection>,
+    readers: readers::Readers,
     pub(crate) event_signer: std::sync::Arc<crate::receipt::ReceiptSigner>,
     path: PathBuf,
     settings_generation: std::sync::atomic::AtomicU64,
@@ -1110,20 +1130,7 @@ impl Store {
                 true,
             )
             .map_err(|e| e.to_string())?;
-        connection
-            .create_scalar_function(
-                "votport_within",
-                2,
-                rusqlite::functions::FunctionFlags::SQLITE_UTF8
-                    | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-                |context| {
-                    Ok(crate::workflow::within(
-                        &context.get::<String>(0)?,
-                        &context.get::<String>(1)?,
-                    ))
-                },
-            )
-            .map_err(|e| e.to_string())?;
+        register_functions(&connection)?;
         if promotion {
             validate_schema(&connection, SCHEMA_VERSION)
                 .map_err(|e| format!("pull a valid replica before promotion: {e}"))?;
@@ -1133,6 +1140,9 @@ impl Store {
         let transaction = connection.transaction().map_err(|e| e.to_string())?;
         transaction
             .execute_batch(workflows::INDEXES)
+            .map_err(|e| e.to_string())?;
+        transaction
+            .execute_batch("CREATE INDEX IF NOT EXISTS files_live_stored_claim ON files(tenant, stored_as, suite, root) WHERE deleted=0;")
             .map_err(|e| e.to_string())?;
         transaction
             .execute_batch(OUTBOUND_INDEXES)
@@ -1182,6 +1192,7 @@ impl Store {
             .map_err(|error| format!("sync {}: {error}", data_dir.display()))?;
         let store = Self {
             upload_allocations: Mutex::new(HashMap::new()),
+            readers: readers::Readers::open(&path)?,
             connection: Mutex::new(connection),
             event_signer: std::sync::Arc::new(crate::receipt::ReceiptSigner::load_or_create(
                 data_dir,
@@ -1203,7 +1214,10 @@ impl Store {
     }
 
     pub fn health_check(&self) -> Result<(), String> {
-        self.with(|connection| {
+        if self.connection.is_poisoned() {
+            return Err("store writer unavailable".into());
+        }
+        self.read(|connection| {
             connection
                 .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
                 .and_then(|_| {
@@ -1215,7 +1229,7 @@ impl Store {
     }
 
     pub fn admin_password_hash(&self) -> Result<Option<String>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .query_row(
                     "SELECT value FROM meta WHERE key = 'admin_password_hash'",
@@ -1282,7 +1296,7 @@ impl Store {
         after: &str,
         limit: usize,
     ) -> Result<Vec<AutomationToken>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let after_created: i64 = if after.is_empty() {
                 -1
             } else {
@@ -1314,7 +1328,7 @@ impl Store {
     /// expired token no longer counts, so revoking one makes room as the
     /// refusal says. The listing pages, so kept rows stay browsable.
     pub fn automation_token_count(&self, tenant: &str) -> Result<u64, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .query_row(
                     "SELECT COUNT(*) FROM automation_tokens
@@ -1363,7 +1377,7 @@ impl Store {
     /// DELETE handler answer an already-revoked repeat with 200 and only an
     /// unknown id with 404.
     pub fn automation_token_exists(&self, tenant: &str, id: &str) -> Result<bool, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .query_row(
                     "SELECT 1 FROM automation_tokens WHERE tenant = ?1 AND id = ?2",
@@ -1380,7 +1394,7 @@ impl Store {
         token_id: &str,
         operation_id: &str,
     ) -> Result<Option<AutomationOperation>, String> {
-        self.with(|connection| connection.query_row(
+        self.read(|connection| connection.query_row(
             "SELECT token_id, operation_id, request_hash, grant_id FROM automation_operations WHERE token_id = ?1 AND operation_id = ?2",
             rusqlite::params![token_id, operation_id],
             |row| Ok(AutomationOperation { token_id: row.get(0)?, operation_id: row.get(1)?, request_hash: row.get(2)?, grant_id: row.get(3)? }),
@@ -1392,7 +1406,7 @@ impl Store {
         token_id: &str,
         grant_id: &str,
     ) -> Result<Option<(String, String)>, String> {
-        self.with(|connection| connection.query_row(
+        self.read(|connection| connection.query_row(
             "SELECT o.operation_id, g.token_hash FROM automation_operations o JOIN outbound_grants g ON g.id = o.grant_id WHERE o.token_id = ?1 AND o.grant_id = ?2",
             rusqlite::params![token_id, grant_id], |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional())
@@ -1404,7 +1418,7 @@ impl Store {
         after: i64,
         limit: usize,
     ) -> Result<Vec<(i64, String, String)>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let mut statement = connection.prepare("SELECT o.rowid, o.grant_id, g.token_hash FROM automation_operations o JOIN outbound_grants g ON g.id = o.grant_id WHERE o.token_id = ?1 AND o.rowid > ?2 ORDER BY o.rowid LIMIT ?3")?;
             let rows = statement.query_map(rusqlite::params![token_id, after, limit as i64], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
             rows.collect()
@@ -1412,7 +1426,7 @@ impl Store {
     }
 
     pub fn links(&self, tenant: &str) -> Result<Vec<Link>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let mut statement = connection.prepare(
                 "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
                         active, legal_hold, events_json, notifications_json,
@@ -1432,7 +1446,7 @@ impl Store {
         tenant: &str,
         output: &mut W,
     ) -> Result<(), String> {
-        self.with(|connection| {
+        self.read(|connection| {
             walk_quota_files(connection, Some(tenant), |identity, bytes| {
                 serde_json::to_writer(&mut *output, &(&identity.stored_as, bytes))
                     .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
@@ -1447,7 +1461,7 @@ impl Store {
     /// Live received files in one tenant namespace (count, bytes), a physical
     /// file counted once however many records reference it.
     pub fn tenant_stored(&self, tenant: &str) -> Result<(u64, u64), String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let (count, total, state) = quota_fold(connection, tenant)?;
             Ok((count, if state == 1 { u64::MAX } else { total }))
         })
@@ -1464,7 +1478,7 @@ impl Store {
         active_hashes: &[String],
     ) -> Result<OutboundSummary, String> {
         let hashes = serde_json::to_string(active_hashes).unwrap_or_else(|_| "[]".to_owned());
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .prepare_cached(
                     "SELECT COALESCE(SUM(revoked_at IS NULL AND expires_at > ?2
@@ -1498,7 +1512,7 @@ impl Store {
         active_hashes: &[String],
     ) -> Result<u64, String> {
         let hashes = serde_json::to_string(active_hashes).unwrap_or_else(|_| "[]".to_owned());
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .prepare_cached(
                     "SELECT COUNT(DISTINCT active.value)
@@ -1519,7 +1533,7 @@ impl Store {
     /// bytes), partial records excluded. Polled, so the statement is cached
     /// and the tenant filter keeps links_tenant_created in play.
     pub fn uploads_since(&self, tenant: &str, since: u64) -> Result<(u64, u64), String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let mut statement = connection.prepare_cached(
                 "SELECT upload.document -> '$.total_bytes'
                  FROM links JOIN link_uploads AS upload ON upload.link_id=links.id
@@ -1562,7 +1576,7 @@ impl Store {
     pub fn search(&self, tenant: &str, query: &str, limit: u64) -> Result<SearchResults, String> {
         let needle = format!("%{}%", escape_like(&query.to_lowercase()));
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        self.with(|connection| {
+        self.read(|connection| {
             let requests = connection
                 .prepare_cached(
                     "SELECT id, label, dest, active, expires_at, created_at
@@ -1666,7 +1680,7 @@ impl Store {
             .unwrap_or((0, 0, ""));
         let search = escape_like(search).to_lowercase();
         let now = i64::try_from(now).unwrap_or(i64::MAX);
-        self.with(|connection| {
+        self.read(|connection| {
             let mut statement = connection.prepare(
                 "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
                         active, legal_hold, events_json, notifications_json,
@@ -1724,12 +1738,14 @@ impl Store {
 
     /// Link policy and capped events, with no upload history.
     pub fn link_metadata(&self, tenant: &str, id: &str) -> Result<Option<Link>, String> {
-        let connection = self.connection.lock().expect("store poisoned");
-        read_link_metadata(&connection, tenant, id)
+        self.read(|connection| {
+            read_link_metadata(connection, tenant, id)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))
+        })
     }
 
     pub fn link(&self, tenant: &str, id: &str) -> Result<Option<Link>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .query_row(
                     "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
@@ -1747,7 +1763,7 @@ impl Store {
     /// 128-bit id is the capability, and senders never know a tenant key.
     /// Administrative reads stay tenant-scoped.
     pub fn link_by_id(&self, id: &str) -> Result<Option<Link>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .query_row(
                     "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
@@ -1763,7 +1779,7 @@ impl Store {
 
     /// Public upload routes need link policy, not its ever-growing history.
     pub fn upload_link(&self, id: &str) -> Result<Option<Link>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .prepare_cached(
                     "SELECT id, tenant, label, dest, password_hash, created_at, expires_at,
@@ -1783,7 +1799,7 @@ impl Store {
         link_id: &str,
         upload_id: &str,
     ) -> Result<Option<u64>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .query_row(
                     "SELECT json_extract(document, '$.completed_at')
@@ -1805,7 +1821,7 @@ impl Store {
         link_id: &str,
         upload_id: &str,
     ) -> Result<Option<UploadRecord>, String> {
-        self.with(|connection| read_upload(connection, tenant, link_id, upload_id))
+        self.read(|connection| read_upload(connection, tenant, link_id, upload_id))
     }
 
     pub(crate) fn upload_allocation(&self, tenant: &str) -> UploadAllocation {
@@ -1832,9 +1848,8 @@ impl Store {
     /// a different object identity (audit finding 373). After a restore a
     /// resurrected record can hold a name whose bytes a later upload
     /// replaced, so an upload must not reuse the name and leave two live
-    /// records on one stored path. ponytail: one scan over the tenant's live
-    /// rows per preparation; a stored_as index would tighten it if sessions
-    /// ever pay for it.
+    /// records on one stored path. The partial covering index probes only
+    /// live rows for the selected tenant and stored names.
     pub(crate) fn conflicting_stored_claims(
         &self,
         tenant: &str,
@@ -1852,7 +1867,7 @@ impl Store {
         }
         let names = serde_json::to_string(&identities.keys().collect::<Vec<_>>())
             .map_err(|error| error.to_string())?;
-        self.with(|connection| {
+        self.read(|connection| {
             let mut statement = connection.prepare(
                 "SELECT stored_as, suite, root FROM files WHERE tenant=?1 AND deleted=0
                  AND stored_as IN (SELECT value FROM json_each(?2))",
@@ -1885,7 +1900,7 @@ impl Store {
         after: &str,
     ) -> Result<Vec<(String, bool)>, String> {
         let (hi, lo) = split_bytes(object.length);
-        self.with(|connection| {
+        self.read(|connection| {
             let mut statement = connection.prepare_cached(
                 "SELECT stored_as, receipt FROM files
                  WHERE tenant=?1 AND link_id=?2 AND suite=?3 AND root=?4
@@ -1910,7 +1925,7 @@ impl Store {
     }
 
     pub fn uploads_by_id(&self, id: &str) -> Result<Option<Vec<UploadRecord>>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .query_row("SELECT events_json FROM links WHERE id=?1", [id], |row| {
                     let _: Vec<SessionEvent> = parse_json(&row.get::<_, String>(0)?, 0)?;
@@ -2187,7 +2202,7 @@ impl Store {
         id: &str,
         upload_id: &str,
     ) -> Result<bool, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM files
                  WHERE tenant=?1 AND link_id=?2 AND upload_id=?3 AND deleted=0)",
@@ -2202,7 +2217,7 @@ impl Store {
     /// Receive page, tenant usage, the retention sweep and
     /// delete_received_file all derive their paths from these rows.
     pub fn link_has_existing_files(&self, tenant: &str, id: &str) -> Result<bool, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM files WHERE tenant=?1 AND link_id=?2 AND deleted=0)",
                 rusqlite::params![tenant, id],
@@ -2342,7 +2357,7 @@ impl Store {
     }
 
     pub fn tenants(&self) -> Result<Vec<Tenant>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let mut statement = connection.prepare(
                 "SELECT key, label, admin_group, CAST(max_total_bytes AS TEXT),
                         CAST(max_links AS TEXT), CAST(max_sessions AS TEXT), created_at, incarnation, retention_days
@@ -2357,7 +2372,7 @@ impl Store {
     // tenant key, resolved to its creation stamp for a keyset seek. An
     // unknown cursor restarts from the oldest tenant.
     pub fn tenants_page(&self, after: &str, limit: usize) -> Result<Vec<Tenant>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let after_created: i64 = if after.is_empty() {
                 -1
             } else {
@@ -2384,7 +2399,7 @@ impl Store {
     }
 
     pub fn tenant(&self, key: &str) -> Result<Option<Tenant>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .query_row(
                     "SELECT key, label, admin_group, CAST(max_total_bytes AS TEXT),
@@ -2401,7 +2416,7 @@ impl Store {
         &self,
         keys: impl IntoIterator<Item = &'a str>,
     ) -> Result<HashMap<String, String>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let mut statement =
                 connection.prepare_cached("SELECT incarnation FROM tenants WHERE key=?1")?;
             let mut incarnations = HashMap::new();
@@ -2418,7 +2433,7 @@ impl Store {
     }
 
     pub fn tenant_link_count(&self, key: &str) -> Result<u64, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .query_row(
                     "SELECT COUNT(*) FROM links WHERE tenant = ?1",
@@ -2602,7 +2617,7 @@ impl Store {
     // ------------------------------------------------------------ branding
 
     pub fn branding(&self, tenant: &str) -> Result<Option<Branding>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .prepare_cached(
                     "SELECT tenant, name, color, logo_ext, updated_at, footer_text, footer_link_label, footer_link_url
@@ -2792,7 +2807,7 @@ impl Store {
         tenant: &str,
         mut visit: impl FnMut(&str, &[String]) -> Result<(), String>,
     ) -> Result<(), String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let mut statement = connection.prepare_cached(
                 "SELECT s.dest_rel,f.stored_components FROM upload_sessions s
                  JOIN upload_session_files f ON f.session_id=s.id
@@ -2817,7 +2832,7 @@ impl Store {
 
     /// When a session's resume record was last written, in Unix seconds.
     pub fn upload_session_written_at(&self, id: &str) -> Result<Option<u64>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .query_row(
                     "SELECT created_at FROM upload_sessions WHERE id=?1",
@@ -2842,7 +2857,7 @@ impl Store {
         push_only: bool,
         push_key: Option<&str>,
     ) -> Result<Vec<PersistedUploadSession>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let mut sessions = Vec::new();
             let mut statement = connection.prepare(
                 "SELECT id, link_id, tenant, dest_dir, dest_rel, package_suite,
@@ -2978,7 +2993,7 @@ impl Store {
 
     /// Whether a boot already reported this suspended session as interrupted.
     pub fn interruption_reported(&self, session_id: &str) -> Result<bool, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM meta WHERE key = ?1)",
                 [interruption_key(session_id)],
@@ -3018,7 +3033,7 @@ impl Store {
     // ponytail: lower(subject) defeats the primary-key index; fine at admin
     // principal counts, move folding into the schema if this table grows.
     pub fn principal(&self, subject: &str) -> Result<Option<Principal>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .query_row(
                     "SELECT subject, credential_version, blocked, last_login_at,
@@ -3065,7 +3080,7 @@ impl Store {
             PrincipalPageOrder::LastLogin => "last_login_at DESC, subject ASC",
             PrincipalPageOrder::Subject => "subject ASC",
         };
-        self.with(|connection| {
+        self.read(|connection| {
             let total = connection.query_row(
                 "SELECT COUNT(*) FROM principals
                  WHERE (?1 IS NULL OR subject LIKE ?1 ESCAPE '\\' COLLATE NOCASE)",
@@ -3147,7 +3162,7 @@ impl Store {
     }
 
     pub fn principal_by_external_id(&self, external_id: &str) -> Result<Option<Principal>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .query_row(
                     "SELECT subject, credential_version, blocked, last_login_at,
@@ -3192,7 +3207,7 @@ impl Store {
     }
 
     pub fn scim_group(&self, id: &str) -> Result<Option<ScimGroup>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let Some(mut group) = connection
                 .query_row(
                     "SELECT id, display_name, external_id, created_at FROM scim_groups WHERE id = ?1",
@@ -3221,7 +3236,7 @@ impl Store {
     }
 
     fn scim_group_by_column(&self, column: &str, value: &str) -> Result<Option<ScimGroup>, String> {
-        let id = self.with(|connection| {
+        let id = self.read(|connection| {
             connection
                 .query_row(
                     &format!(
@@ -3246,7 +3261,7 @@ impl Store {
     ) -> Result<(Vec<ScimGroup>, u64), String> {
         let limit = i64::try_from(limit).map_err(|_| "group limit overflow".to_owned())?;
         let offset = i64::try_from(offset).map_err(|_| "group offset overflow".to_owned())?;
-        self.with(|connection| {
+        self.read(|connection| {
             let total = connection.query_row("SELECT COUNT(*) FROM scim_groups", [], |row| {
                 row.get::<_, i64>(0)
             })?;
@@ -3368,7 +3383,7 @@ impl Store {
     /// mapping. Matches case-insensitively so memberships stored with mixed
     /// case by earlier versions still join a folded sign-in subject.
     pub fn scim_groups_of(&self, subject: &str) -> Result<Vec<String>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let mut statement = connection.prepare(
                 "SELECT g.display_name FROM scim_group_members m
                  JOIN scim_groups g ON g.id = m.group_id
@@ -3386,9 +3401,9 @@ impl Store {
     /// safe answer to "cannot tell" is no. The local break-glass subject never
     /// reaches here, so denying cannot lock the operator out.
     pub fn principal_allows(&self, subject: &str, credential_version: u64) -> bool {
-        // One read under one lock: a sign-in re-creating the row between a
-        // row read and a tombstone read would otherwise admit an old cookie.
-        let row = self.with(|connection| {
+        // One snapshot: re-creating a principal between the row and tombstone
+        // queries must not admit an old cookie.
+        let row = self.read(|connection| {
             let row = connection
                 .query_row(
                     "SELECT subject, credential_version, blocked, last_login_at,
@@ -3594,7 +3609,7 @@ impl Store {
     /// Every link across every tenant. Internal use only for complete scans;
     /// administrative API reads stay tenant-scoped.
     pub fn all_links(&self) -> Result<Vec<Link>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let mut statement = connection.prepare(
                 "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
                         active, legal_hold, events_json, notifications_json,
@@ -3621,7 +3636,7 @@ impl Store {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         // LEFT JOIN: the default tenant has no tenants row, and a missing
         // tenant row means "no tenant-level retention".
-        self.with(|connection| {
+        self.read(|connection| {
             if let Some(after) = after {
                 let mut statement = connection.prepare_cached(
                     "SELECT links.tenant, links.id, tenants.retention_days
@@ -3660,7 +3675,7 @@ impl Store {
     /// Whether any tenant or link sets its own upload retention, so the
     /// sweep runs even when the platform-wide setting is off (finding 378).
     pub(crate) fn scoped_retention_exists(&self) -> Result<bool, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM links WHERE retention_days IS NOT NULL)
                      OR EXISTS(SELECT 1 FROM tenants WHERE retention_days IS NOT NULL)",
@@ -3672,7 +3687,7 @@ impl Store {
     }
 
     pub fn audit_count(&self) -> Result<u64, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .query_row("SELECT rows FROM audit_log_count WHERE id = 1", [], |row| {
                     row.get::<_, i64>(0)
@@ -3685,7 +3700,7 @@ impl Store {
     /// value deliberately means that this is an existing installation whose
     /// clock has not been acknowledged yet.
     pub(crate) fn retention_clock_anchor(&self) -> Result<Option<u64>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .query_row(
                     "SELECT value FROM meta WHERE key = ?1",
@@ -3766,7 +3781,7 @@ impl Store {
     // -------------------------------------------------------------- settings
 
     pub fn setting(&self, key: &str) -> Result<Option<String>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection
                 .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
                     row.get(0)
@@ -3776,7 +3791,7 @@ impl Store {
     }
 
     pub fn settings_map(&self) -> Result<HashMap<String, String>, String> {
-        self.with(read_settings_map)
+        self.read(read_settings_map)
     }
 
     pub fn put_settings(
@@ -3953,7 +3968,7 @@ impl Store {
         tenant: &str,
     ) -> Result<(u64, Vec<RetainedReservation>), String> {
         let received = self.tenant_received_bytes(tenant)?;
-        let retained = self.with(|connection| {
+        let retained = self.read(|connection| {
             let mut statement = connection.prepare_cached("SELECT id,push_key,package_length FROM upload_sessions WHERE tenant=?1 AND committed_upload_id IS NULL AND EXISTS(SELECT 1 FROM upload_session_files WHERE session_id=upload_sessions.id)")?;
             let rows = statement.query_map([tenant], |row| Ok(RetainedReservation {
                 id: row.get(0)?, push_key: row.get(1)?, bytes: row.get::<_, i64>(2)?.max(0) as u64,
@@ -5302,7 +5317,7 @@ impl Store {
         limit: u64,
         filters: AuditFilters<'_>,
     ) -> Result<Vec<AuditRow>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             Self::audit_export_query(connection, tenant, since, after_rowid, limit, filters)
         })
     }
@@ -5323,7 +5338,7 @@ impl Store {
         limit: u64,
         filters: AuditFilters<'_>,
     ) -> Result<Vec<AuditRow>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let mut sql = "SELECT rowid, at, tenant, actor, event, subject, detail
                             FROM audit_log
                             WHERE 1"

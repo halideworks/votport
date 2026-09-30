@@ -32,7 +32,7 @@ pub(crate) const ROOT_CACHE_MAX_ENTRIES: usize = 8192;
 const ROOT_CACHE_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
 const ROOT_CACHE_VERSION: u32 = 2;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct RootCacheEntry {
     tenant: String,
     path: String,
@@ -47,12 +47,14 @@ struct RootCacheEntry {
 struct RootCacheState {
     loaded: bool,
     dirty: bool,
+    generation: u64,
     entries: HashMap<String, RootCacheEntry>,
 }
 
 pub(crate) struct RootCache {
     path: PathBuf,
     state: Mutex<RootCacheState>,
+    persistence: Mutex<()>,
 }
 
 fn cache_key(tenant: &str, path: &Path) -> String {
@@ -114,6 +116,7 @@ impl RootCache {
         Self {
             path: data_dir.join("outbound-roots.json"),
             state: Mutex::new(RootCacheState::default()),
+            persistence: Mutex::new(()),
         }
     }
 
@@ -187,26 +190,39 @@ impl RootCache {
             }
         }
         state.dirty = true;
+        state.generation = state.generation.wrapping_add(1);
     }
 
     /// Writes the sidecar atomically when anything changed since the last
     /// persist; callers invoke it after a grant's hashing phase.
     pub(crate) fn persist(&self) {
-        let mut state = self.state.lock().expect("root cache poisoned");
-        if !state.dirty {
-            return;
-        }
-        let document = serde_json::json!({
-            "version": ROOT_CACHE_VERSION,
-            "entries": state.entries.values().collect::<Vec<_>>(),
-        });
+        self.persist_after_snapshot(|| {});
+    }
+
+    fn persist_after_snapshot(&self, after_snapshot: impl FnOnce()) {
+        let _persistence = self.persistence.lock().expect("root persistence poisoned");
+        let (entries, generation) = {
+            let state = self.state.lock().expect("root cache poisoned");
+            if !state.dirty {
+                return;
+            }
+            (
+                state.entries.values().cloned().collect::<Vec<_>>(),
+                state.generation,
+            )
+        };
+        after_snapshot();
         let mut stage = self.path.clone();
         stage.set_extension("json.stage");
         stage
             .as_mut_os_string()
             .push(format!("-{}", crate::auth::random_token()));
         let result = (|| {
-            let body = serde_json::to_vec(&document).ok()?;
+            let body = serde_json::to_vec(&serde_json::json!({
+                "version": ROOT_CACHE_VERSION,
+                "entries": entries,
+            }))
+            .ok()?;
             if let Some(parent) = self.path.parent() {
                 std::fs::create_dir_all(parent).ok()?;
             }
@@ -225,7 +241,10 @@ impl RootCache {
             std::fs::rename(&stage, &self.path).ok()
         })();
         if result.is_some() {
-            state.dirty = false;
+            let mut state = self.state.lock().expect("root cache poisoned");
+            if state.generation == generation {
+                state.dirty = false;
+            }
         } else {
             let _ = std::fs::remove_file(&stage);
         }
@@ -396,6 +415,51 @@ mod tests {
         assert!(reloaded.lookup("acme", path, 4, 100, first).is_none());
         assert_eq!(
             reloaded.lookup("acme", path, 4, 100, second),
+            Some("cd".repeat(32))
+        );
+    }
+
+    #[test]
+    fn persistence_does_not_block_lookups_or_clear_newer_changes() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let directory = tempfile::tempdir().unwrap();
+        let cache = RootCache::new(directory.path());
+        let path = Path::new("/library/a.bin");
+        cache.insert("acme", path, 4, 100, None, "ab".repeat(32));
+        std::thread::scope(|scope| {
+            let (started, ready) = mpsc::channel();
+            let (release, proceed) = mpsc::channel();
+            let cache = &cache;
+            scope.spawn(move || {
+                cache.persist_after_snapshot(|| {
+                    started.send(()).unwrap();
+                    proceed.recv_timeout(Duration::from_secs(5)).unwrap();
+                })
+            });
+            ready.recv_timeout(Duration::from_secs(5)).unwrap();
+            let (done, result) = mpsc::channel();
+            scope.spawn(move || {
+                assert_eq!(
+                    cache.lookup("acme", path, 4, 100, None),
+                    Some("ab".repeat(32))
+                );
+                cache.insert("acme", path, 4, 100, None, "cd".repeat(32));
+                done.send(()).unwrap();
+            });
+            let progress = result.recv_timeout(Duration::from_secs(2));
+            release.send(()).unwrap();
+            assert!(
+                progress.is_ok(),
+                "disk persistence blocked cache lookup/insertion"
+            );
+        });
+        assert!(cache.state.lock().unwrap().dirty);
+        cache.persist();
+        assert!(!cache.state.lock().unwrap().dirty);
+        let restarted = RootCache::new(directory.path());
+        assert_eq!(
+            restarted.lookup("acme", path, 4, 100, None),
             Some("cd".repeat(32))
         );
     }

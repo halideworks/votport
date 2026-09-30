@@ -56,7 +56,7 @@ fn attempt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WebhookAttempt> {
 
 impl Store {
     pub fn delivery_webhook(&self, tenant: &str) -> Result<Option<DeliveryWebhook>, String> {
-        self.with(|connection| connection.query_row("SELECT tenant,url,secret,revision,enabled,cursor FROM delivery_webhooks WHERE tenant=?1", [tenant], hook_row).optional())
+        self.read(|connection| connection.query_row("SELECT tenant,url,secret,revision,enabled,cursor FROM delivery_webhooks WHERE tenant=?1", [tenant], hook_row).optional())
     }
 
     pub fn save_delivery_webhook(
@@ -130,7 +130,7 @@ impl Store {
     /// events will never deliver until the webhooks are changed. Drives the
     /// votport_webhook_attempts_dead gauge.
     pub fn dead_delivery_webhooks(&self) -> Result<u64, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             connection.query_row(
                 "SELECT COUNT(*) FROM delivery_webhook_attempts WHERE status='dead'",
                 [],
@@ -140,7 +140,7 @@ impl Store {
     }
 
     pub fn due_delivery_webhooks(&self, now: u64) -> Result<Vec<WebhookAttempt>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let mut query = connection.prepare("SELECT a.tenant,a.event_id,a.revision,a.status,a.attempts,a.next_try,a.error,a.id FROM delivery_webhook_attempts a JOIN delivery_webhooks h ON h.tenant=a.tenant AND h.revision=a.revision WHERE h.enabled=1 AND a.status='pending' AND a.next_try<=?1 ORDER BY a.next_try,a.event_id LIMIT 16")?;
             let rows = query.query_map([now as i64],attempt_row)?; rows.collect()
         })
@@ -170,7 +170,7 @@ impl Store {
         after: u64,
         limit: usize,
     ) -> Result<Vec<WebhookAttempt>, String> {
-        self.with(|connection| {
+        self.read(|connection| {
             let mut query = connection.prepare("SELECT tenant,event_id,revision,status,attempts,next_try,error,id FROM delivery_webhook_attempts WHERE tenant=?1 AND id>?2 ORDER BY id LIMIT ?3")?;
             let rows = query.query_map(params![tenant,after as i64,limit.min(100) as i64],attempt_row)?; rows.collect()
         })
