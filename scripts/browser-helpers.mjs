@@ -60,3 +60,13 @@ export async function chooseNotification(host, destination, event) {
   const checkbox = group.getByLabel(event, { exact: true });
   await openAncestors(checkbox); await checkbox.check();
 }
+
+export async function waitForFixture(promise, label) {
+  let timeout;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timeout = setTimeout(() => reject(new Error(`${label} did not settle within 30 seconds`)), 30000);
+      timeout.unref();
+    })]);
+  } finally { clearTimeout(timeout); }
+}

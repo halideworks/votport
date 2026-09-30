@@ -15,7 +15,10 @@ export const workflowEvents = [...downloadEvents, 'workflow_retry_scheduled', 'w
 export const notificationServices = { slack: 'Slack', teams: 'Microsoft Teams', google_chat: 'Google Chat', discord: 'Discord', email: 'Email', webhook: 'JSON webhook', ntfy: 'ntfy', pushover: 'Pushover' };
 let pending;
 export function loadNotificationSettings(refresh = false) {
-  if (!pending || refresh) pending = api('/api/notifications').catch((error) => { pending = null; throw error; });
+  if (!pending || refresh) {
+    const request = api('/api/notifications').catch((error) => { if (pending === request) pending = null; throw error; });
+    pending = request;
+  }
   return pending;
 }
 

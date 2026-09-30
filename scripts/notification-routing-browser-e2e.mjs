@@ -1,4 +1,4 @@
-import { apiClient, chooseNotification as choose, openAncestors } from './browser-helpers.mjs';
+import { apiClient, chooseNotification as choose, openAncestors, waitForFixture } from './browser-helpers.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import http from 'node:http';
@@ -82,12 +82,13 @@ try {
   const lifecycleCatalog = await api('notifications');
   const lifecycleReload = page.locator('#create-notifications').getByRole('button', { name: 'Refresh destinations', exact: true });
   const lifecycleStatus = page.locator('#create-notifications .notification-editor > p.field-help');
-  let releaseOlder;
+  let releaseOlder, olderStarted;
+  const olderPending = new Promise((resolve) => { olderStarted = resolve; });
   let lifecycleRequests = 0;
   await page.route(`${base}/api/notifications`, async (route) => {
     lifecycleRequests++;
     if (lifecycleRequests === 1) {
-      await new Promise((resolve) => { releaseOlder = resolve; });
+      await new Promise((resolve) => { releaseOlder = resolve; olderStarted(); });
       await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'older refresh failed' }) });
     } else if (lifecycleRequests === 2) {
       await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(lifecycleCatalog) });
@@ -95,6 +96,7 @@ try {
   });
   try {
     await lifecycleReload.dispatchEvent('click');
+    await waitForFixture(olderPending, 'older notification refresh');
     await lifecycleReload.dispatchEvent('click');
     await page.waitForFunction(() => !document.querySelector('#create-notifications .notification-editor')?.disabled, null, { timeout: 5000 });
     assert.equal(lifecycleRequests, 2);
@@ -106,12 +108,13 @@ try {
     releaseOlder?.();
     await page.unroute(`${base}/api/notifications`);
   }
-  let releaseDestroyed;
+  let releaseDestroyed, destroyedStarted;
+  const destroyedPending = new Promise((resolve) => { destroyedStarted = resolve; });
   let destroyRequests = 0;
   await page.route(`${base}/api/notifications`, async (route) => {
     destroyRequests++;
     if (destroyRequests === 1) {
-      await new Promise((resolve) => { releaseDestroyed = resolve; });
+      await new Promise((resolve) => { releaseDestroyed = resolve; destroyedStarted(); });
       await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'destroyed refresh failed' }) });
     } else await route.continue();
   });
@@ -121,13 +124,14 @@ try {
   assert.ok(discardedStatusHandle);
   try {
     await lifecycleReload.dispatchEvent('click');
+    await waitForFixture(destroyedPending, 'discarded notification refresh');
+    assert.equal(destroyRequests, 1);
     const discardedStatusBefore = await discardedStatusHandle.textContent();
     await page.locator('#create-label').fill(`Discarded stale ${id}`);
     await page.getByRole('button', { name: 'Create request link', exact: true }).click();
     await page.locator('#new-link').waitFor({ state: 'visible' });
     releaseDestroyed();
     await page.waitForTimeout(100);
-    assert.equal(destroyRequests, 1);
     assert.equal(await discardedStatusHandle.textContent(), discardedStatusBefore);
     assert.equal(await discardedStatusHandle.getAttribute('role'), null);
   } finally {
