@@ -1,4 +1,4 @@
-import { apiClient, openAncestors } from './browser-helpers.mjs';
+import { apiClient, openAncestors, waitForFixture } from './browser-helpers.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -15,15 +15,6 @@ const page = await context.newPage(), errors = [];
 page.on('dialog', (dialog) => dialog.accept());
 page.on('pageerror', (error) => errors.push(error.message));
 const api = apiClient(context, base);
-async function waitForFixture(promise, label) {
-  let timeout;
-  try {
-    return await Promise.race([promise, new Promise((_, reject) => {
-      timeout = setTimeout(() => reject(new Error(`${label} did not settle within 30 seconds`)), 30000);
-      timeout.unref();
-    })]);
-  } finally { clearTimeout(timeout); }
-}
 async function layout(name) {
   for (const width of [1440, 900, 640, 390, 320]) {
     await page.setViewportSize({ width, height: 1000 });
