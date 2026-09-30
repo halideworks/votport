@@ -870,6 +870,25 @@ mod tests {
     }
 
     #[test]
+    fn failed_cross_process_claims_refuse_transfer_and_can_retry() {
+        let _test_lock = TEST_LOCK.lock().unwrap();
+        let (state, _state_scope) = test_state();
+        let watch = watch_in(state.path());
+        store(std::slice::from_ref(&watch)).unwrap();
+        let flights = state_dir().join("flights");
+        std::fs::write(&flights, b"blocked directory").unwrap();
+        let before = WATCH_IN_FLIGHT.load(Ordering::Acquire);
+        assert!(single_flight("blocked").is_err());
+        assert!(try_admit(&watch.id, "blocked").is_none());
+        assert_eq!(WATCH_IN_FLIGHT.load(Ordering::Acquire), before);
+        std::fs::remove_file(flights).unwrap();
+        drop(single_flight("blocked").unwrap());
+        let admitted = try_admit(&watch.id, "blocked").unwrap();
+        admitted.release();
+        assert_eq!(WATCH_IN_FLIGHT.load(Ordering::Acquire), before);
+    }
+
+    #[test]
     fn flight_cleanup_preserves_active_locks_and_probes_do_not_create_files() {
         let _test_lock = TEST_LOCK.lock().unwrap();
         let (_state, _state_scope) = test_state();

@@ -72,8 +72,8 @@ background hashing and validated cache reuse address delivery creation delay.
 
 ## Verification
 
-Local validation passed 975 server checks, 188 native workspace checks
-(including 139 core tests), and 84 JavaScript checks with zero skips. Format,
+Local validation passed 975 server checks, 189 native workspace checks
+(including 140 core tests), and 84 JavaScript checks with zero skips. Format,
 deny-warning lints, release validation, and dependency advisory/license/source
 checks passed. CI rejected the existing transitive `yoke-derive 0.8.3` as
 yanked; the client lockfile now selects compatible patch `0.8.4` and the native
@@ -85,8 +85,8 @@ Native shell checks run on their respective CI platforms: macOS XCTest and the
 Windows production-model dispatcher harness. They cover stale success/failure,
 signed-out failures, overlapping busy ownership, browser sign-in generation,
 and cancellation reconciliation, including a committed session whose displayed
-port fields match the previous account. Seven hand-applied mutations of read-only
+port fields match the previous account. Eight hand-applied mutations of read-only
 access, snapshot ownership, the claim index, concurrent publication, cache dirty
-generation, state cleanup ownership and SSO lease release each failed a bounded
-regression test. Sources were restored before final validation. No installed
+generation, state cleanup ownership, failed claim admission and SSO lease release
+each failed a bounded regression test. Sources were restored before final validation. No installed
 desktop was controlled.
