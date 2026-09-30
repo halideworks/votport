@@ -101,9 +101,10 @@
         <label>Search files
           <input id="library-search" type="search" autocomplete="off" placeholder="name or path" />
         </label>
+        <p id="library-preparation-help" class="muted">Ready files are prepared for sharing. You can create a link at any time; files that are not ready may take longer.</p>
         <p id="library-selection-status" class="muted" aria-live="polite">0 files selected · 0 B</p>
         <p id="library-selection-error" class="error" role="alert" hidden></p>
-        <fieldset id="library-files" class="library-list" aria-label="Library files" aria-describedby="library-selection-error"></fieldset>
+        <fieldset id="library-files" class="library-list" aria-label="Library files" aria-describedby="library-selection-error library-preparation-help"></fieldset>
         <div id="library-pagination" class="actions" hidden>
           <button id="library-pagination-previous" type="button" class="tiny ghost">Previous page</button>
           <button id="library-pagination-next" type="button" class="tiny ghost">Next page</button>

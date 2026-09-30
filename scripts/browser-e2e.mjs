@@ -1619,6 +1619,68 @@ await page.waitForFunction(
   { timeout: 15000 },
 );
 
+// Preparation updates change only the status text, retaining the selected file and focus.
+const readinessRoute = "**/api/admin/outbound-files/preparation-status";
+const readinessStates = ["ready", "preparing", "waiting_for_idle", "not_prepared", "on_demand", "unavailable"];
+let readinessMode = "states";
+let releaseReadiness;
+let sawHeldReadiness;
+let readinessHeld;
+let readinessStarted;
+await page.route(readinessRoute, async (route) => {
+  const paths = route.request().postDataJSON().paths;
+  const mode = readinessMode;
+  if (mode === "held") {
+    sawHeldReadiness();
+    await readinessHeld;
+  }
+  if (mode === "failed") return route.fulfill({ status: 503, json: { error: "status unavailable" } });
+  return route.fulfill({ json: { files: paths.map((path, index) => ({ path,
+    preparation: mode === "states" ? readinessStates[index % readinessStates.length]
+      : mode === "held" ? "ready" : mode === "unknown" ? "future_state" : "not_prepared",
+  })) } });
+});
+await page.waitForFunction(() => [...document.querySelectorAll('.library-preparation')]
+  .map((row) => row.textContent).join('|') === 'Ready|Preparing|Waiting for idle|Not prepared|On demand|Unavailable|Ready|Preparing|Waiting for idle|Not prepared|On demand|Unavailable', null, { timeout: 15000 });
+const readinessCheckbox = page.locator('#library-files input[type="checkbox"]').first();
+await readinessCheckbox.check();
+await readinessCheckbox.focus();
+readinessMode = "pending";
+await page.waitForFunction(() => [...document.querySelectorAll('.library-preparation')]
+  .every((row) => row.textContent === 'Not prepared'), null, { timeout: 15000 });
+if (!await readinessCheckbox.isChecked() || !await readinessCheckbox.evaluate((checkbox) => checkbox === document.activeElement)) {
+  throw new Error("preparation status refresh replaced selection or focus");
+}
+readinessMode = "failed";
+await page.waitForFunction(() => [...document.querySelectorAll('.library-preparation')]
+  .every((row) => row.textContent === 'Unknown'), null, { timeout: 15000 });
+if (!await readinessCheckbox.isChecked()) throw new Error("status failure changed Library selection");
+readinessMode = "unknown";
+// An unknown future value must remain neutral, with no wire text displayed.
+await page.waitForFunction(() => [...document.querySelectorAll('.library-preparation')]
+  .every((row) => row.dataset.state === 'future_state' && row.textContent === 'Unknown'), null, { timeout: 15000 });
+readinessHeld = new Promise((resolve) => { releaseReadiness = resolve; });
+readinessStarted = new Promise((resolve) => { sawHeldReadiness = resolve; });
+readinessMode = "held";
+await Promise.race([readinessStarted, new Promise((_, reject) => setTimeout(() => reject(new Error("preparation poll did not run")), 15000))]);
+try {
+  await page.getByRole("button", { name: "Library", exact: true }).click();
+  await page.waitForSelector(`#library-files input[aria-label="Select folder ${PROJECT}"]`);
+  readinessMode = "pending";
+  releaseReadiness();
+  await page.getByRole("button", { name: `Open folder ${PROJECT}`, exact: true }).click();
+  await page.waitForFunction(() => document.querySelectorAll('.library-preparation').length === 12
+    && [...document.querySelectorAll('.library-preparation')].every((row) => row.textContent === 'Not prepared'), null, { timeout: 15000 });
+  await page.locator('#library-files input[type="checkbox"]').first().uncheck();
+} finally {
+  releaseReadiness();
+  await page.unroute(readinessRoute);
+}
+// Real server state still resolves after the fixture is removed.
+await page.waitForFunction(() => [...document.querySelectorAll('.library-preparation')]
+  .every((row) => row.textContent !== 'Checking…' && row.textContent !== 'Unknown'), null, { timeout: 15000 });
+console.log("Library preparation labels preserve selection and focus, tolerate errors, and discard stale responses: ok");
+
 const projectFiles = await page.$$eval("#library-files .library-file:not(.library-folder) .mono", (els) =>
   els.map((el) => el.textContent).sort(),
 );

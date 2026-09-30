@@ -503,10 +503,16 @@ function renderLibraryFile(file, container, showPath = false) {
   checkbox.value = file.path;
   const name = node('span', showPath ? file.path : file.path.slice(file.path.lastIndexOf('/') + 1), 'mono');
   const size = node('span', formatBytes(file.bytes), 'muted');
+  const preparation = node('span', 'Checking…', 'library-preparation muted');
+  preparation.id = `library-preparation-${container.childElementCount}`;
+  preparation.dataset.path = file.path;
+  checkbox.setAttribute('aria-describedby', preparation.id);
+  const details = node('div', '', 'library-file-details');
+  details.append(size, preparation);
   if (!deliverAdministrator) {
     checkbox.disabled = true;
     label.append(checkbox, name);
-    row.append(label, size);
+    row.append(label, details);
     container.append(row);
     return;
   }
@@ -531,7 +537,7 @@ function renderLibraryFile(file, container, showPath = false) {
   });
   remove.setAttribute('aria-label', `Delete ${file.path}`);
   label.append(checkbox, name);
-  row.append(label, size, remove);
+  row.append(label, details, remove);
   container.append(row);
 }
 
@@ -621,6 +627,47 @@ function renderLibrary(response) {
   if (restoreFocus) $('library-breadcrumbs').querySelector('[aria-current=page]').focus();
 }
 
+const libraryPreparationNames = {
+  ready: ['Ready', 'Prepared for sharing. Creating a link will recheck the file.'],
+  preparing: ['Preparing', 'This file is being prepared for sharing.'],
+  waiting_for_idle: ['Waiting for idle', 'Automatic preparation pauses while transfers are active or the server is draining. You can still create a link.'],
+  not_prepared: ['Not prepared', 'Automatic preparation checks stable files while idle. Creating a link also prepares the files you select.'],
+  on_demand: ['On demand', 'This file will be prepared when you create a link.'],
+  unavailable: ['Unavailable', 'This file is missing or cannot currently be shared. Refresh the Library to check it.'],
+};
+let libraryPreparationLoading = false;
+
+async function refreshLibraryPreparation() {
+  if (libraryPreparationLoading || libraryLoading || document.hidden) return;
+  const rows = [...$('library-files').querySelectorAll('.library-preparation')];
+  if (!rows.length) return;
+  const generation = libraryRequestGeneration;
+  libraryPreparationLoading = true;
+  try {
+    const response = await api('/api/admin/outbound-files/preparation-status', {
+      method: 'POST', body: JSON.stringify({ paths: rows.map((row) => row.dataset.path) }),
+    });
+    if (generation !== libraryRequestGeneration) return;
+    const statuses = new Map(response.files.map((file) => [file.path, file.preparation]));
+    for (const row of rows) {
+      const status = statuses.get(row.dataset.path);
+      const [label, detail] = libraryPreparationNames[status] || ['Unknown', 'Preparation status is unavailable.'];
+      row.textContent = label;
+      row.title = detail;
+      row.dataset.state = status || 'unknown';
+    }
+  } catch {
+    if (generation !== libraryRequestGeneration) return;
+    for (const row of rows) {
+      row.textContent = 'Unknown';
+      row.title = 'Preparation status is unavailable. You can still create a link.';
+      row.dataset.state = 'unknown';
+    }
+  } finally {
+    libraryPreparationLoading = false;
+  }
+}
+
 function restoreLibraryView() {
   if (!libraryLastSuccessfulView) return;
   libraryDirectory = libraryLastSuccessfulView.directory;
@@ -689,6 +736,7 @@ async function refreshLibrary() {
     if (generation === libraryRequestGeneration) {
       libraryLoading = false;
       renderLibraryPagination();
+      void refreshLibraryPreparation();
     }
   }
 }
@@ -934,5 +982,8 @@ const sessionReady = requireSession().then(async (session) => {
 });
 await Promise.all([sessionReady, refreshGrants(), refreshLibrary()]);
 await revealGrant();
+void refreshLibraryPreparation();
+setInterval(refreshLibraryPreparation, 5000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) void refreshLibraryPreparation(); });
 
 $('library-files').addEventListener('change', () => markFormChanged($('deliver-form')));
