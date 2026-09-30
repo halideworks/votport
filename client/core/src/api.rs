@@ -12,6 +12,7 @@ use crate::error::{Error, Result};
 /// A blocking client bound to one votport origin.
 pub struct Client {
     http: reqwest::blocking::Client,
+    rendezvous_filter: Option<Box<dyn Fn(std::net::IpAddr) -> bool + Send + Sync>>,
     base: String,
     recipient_cookie: std::sync::Mutex<Option<String>>,
     route: Option<String>,
@@ -414,6 +415,28 @@ impl Client {
         Ok(client)
     }
 
+    /// Creates a peer sender using the caller's network restrictions.
+    ///
+    /// # Errors
+    /// An invalid origin, or a TLS or HTTP client setup failure.
+    pub fn for_route_with_network(
+        base: impl Into<String>,
+        route: String,
+        http: reqwest::blocking::Client,
+        rendezvous_filter: impl Fn(std::net::IpAddr) -> bool + Send + Sync + 'static,
+    ) -> Result<Self> {
+        let mut client = Self::for_route(base, route)?;
+        client.http = http;
+        client.rendezvous_filter = Some(Box::new(rendezvous_filter));
+        Ok(client)
+    }
+
+    pub(crate) fn filter_rendezvous(&self, addresses: &mut Vec<std::net::SocketAddr>) {
+        if let Some(filter) = &self.rendezvous_filter {
+            addresses.retain(|address| filter(address.ip()));
+        }
+    }
+
     pub(crate) fn is_route(&self) -> bool {
         self.route.is_some()
     }
@@ -467,6 +490,7 @@ impl Client {
             })?;
         Ok(Self {
             http,
+            rendezvous_filter: None,
             recipient_cookie: std::sync::Mutex::new(None),
             route: None,
             base,
@@ -1413,6 +1437,97 @@ mod tests {
     use crate::error::Error;
 
     #[test]
+    fn route_senders_use_the_supplied_network_policy() {
+        use std::io::{Read, Write};
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        udp.set_nonblocking(true).unwrap();
+        let identity = serde_json::json!({
+            "address": udp.local_addr().unwrap().to_string(),
+            "certificate_digest": "00".repeat(32),
+        })
+        .to_string();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = (0..400)
+                .find_map(|_| match listener.accept() {
+                    Ok(socket) => Some(socket),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        None
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                })
+                .expect("injected resolver reached the fixture");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            assert!(socket.read(&mut [0; 4096]).unwrap() > 0);
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", identity.len(), identity).unwrap();
+        });
+        let http = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .resolve("peer.invalid", address)
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let client = super::Client::for_route_with_network(
+            format!("http://peer.invalid:{}", address.port()),
+            "route".into(),
+            http,
+            |ip| !ip.is_loopback(),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::write(&source, b"x").unwrap();
+        let prepared = crate::package::build(
+            vec![crate::entries::Entry {
+                path: vot_manifest::PackagePath::portable(["source".to_owned()]).unwrap(),
+                source,
+            }],
+            &dir.path().join("manifest"),
+        )
+        .unwrap();
+        let device = crate::identity::Device::from_signing_key(
+            ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+        );
+        assert!(matches!(
+            crate::send_push::try_push(
+                &client,
+                "token",
+                None,
+                &device,
+                &prepared,
+                &mut crate::progress::Silent
+            )
+            .unwrap(),
+            crate::send_push::Outcome::Unreachable
+        ));
+        assert_eq!(
+            udp.recv(&mut [0; 2048]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(client.route.as_deref(), Some("route"));
+        assert_eq!(client.metadata_timeout, Duration::from_secs(300));
+        let original = vec![
+            "127.0.0.1:443".parse().unwrap(),
+            "8.8.8.8:443".parse().unwrap(),
+        ];
+        let mut addresses = original.clone();
+        client.filter_rendezvous(&mut addresses);
+        assert_eq!(addresses, original[1..]);
+        let unrestricted =
+            super::Client::for_route("https://peer.invalid", "route".into()).unwrap();
+        addresses = original.clone();
+        unrestricted.filter_rendezvous(&mut addresses);
+        assert_eq!(addresses, original);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn error_bodies_are_bounded_and_decode_invalid_utf8() {
         assert_eq!(super::error_body(std::io::repeat(b'x')).len(), 8192);
         assert_eq!(super::error_body(&b"bad\xff"[..]), "bad\u{fffd}");
@@ -1799,6 +1914,7 @@ mod tests {
             });
             let client = super::Client {
                 http: reqwest::blocking::Client::builder().no_proxy().timeout(Duration::from_secs(2)).build().unwrap(),
+                rendezvous_filter: None,
                 base,
                 recipient_cookie: std::sync::Mutex::new(None),
                 route: None,

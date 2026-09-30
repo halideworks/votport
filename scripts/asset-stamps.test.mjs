@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -108,4 +108,40 @@ test('the built wasm loader stamps its wasm binary', async (t) => {
   const match = loader.match(/vot_wasm_bg\.wasm\?v=([0-9a-f]{16})/);
   assert.ok(match, 'vot_wasm.js has no ?v= stamp; rerun scripts/build-wasm.sh');
   assert.equal(match[1], await hash16('web/assets/vendor/vot_wasm_bg.wasm'), 'stale wasm stamp; rerun scripts/build-wasm.sh');
+});
+
+test('the wasm build honors absolute, relative and default Cargo target directories', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'votport-wasm-build-'));
+  const app = join(directory, 'app'), vot = join(directory, 'VOT source'), bin = join(directory, 'bin');
+  try {
+    await mkdir(join(app, 'scripts'), { recursive: true });
+    await mkdir(join(vot, 'crates/vot-wasm'), { recursive: true });
+    await mkdir(bin);
+    await writeFile(join(vot, 'crates/vot-wasm/Cargo.toml'), 'fixture');
+    for (const name of ['build-wasm.sh', 'stamp-wasm.sh']) await copyFile(new URL(`scripts/${name}`, root), join(app, 'scripts', name));
+    await writeFile(join(bin, 'cargo'), `#!/bin/sh
+target="\${CARGO_TARGET_DIR:-$PWD/target}"
+mkdir -p "$target/wasm32-unknown-unknown/release"
+printf 'fixture wasm' > "$target/wasm32-unknown-unknown/release/vot_wasm.wasm"
+`);
+    await writeFile(join(bin, 'wasm-bindgen'), `#!/bin/sh
+[ -f "$6" ] || exit 2
+mkdir -p "$5"
+cp "$6" "$5/vot_wasm_bg.wasm"
+printf "const module = new URL('vot_wasm_bg.wasm', import.meta.url);\\n" > "$5/vot_wasm.js"
+`);
+    for (const name of ['cargo', 'wasm-bindgen']) await chmod(join(bin, name), 0o755);
+    for (const target of [undefined, 'relative target', join(directory, 'absolute target')]) {
+      const env = { ...process.env, PATH: `${bin}:${process.env.PATH}` };
+      delete env.CARGO_TARGET_DIR;
+      if (target !== undefined) env.CARGO_TARGET_DIR = target;
+      const result = spawnSync('sh', [join(app, 'scripts/build-wasm.sh'), '../VOT source'], { cwd: app, env, encoding: 'utf8' });
+      assert.ifError(result.error);
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(await readFile(join(app, 'web/assets/vendor/vot_wasm_bg.wasm'), 'utf8'), 'fixture wasm');
+      await rm(join(app, 'web'), { recursive: true });
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

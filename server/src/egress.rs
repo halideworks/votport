@@ -7,6 +7,20 @@ use crate::config::IpCidr;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
+pub(crate) fn client<'a>(
+    app: &'a crate::app::App,
+    tenant: &str,
+    origin: &str,
+) -> Result<&'a reqwest::Client, &'static str> {
+    if tenant.is_empty() {
+        Ok(&app.http)
+    } else if refused_literal(origin, &app.config.tenant_private_networks) {
+        Err("destination address is restricted")
+    } else {
+        Ok(&app.tenant_http)
+    }
+}
+
 /// Whether a named tenant's request may reach `ip`.
 pub fn reachable(ip: IpAddr, allowed: &[IpCidr]) -> bool {
     public(ip) || allowed.iter().any(|block| block.contains(&ip))
@@ -40,7 +54,11 @@ fn public(ip: IpAddr) -> bool {
             if s[0] == 0x2002 {
                 return public(Ipv4Addr::from((u32::from(s[1]) << 16) | u32::from(s[2])).into());
             }
-            !(v6.is_multicast()
+            // Other unallocated, site-local and translation prefixes are not public destinations.
+            !(s[0] & 0xe000 != 0x2000
+                || (s[0] == 0x2001 && (s[1] == 0 || (s[1] == 2 && s[2] == 0)))
+                || (s[0] == 0x3fff && s[1] & 0xf000 == 0)
+                || v6.is_multicast()
                 || s[0] & 0xfe00 == 0xfc00
                 || s[0] & 0xffc0 == 0xfe80
                 || (s[0] == 0x2001 && s[1] == 0x0db8))
@@ -92,9 +110,71 @@ pub fn restrict(builder: reqwest::ClientBuilder, allowed: &[IpCidr]) -> reqwest:
         .dns_resolver(Arc::new(TenantResolver(Arc::new(allowed.to_vec()))))
 }
 
+pub(crate) fn restrict_blocking(
+    builder: reqwest::blocking::ClientBuilder,
+    allowed: &[IpCidr],
+) -> reqwest::blocking::ClientBuilder {
+    builder
+        .no_proxy()
+        .dns_resolver(Arc::new(TenantResolver(Arc::new(allowed.to_vec()))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocking_senders_refuse_internal_dns_and_honor_allowed_networks() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = restrict_blocking(reqwest::blocking::Client::builder(), &[])
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert!(client
+            .get(format!("http://localhost:{port}/"))
+            .send()
+            .is_err());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = (0..400)
+                .find_map(|_| match listener.accept() {
+                    Ok(socket) => Some(socket),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        None
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                })
+                .expect("allowed sender reached the fixture");
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            assert!(socket.read(&mut [0; 4096]).unwrap() > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let client = restrict_blocking(
+            reqwest::blocking::Client::builder(),
+            &[IpCidr::parse("127.0.0.0/8").unwrap()],
+        )
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap();
+        assert!(client
+            .get(format!("http://localhost:{port}/"))
+            .send()
+            .unwrap()
+            .status()
+            .is_success());
+        server.join().unwrap();
+    }
 
     #[test]
     fn only_public_addresses_and_named_networks_are_reachable() {
@@ -121,6 +201,13 @@ mod tests {
             "fe80::1",
             "ff02::1",
             "2001:db8::1",
+            "fec0::1",
+            "64:ff9b:1::a9fe:a9fe",
+            "100::1",
+            "2001::ffff:ffff",
+            "2001:2::1",
+            "3fff::1",
+            "5f00::1",
         ] {
             assert!(!reachable(internal.parse().unwrap(), &[]), "{internal}");
         }
@@ -129,6 +216,7 @@ mod tests {
             "100.128.0.1",
             "172.32.0.1",
             "2606:4700::1111",
+            "2001:4860:4860::8888",
             "64:ff9b::101:101",
             "::ffff:8.8.8.8",
         ] {

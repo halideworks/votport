@@ -29,6 +29,8 @@ pub struct Config {
     pub receive_dir: PathBuf,
     /// Root directory for outbound library files and rendered projects.
     pub outbound_dir: PathBuf,
+    /// Prepare stable library sources in the background while storage is idle.
+    pub library_prehash: bool,
     /// Directory holding the static web assets.
     pub web_root: PathBuf,
     /// Argon2 PHC hash of the admin password.
@@ -491,6 +493,7 @@ const KNOWN_ENVIRONMENT_NAMES: &[&str] = &[
     "VOTPORT_DEFAULT_MAX_SESSIONS",
     "VOTPORT_DEFAULT_MAX_TOTAL_BYTES",
     "VOTPORT_FFPROBE",
+    "VOTPORT_LIBRARY_PREHASH",
     "VOTPORT_LOG_FORMAT",
     "VOTPORT_MAX_LINK_SESSIONS",
     "VOTPORT_MAX_TOTAL_SESSIONS",
@@ -808,6 +811,7 @@ pub fn from_env() -> Result<Config, String> {
         data_dir,
         receive_dir,
         outbound_dir,
+        library_prehash: env_bool("VOTPORT_LIBRARY_PREHASH", true)?,
         web_root,
         admin_password_hash,
         admin_token_tag,

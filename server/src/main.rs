@@ -112,6 +112,7 @@ async fn main() {
     tokio::spawn(app::session_sweeper(application.clone()));
     tokio::spawn(app::lease_keeper(application.clone()));
     tokio::spawn(app::upload_ended_notifier(application.clone()));
+    tokio::spawn(votport::api::outbound::prehash::worker(application.clone()));
     tokio::spawn(votport::backup::scheduler(application.clone()));
     tokio::spawn(votport::api::trade::worker(application.clone()));
     tokio::spawn(votport::api::outbound::workflows::worker(
@@ -664,6 +665,7 @@ mod serve_tests {
             max_upload_bytes: 1024 * 1024,
             workflow_snapshot_bytes: 4 * 1024 * 1024,
             allow_hidden: false,
+            library_prehash: false,
             session_idle_secs: 60,
             audit_retention_days: 400,
             upload_retention_days: 0,

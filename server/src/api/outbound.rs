@@ -18,6 +18,7 @@ use futures_util::{Stream, StreamExt as _};
 use serde::Deserialize;
 
 pub mod automation;
+pub mod prehash;
 pub mod root_cache;
 pub mod workflows;
 use crate::receipt::verify_receipt_with_key;
@@ -32,8 +33,8 @@ use vot_sdk::object::{InMemoryObjectBuilder, ObjectId, Suite};
 use vot_sdk::proof::{self, CatalogHeader};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
-use self::root_cache::mtime_nanos;
 pub(crate) use self::root_cache::RootCache;
+use self::root_cache::{change_stamp, mtime_nanos};
 use super::{ApiError, ApiResult};
 use crate::api::admin;
 use crate::app::App;
@@ -129,6 +130,21 @@ static LIBRARY_MUTATION_LOCK: Mutex<()> = Mutex::new(());
 static LIBRARY_MUTATION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 static LIBRARY_HASH_PERMITS: Semaphore = Semaphore::const_new(LIBRARY_HASH_CONCURRENCY);
+// Cached catalogs enter the prune keep set in the same publication critical section.
+pub(crate) static CATALOG_CACHE_LOCK: Mutex<()> = Mutex::new(());
+
+fn library_hash_lock(app: &App, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = app
+        .library_hash_locks
+        .lock()
+        .expect("library hash locks poisoned");
+    locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    Arc::clone(
+        locks
+            .entry(path.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+    )
+}
 
 // The deliver page's create-share used to block the POST on hashing every
 // selected file, so a multi-gigabyte folder froze the page with no feedback.
@@ -1760,14 +1776,14 @@ fn list_library_directory(
     direct_library_entries_page(root, directory, after, limit).map_err(|_| ())
 }
 
-fn search_library_dir(
+fn visit_library_files(
     root: &Path,
     directory: &Path,
-    query: &str,
-    matches: &mut BinaryHeap<(String, String, u64)>,
     visited: &mut usize,
     max_nodes: usize,
     depth: usize,
+    include: &impl Fn(&std::ffi::OsStr) -> bool,
+    visit: &mut impl FnMut(&Path, &std::fs::Metadata) -> bool,
 ) -> bool {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return true;
@@ -1781,7 +1797,7 @@ fn search_library_dir(
             continue;
         };
         let name = entry.file_name();
-        if is_private_library_name(&name) {
+        if is_private_library_name(&name) || !include(&name) {
             continue;
         }
         let path = entry.path();
@@ -1800,23 +1816,12 @@ fn search_library_dir(
         }
         if meta.file_type().is_dir() {
             if depth >= MAX_LIBRARY_SEARCH_DEPTH
-                || search_library_dir(root, &path, query, matches, visited, max_nodes, depth + 1)
+                || visit_library_files(root, &path, visited, max_nodes, depth + 1, include, visit)
             {
                 return true;
             }
-        } else if meta.file_type().is_file() {
-            let Some(relative) = path.strip_prefix(root).ok() else {
-                continue;
-            };
-            let relative = relative.to_string_lossy().replace('\\', "/");
-            let lowercase = relative.to_lowercase();
-            if !lowercase.contains(query) {
-                continue;
-            }
-            matches.push((lowercase, relative, meta.len()));
-            if matches.len() > RETAINED_LIBRARY_SEARCH_RESULTS {
-                matches.pop();
-            }
+        } else if meta.file_type().is_file() && !visit(&path, &meta) {
+            return true;
         }
     }
     false
@@ -1836,8 +1841,28 @@ fn list_library_search_with_budget(
     }
     let mut matches = BinaryHeap::new();
     let mut visited = 0;
-    let budget_exhausted =
-        search_library_dir(root, root, query, &mut matches, &mut visited, max_nodes, 0);
+    let budget_exhausted = visit_library_files(
+        root,
+        root,
+        &mut visited,
+        max_nodes,
+        0,
+        &|_| true,
+        &mut |path, meta| {
+            let Some(relative) = path.strip_prefix(root).ok() else {
+                return true;
+            };
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            let lowercase = relative.to_lowercase();
+            if lowercase.contains(query) {
+                matches.push((lowercase, relative, meta.len()));
+                if matches.len() > RETAINED_LIBRARY_SEARCH_RESULTS {
+                    matches.pop();
+                }
+            }
+            true
+        },
+    );
     let truncated = budget_exhausted || matches.len() > MAX_LIBRARY_SEARCH_RESULTS;
     let mut matches = matches.into_sorted_vec();
     matches.truncate(MAX_LIBRARY_SEARCH_RESULTS);
@@ -2853,37 +2878,51 @@ async fn create_library_grant(
             .unwrap_or(name)
     }))
     .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error))?;
-    let mut selections = Vec::with_capacity(requested.len());
-    let mut total_bytes = 0u64;
-    for name in requested {
-        let path = if let Some(received) = &received {
-            let file = received.get(name).ok_or_else(ApiError::not_found)?;
-            admin::stored_path(app, &identity.tenant, &file.stored_as)
-                .ok_or_else(ApiError::not_found)?
-        } else if let Some(job) = options.workflow.as_ref().filter(|job| job.uses_snapshot()) {
-            workflows::payload_path(app, &identity.tenant, &job.id, name)?
-        } else {
-            safe_library_path(app, &identity.tenant, name)?
-        };
-        if !library_components_safe(&root, &path) {
-            return Err(ApiError::not_found());
+    let selection_app = Arc::clone(app);
+    let selection_names = requested.to_vec();
+    let selection_received = received.clone();
+    let selection_workflow = options.workflow.clone();
+    let selection_tenant = identity.tenant.clone();
+    let selection_root = root.clone();
+    let (selections, total_bytes) = tokio::task::spawn_blocking(move || {
+        let mut selections = Vec::with_capacity(selection_names.len());
+        let mut total_bytes = 0u64;
+        for name in &selection_names {
+            let path = if let Some(received) = &selection_received {
+                let file = received.get(name).ok_or_else(ApiError::not_found)?;
+                admin::stored_path(&selection_app, &selection_tenant, &file.stored_as)
+                    .ok_or_else(ApiError::not_found)?
+            } else if let Some(job) = selection_workflow
+                .as_ref()
+                .filter(|job| job.uses_snapshot())
+            {
+                workflows::payload_path(&selection_app, &selection_tenant, &job.id, name)?
+            } else {
+                safe_library_path(&selection_app, &selection_tenant, name)?
+            };
+            if !library_components_safe(&selection_root, &path) {
+                return Err(ApiError::not_found());
+            }
+            let meta = std::fs::symlink_metadata(&path).map_err(|_| ApiError::not_found())?;
+            if !meta.file_type().is_file() || meta.file_type().is_symlink() {
+                return Err(ApiError::not_found());
+            }
+            let name = name.trim_matches('/').to_owned();
+            total_bytes = total_bytes
+                .checked_add(meta.len())
+                .filter(|total| *total <= selection_app.config.max_upload_bytes)
+                .ok_or_else(|| {
+                    ApiError::new(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "selected files exceed total size limit",
+                    )
+                })?;
+            selections.push((name, path));
         }
-        let meta = std::fs::symlink_metadata(&path).map_err(|_| ApiError::not_found())?;
-        if !meta.file_type().is_file() || meta.file_type().is_symlink() {
-            return Err(ApiError::not_found());
-        }
-        let name = name.trim_matches('/').to_owned();
-        total_bytes = total_bytes
-            .checked_add(meta.len())
-            .filter(|total| *total <= app.config.max_upload_bytes)
-            .ok_or_else(|| {
-                ApiError::new(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "selected files exceed total size limit",
-                )
-            })?;
-        selections.push((name, path));
-    }
+        Ok::<_, ApiError>((selections, total_bytes))
+    })
+    .await
+    .map_err(|_| ApiError::internal("select outbound files failed"))??;
     let max = app.config.max_upload_bytes;
     let revalidation = selections.clone();
     let hash_root = root.clone();
@@ -2893,42 +2932,81 @@ async fn create_library_grant(
     if let Some(progress) = progress {
         progress.set_totals(selections.len() as u64, total_bytes);
     }
-    let hashed = futures_util::stream::iter(selections.into_iter().map(|(name, path)| {
-        let hash_root = hash_root.clone();
-        let proof_root = proof_root.clone();
-        let tenant = tenant.clone();
-        let cache_app = Arc::clone(&cache_app);
-        async move {
-            let _permit = LIBRARY_HASH_PERMITS
-                .acquire()
+    let mut hashed = futures_util::stream::iter(selections.into_iter().enumerate().map(
+        |(index, (name, path))| {
+            let expected = received
+                .as_ref()
+                .and_then(|files| files.get(&name))
+                .filter(|file| file.suite == "sha256")
+                .map(|file| {
+                    Ok::<_, ApiError>(ObjectId {
+                        suite: 2,
+                        root: hex::decode(&file.root)
+                            .ok()
+                            .and_then(|bytes| bytes.try_into().ok())
+                            .ok_or_else(ApiError::not_found)?,
+                        length: file.bytes,
+                    })
+                })
+                .transpose();
+            let hash_root = hash_root.clone();
+            let proof_root = proof_root.clone();
+            let tenant = tenant.clone();
+            let cache_app = Arc::clone(&cache_app);
+            async move {
+                let expected = expected?;
+                let verifies_received = expected.is_some();
+                let hash_lock = library_hash_lock(&cache_app, &path);
+                let hash_guard = hash_lock.lock_owned().await;
+                let permit = LIBRARY_HASH_PERMITS
+                    .acquire()
+                    .await
+                    .map_err(|_| ApiError::internal("hash outbound files failed"))?;
+                let hashed = tokio::task::spawn_blocking(move || {
+                    let _hash_guard = hash_guard;
+                    let _permit = permit;
+                    hash_library_file(
+                        &hash_root,
+                        &name,
+                        &path,
+                        &proof_root,
+                        max,
+                        &tenant,
+                        &cache_app.root_cache,
+                        expected.as_ref(),
+                        None,
+                    )
+                })
                 .await
-                .map_err(|_| ApiError::internal("hash outbound files failed"))?;
-            let hashed = tokio::task::spawn_blocking(move || {
-                hash_library_file(
-                    &hash_root,
-                    &name,
-                    &path,
-                    &proof_root,
-                    max,
-                    &tenant,
-                    &cache_app.root_cache,
-                )
-            })
-            .await
-            .map_err(|_| ApiError::internal("hash outbound files failed"))?
-            .map_err(|_| ApiError::not_found());
-            if let Some(progress) = progress {
-                progress.record_file_done(hashed.as_ref().ok().map(|file| file.bytes));
+                .map_err(|_| ApiError::internal("hash outbound files failed"))?
+                .map_err(|_| {
+                    if verifies_received {
+                        ApiError::new(
+                            StatusCode::CONFLICT,
+                            "incoming content changed since verification",
+                        )
+                    } else {
+                        ApiError::not_found()
+                    }
+                });
+                if let Some(progress) = progress {
+                    progress.record_file_done(hashed.as_ref().ok().map(|file| file.bytes));
+                }
+                Ok::<_, ApiError>((index, hashed?))
             }
-            hashed
-        }
-    }))
-    .buffered(LIBRARY_HASH_CONCURRENCY)
+        },
+    ))
+    .buffer_unordered(LIBRARY_HASH_CONCURRENCY)
     .collect::<Vec<_>>()
     .await
     .into_iter()
     .collect::<ApiResult<Vec<_>>>()?;
-    app.root_cache.persist();
+    hashed.sort_unstable_by_key(|(index, _)| *index);
+    let hashed = hashed.into_iter().map(|(_, file)| file).collect::<Vec<_>>();
+    let cache_app = Arc::clone(app);
+    tokio::task::spawn_blocking(move || cache_app.root_cache.persist())
+        .await
+        .map_err(|_| ApiError::internal("persist outbound roots failed"))?;
     if let Some(expected) = &received {
         if expected.len() != hashed.len() {
             return Err(ApiError::new(
@@ -2941,41 +3019,14 @@ async fn create_library_grant(
                 .get(file.name.as_str())
                 .filter(|original| !original.deleted && original.bytes == file.bytes)
                 .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "incoming file changed"))?;
-            match original.suite.as_str() {
-                "blake3" if original.root == file.root => {}
-                "sha256" => {
-                    let object = ObjectId {
-                        suite: 2,
-                        root: hex::decode(&original.root)
-                            .ok()
-                            .and_then(|bytes| bytes.try_into().ok())
-                            .ok_or_else(ApiError::not_found)?,
-                        length: original.bytes,
-                    };
-                    let path = admin::stored_path(app, &identity.tenant, &original.stored_as)
-                        .ok_or_else(ApiError::not_found)?;
-                    let proof_root = proof_root.clone();
-                    tokio::task::spawn_blocking(move || build_catalog(&proof_root, &path, &object))
-                        .await
-                        .map_err(|_| ApiError::internal("verify incoming file failed"))?
-                        .map_err(|_| {
-                            ApiError::new(
-                                StatusCode::CONFLICT,
-                                "incoming content changed since verification",
-                            )
-                        })?;
-                    // This pass re-reads whole files after hashing ended;
-                    // each verified file is progress for the stale check.
-                    if let Some(progress) = progress {
-                        progress.touched_at.store(now_unix(), Ordering::Relaxed);
-                    }
-                }
-                _ => {
-                    return Err(ApiError::new(
-                        StatusCode::CONFLICT,
-                        "incoming content changed since verification",
-                    ))
-                }
+            if !matches!(original.suite.as_str(), "blake3" | "sha256")
+                || original.suite != file.suite
+                || original.root != file.root
+            {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "incoming content changed since verification",
+                ));
             }
         }
     }
@@ -3171,6 +3222,7 @@ fn prepare_library_file(
     suite: Suite,
     expected_length: Option<u64>,
     max: u64,
+    idle: Option<&App>,
 ) -> io::Result<vot_sdk::object::InMemoryPreparedObject> {
     use std::io::Read as _;
     let invalid = || io::Error::new(io::ErrorKind::InvalidData, "source");
@@ -3179,7 +3231,7 @@ fn prepare_library_file(
     if !valid_preparation_length(length, expected_length, max) {
         return Err(invalid());
     }
-    if length > vot_sdk::object::PROOF_LEAF_SIZE {
+    if length > vot_sdk::object::PROOF_LEAF_SIZE && idle.is_none() {
         let leaves =
             vot_cli::file_proof_leaves(&mut input, suite, length).map_err(|error| match error {
                 vot_cli::Error::Io(error) => error,
@@ -3192,8 +3244,14 @@ fn prepare_library_file(
     }
     let mut builder =
         InMemoryObjectBuilder::new(suite, Some(length), max).map_err(|_| invalid())?;
-    let mut buffer = vec![0; CHUNK];
+    let mut buffer = vec![0; (length as usize).clamp(1, CHUNK)];
     loop {
+        if idle.is_some_and(|app| !prehash::idle(app)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "library prehash paused",
+            ));
+        }
         let count = input.read(&mut buffer)?;
         if count == 0 {
             break;
@@ -3203,6 +3261,7 @@ fn prepare_library_file(
     builder.finish().map_err(|_| invalid())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn hash_library_file(
     root: &Path,
     name: &str,
@@ -3211,6 +3270,8 @@ fn hash_library_file(
     max: u64,
     tenant: &str,
     cache: &RootCache,
+    expected: Option<&ObjectId>,
+    idle: Option<&App>,
 ) -> io::Result<OutboundGrantFile> {
     let grant_file = |object: &ObjectId| -> io::Result<OutboundGrantFile> {
         Ok(OutboundGrantFile {
@@ -3220,7 +3281,12 @@ fn hash_library_file(
                 .to_string_lossy()
                 .replace('\\', "/"),
             name: name.to_owned(),
-            suite: "blake3".to_owned(),
+            suite: if object.suite == 2 {
+                "sha256"
+            } else {
+                "blake3"
+            }
+            .to_owned(),
             root: hex::encode(object.root),
             bytes: object.length,
             receipt_b64: String::new(),
@@ -3234,8 +3300,16 @@ fn hash_library_file(
     // catalog; if the cached root cannot produce one, fall through to the
     // honest full hash.
     let stat = std::fs::symlink_metadata(path)?;
-    let (size, mtime) = (stat.len(), mtime_nanos(&stat));
-    if let Some(hex_root) = cache.lookup(tenant, path, size, mtime) {
+    let (size, mtime, change) = (stat.len(), mtime_nanos(&stat), change_stamp(&stat));
+    if !stat.is_file() || !valid_preparation_length(size, expected.map(|object| object.length), max)
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "source"));
+    }
+    if let Some(hex_root) = expected
+        .is_none()
+        .then(|| cache.lookup(tenant, path, size, mtime, change))
+        .flatten()
+    {
         let object = hex::decode(&hex_root)
             .ok()
             .and_then(|bytes| TryInto::<[u8; 32]>::try_into(bytes).ok())
@@ -3245,21 +3319,43 @@ fn hash_library_file(
                 length: size,
             });
         if let Some(object) = object {
-            let usable =
-                size < BATCH_STAGE_BYTES || ensure_catalog(proof_root, path, &object).is_ok();
+            let usable = if idle.is_some() {
+                cached_catalog_usable(proof_root, &object)
+            } else {
+                size < BATCH_STAGE_BYTES || ensure_catalog(proof_root, path, &object).is_ok()
+            };
             if usable {
                 return grant_file(&object);
             }
         }
     }
-    let prepared = prepare_library_file(path, Suite::Blake3Bao64, None, max)?;
+    let suite = expected.map_or(Suite::Blake3Bao64, |_| Suite::Sha256Bep52);
+    let prepared =
+        prepare_library_file(path, suite, expected.map(|object| object.length), max, idle)?;
     let bytes = prepared.object_id().length;
     let object = prepared.object_id().clone();
-    if bytes >= BATCH_STAGE_BYTES {
+    if expected.is_some_and(|expected| expected != &object) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "source"));
+    }
+    let _publication = CATALOG_CACHE_LOCK
+        .lock()
+        .expect("catalog cache lock poisoned");
+    if bytes >= BATCH_STAGE_BYTES || expected.is_some() || idle.is_some() {
         ensure_catalog_from_prepared(proof_root, &prepared)?;
     }
-    if bytes == size {
-        cache.insert(tenant, path, size, mtime, hex::encode(object.root));
+    let after = std::fs::symlink_metadata(path)?;
+    if !after.is_file()
+        || after.len() != size
+        || mtime_nanos(&after) != mtime
+        || change_stamp(&after) != change
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "source changed while hashing",
+        ));
+    }
+    if bytes == size && expected.is_none() {
+        cache.insert(tenant, path, size, mtime, change, hex::encode(object.root));
     }
     grant_file(&object)
 }
@@ -3271,6 +3367,12 @@ fn catalog_path(root: &Path, object: &ObjectId) -> PathBuf {
         hex::encode(object.root),
         object.length
     ))
+}
+
+fn cached_catalog_usable(root: &Path, object: &ObjectId) -> bool {
+    std::fs::File::open(catalog_path(root, object))
+        .and_then(|mut file| catalog_header(&mut file, object))
+        .is_ok()
 }
 
 fn catalog_header(file: &mut std::fs::File, expected: &ObjectId) -> io::Result<CatalogHeader> {
@@ -3392,7 +3494,8 @@ fn ensure_catalog(root: &Path, source: &Path, expected: &ObjectId) -> io::Result
 
 fn build_catalog(root: &Path, source: &Path, expected: &ObjectId) -> io::Result<PathBuf> {
     let suite = Suite::try_from(expected.suite).map_err(|_| io::Error::other("suite"))?;
-    let prepared = prepare_library_file(source, suite, Some(expected.length), expected.length)?;
+    let prepared =
+        prepare_library_file(source, suite, Some(expected.length), expected.length, None)?;
     if prepared.object_id() != expected {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "source"));
     }
@@ -5893,24 +5996,42 @@ pub(crate) struct ActiveDownload {
 /// Stops a live download when its grant is revoked or expires. Revocation
 /// cancels the grant's token (see [`cancel_grant_streams`]); expiry is a
 /// clock compare against the grant's own deadline, checked at the same frame
-/// boundaries. Admission-only checks would otherwise let a stream verified
+/// boundaries. An elapsed deadline is refreshed from the store in case the
+/// operator extended it. Admission-only checks would let a stream verified
 /// before the revocation deliver the whole body.
 #[derive(Clone)]
 struct StreamGate {
     cancel: CancellationToken,
-    expires_at: u64,
+    expires_at: Arc<AtomicU64>,
+    app: Arc<App>,
+    token_hash: String,
 }
 
 impl StreamGate {
-    fn for_grant(app: &App, grant: &OutboundGrant) -> Self {
+    fn for_grant(app: &Arc<App>, grant: &OutboundGrant) -> Self {
         Self {
             cancel: stream_cancel_token(app, &grant.token_hash),
-            expires_at: grant.expires_at,
+            expires_at: Arc::new(AtomicU64::new(grant.expires_at)),
+            app: Arc::clone(app),
+            token_hash: grant.token_hash.clone(),
         }
     }
 
     fn stopped(&self) -> bool {
-        self.cancel.is_cancelled() || self.expires_at <= now_unix()
+        if self.cancel.is_cancelled() {
+            return true;
+        }
+        let now = now_unix();
+        if self.expires_at.load(Ordering::Relaxed) > now {
+            return false;
+        }
+        match self.app.store.outbound_grant_deadline(&self.token_hash) {
+            Ok(Some(deadline)) if deadline > now_unix() => {
+                self.expires_at.fetch_max(deadline, Ordering::Relaxed);
+                self.cancel.is_cancelled()
+            }
+            _ => true,
+        }
     }
 }
 

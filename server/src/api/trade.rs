@@ -246,17 +246,20 @@ pub struct InspectRequest {
 }
 async fn remote_json(
     app: &App,
+    tenant: &str,
     origin: &str,
     path: &str,
     body: Option<&impl serde::Serialize>,
 ) -> ApiResult<SignedPortMessage> {
+    let client = crate::egress::client(app, tenant, origin)
+        .map_err(|_| invalid("no Votport port answered at that address"))?;
     let request = if let Some(body) = body {
-        app.http
+        client
             .post(format!("{origin}{path}"))
             .header("X-Votport", "1")
             .json(body)
     } else {
-        app.http.get(format!("{origin}{path}"))
+        client.get(format!("{origin}{path}"))
     };
     let mut response = request
         .timeout(std::time::Duration::from_secs(15))
@@ -289,12 +292,14 @@ async fn remote_json(
 }
 pub async fn probe(
     app: &App,
+    tenant: &str,
     origin: &str,
     expected: Option<&str>,
 ) -> ApiResult<SignedPortMessage> {
     let challenge = crate::auth::random_token();
     let response = remote_json(
         app,
+        tenant,
         origin,
         &format!("/api/port?challenge={challenge}"),
         None::<&serde_json::Value>,
@@ -343,7 +348,7 @@ pub async fn inspect(
     };
     // The address is admin-chosen and unverified; the reply says whether a
     // Votport port answered, not how the host failed.
-    let probed = probe(&app, &origin, key).await;
+    let probed = probe(&app, &actor.tenant, &origin, key).await;
     app.store.audit(
         &actor.tenant,
         &actor.subject,
@@ -383,7 +388,13 @@ pub async fn accept(
         return Err(unprocessable("enter a route name"));
     }
     super::notifications::validate_policy(&app, &actor.tenant, &body.notifications, &TRADE_EVENTS)?;
-    let probed = probe(&app, &origin, Some(&body.invitation.document.issuer)).await;
+    let probed = probe(
+        &app,
+        &actor.tenant,
+        &origin,
+        Some(&body.invitation.document.issuer),
+    )
+    .await;
     app.store.audit(
         &actor.tenant,
         &actor.subject,
@@ -460,13 +471,20 @@ pub(crate) async fn enroll_outgoing(app: &App, route: &TradeRoute) -> ApiResult<
         .trade_enrollment(&route.tenant, &route.id)
         .map_err(store_unavailable)?
         .ok_or_else(|| invalid("enrollment is already complete"))?;
-    probe(app, &route.address, Some(&route.peer_key)).await?;
+    probe(app, &route.tenant, &route.address, Some(&route.peer_key)).await?;
     let credential = app
         .store
         .trade_credential(&route.tenant, &route.id)
         .map_err(store_unavailable)?;
     let request=app.signer.port_message("enroll",&route.peer_key,invitation.document.nonce.clone(),minted_now(),json!({"secret":invitation.document.body["secret"],"credential":credential,"name":identity(app)?["name"],"address":identity(app)?["address"]}));
-    let response = remote_json(app, &route.address, "/api/port/enroll", Some(&request)).await?;
+    let response = remote_json(
+        app,
+        &route.tenant,
+        &route.address,
+        "/api/port/enroll",
+        Some(&request),
+    )
+    .await?;
     verify_response(app, route, &request, &response, "enrolled")?;
     let grant = response.document.body["grant"]
         .as_str()
@@ -592,7 +610,14 @@ async fn route_status(
         minted_now(),
         json!({"grant": route.remote_grant, "credential": credential}),
     );
-    let response = remote_json(app, &route.address, "/api/port/status", Some(&request)).await?;
+    let response = remote_json(
+        app,
+        &route.tenant,
+        &route.address,
+        "/api/port/status",
+        Some(&request),
+    )
+    .await?;
     Ok((request, response))
 }
 
@@ -600,7 +625,7 @@ async fn refresh_route_inner(app: &Arc<App>, route: &TradeRoute) -> ApiResult<()
     if route.remote_grant.is_empty() {
         return enroll_outgoing(app, route).await;
     }
-    probe(app, &route.address, Some(&route.peer_key)).await?;
+    probe(app, &route.tenant, &route.address, Some(&route.peer_key)).await?;
     let credential = app
         .store
         .trade_credential(&route.tenant, &route.id)
@@ -785,7 +810,7 @@ pub async fn rotate(
             "only an enrolled outgoing route can rotate its credential",
         ));
     }
-    probe(&app, &route.address, Some(&route.peer_key)).await?;
+    probe(&app, &route.tenant, &route.address, Some(&route.peer_key)).await?;
     let old = app
         .store
         .trade_credential(&actor.tenant, &id)
@@ -801,7 +826,14 @@ pub async fn rotate(
         minted_now(),
         json!({"grant":route.remote_grant,"credential":old,"next":next}),
     );
-    let response = remote_json(&app, &route.address, "/api/port/rotate", Some(&request)).await?;
+    let response = remote_json(
+        &app,
+        &route.tenant,
+        &route.address,
+        "/api/port/rotate",
+        Some(&request),
+    )
+    .await?;
     verify_response(&app, &route, &request, &response, "rotated")?;
     app.store
         .rotate_trade_credential(&id, &old, &next, &actor.subject)
@@ -831,7 +863,7 @@ pub async fn change_address(
         .map_err(store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
     let origin = address(&body.address).map_err(unprocessable)?;
-    probe(&app, &origin, Some(&route.peer_key))
+    probe(&app, &route.tenant, &origin, Some(&route.peer_key))
         .await
         .map_err(collapse_probe_error)?;
     app.store
@@ -1278,6 +1310,78 @@ mod tests {
                 })
             })
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn tenant_port_requests_obey_private_network_restrictions() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        for host in ["127.0.0.1", "localhost"] {
+            for body in [None, Some(json!({"fixture":true}))] {
+                let result = remote_json(
+                    &app,
+                    "acme",
+                    &format!("http://{host}:{port}"),
+                    "/api/port",
+                    body.as_ref(),
+                )
+                .await;
+                assert!(result.is_err());
+            }
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+        let mut config = crate::api::testing::config(directory.path().join("allowed").as_path());
+        config.tenant_private_networks = vec![crate::config::IpCidr::parse("127.0.0.0/8").unwrap()];
+        let allowed = crate::app::build(config).unwrap();
+        let reply = allowed.signer.port_message(
+            "discovery",
+            "",
+            "fixture".into(),
+            minted_now(),
+            json!({"protocols":[1]}),
+        );
+        let expected = serde_json::to_vec(&reply).unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = [0; 4096];
+                assert!(socket.read(&mut buffer).await.unwrap() > 0);
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            expected.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                socket.write_all(&expected).await.unwrap();
+            }
+        });
+        for tenant in ["acme", ""] {
+            let app = if tenant.is_empty() { &app } else { &allowed };
+            let result = remote_json(
+                app,
+                tenant,
+                &format!("http://127.0.0.1:{port}"),
+                "/api/port",
+                None::<&serde_json::Value>,
+            )
+            .await;
+            assert!(result.is_ok());
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

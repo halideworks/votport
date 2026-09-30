@@ -3978,6 +3978,7 @@ mod ops_tests {
             max_upload_bytes: 1024 * 1024,
             workflow_snapshot_bytes: 4 * 1024 * 1024,
             allow_hidden: false,
+            library_prehash: false,
             session_idle_secs: 60,
             audit_retention_days: 400,
             upload_retention_days: 0,

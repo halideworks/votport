@@ -548,20 +548,24 @@ fn active_library_grants_match_source_with_tenant_and_revocation_scope() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path()).unwrap();
     let mut active = test_outbound_grant("active", "acme", 0);
-    active.files = ["project/file.bin", "Caf\u{E9}/Pl\u{E4}n.mov"]
-        .into_iter()
-        .map(|source| OutboundGrantFile {
-            source: source.to_owned(),
-            name: source.rsplit('/').next().unwrap().to_owned(),
-            suite: "blake3".to_owned(),
-            root: "root".to_owned(),
-            bytes: 1,
-            receipt_b64: "receipt".to_owned(),
-            downloads: 0,
-            first_download_at: None,
-            last_download_at: None,
-        })
-        .collect();
+    active.files = [
+        "project/file.bin",
+        "Caf\u{E9}/Pl\u{E4}n.mov",
+        "\u{212A}elvin/stra\u{DF}e.txt",
+    ]
+    .into_iter()
+    .map(|source| OutboundGrantFile {
+        source: source.to_owned(),
+        name: source.rsplit('/').next().unwrap().to_owned(),
+        suite: "blake3".to_owned(),
+        root: "root".to_owned(),
+        bytes: 1,
+        receipt_b64: "receipt".to_owned(),
+        downloads: 0,
+        first_download_at: None,
+        last_download_at: None,
+    })
+    .collect();
     store.insert_outbound_grant(active).unwrap();
 
     let mut other = test_outbound_grant("other", "other", 0);
@@ -617,6 +621,12 @@ fn active_library_grants_match_source_with_tenant_and_revocation_scope() {
         .unwrap());
     assert!(store
         .serves_library_file("acme", "Cafe\u{301}/pla\u{308}n.mov")
+        .unwrap());
+    assert!(store
+        .serves_library_file("acme", "kelvin/strasse.txt")
+        .unwrap());
+    assert!(!store
+        .serves_library_file("other", "kelvin/strasse.txt")
         .unwrap());
     assert!(!store
         .serves_library_file("acme", "Caf\u{E9}/other.mov")
@@ -4362,6 +4372,7 @@ mod settings_tests {
             max_upload_bytes: 1024,
             workflow_snapshot_bytes: 4 * 1024 * 1024,
             allow_hidden: false,
+            library_prehash: false,
             session_idle_secs: 60,
             audit_retention_days: 400,
             upload_retention_days: 0,

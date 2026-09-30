@@ -12,13 +12,18 @@ if [ ! -f "$vot/crates/vot-wasm/Cargo.toml" ]; then
     exit 2
 fi
 
+vot="$(cd "$vot" && pwd)"
+
 (cd "$vot" && cargo build --release \
     -p vot-wasm --target wasm32-unknown-unknown --locked)
+
+target="${CARGO_TARGET_DIR:-$vot/target}"
+case "$target" in /*) ;; *) target="$vot/$target" ;; esac
 
 mkdir -p "$here/web/assets/vendor"
 wasm-bindgen --target web --no-typescript \
     --out-dir "$here/web/assets/vendor" \
-    "$vot/target/wasm32-unknown-unknown/release/vot_wasm.wasm"
+    "$target/wasm32-unknown-unknown/release/vot_wasm.wasm"
 
 sh "$here/scripts/stamp-wasm.sh" "$here/web/assets/vendor"
 

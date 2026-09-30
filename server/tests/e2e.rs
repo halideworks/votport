@@ -299,6 +299,7 @@ async fn start_server_in(
         max_upload_bytes: options.max_upload_bytes,
         workflow_snapshot_bytes: options.max_upload_bytes.saturating_mul(4),
         allow_hidden: false,
+        library_prehash: false,
         session_idle_secs: options.session_idle_secs,
         audit_retention_days: 400,
         upload_retention_days: 0,

@@ -111,8 +111,10 @@ struct RemoteRoute {
     transport: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn command(
     app: &App,
+    tenant: &str,
     origin: &str,
     token: &str,
     password: Option<&str>,
@@ -120,8 +122,7 @@ async fn command(
     ancestry: &[crate::route_protocol::RouteReceipt],
     credential: Option<&str>,
 ) -> ApiResult<RemoteRoute> {
-    let response = app
-        .http
+    let response = crate::egress::client(app, tenant, origin).map_err(|reason| conflict(reason.into()))?
         .post(format!("{origin}/api/r/{token}/route"))
         .header("X-Votport", "1")
         .json(&json!({"password":password,"source":source,"ancestry":ancestry,"credential":credential}))
@@ -322,8 +323,14 @@ pub(super) async fn export(app: &Arc<App>, job: &Job, config: &storage::Storage)
     if !crate::route_protocol::verify_ancestry(&source, &ancestry) {
         return Err(conflict("route exceeds its forwarding limit".into()));
     }
+    let peer_tenant = if trade.is_some() {
+        job.tenant.as_str()
+    } else {
+        ""
+    };
     let mut remote = command(
         app,
+        peer_tenant,
         &origin,
         &token,
         password.as_deref(),
@@ -367,10 +374,22 @@ pub(super) async fn export(app: &Arc<App>, job: &Job, config: &storage::Storage)
         let previous_session = remote.session.clone();
         let previous_transport = remote.transport.clone();
         let destination = config.id.clone();
+        let restrict_peer = !peer_tenant.is_empty();
         let outcome = tokio::task::spawn_blocking(move || -> Result<(),votport_client_core::Error> {
             let grant = application.store.outbound_grant_by_id(&owned_job.id).map_err(votport_client_core::Error::Other)?.ok_or_else(||votport_client_core::Error::Other("delivery missing".into()))?;
             let prepared = crate::api::serve::prepare_route_package(&application,&grant).map_err(|_|votport_client_core::Error::Other("prepare peer delivery failed".into()))?;
-            let client = votport_client_core::api::Client::for_route(base,route_id)?;
+            let client = if restrict_peer {
+                if crate::egress::refused_literal(&base, &application.config.tenant_private_networks) {
+                    return Err(votport_client_core::Error::Other("destination address is restricted".into()));
+                }
+                let http = crate::egress::restrict_blocking(reqwest::blocking::Client::builder(), &application.config.tenant_private_networks)
+                    .redirect(reqwest::redirect::Policy::none()).timeout(std::time::Duration::from_secs(300)).connect_timeout(std::time::Duration::from_secs(20))
+                    .build().map_err(|source| votport_client_core::Error::Http {url:"<client build>".into(),source})?;
+                let networks = application.config.tenant_private_networks.clone();
+                votport_client_core::api::Client::for_route_with_network(base,route_id,http,move |ip| crate::egress::reachable(ip, &networks))?
+            } else {
+                votport_client_core::api::Client::for_route(base,route_id)?
+            };
             let mut progress = Progress {app:Arc::clone(&application),job:owned_job,destination,moved:0,reported:std::time::Instant::now()-std::time::Duration::from_secs(5),checked:std::cell::Cell::new(std::time::Instant::now()-std::time::Duration::from_secs(1)),cancelled:std::cell::Cell::new(false)};
             use votport_client_core::progress::Observer;
             if progress.cancelled() { return Err(votport_client_core::Error::Cancelled); }
@@ -393,6 +412,7 @@ pub(super) async fn export(app: &Arc<App>, job: &Job, config: &storage::Storage)
         // A lost finish response does not turn a verified remote receipt into a second upload.
         remote = command(
             app,
+            peer_tenant,
             &origin,
             &token,
             password.as_deref(),
@@ -492,8 +512,18 @@ async fn revoke_remote(
     app: &App,
     control: &crate::store::OutboundControl,
 ) -> ApiResult<crate::route_protocol::RouteRevoked> {
-    let response = app
-        .http
+    let job = app
+        .store
+        .delivery_job(&control.job_id)
+        .map_err(crate::api::store_unavailable)?
+        .ok_or_else(ApiError::not_found)?;
+    let tenant = if job.checks["trade_routes"][&control.destination].is_object() {
+        job.tenant.as_str()
+    } else {
+        ""
+    };
+    let response = crate::egress::client(app, tenant, &control.origin)
+        .map_err(|reason| conflict(reason.into()))?
         .post(format!(
             "{}/api/route/{}/revoke",
             control.origin, control.route_id
@@ -595,4 +625,50 @@ pub async fn evidence(
         .filter(|route| route.link_id == link)
         .ok_or_else(ApiError::not_found)?;
     Ok(([(header::CACHE_CONTROL,"no-store")],Json(json!({"receipt":route.receipt,"ancestors":route.ancestry,"revoked_at":route.revoked_at}))).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn named_tenant_route_commands_refuse_internal_addresses() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let source = app.signer.sign_route(crate::route_protocol::RouteDocument {
+            issuer: app.signer.public_hex.clone(),
+            operation_id: "fixture".into(),
+            manifest: "ab".repeat(32),
+            label: String::new(),
+            metadata: Default::default(),
+            parent_receipt: None,
+            visited: vec![app.signer.public_hex.clone()],
+            permission: None,
+        });
+        for host in ["127.0.0.1", "localhost"] {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                command(
+                    &app,
+                    "acme",
+                    &format!("http://{host}:{port}"),
+                    "request",
+                    None,
+                    &source,
+                    &[],
+                    None,
+                ),
+            )
+            .await
+            .expect("restricted commands must finish without reaching the listener");
+            assert!(result.is_err());
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    }
 }

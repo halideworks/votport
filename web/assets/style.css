@@ -2136,6 +2136,8 @@ body:has(#nav) .sheet {
  overflow: visible;
 }
 body:has(#nav) .sheet::before { display: none; }
+body:has(#nav) .card > button + p,
+body:has(#nav) .card > .actions + p { margin-top: 1rem; }
 body:has(#nav) h1 { font-size: clamp(1.7rem, 3vw, 2rem); letter-spacing: -.035em; line-height: 1.25; }
 body:has(#nav) h2 { font-size: 1.05rem; text-transform: none; letter-spacing: -.015em; color: var(--text); }
 body:has(#nav) .card { min-width: 0; padding: clamp(1rem, 2.2vw, 1.75rem); }
@@ -2267,6 +2269,10 @@ body:has(#nav) .permission-grid { display: grid; grid-template-columns: repeat(2
 .notification-destination legend, .notification-editor .field-help { overflow-wrap: anywhere; }
 .notification-details { margin-block: 1rem; }
 .notification-details > summary { cursor: pointer; }
+.notification-editor > .field-help,
+.notification-details > .field-help { margin-block: 1rem; }
+.notification-editor > .text-link { display: inline-block; margin: .5rem .75rem .5rem 0; }
+.notification-editor > button { margin-block: .5rem; }
 
 .feedback:empty { display: none; }
 
