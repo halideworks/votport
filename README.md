@@ -168,7 +168,7 @@ remain retained while in flight.
 | `VOTPORT_DATA_DIR` | `/data` | State: `votport.db` (links and upload records; current schema required) and the cookie secret. |
 | `VOTPORT_RECEIVE_DIR` | `/received` | Root folder received files are published into. |
 | `VOTPORT_OUTBOUND_DIR` | `/outbound` | Root folder for server-rendered projects and files uploaded by admins for outbound links. Nested project subdirectories are allowed. |
-| `VOTPORT_LIBRARY_PREHASH` | `true` | Prepare roots and proof catalogs for stable Library files while transfers are idle. Scans every 15 seconds, skips temporary files and symlinks, and warms the newest 4,096 eligible sources. Set to `false` to disable background disk reads. |
+| `VOTPORT_LIBRARY_PREHASH` | `true` | Prepare roots and proof catalogs for stable Library files while transfers are idle. Polls every 15 seconds between hashes, skips temporary files and symlinks, and warms the newest 4,096 discovered eligible sources. Set to `false` to disable background disk reads. |
 | `VOTPORT_MAX_UPLOAD_BYTES` | 50 GiB | Hard cap per upload session (per-link caps can be lower). Accepts plain bytes or a `K/KiB/KB`, `M/MiB/MB`, `G/GiB/GB`, `T/TiB/TB` suffix, e.g. `500G`. |
 | `VOTPORT_ALLOW_HIDDEN` | off | Set `1` to accept dot-file names from uploaders. |
 | `VOTPORT_SESSION_IDLE_SECS` | `1800` | Positive idle time in seconds before an unfinished upload session is discarded; zero stops startup. |
